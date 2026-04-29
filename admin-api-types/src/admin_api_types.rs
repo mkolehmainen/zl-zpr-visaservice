@@ -161,8 +161,9 @@ impl fmt::Display for VisaDescriptor {
     }
 }
 
-// intentionally match the zpr::vsapi_types KeySet and KeyFormat, but
-// reproduced here to prevent coupling of the API types from the internal types
+/// Intentionally match the zpr::vsapi_types KeySet and KeyFormat, but
+/// reproduced here to prevent coupling of the API types from the internal types
+/// Note these keys are encrypted.
 #[serde_as]
 #[derive(Default, Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ApiKeySet {

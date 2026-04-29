@@ -145,6 +145,8 @@ async fn require_api_key(
         .and_then(|hv| hv.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
+    // TODO: Add exponential backoff on unauthorizied requests.
+
     let perm = validate_api_key(&state, api_key).await?;
     req.extensions_mut().insert(perm);
     Ok(next.run(req).await)
@@ -586,21 +588,29 @@ async fn get_service(
     debug!(target: ADMIN, "GET /admin/service CN={}", cn);
     let rstate = state.read().await;
 
-    if let Some(detail) = rstate.asm.actor_mgr.get_service_detail(&cn).await.unwrap() {
-        let connect_via = match detail.connect_via.as_ref() {
-            Some(cv_addr) => cv_addr.to_string(),
-            None => "".to_string(),
-        };
-        let sd = ServiceDescriptor {
-            service_name: detail.service_name,
-            zpr_addr: detail.zpr_addr.to_string(),
-            actor_cn: detail.actor_cn,
-            dock_zpr_addr: connect_via,
-        };
-        return Ok(Json(sd));
+    match rstate.asm.actor_mgr.get_service_detail(&cn).await {
+        Err(e) => {
+            error!(target: ADMIN, "error getting service detail for CN {}: {}", cn, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Ok(opt_detail) => {
+            if let Some(detail) = opt_detail {
+                let connect_via = match detail.connect_via.as_ref() {
+                    Some(cv_addr) => cv_addr.to_string(),
+                    None => "".to_string(),
+                };
+                let sd = ServiceDescriptor {
+                    service_name: detail.service_name,
+                    zpr_addr: detail.zpr_addr.to_string(),
+                    actor_cn: detail.actor_cn,
+                    dock_zpr_addr: connect_via,
+                };
+                Ok(Json(sd))
+            } else {
+                Err(StatusCode::NOT_FOUND)
+            }
+        }
     }
-
-    Err(StatusCode::NOT_FOUND)
 }
 
 async fn get_revokes() -> impl IntoResponse {

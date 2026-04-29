@@ -108,7 +108,7 @@ pub mod tests {
             config: VSConfig::default(),
             counters: counters.clone(),
             system_start_time: std::time::Instant::now(),
-            cc: ConnectionControl::new(),
+            cc: ConnectionControl::new("vs_ident".to_string()),
             policy_mgr: PolicyMgr::new_with_initial_policy(initial_policy, policy_repo)
                 .await
                 .expect("failed to initialize PolicyMgr"),

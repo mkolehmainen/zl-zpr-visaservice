@@ -273,7 +273,7 @@ async fn main() -> std::process::ExitCode {
         config: cfg.clone(),
         counters,
         system_start_time: std::time::Instant::now(),
-        cc: ConnectionControl::new(),
+        cc: ConnectionControl::new(identity),
         policy_mgr: policy_mgr,
         actor_mgr: Arc::new(actor_mgr),
         state_db: db_handle,

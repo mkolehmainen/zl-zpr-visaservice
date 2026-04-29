@@ -310,8 +310,8 @@ impl EvalContext {
             .unwrap();
 
         // Policy configuration also tells us what attributes are tied to identity.
-        // TODO: use policy to figure out the identity attributes.
-        // For now this is just a hack.  We try CN, address, or if those fail we use the hash.
+        // TODO: use policy to figure out the identity attributes. (https://github.com/org-zpr/zpr-visaservice/issues/201)
+        // For now this is just a hack: we try CN, address, and if those fail we use the hash.
         if actor.has_attribute_named(key::CN) {
             // use cn
             actor.add_identity_key(0, key::CN).unwrap();
