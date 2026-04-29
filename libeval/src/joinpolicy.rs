@@ -3,6 +3,7 @@
 use enumset::{EnumSet, EnumSetType};
 use std::collections::HashMap;
 use zpr::policy::v1;
+use zpr::policy_types::{AttrExp, AttrOp};
 
 use crate::attribute::Attribute;
 use crate::policy::PolicyError;
@@ -20,21 +21,6 @@ pub enum JFlag {
     IsNode,
     IsVs,
     IsVsDock,
-}
-
-#[derive(Debug)]
-pub struct AttrExp {
-    pub key: String,
-    pub op: AttrOp,
-    pub value: Vec<String>, // could be empty
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum AttrOp {
-    Eq,
-    Ne,
-    Has,
-    Excludes,
 }
 
 // Extract a `JPolicy` from a Cap'n Proto `j_policy`.
@@ -94,34 +80,32 @@ impl TryFrom<v1::j_policy::Reader<'_>> for JPolicy {
     }
 }
 
-impl AttrExp {
-    /// True if `vals` includes exactly the values from this AttrExp. Order not important.
-    /// If there are duplicates in `vals` there must also be duplicates in `self.value`
-    /// and vice versa.
-    ///
-    /// Note that there should never normally be duplicates in `self.value`
-    /// since AttrExprs are created by the compiler and duplicates are not generated.
-    fn contains_exactly<S: AsRef<str>>(&self, vals: &[S]) -> bool {
-        if vals.len() != self.value.len() {
-            return false;
-        }
-
-        let mut m = HashMap::<String, usize>::new();
-        for s in vals {
-            *m.entry(s.as_ref().to_owned()).or_insert(0) += 1;
-        }
-
-        let mut n = HashMap::<String, usize>::new();
-        for s in &self.value {
-            *n.entry(s.to_owned()).or_insert(0) += 1;
-        }
-
-        m == n
+/// True if `vals` includes exactly the values from this AttrExp. Order not important.
+/// If there are duplicates in `vals` there must also be duplicates in `attr_exp.value`
+/// and vice versa.
+///
+/// Note that there should never normally be duplicates in `attr_exp.value`
+/// since AttrExprs are created by the compiler and duplicates are not generated.
+pub fn contains_exactly<S: AsRef<str>>(attr_exp: &AttrExp, vals: &[S]) -> bool {
+    if vals.len() != attr_exp.value.len() {
+        return false;
     }
 
-    fn is_empty_value(&self) -> bool {
-        self.value.is_empty() || self.value[0].is_empty()
+    let mut m = HashMap::<String, usize>::new();
+    for s in vals {
+        *m.entry(s.as_ref().to_owned()).or_insert(0) += 1;
     }
+
+    let mut n: HashMap<String, usize> = HashMap::<String, usize>::new();
+    for s in &attr_exp.value {
+        *n.entry(s.to_owned()).or_insert(0) += 1;
+    }
+
+    m == n
+}
+
+fn is_empty_value(attr_exp: &AttrExp) -> bool {
+    attr_exp.value.is_empty() || attr_exp.value[0].is_empty()
 }
 
 impl JPolicy {
@@ -149,19 +133,19 @@ impl JPolicy {
 
                     match jp_exp.op {
                         AttrOp::Eq => {
-                            if !jp_exp.contains_exactly(&attr.get_value()) {
+                            if !contains_exactly(jp_exp, &attr.get_value()) {
                                 return false;
                             }
                         }
                         AttrOp::Ne => {
-                            if jp_exp.contains_exactly(&attr.get_value()) {
+                            if contains_exactly(jp_exp, &attr.get_value()) {
                                 return false;
                             }
                         }
                         AttrOp::Has => {
                             // HAS - the attribute must have all the values present in the attr exp.
                             // ALSO, if the AttrExp is (KEY, HAS, "") that is a match for any values on the attr.
-                            if !jp_exp.is_empty_value() {
+                            if !is_empty_value(jp_exp) {
                                 if !attr.value_has_all(&jp_exp.value) {
                                     return false;
                                 }
@@ -170,7 +154,7 @@ impl JPolicy {
                         AttrOp::Excludes => {
                             // EXCLUDES - the attribute must not have any of the values present in the AttrExp.
                             // ALSO, if the AttrExp is (KEY, EXCLUDES, "") that means we exclude the key, so it's a fail.
-                            if jp_exp.is_empty_value() {
+                            if is_empty_value(jp_exp) {
                                 return false;
                             }
                             if attr.value_has_any(&jp_exp.value) {
@@ -182,7 +166,7 @@ impl JPolicy {
             }
             if !found {
                 // EXCLUDES with an empty value matches not-having the attribute.
-                if jp_exp.op == AttrOp::Excludes && jp_exp.is_empty_value() {
+                if jp_exp.op == AttrOp::Excludes && is_empty_value(jp_exp) {
                     continue;
                 }
                 // Fail - all keys must be present.
@@ -210,16 +194,16 @@ mod tests {
             value: vec!["a".to_string(), "b".to_string()],
         };
         let values = vec!["a".to_string()];
-        assert!(!exp.contains_exactly(&values));
+        assert!(!contains_exactly(&exp, &values));
 
         let values = vec!["a".to_string(), "b".to_string()];
-        assert!(exp.contains_exactly(&values));
+        assert!(contains_exactly(&exp, &values));
 
         let values = vec!["b".to_string(), "a".to_string()];
-        assert!(exp.contains_exactly(&values));
+        assert!(contains_exactly(&exp, &values));
 
         let values = vec!["a".to_string(), "b".to_string(), "b".to_string()];
-        assert!(!exp.contains_exactly(&values));
+        assert!(!contains_exactly(&exp, &values));
     }
 
     #[test]
@@ -233,13 +217,13 @@ mod tests {
         };
 
         // Any combo of two "a" and one "b" should work
-        assert!(exp.contains_exactly(&vec!["a", "b", "a"]));
-        assert!(exp.contains_exactly(&vec!["a", "a", "b"]));
-        assert!(exp.contains_exactly(&vec!["b", "a", "a"]));
+        assert!(contains_exactly(&exp, &vec!["a", "b", "a"]));
+        assert!(contains_exactly(&exp, &vec!["a", "a", "b"]));
+        assert!(contains_exactly(&exp, &vec!["b", "a", "a"]));
 
-        assert!(!exp.contains_exactly(&vec!["b", "a", "a", "b", "a"]));
-        assert!(!exp.contains_exactly(&vec!["a", "b", "b"]));
-        assert!(!exp.contains_exactly(&vec!["a", "b"]));
+        assert!(!contains_exactly(&exp, &vec!["b", "a", "a", "b", "a"]));
+        assert!(!contains_exactly(&exp, &vec!["a", "b", "b"]));
+        assert!(!contains_exactly(&exp, &vec!["a", "b"]));
     }
 
     #[test]
@@ -260,9 +244,9 @@ mod tests {
             value: vec!["a".to_string(), "".to_string()],
         };
 
-        assert!(empty.is_empty_value());
-        assert!(empty_str.is_empty_value());
-        assert!(!non_empty.is_empty_value());
+        assert!(is_empty_value(&empty));
+        assert!(is_empty_value(&empty_str));
+        assert!(!is_empty_value(&non_empty));
     }
 
     #[test]
