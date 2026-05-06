@@ -56,6 +56,13 @@ pub struct Attribute {
     expires_at: SystemTime,
 }
 
+/// TBD. Placeholder for that which is used to match link attributes based on policy.
+/// For example, a ZPL constrainted attribute might be "location:spain" and in that
+/// case the AttrMatch would indicates that we are looking for a "location"
+/// key with a "spain" value.
+#[derive(Debug, Clone, Serialize, Hash, Eq, PartialEq)]
+pub struct AttrMatch {} // TODO
+
 pub struct AttributeBuilder {
     key: String,
     expires_at: SystemTime,

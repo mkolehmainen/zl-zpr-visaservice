@@ -10,7 +10,8 @@ Rust workspace with main crate `vs` (visa service) and supporting crates:
 - Then run `cargo fmt -- --check` and fix formatting.
 - Run `cargo test` when tests exist or are relevant.
 - For refactors/renames, search usages across all crates in this workspace.
-- If a plan file exists (e.g. `PLAN.md`), follow it exactly unless the user approves scope changes.
+- Never patch a failing test you didn't write unless explicitly told to do so.
+- Any functions written (include tests) should have a brief comment explaining what they do.
 
 ## Project Note
 - ZPR addresses are IPv6 and must use prefix `fd5a:5052`.

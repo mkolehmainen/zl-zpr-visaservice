@@ -130,7 +130,7 @@ impl VisaMgr {
         )
         .await
         {
-            Ok(VisaDecision::Allow(visa)) => Ok(visa),
+            Ok(VisaDecision::Allow(visa, _route)) => Ok(visa), // TODO: do something with the route
             Ok(VisaDecision::Deny(dcode)) => Err(ServiceError::VisaDenied(dcode.to_string())),
             Err(e) => Err(e),
         }

@@ -27,6 +27,7 @@ mod logging;
 mod net_mgr;
 mod packet;
 mod policy_mgr;
+mod router;
 mod signal_worker;
 mod visa_mgr;
 mod visareq_worker;
@@ -51,6 +52,7 @@ use crate::logging::enable_logging;
 use crate::logging::targets::MAIN;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::PolicyMgr;
+use crate::router::Router;
 use crate::visa_mgr::VisaMgr;
 use crate::vss_mgr::VssMgr;
 
@@ -283,6 +285,7 @@ async fn main() -> std::process::ExitCode {
         net_mgr: Arc::new(net_mgr),
         event_mgr: EventMgr::new(event_tx),
         admin_api_keys: Arc::new(admin_api_keys),
+        router: Router::new(),
     });
 
     js.spawn_local(signal_worker::launch(asm.clone()));
@@ -389,7 +392,7 @@ async fn self_authorize(asm: Arc<Assembly>, vs_addr: &IpAddr) -> Result<(), Serv
         .authenticate_visa_service(asm.clone(), claims)
         .await?;
 
-    asm.actor_mgr.add_adapter_no_node(&actor).await?;
+    asm.actor_mgr.hack_add_adapter_no_node(&actor).await?;
 
     let evt = VsEvent::ActorJoins(vs_addr.clone());
     if let Err(e) = asm.event_mgr.record_event(evt).await {

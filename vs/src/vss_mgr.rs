@@ -333,7 +333,7 @@ async fn vss_worker_loop(
         }
     };
 
-    info!(target: VSS, "connected to VSS at {}", node_addr);
+    info!(target: VSS, "now connected to VSS at {}", node_addr);
 
     do_vss_initialization(&asm, &node_addr.ip(), &vss_handle).await;
 

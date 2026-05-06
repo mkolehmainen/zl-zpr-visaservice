@@ -115,6 +115,7 @@ async fn handle_actor_leaves(
     // The disconnect call updates our state database.
     // Could be we just lost a single adapter, or we lost a node and all adapters connected.
     // TODO: In future we may want to not wipe state so quickly? What if this is temporary (for node)?
+    // TODO: What are the implications for VS if this next call errors out?
     asm.cc.disconnect(asm.clone(), actor_addr, reason).await?;
 
     if !prev_auth_services.is_empty() {

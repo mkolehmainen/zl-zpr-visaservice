@@ -22,11 +22,50 @@ use zpr::write_to::WriteTo;
 use crate::assembly::Assembly;
 use crate::config;
 use crate::counters::CounterType;
-use crate::error::ServiceError;
+use crate::error::{ServiceError, TopologyError};
 use crate::event_mgr::VsEvent;
 use crate::logging::targets::API;
 use crate::net_mgr;
 use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
+
+// During node authentication we keep track in here of what state we have
+// changed so that we can do an undo in case of an error in the sequence.
+#[derive(Default)]
+struct AuthenticateUndo {
+    taken_zpr_addr: Option<IpAddr>,
+    actor_mgr_add_node: Option<IpAddr>,
+    added_node_to_router: Option<IpAddr>,
+}
+
+impl AuthenticateUndo {
+    /// We checked out one of our ZPR addresses.
+    fn took_zpr_addr(&mut self, addr: &IpAddr) {
+        self.taken_zpr_addr = Some(addr.clone());
+    }
+
+    /// We added a node to state.
+    fn added_node_to_actor_mgr(&mut self, addr: &IpAddr) {
+        self.actor_mgr_add_node = Some(addr.clone());
+    }
+
+    /// We added a node to the router.
+    fn added_node_to_router(&mut self, addr: &IpAddr) {
+        self.added_node_to_router = Some(addr.clone());
+    }
+
+    async fn undo(self, asm: &Assembly) {
+        if let Some(addr) = self.added_node_to_router {
+            asm.router.remove_node(&addr);
+        }
+        if let Some(addr) = self.actor_mgr_add_node {
+            let _ = asm.actor_mgr.remove_node(&addr).await;
+            let _ = asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await;
+        }
+        if let Some(addr) = self.taken_zpr_addr {
+            let _ = asm.net_mgr.release_zpr_addr(addr);
+        }
+    }
+}
 
 pub async fn launch_capnp(
     asm: Arc<Assembly>,
@@ -537,27 +576,36 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             }
         };
 
+        // At this point we may have taken an IP addr and assigned it to the actor.
+        let mut undo = AuthenticateUndo::default();
+
         // Sanity check - every node has a CN and a ZPR address.
         // If this fails it means our authentication code is broken.
-        let node_cn = match node_actor.get_cn() {
-            Some(cn) => cn.to_owned(),
-            None => {
-                error!(target: API, "auth subsystem failed to set a CN on an authenticated node");
-                return self.ok_with_authenticate_error(
-                    results,
-                    vsapi::ErrorCode::Internal,
-                    "assertion failed (CN)",
-                );
-            }
-        };
         let node_zpr_addr = match node_actor.get_zpr_addr() {
             Some(addr) => addr.clone(),
             None => {
                 error!(target: API, "auth subsystem failed to set a ZPR address on an authenticated node");
+                undo.undo(&self.asm).await;
                 return self.ok_with_authenticate_error(
                     results,
                     vsapi::ErrorCode::Internal,
                     "assertion failed (ADDR)",
+                );
+            }
+        };
+        if self.asm.net_mgr.is_managed_address(&node_zpr_addr) {
+            undo.took_zpr_addr(&node_zpr_addr);
+        }
+
+        let node_cn = match node_actor.get_cn() {
+            Some(cn) => cn.to_owned(),
+            None => {
+                error!(target: API, "auth subsystem failed to set a CN on an authenticated node");
+                undo.undo(&self.asm).await;
+                return self.ok_with_authenticate_error(
+                    results,
+                    vsapi::ErrorCode::Internal,
+                    "assertion failed (CN)",
                 );
             }
         };
@@ -588,14 +636,17 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         if !self.reconnect {
             if let Err(e) = self.asm.visa_mgr.clear_node_state(&node_zpr_addr).await {
                 error!(target: API, "failed to clear node state for {:?}: {}", &node_cn, e);
+                undo.undo(&self.asm).await;
                 return self.ok_with_authenticate_error(
                     results,
                     vsapi::ErrorCode::Internal,
                     "failed to clear node state",
                 );
             }
+            self.asm.router.remove_node(&node_zpr_addr);
         }
 
+        // The add_node call will clean up after ifself if it fails.
         if let Err(e) = self
             .asm
             .actor_mgr
@@ -603,16 +654,86 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             .await
         {
             error!(target: API, "failed to add authenticated node {:?} to actor db: {}", &node_cn, e);
+            undo.undo(&self.asm).await;
             return self.ok_with_authenticate_error(
                 results,
                 vsapi::ErrorCode::Internal,
                 "state update failed",
             );
         }
+        undo.added_node_to_actor_mgr(&node_zpr_addr);
+
+        // TODO: This is a hack: the visa service "actor" needs to know what node it's adapter is docked to.
+        //       Ideally we would query our adapter directly.
+        {
+            if let Ok(maybe_visa_service_actor) =
+                self.asm.actor_mgr.get_actor_by_cn(config::VS_CN).await
+            {
+                if let Some(visa_service_actor) = maybe_visa_service_actor {
+                    if self
+                        .asm
+                        .actor_mgr
+                        .get_docking_node_for_actor(&visa_service_actor)
+                        .is_none()
+                    {
+                        // VS does not yet have a docking address.  ASSUME this node is our dock.
+                        // This does not update the 'connect_via' attribute on the vs actor. (TODO - rethink that)
+
+                        if let Err(e) = self
+                            .asm
+                            .actor_mgr
+                            .hack_set_vs_docking_node(&node_zpr_addr)
+                            .await
+                        {
+                            error!(target: API, "failed to set VS docking node to {:?}: {}", &node_cn, e);
+                            undo.undo(&self.asm).await;
+                            return self.ok_with_authenticate_error(
+                                results,
+                                vsapi::ErrorCode::Internal,
+                                "vs docking node update failed",
+                            );
+                        }
+                        // No need to update the `undo` here since undoing the node-add will also remove the vs docking mapping.
+                    }
+                }
+            }
+        }
+
+        // Add the node to the router.
+        match self.asm.router.add_node(&node_zpr_addr) {
+            Ok(()) => (),
+            Err(TopologyError::NodeExists(_)) => {
+                // Attempt to remove and re-add.
+                warn!(target: API, "node {:?} already exists in router, attempting to remove and re-add", &node_cn);
+                self.asm.router.remove_node(&node_zpr_addr);
+                if let Err(e) = self.asm.router.add_node(&node_zpr_addr) {
+                    // Failed to add the node to the router. We won't be able to route visas through this node.
+                    // Best to just abort this connect.
+                    error!(target: API, "router: failed to add node {} to router after removing existing: {}", node_zpr_addr, e);
+                    undo.undo(&self.asm).await;
+                    return self.ok_with_authenticate_error(
+                        results,
+                        vsapi::ErrorCode::Internal,
+                        "router update failed",
+                    );
+                }
+            }
+            Err(e) => {
+                unreachable!("unexpected error adding node to router: {}", e);
+            }
+        }
+
+        undo.added_node_to_router(&node_zpr_addr);
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
         if let Err(e) = self.asm.event_mgr.record_event(evt).await {
-            warn!(target: API, "failed to record actor joins event for node {:?}: {}", &node_cn, e);
+            error!(target: API, "failed to record actor joins event for node {:?}: {}", &node_cn, e);
+            undo.undo(&self.asm).await;
+            return self.ok_with_authenticate_error(
+                results,
+                vsapi::ErrorCode::Internal,
+                "event enqueue failed",
+            );
         }
         self.asm.counters.incr(CounterType::NodeConnectionsSuccess);
 
@@ -974,7 +1095,8 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             .await
         {
             Ok(decision) => match decision {
-                VisaDecision::Allow(visa) => {
+                VisaDecision::Allow(visa, _route) => {
+                    // TODO: Do something with the route
                     let res_builder = response.get().init_resp();
                     let mut visa_bldr = res_builder.init_allow();
                     visa.write_to(&mut visa_bldr);
@@ -1143,5 +1265,108 @@ mod tests {
         assert_eq!(result[0].name, "param0");
         assert_eq!(result[1].name, "param1");
         assert_eq!(result[2].name, "param2");
+    }
+
+    mod authenticate_undo {
+        use super::*;
+        use crate::assembly::tests::new_assembly_for_tests;
+        use crate::test_helpers::make_node_actor_defexp;
+        use libeval::actor::Role;
+        use std::sync::Arc;
+
+        #[tokio::test]
+        async fn test_noop() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let undo = AuthenticateUndo::default();
+            undo.undo(&asm).await; // must not panic
+        }
+
+        #[tokio::test]
+        async fn test_releases_zpr_addr() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let addr = asm.net_mgr.get_next_zpr_addr(&Role::Node).unwrap();
+
+            let mut undo = AuthenticateUndo::default();
+            undo.took_zpr_addr(&addr);
+            undo.undo(&asm).await;
+
+            // Address was released back to the pool, so take_zpr_addr should succeed.
+            assert!(
+                asm.net_mgr.take_zpr_addr(&addr).is_ok(),
+                "address should have been released by undo"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_removes_node_from_router() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let addr: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
+
+            asm.router.add_node(&addr).unwrap();
+
+            let mut undo = AuthenticateUndo::default();
+            undo.added_node_to_router(&addr);
+            undo.undo(&asm).await;
+
+            // Node was removed, so add_node must succeed again.
+            assert!(
+                asm.router.add_node(&addr).is_ok(),
+                "node should have been removed from router by undo"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_removes_node_from_actor_mgr() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let addr: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
+            let actor =
+                make_node_actor_defexp("fd5a:5052:90de:1::2", "test-node", "[fd5a:5052::100]:1234");
+
+            asm.actor_mgr.add_node(&actor, false).await.unwrap();
+
+            let mut undo = AuthenticateUndo::default();
+            undo.added_node_to_actor_mgr(&addr);
+            undo.undo(&asm).await;
+
+            let result = asm.actor_mgr.get_actor_by_zpr_addr(&addr).await.unwrap();
+            assert!(
+                result.is_none(),
+                "node should have been removed from actor_mgr by undo"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_all_three_undone() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let addr = asm.net_mgr.get_next_zpr_addr(&Role::Node).unwrap();
+            let actor =
+                make_node_actor_defexp(&addr.to_string(), "test-node-2", "[fd5a:5052::101]:1234");
+
+            asm.actor_mgr.add_node(&actor, false).await.unwrap();
+            asm.router.add_node(&addr).unwrap();
+
+            let mut undo = AuthenticateUndo::default();
+            undo.took_zpr_addr(&addr);
+            undo.added_node_to_actor_mgr(&addr);
+            undo.added_node_to_router(&addr);
+            undo.undo(&asm).await;
+
+            assert!(
+                asm.router.add_node(&addr).is_ok(),
+                "node should have been removed from router"
+            );
+            asm.router.remove_node(&addr);
+
+            let actor_result = asm.actor_mgr.get_actor_by_zpr_addr(&addr).await.unwrap();
+            assert!(
+                actor_result.is_none(),
+                "node should have been removed from actor_mgr"
+            );
+
+            assert!(
+                asm.net_mgr.take_zpr_addr(&addr).is_ok(),
+                "zpr address should have been released"
+            );
+        }
     }
 }

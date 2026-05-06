@@ -128,6 +128,22 @@ pub enum VssSyncError {
     Timeout(String),
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub enum TopologyError {
+    #[error("node already exists: {0}")]
+    NodeExists(String),
+
+    #[error("link already exists: {0}")]
+    LinkExists(String),
+
+    #[error("link to self is not allowed: {0}")]
+    LinkToSelf(String),
+
+    #[error("node not found: {0}")]
+    NodeNotFound(String),
+}
+
 impl From<ApiResponseError> for VssSyncError {
     fn from(err: ApiResponseError) -> Self {
         VssSyncError::ApiResponse(err.code, err.message, err.retry_in)
