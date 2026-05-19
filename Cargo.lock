@@ -5259,8 +5259,8 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zpr"
-version = "0.16.0"
-source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.16.0#05dd786c44382e8683ef8118fbe1f20e9676e6c4"
+version = "0.17.1"
+source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.17.1#8292918d0c193f4d4c4f0c2b2388f39309ad2b58"
 dependencies = [
  "capnp",
  "capnpc",
