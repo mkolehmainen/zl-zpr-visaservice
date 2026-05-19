@@ -6,7 +6,7 @@ use libeval::actor::Actor;
 use libeval::attribute::{Attribute, ROLE_ADAPTER, ROLE_NODE, key};
 use std::time::Duration;
 use std::time::SystemTime;
-use zpr::vsapi_types::{DockPep, EndpointT, KeySet, TcpUdpPep, Visa};
+use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, TcpUdpPep, Visa};
 
 const DEFAULT_EXPIRES: Duration = Duration::from_secs(3600);
 
@@ -115,7 +115,7 @@ pub fn make_visa(visa_id: u64, expires_in: Duration) -> Visa {
         SystemTime::now() + expires_in,
         "fd5a:5052::10".parse().unwrap(),
         "fd5a:5052::20".parse().unwrap(),
-        DockPep::TCP(TcpUdpPep::new(1234, 443, EndpointT::Server)),
+        DockPepType::TCP(TcpUdpPep::new(1234, 443, EndpointT::Server)),
         KeySet::new(b"ingress", b"egress"),
         None,
     )

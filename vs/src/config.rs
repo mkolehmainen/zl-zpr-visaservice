@@ -27,7 +27,7 @@ pub const EVENT_QUEUE_DEPTH: usize = 1024;
 
 // We only load policy files built by this version or later.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 9;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 11;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 1;
 
 /// Default VSAPI port - must be in sync with compiler since it adds policy for that.

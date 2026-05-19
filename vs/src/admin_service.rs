@@ -25,7 +25,7 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tower_service::Service;
 
-use zpr::vsapi_types::{DockPep, KeyFormat, KeySet, Visa};
+use zpr::vsapi_types::{DockPepType, KeyFormat, KeySet, Visa};
 
 use rustls::ServerConfig;
 use rustls::pki_types::PrivateKeyDer;
@@ -70,8 +70,8 @@ enum ActorRole {
 struct ProtocolDetails {
     /// Human readable protocol name, e.g. "TCP", "UDP", "ICMP"
     protocol: String,
-    source_port: u16,
-    dest_port: u16,
+    source_port: Option<u16>,
+    dest_port: Option<u16>,
 }
 
 /// Blocking start of the admin server.
@@ -324,13 +324,25 @@ async fn get_visa(
                             admin_api_types::VisaMatchDirection::Reverse
                         }
                     },
-                    source_addr: visa.source_addr.to_string(),
-                    dest_addr: visa.dest_addr.to_string(),
+                    source_addr: if let Some(ref dock_pep) = visa.dock_pep {
+                        Some(dock_pep.source_addr.to_string())
+                    } else {
+                        None
+                    },
+                    dest_addr: if let Some(ref dock_pep) = visa.dock_pep {
+                        Some(dock_pep.dest_addr.to_string())
+                    } else {
+                        None
+                    },
                     source_port: proto_deets.source_port,
                     dest_port: proto_deets.dest_port,
                     proto: proto_deets.protocol,
                     signals: metadata.signal_msgs.clone(),
-                    session_key: to_api_keyset(&visa.session_key),
+                    session_key: if let Some(ref dock_pep) = visa.dock_pep {
+                        to_api_keyset(&dock_pep.session_key)
+                    } else {
+                        ApiKeySet::default()
+                    },
                 };
                 return Ok(Json(vd));
             }
@@ -339,14 +351,29 @@ async fn get_visa(
 }
 
 fn protocol_details_for_visa(visa: &Visa) -> ProtocolDetails {
-    let (proto_name, source_port, dest_port) = match &visa.dock_pep {
-        DockPep::ICMP(icmp_pep) => (
+    if visa.dock_pep.is_none() {
+        return ProtocolDetails {
+            protocol: "N/A".to_string(),
+            source_port: None,
+            dest_port: None,
+        };
+    }
+    let (proto_name, source_port, dest_port) = match &visa.dock_pep.as_ref().unwrap().pep {
+        DockPepType::ICMP(icmp_pep) => (
             "ICMP".to_string(),
-            icmp_pep.icmp_type as u16,
-            icmp_pep.icmp_code as u16,
+            Some(icmp_pep.icmp_type as u16),
+            Some(icmp_pep.icmp_code as u16),
         ),
-        DockPep::UDP(tu_pep) => ("UDP".to_string(), tu_pep.source_port, tu_pep.dest_port),
-        DockPep::TCP(tu_pep) => ("TCP".to_string(), tu_pep.source_port, tu_pep.dest_port),
+        DockPepType::UDP(tu_pep) => (
+            "UDP".to_string(),
+            Some(tu_pep.source_port),
+            Some(tu_pep.dest_port),
+        ),
+        DockPepType::TCP(tu_pep) => (
+            "TCP".to_string(),
+            Some(tu_pep.source_port),
+            Some(tu_pep.dest_port),
+        ),
     };
 
     ProtocolDetails {
@@ -678,6 +705,7 @@ mod tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use libeval::eval_result::{Direction, Hit, Signal};
+    use libeval::route::Route;
     use std::net::IpAddr;
     use tower::ServiceExt;
     use zpr::vsapi_types::PacketDesc;
@@ -739,10 +767,12 @@ mod tests {
             PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80).unwrap();
         let hit = Hit::new_no_signal(0, Direction::Forward);
 
+        let route = Route::new_direct(node_addr.into());
+
         // Add a visa.
         let v = asm
             .visa_mgr
-            .create_visa(&node_addr, &pdesc, &hit, "", 0)
+            .create_visa(&asm, &node_addr, &pdesc, &hit, &route, "", 0)
             .await
             .unwrap();
 
@@ -787,19 +817,21 @@ mod tests {
         let pdesc2 =
             PacketDesc::new_tcp("fd5a:5052:3000::5", "fd5a:5052:3000::6", 12347, 22).unwrap();
 
+        let route = Route::new_direct(node_addr.into());
+
         let v0 = asm
             .visa_mgr
-            .create_visa(&node_addr, &pdesc0, &hit, "", 0)
+            .create_visa(&asm, &node_addr, &pdesc0, &hit, &route, "", 0)
             .await
             .unwrap();
         let v1 = asm
             .visa_mgr
-            .create_visa(&node_addr, &pdesc1, &hit, "", 0)
+            .create_visa(&asm, &node_addr, &pdesc1, &hit, &route, "", 0)
             .await
             .unwrap();
         let v2 = asm
             .visa_mgr
-            .create_visa(&node_addr, &pdesc2, &hit, "", 0)
+            .create_visa(&asm, &node_addr, &pdesc2, &hit, &route, "", 0)
             .await
             .unwrap();
 
@@ -1023,10 +1055,19 @@ mod tests {
         let zpl_str = "permit tcp from groupA to groupB port 80";
         let policy_version: u64 = 42;
         let hit = Hit::new_no_signal(0, Direction::Forward);
+        let route = Route::new_direct(node_addr.into());
 
         let v = asm
             .visa_mgr
-            .create_visa(&node_addr, &pdesc, &hit, zpl_str, policy_version)
+            .create_visa(
+                &asm,
+                &node_addr,
+                &pdesc,
+                &hit,
+                &route,
+                zpl_str,
+                policy_version,
+            )
             .await
             .unwrap();
 
@@ -1068,10 +1109,11 @@ mod tests {
         let pdesc =
             PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80).unwrap();
         let hit = Hit::new_no_signal(0, Direction::Reverse);
+        let route = Route::new_direct(node_addr.into());
 
         let v = asm
             .visa_mgr
-            .create_visa(&node_addr, &pdesc, &hit, "", 0)
+            .create_visa(&asm, &node_addr, &pdesc, &hit, &route, "", 0)
             .await
             .unwrap();
 
@@ -1111,10 +1153,11 @@ mod tests {
             service: "svc1".to_string(),
         };
         let hit = Hit::new_with_signal(0, Direction::Forward, signal);
+        let route = Route::new_direct(node_addr.into());
 
         let v = asm
             .visa_mgr
-            .create_visa(&node_addr, &pdesc, &hit, "", 0)
+            .create_visa(&asm, &node_addr, &pdesc, &hit, &route, "", 0)
             .await
             .unwrap();
 

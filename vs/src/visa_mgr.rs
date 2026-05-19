@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, error, warn};
 
 use crate::assembly::Assembly;
 use crate::config;
@@ -13,9 +13,11 @@ use crate::packet::make_fivetuple_tcp;
 use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
 use libeval::eval_result::{Direction, Hit};
+use libeval::route::{NodeId, Route};
 use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 use zpr::vsapi_types::{
-    CommFlag, DockPep, EndpointT, IcmpPep, KeySet, PacketDesc, TcpUdpPep, Visa, VsapiFiveTuple,
+    CommFlag, DockPep, DockPepType, EndpointT, FwdPep, FwdPepStyle, IcmpPep, KeySet, PacketDesc,
+    TcpUdpPep, Visa, VisaType, VsapiFiveTuple,
 };
 
 use tracing::info;
@@ -29,12 +31,110 @@ pub struct VisaWithMetadata {
     pub metadata: db::VisaMetadata,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VCtx {
+    Ingress,
+    Intermediary,
+    Egress,
+}
+
 impl VisaMgr {
     pub fn new(db: db::VisaRepo) -> Self {
         VisaMgr { repo: db }
     }
 
-    pub async fn initial_visas_for_node(
+    /// To "actualize" a visa means to adjust it for the context in which it is deployed.
+    /// The contexts are:
+    /// - On an ingress node we send a full visa which may also have forwarding instuctions
+    ///   when there are links that need to be traversed.
+    /// - On an intermediary node we send a very truncated visa: just the ID and forwarding
+    ///   instructions.
+    /// - On an egress node we send a full visa, no forwarding info.
+    ///
+    pub async fn actualize_visa_for_target_node(
+        &self,
+        mut visa: Visa,
+        target_node: &IpAddr,
+        direction: Direction,
+    ) -> Result<Visa, ServiceError> {
+        let md = self.repo.get_visa_metadata_by_id(visa.issuer_id).await?;
+
+        let Some(path) = md.path.as_ref() else {
+            return Ok(visa);
+        };
+        if path.len() < 2 {
+            // should not happen but just in case, treat as no path.
+            return Ok(visa);
+        }
+
+        let vctx = if path.first().unwrap() == target_node {
+            match direction {
+                Direction::Forward => VCtx::Ingress,
+                Direction::Reverse => VCtx::Egress,
+            }
+        } else if path.last().unwrap() == target_node {
+            match direction {
+                Direction::Forward => VCtx::Egress,
+                Direction::Reverse => VCtx::Ingress,
+            }
+        } else {
+            VCtx::Intermediary
+        };
+
+        match vctx {
+            VCtx::Ingress => {
+                // We already know path is at least 2 so there is a forwarding instruction.
+                if let Some(next_hop) = next_hop_in_path(path, target_node, direction) {
+                    let fwd_pep = FwdPep {
+                        next_hop: *next_hop,
+                        style: FwdPepStyle::OneWay, // TODO: Not sure when to set this to symmetric.
+                    };
+                    visa.fwd_pep = Some(fwd_pep);
+                    return Ok(visa);
+                } else {
+                    error!(target: VISA, "error actualizing visa for ingress node {target_node} on path is {path:?}: no next_hop found");
+                    return Err(ServiceError::Internal(format!("failed to actualize visa")));
+                }
+            }
+            VCtx::Egress => {
+                // Just return the full visa.
+                return Ok(visa);
+            }
+            VCtx::Intermediary => {
+                // Build a forwardingOnly visa ...
+                match next_hop_in_path(path, target_node, direction) {
+                    Some(next_hop) => {
+                        let fpep = FwdPep {
+                            next_hop: *next_hop,
+                            style: FwdPepStyle::OneWay, // TODO: Not sure when to set this to symmetric.
+                        };
+                        return Ok(to_forwarding_visa(visa, fpep));
+                    }
+                    None => {
+                        error!(target: VISA, "error actualizing visa for ingress node {target_node} on path is {path:?}: no next_hop found");
+                        return Err(ServiceError::Internal(format!("failed to actualize visa")));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Used when a node has already connected to the VS via the VSAPI and has called
+    /// `register_vss`.
+    ///
+    /// Creates visas for:
+    /// - allow visa service to talk to node VSS.
+    ///
+    /// `node_addr` - The node, already connected and has just called `register_vss` over
+    /// VSAPI.  The idea is that the VS is next going to open a connection back to the node's
+    /// VSS so this can preempt the visa request.
+    ///
+    /// The visas returned here are any pending visas that should be installed on the
+    /// node `node_addr` which has just called to initialize vss.  If there are intermediary
+    /// nodes between the VS and `node_addr` those other visas are also created and set
+    /// PENDING on the relevant nodes -- but are not returned here.
+    ///
+    pub async fn post_register_vss_visas_for_node(
         &self,
         asm: Arc<Assembly>,
         node_addr: &IpAddr,
@@ -42,8 +142,15 @@ impl VisaMgr {
     ) -> Result<Vec<Visa>, ServiceError> {
         let mut visas = Vec::new();
 
+        // Start with any visas that may already be pending.
         if let Ok(pendings) = self.get_pending_visas_for_node(node_addr).await {
-            visas.extend(pendings); // ignore errors here
+            for v in pendings {
+                let md = self.repo.get_visa_metadata_by_id(v.issuer_id).await?;
+                let av = self
+                    .actualize_visa_for_target_node(v, node_addr, md.direction)
+                    .await?;
+                visas.push(av);
+            }
         }
 
         // The node may be reconnecting, in which case it may already have the core visas installed.
@@ -84,10 +191,17 @@ impl VisaMgr {
             .get_visas_for_node_by_state(node_addr, db::NodeVisaState::Installed)
             .await?
         {
-            if &visa.source_addr == &ft.source_addr && &visa.dest_addr == &ft.dest_addr {
+            if visa.dock_pep.is_none() {
+                warn!(target: VISA, "found visa in store with no dock_pep ID={}", visa.issuer_id);
+                continue; // not a full visa -- should not happen as only full visas are stored.
+            }
+            let dock_pep = visa.dock_pep.as_ref().unwrap();
+            let vsource = &dock_pep.source_addr;
+            let vdest = &dock_pep.dest_addr;
+            if vsource == &ft.source_addr && vdest == &ft.dest_addr {
                 // Is from VS -> NODE, check for VSS port match.
-                match &visa.dock_pep {
-                    DockPep::TCP(tpep) => {
+                match &dock_pep.pep {
+                    DockPepType::TCP(tpep) => {
                         if tpep.dest_port == ft.dest_port && tpep.source_port == ft.source_port {
                             // Found it
                             return Ok(Some(visa));
@@ -105,7 +219,14 @@ impl VisaMgr {
     }
 
     /// Ask policy for a visa permitting this visa service to talk to the given node VSS addr.
-    pub async fn create_vs_to_node_vss_visa(
+    /// Creating the visa has side effect of storing it in state and as PENDING on the requesting node.
+    ///
+    /// TODO: Should also be set pending on any intermediary nodes.
+    ///
+    /// `node_addr` - node ZPR address hosting the VSS.
+    ///
+    /// Returns a visa for the docking node of `node_addr` (based on route of VS->node_addr).
+    async fn create_vs_to_node_vss_visa(
         &self,
         asm: Arc<Assembly>,
         node_addr: &IpAddr,
@@ -122,9 +243,31 @@ impl VisaMgr {
         )
         .unwrap();
 
+        // TODO: This call to return a FULL visa plus Route info.
+        // then we need to do some work.
+        self.create_visa_for_packet(asm, pkt_data, node_addr).await
+    }
+
+    /// TODO: Update this to create a chain of visas or at any rate to set up the visa installation chain.    /// `requesting_node_addr` - The visa is created as if this node has requested it.
+    ///
+    /// The returned visa is a full visa (TODO: return route info).
+    /// The visa needs to be crunched through PATH to determine what is sent to `requesting_node_addr` node.
+    async fn create_visa_for_packet(
+        &self,
+        asm: Arc<Assembly>,
+        pkt_data: PacketDesc,
+        requesting_node_addr: &IpAddr,
+    ) -> Result<Visa, ServiceError> {
+        // This will end up calling into `create_visa` which means we get a route
+        // and state will have been updated if any visas need to be sent to nodes.
+        //
+        // When it comes time to actually deliver a visa to a node
+        // we can use the PATH to create correct visa contents. The visa stored in state
+        // by ID is the FULL visa.
+        //
         match request_visa_wait_response(
             &asm,
-            node_addr,
+            requesting_node_addr,
             pkt_data,
             config::DEFAULT_VISA_REQ_TIMEOUT,
         )
@@ -142,12 +285,18 @@ impl VisaMgr {
     /// No checking to see if visa already exists.
     /// Fake keys.
     ///
-    /// Note that visa state with respect tot he requesting node is set to PENDING_INSTALL.
+    /// Note that visa state with respect to the requesting node is set to PENDING_INSTALL.
+    ///
+    /// A path is created from the route using the direction inforation in the hit.
+    ///
+    /// This returns a FULL visa.
     pub async fn create_visa(
         &self,
+        asm: &Assembly,
         requesting_node: &IpAddr,
         pdesc: &PacketDesc,
         hit: &Hit,
+        route: &Route,
         source_zpl: impl Into<String>,
         policy_version: u64,
     ) -> Result<Visa, ServiceError> {
@@ -189,44 +338,70 @@ impl VisaMgr {
         };
 
         let pep = match pdesc.five_tuple.l4_protocol {
-            ip_proto::TCP => DockPep::TCP(TcpUdpPep::new(
+            ip_proto::TCP => DockPepType::TCP(TcpUdpPep::new(
                 source_port,
                 dest_port,
                 ep_from_dir(&hit.direction),
             )),
-            ip_proto::UDP => DockPep::UDP(TcpUdpPep::new(
+            ip_proto::UDP => DockPepType::UDP(TcpUdpPep::new(
                 source_port,
                 dest_port,
                 ep_from_dir(&hit.direction),
             )),
-            ip_proto::IPV6_ICMP => DockPep::ICMP(IcmpPep::new(source_port as u8, dest_port as u8)),
+            ip_proto::IPV6_ICMP => {
+                DockPepType::ICMP(IcmpPep::new(source_port as u8, dest_port as u8))
+            }
 
             _ => unreachable!(), // already handled above
         };
 
         let visa_id = self.repo.get_next_visa_id().await?;
 
+        let path: Option<Vec<IpAddr>> = if matches!(route.kind, libeval::route::RouteKind::Multihop)
+        {
+            let starting_node = NodeId(*requesting_node);
+            let mut node_id_path = asm.topo_mgr.route_to_path(route, &starting_node)?;
+            // Normalize to canonical forward order (ingress→…→egress) so that
+            // actualize_visa_for_target_node applies direction logic correctly.
+            // A reverse hit starts traversal from the forward-egress node, so reversing
+            // restores forward orientation.
+            if hit.direction == Direction::Reverse {
+                node_id_path.reverse();
+            }
+            Some(node_id_path.into_iter().map(|id| id.into()).collect())
+        } else {
+            None
+        };
+
         let mut metadata = db::VisaMetadata::new(
             requesting_node.clone(),
             policy_version,
             source_zpl.into(),
             hit.direction,
+            path,
         );
         if let Some(sig) = hit.signal.as_ref() {
             metadata.signal_msgs.push(sig.message.clone());
         }
 
+        let pep = DockPep {
+            pep,
+            source_addr: pdesc.five_tuple.source_addr.clone(),
+            dest_addr: pdesc.five_tuple.dest_addr.clone(),
+            session_key: KeySet::new("secret".as_bytes(), "secret".as_bytes()),
+        };
+
         let visa = Visa {
             issuer_id: visa_id,
             config: 0,
             expires: expiration_time,
-            source_addr: pdesc.five_tuple.source_addr.clone(),
-            dest_addr: pdesc.five_tuple.dest_addr.clone(),
-            dock_pep: pep,
+            visa_type: VisaType::Full,
+            dock_pep: Some(pep),
+            fwd_pep: None,
             cons: None,
-            session_key: KeySet::new("secret".as_bytes(), "secret".as_bytes()),
         };
 
+        // The store also updates the visa state along the path.
         self.repo
             .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
             .await?;
@@ -375,6 +550,28 @@ fn ep_from_dir(dir: &Direction) -> EndpointT {
     }
 }
 
+fn to_forwarding_visa(mut visa: Visa, fwd_pep: FwdPep) -> Visa {
+    visa.visa_type = VisaType::ForwardOnly;
+    visa.dock_pep = None;
+    visa.fwd_pep = Some(fwd_pep);
+    visa
+}
+
+/// Returns the adjacent node after `target_node` in `path`, stepping forward or backward
+/// according to `direction`. Returns None if `target_node` is not in the path or there is
+/// no neighbor in the requested direction.
+fn next_hop_in_path<'a>(
+    path: &'a [IpAddr],
+    target_node: &IpAddr,
+    direction: Direction,
+) -> Option<&'a IpAddr> {
+    let pos = path.iter().position(|n| n == target_node)?;
+    match direction {
+        Direction::Forward => path.get(pos + 1),
+        Direction::Reverse => pos.checked_sub(1).and_then(|i| path.get(i)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +579,7 @@ mod tests {
     use crate::packet::make_fivetuple_tcp;
     use crate::test_helpers::make_visa;
     use std::sync::Arc;
+    use std::time::Duration;
 
     async fn make_mgr() -> VisaMgr {
         let db = Arc::new(FakeDb::new());
@@ -400,8 +598,13 @@ mod tests {
         let node_addr: IpAddr = NODE_ADDR.parse().unwrap();
         let visa = make_visa(1, std::time::Duration::from_secs(60));
 
-        let metadata =
-            db::VisaMetadata::new(node_addr.clone(), 0, "zpl".to_string(), Direction::Forward);
+        let metadata = db::VisaMetadata::new(
+            node_addr.clone(),
+            0,
+            "zpl".to_string(),
+            Direction::Forward,
+            None,
+        );
 
         mgr.repo
             .store_visa(&visa, metadata, db::NodeVisaState::Installed)
@@ -451,8 +654,13 @@ mod tests {
         let mgr = make_mgr().await;
         let node_addr: IpAddr = NODE_ADDR.parse().unwrap();
         let visa = make_visa(2, std::time::Duration::from_secs(60));
-        let metadata =
-            db::VisaMetadata::new(node_addr.clone(), 0, "zpl".to_string(), Direction::Forward);
+        let metadata = db::VisaMetadata::new(
+            node_addr.clone(),
+            0,
+            "zpl".to_string(),
+            Direction::Forward,
+            None,
+        );
 
         mgr.repo
             .store_visa(&visa, metadata, db::NodeVisaState::Installed)
@@ -481,8 +689,13 @@ mod tests {
         let mgr = make_mgr().await;
         let node_addr: IpAddr = NODE_ADDR.parse().unwrap();
         let visa = make_visa(3, std::time::Duration::from_secs(60));
-        let metadata =
-            db::VisaMetadata::new(node_addr.clone(), 0, "zpl".to_string(), Direction::Forward);
+        let metadata = db::VisaMetadata::new(
+            node_addr.clone(),
+            0,
+            "zpl".to_string(),
+            Direction::Forward,
+            None,
+        );
 
         mgr.repo
             .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
@@ -503,5 +716,403 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
+    }
+
+    // --- actualize_visa_for_target_node tests ---
+
+    // Path nodes used by actualize tests; distinct from the constants above.
+    const PATH_NODE_A: &str = "fd5a:5052::a"; // ingress position
+    const PATH_NODE_B: &str = "fd5a:5052::b"; // intermediary position
+    const PATH_NODE_C: &str = "fd5a:5052::c"; // egress position
+
+    /// Three-node path [A, B, C] used by the actualize tests.
+    fn three_node_path() -> Vec<IpAddr> {
+        vec![
+            PATH_NODE_A.parse().unwrap(),
+            PATH_NODE_B.parse().unwrap(),
+            PATH_NODE_C.parse().unwrap(),
+        ]
+    }
+
+    /// Store a visa in the repo with the given path; requesting_node is the first path node (or A if no path).
+    async fn store_test_visa(mgr: &VisaMgr, id: u64, path: Option<Vec<IpAddr>>) -> Visa {
+        let visa = make_visa(id, Duration::from_secs(60));
+        let requesting_node: IpAddr = path
+            .as_ref()
+            .and_then(|p| p.first())
+            .cloned()
+            .unwrap_or_else(|| PATH_NODE_A.parse().unwrap());
+        let metadata = db::VisaMetadata::new(
+            requesting_node,
+            0,
+            "zpl".to_string(),
+            Direction::Forward,
+            path,
+        );
+        mgr.repo
+            .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
+            .await
+            .unwrap();
+        visa
+    }
+
+    /// No path in metadata → visa returned unchanged with no fwd_pep.
+    #[tokio::test]
+    async fn test_actualize_no_path_returns_unchanged() {
+        let mgr = make_mgr().await;
+        let node_addr: IpAddr = PATH_NODE_A.parse().unwrap();
+        let visa = store_test_visa(&mgr, 1, None).await;
+
+        let result = mgr
+            .actualize_visa_for_target_node(visa, &node_addr, Direction::Forward)
+            .await
+            .unwrap();
+        assert_eq!(result.issuer_id, 1);
+        assert!(result.fwd_pep.is_none());
+    }
+
+    /// Path with only one node → visa returned unchanged.
+    #[tokio::test]
+    async fn test_actualize_path_too_short_returns_unchanged() {
+        let mgr = make_mgr().await;
+        let node_addr: IpAddr = PATH_NODE_A.parse().unwrap();
+        let visa = store_test_visa(&mgr, 1, Some(vec![node_addr.clone()])).await;
+
+        let result = mgr
+            .actualize_visa_for_target_node(visa, &node_addr, Direction::Forward)
+            .await
+            .unwrap();
+        assert_eq!(result.issuer_id, 1);
+        assert!(result.fwd_pep.is_none());
+    }
+
+    /// Ingress context (first node + Forward) → full visa with fwd_pep pointing to the second path node.
+    #[tokio::test]
+    async fn test_actualize_ingress_forward_sets_fwd_pep() {
+        let mgr = make_mgr().await;
+        let node_a: IpAddr = PATH_NODE_A.parse().unwrap();
+        let node_b: IpAddr = PATH_NODE_B.parse().unwrap();
+        let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+
+        let result = mgr
+            .actualize_visa_for_target_node(visa, &node_a, Direction::Forward)
+            .await
+            .unwrap();
+        let fwd_pep = result.fwd_pep.expect("expected fwd_pep on ingress visa");
+        assert_eq!(fwd_pep.next_hop, node_b);
+        assert!(result.dock_pep.is_some(), "ingress visa retains dock_pep");
+    }
+
+    /// Egress context (last node + Forward) → full visa returned unchanged (no fwd_pep added).
+    #[tokio::test]
+    async fn test_actualize_egress_forward_returns_full_visa() {
+        let mgr = make_mgr().await;
+        let node_c: IpAddr = PATH_NODE_C.parse().unwrap();
+        let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+
+        let result = mgr
+            .actualize_visa_for_target_node(visa, &node_c, Direction::Forward)
+            .await
+            .unwrap();
+        assert!(result.fwd_pep.is_none());
+        assert!(result.dock_pep.is_some(), "egress returns full visa");
+    }
+
+    /// Ingress context (last node + Reverse) → full visa with fwd_pep pointing to node before target.
+    #[tokio::test]
+    async fn test_actualize_ingress_reverse_sets_fwd_pep() {
+        let mgr = make_mgr().await;
+        let node_b: IpAddr = PATH_NODE_B.parse().unwrap();
+        let node_c: IpAddr = PATH_NODE_C.parse().unwrap();
+        let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+
+        let result = mgr
+            .actualize_visa_for_target_node(visa, &node_c, Direction::Reverse)
+            .await
+            .unwrap();
+        let fwd_pep = result
+            .fwd_pep
+            .expect("expected fwd_pep on ingress-reverse visa");
+        // Traversing in reverse from C, the next hop is B (the node immediately before C).
+        assert_eq!(fwd_pep.next_hop, node_b);
+        assert!(
+            result.dock_pep.is_some(),
+            "ingress-reverse visa retains dock_pep"
+        );
+    }
+
+    /// Egress context (first node + Reverse) → full visa returned unchanged.
+    #[tokio::test]
+    async fn test_actualize_egress_reverse_returns_full_visa() {
+        let mgr = make_mgr().await;
+        let node_a: IpAddr = PATH_NODE_A.parse().unwrap();
+        let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+
+        let result = mgr
+            .actualize_visa_for_target_node(visa, &node_a, Direction::Reverse)
+            .await
+            .unwrap();
+        assert!(result.fwd_pep.is_none());
+        assert!(
+            result.dock_pep.is_some(),
+            "egress-reverse returns full visa"
+        );
+    }
+
+    /// Demonstrates the next_hop bug: for intermediary node B on path [A, B, C] with Forward
+    /// direction, the correct next hop is C (the node AFTER B in the path), not A (the first
+    /// node != B, as returned by the buggy iter().find()).
+    #[tokio::test]
+    async fn test_actualize_next_hop_bug_intermediary_forward() {
+        let mgr = make_mgr().await;
+        let node_b: IpAddr = PATH_NODE_B.parse().unwrap();
+        let node_c: IpAddr = PATH_NODE_C.parse().unwrap();
+        let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+
+        let result = mgr
+            .actualize_visa_for_target_node(visa, &node_b, Direction::Forward)
+            .await
+            .unwrap();
+        assert_eq!(result.visa_type, VisaType::ForwardOnly);
+        let fwd_pep = result
+            .fwd_pep
+            .expect("expected fwd_pep on intermediary visa");
+        assert_eq!(
+            fwd_pep.next_hop, node_c,
+            "next hop for B (Forward) must be C, not A"
+        );
+    }
+
+    /// Intermediary context → ForwardOnly visa: dock_pep stripped, fwd_pep set to node after target.
+    #[tokio::test]
+    async fn test_actualize_intermediary_returns_forwarding_only_visa() {
+        let mgr = make_mgr().await;
+        let node_b: IpAddr = PATH_NODE_B.parse().unwrap();
+        let node_c: IpAddr = PATH_NODE_C.parse().unwrap();
+        let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+
+        let result = mgr
+            .actualize_visa_for_target_node(visa, &node_b, Direction::Forward)
+            .await
+            .unwrap();
+        assert_eq!(result.visa_type, VisaType::ForwardOnly);
+        assert!(
+            result.dock_pep.is_none(),
+            "ForwardOnly visa has no dock_pep"
+        );
+        let fwd_pep = result
+            .fwd_pep
+            .expect("expected fwd_pep on intermediary visa");
+        assert_eq!(fwd_pep.next_hop, node_c);
+    }
+
+    // --- create_visa multihop integration tests ---
+    // These verify that create_visa uses the explicit route parameter to populate
+    // metadata.path, mark all path nodes pending, and enable actualize to set fwd_pep.
+
+    use crate::assembly::tests::new_assembly_for_tests;
+    use libeval::route::LinkId;
+
+    // Three nodes forming a linear chain: SRC → MID → DST (no direct SRC–DST link).
+    const MH_SRC: &str = "fd5a:5052::a1";
+    const MH_MID: &str = "fd5a:5052::b1";
+    const MH_DST: &str = "fd5a:5052::c1";
+
+    /// Build an assembly with topology SRC→MID→DST and no direct SRC–DST link.
+    async fn make_multihop_assembly() -> Assembly {
+        let asm = new_assembly_for_tests(None).await;
+        let src: IpAddr = MH_SRC.parse().unwrap();
+        let mid: IpAddr = MH_MID.parse().unwrap();
+        let dst: IpAddr = MH_DST.parse().unwrap();
+        asm.topo_mgr.add_node(src).unwrap();
+        asm.topo_mgr.add_node(mid).unwrap();
+        asm.topo_mgr.add_node(dst).unwrap();
+        asm.topo_mgr
+            .add_link(src, mid, LinkId("link-src-mid".into()), vec![], 1)
+            .unwrap();
+        asm.topo_mgr
+            .add_link(mid, dst, LinkId("link-mid-dst".into()), vec![], 1)
+            .unwrap();
+        asm
+    }
+
+    /// create_visa with a multihop route records the full [src, mid, dst] path in metadata.
+    #[tokio::test]
+    async fn test_create_visa_multihop_path_stored_in_metadata() {
+        let asm = make_multihop_assembly().await;
+        let src: IpAddr = MH_SRC.parse().unwrap();
+        let mid: IpAddr = MH_MID.parse().unwrap();
+        let dst: IpAddr = MH_DST.parse().unwrap();
+
+        let src_adapter: IpAddr = "fd5a:5052:1234::a100".parse().unwrap();
+        let dst_adapter: IpAddr = "fd5a:5052:1234::a200".parse().unwrap();
+
+        let pdesc = PacketDesc::new_tcp(
+            &src_adapter.to_string(),
+            &dst_adapter.to_string(),
+            12345,
+            80,
+        )
+        .unwrap();
+        let hit = Hit::new_no_signal(0, Direction::Forward);
+        let route = asm.topo_mgr.get_best_route(&src, &dst).unwrap(); // route between the nodes
+
+        let visa = asm
+            .visa_mgr
+            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0)
+            .await
+            .unwrap();
+
+        let metadata = asm
+            .visa_mgr
+            .repo
+            .get_visa_metadata_by_id(visa.issuer_id)
+            .await
+            .unwrap();
+        assert_eq!(metadata.path, Some(vec![src, mid, dst]));
+    }
+
+    /// create_visa with a multihop route marks every path node (including the intermediary) pending.
+    #[tokio::test]
+    async fn test_create_visa_multihop_marks_all_path_nodes_pending() {
+        let asm = make_multihop_assembly().await;
+        let src: IpAddr = MH_SRC.parse().unwrap();
+        let mid: IpAddr = MH_MID.parse().unwrap();
+        let dst: IpAddr = MH_DST.parse().unwrap();
+        let src_adapter: IpAddr = "fd5a:5052:1234::a100".parse().unwrap();
+        let dst_adapter: IpAddr = "fd5a:5052:1234::a200".parse().unwrap();
+        let pdesc = PacketDesc::new_tcp(
+            &src_adapter.to_string(),
+            &dst_adapter.to_string(),
+            12345,
+            80,
+        )
+        .unwrap();
+        let hit = Hit::new_no_signal(0, Direction::Forward);
+        let route = asm.topo_mgr.get_best_route(&src, &dst).unwrap();
+
+        let visa = asm
+            .visa_mgr
+            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0)
+            .await
+            .unwrap();
+
+        let visa_id = visa.issuer_id;
+        let pending_src = asm.visa_mgr.get_pending_visas_for_node(&src).await.unwrap();
+        let pending_mid = asm.visa_mgr.get_pending_visas_for_node(&mid).await.unwrap();
+        let pending_dst = asm.visa_mgr.get_pending_visas_for_node(&dst).await.unwrap();
+
+        assert_eq!(
+            pending_src.len(),
+            1,
+            "requesting node (src) must be pending"
+        );
+        assert_eq!(pending_mid.len(), 1, "intermediary (mid) must be pending");
+        assert_eq!(pending_dst.len(), 1, "egress node (dst) must be pending");
+        // All three pending entries refer to the same visa.
+        assert!(pending_src.iter().any(|v| v.issuer_id == visa_id));
+        assert!(pending_mid.iter().any(|v| v.issuer_id == visa_id));
+        assert!(pending_dst.iter().any(|v| v.issuer_id == visa_id));
+    }
+
+    /// For a reverse multihop visa the requesting node is the reverse-direction ingress and
+    /// must receive fwd_pep pointing to the next hop toward the forward source.
+    ///
+    /// The bug: create_visa always passes requesting_node as starting_node to route_to_path,
+    /// so for a reverse hit where requesting_node == forward-egress (dst) the stored path is
+    /// [dst, mid, src].  actualize_visa_for_target_node then sees path.first()==dst with
+    /// Direction::Reverse → VCtx::Egress → no fwd_pep.  The fix is to reverse the stored
+    /// path for reverse hits so it is always in canonical forward order [src, mid, dst].
+    #[tokio::test]
+    async fn test_create_visa_reverse_multihop_requesting_node_gets_fwd_pep() {
+        let asm = make_multihop_assembly().await;
+        let src: IpAddr = MH_SRC.parse().unwrap();
+        let mid: IpAddr = MH_MID.parse().unwrap();
+        let dst: IpAddr = MH_DST.parse().unwrap();
+        let src_adapter: IpAddr = "fd5a:5052:1234::a100".parse().unwrap();
+        let dst_adapter: IpAddr = "fd5a:5052:1234::a200".parse().unwrap();
+
+        // Reverse packet: dst is the sender, src is the destination.
+        let pdesc = PacketDesc::new_tcp(
+            &dst_adapter.to_string(),
+            &src_adapter.to_string(),
+            54321,
+            80,
+        )
+        .unwrap();
+        let hit = Hit::new_no_signal(0, Direction::Reverse);
+        let route = asm.topo_mgr.get_best_route(&dst, &src).unwrap();
+
+        let visa = asm
+            .visa_mgr
+            .create_visa(&asm, &dst, &pdesc, &hit, &route, "", 0)
+            .await
+            .unwrap();
+
+        // dst is the ingress for reverse traffic; it must get fwd_pep pointing to mid.
+        let actualized = asm
+            .visa_mgr
+            .actualize_visa_for_target_node(visa, &dst, Direction::Reverse)
+            .await
+            .unwrap();
+
+        let fwd_pep = actualized
+            .fwd_pep
+            .expect("reverse ingress node (dst) must have fwd_pep on a multihop visa");
+        assert_eq!(
+            fwd_pep.next_hop, mid,
+            "reverse ingress fwd_pep must point to the intermediary"
+        );
+        assert!(
+            actualized.dock_pep.is_some(),
+            "reverse ingress node retains dock_pep"
+        );
+    }
+
+    /// Actualizing a multihop visa for the ingress node sets fwd_pep to the next hop.
+    #[tokio::test]
+    async fn test_create_visa_multihop_actualize_ingress_sets_fwd_pep() {
+        let asm = make_multihop_assembly().await;
+        let src: IpAddr = MH_SRC.parse().unwrap();
+        let mid: IpAddr = MH_MID.parse().unwrap();
+        let dst: IpAddr = MH_DST.parse().unwrap();
+        let src_adapter: IpAddr = "fd5a:5052:1234::a100".parse().unwrap();
+        let dst_adapter: IpAddr = "fd5a:5052:1234::a200".parse().unwrap();
+        let pdesc = PacketDesc::new_tcp(
+            &src_adapter.to_string(),
+            &dst_adapter.to_string(),
+            12345,
+            80,
+        )
+        .unwrap();
+        let hit = Hit::new_no_signal(0, Direction::Forward);
+        let route = asm.topo_mgr.get_best_route(&src, &dst).unwrap();
+
+        let visa = asm
+            .visa_mgr
+            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0)
+            .await
+            .unwrap();
+
+        let actualized = asm
+            .visa_mgr
+            .actualize_visa_for_target_node(visa, &src, Direction::Forward)
+            .await
+            .unwrap();
+
+        let fwd_pep = actualized
+            .fwd_pep
+            .expect("ingress node must have a forwarding PEP on a multihop visa");
+        assert_eq!(
+            fwd_pep.next_hop, mid,
+            "ingress fwd_pep must point to the intermediary"
+        );
+        assert!(
+            actualized.dock_pep.is_some(),
+            "ingress node retains the dock PEP"
+        );
+        // The egress node dst is not the target here, so this just confirms the visa
+        // was created for the right endpoints.
+        let _ = dst;
     }
 }

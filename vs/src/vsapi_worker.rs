@@ -55,7 +55,7 @@ impl AuthenticateUndo {
 
     async fn undo(self, asm: &Assembly) {
         if let Some(addr) = self.added_node_to_router {
-            asm.router.remove_node(&addr);
+            asm.topo_mgr.remove_node(&addr);
         }
         if let Some(addr) = self.actor_mgr_add_node {
             let _ = asm.actor_mgr.remove_node(&addr).await;
@@ -76,8 +76,6 @@ pub async fn launch_capnp(
     let listener = tokio::net::TcpListener::bind(listen).await?;
 
     loop {
-        // TODO: Figure out how to get tokio TLS in here.
-
         let (sock, addr) = listener.accept().await?;
         info!(target: API, "TCP connection from {}", addr);
         sock.set_nodelay(true)?;
@@ -101,7 +99,6 @@ pub async fn launch_capnp(
         let rpc_system =
             capnp_rpc::RpcSystem::new(Box::new(network), Some(vs_service.clone().client));
 
-        // TODO: spawn_local or spawn?
         tokio::task::spawn_local(async move {
             let err = rpc_system.await;
             err
@@ -362,6 +359,21 @@ impl VisaServiceImpl {
         write_error(&mut err_builder, code, message);
         Ok(())
     }
+
+    /// Helper to handle errors during connect call.
+    /// Returns a Capn Proto OK, but an API level error.
+    fn ok_with_open_error(
+        &self,
+        mut results: vsapi::visa_service::OpenResults,
+        code: vsapi::ErrorCode,
+        message: &str,
+    ) -> Result<(), capnp::Error> {
+        self.asm.counters.incr(CounterType::NodeConnectionsFailed);
+        let res_builder = results.get().init_resp();
+        let mut err_builder = res_builder.init_error();
+        write_error(&mut err_builder, code, message);
+        Ok(())
+    }
 }
 
 impl vsapi::visa_service::Server for VisaServiceImpl {
@@ -455,6 +467,66 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
 
         res_builder.set_ok(vs_gate)?;
 
+        Ok(())
+    }
+
+    async fn open(
+        self: Rc<Self>,
+        params: vsapi::visa_service::OpenParams,
+        mut results: vsapi::visa_service::OpenResults,
+    ) -> Result<(), capnp::Error> {
+        debug!(target: API, "open call from {}", self.remote);
+
+        let vs_connect_request = params.get()?.get_req()?;
+        let req_cn = vs_connect_request.get_cn()?.to_string()?;
+        let req_type = vs_connect_request.get_ctype()?;
+
+        // TODO: are there any needed params for an Open call?
+
+        // The node should be using its real ZPR address already authenticated/granted during
+        // authorize_conenct.
+
+        let node_zpr_addr = self.remote.ip();
+        info!(target: API, "node {} requests open from addr {} (CONNECT_TYPE={:?})", req_cn, node_zpr_addr, req_type);
+
+        let existing_actor = match self
+            .asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&node_zpr_addr)
+            .await
+        {
+            Ok(Some(actor)) => actor,
+            Ok(None) => {
+                return self.ok_with_open_error(results, vsapi::ErrorCode::OutOfSync, "no state");
+            }
+            Err(e) => {
+                error!(target: API, "error checking existing state for node calling open {}: {}", node_zpr_addr, e);
+                return self.ok_with_open_error(
+                    results,
+                    vsapi::ErrorCode::Internal,
+                    "internal error during open",
+                );
+            }
+        };
+        if !existing_actor.is_node() {
+            warn!(target: API, "reconnect attempt denied for {}: found {:?}", node_zpr_addr, existing_actor.get_cn());
+            return self.ok_with_open_error(
+                results,
+                vsapi::ErrorCode::InvalidOperation,
+                "address in use",
+            );
+        }
+
+        // Not yet sure if we support a RESET over this channel...but might make sense.
+        if matches!(req_type, vsapi::VSConnT::Reset) {
+            warn!(target: API, "{req_cn} requests RESET: not yet implemented");
+        }
+
+        // Skip ahead to the handle:
+        let vs_handle: vsapi::v_s_handle::Client =
+            capnp_rpc::new_client(VSHandleImpl::new(self.asm.clone(), existing_actor));
+        let mut res_builder = results.get().init_resp();
+        res_builder.set_ok(vs_handle)?;
         Ok(())
     }
 }
@@ -643,7 +715,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                     "failed to clear node state",
                 );
             }
-            self.asm.router.remove_node(&node_zpr_addr);
+            self.asm.topo_mgr.remove_node(&node_zpr_addr);
         }
 
         // The add_node call will clean up after ifself if it fails.
@@ -700,13 +772,13 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         }
 
         // Add the node to the router.
-        match self.asm.router.add_node(&node_zpr_addr) {
+        match self.asm.topo_mgr.add_node(node_zpr_addr) {
             Ok(()) => (),
             Err(TopologyError::NodeExists(_)) => {
                 // Attempt to remove and re-add.
                 warn!(target: API, "node {:?} already exists in router, attempting to remove and re-add", &node_cn);
-                self.asm.router.remove_node(&node_zpr_addr);
-                if let Err(e) = self.asm.router.add_node(&node_zpr_addr) {
+                self.asm.topo_mgr.remove_node(&node_zpr_addr);
+                if let Err(e) = self.asm.topo_mgr.add_node(node_zpr_addr) {
                     // Failed to add the node to the router. We won't be able to route visas through this node.
                     // Best to just abort this connect.
                     error!(target: API, "router: failed to add node {} to router after removing existing: {}", node_zpr_addr, e);
@@ -798,7 +870,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let initial_visas = match self
             .asm
             .visa_mgr
-            .initial_visas_for_node(amgr_asm, node_zpr_addr, &saddr)
+            .post_register_vss_visas_for_node(amgr_asm, node_zpr_addr, &saddr)
             .await
         {
             Ok(visas) => visas,
@@ -869,51 +941,11 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         Ok(())
     }
 
-    // When an adapter connects to a node, a node ends up making a call here to authorize
-    // the connection.  If successful the VS returns a ZPR address for the adapter, and an
-    // expiration time.
+    // When an adapter (or node, which for connection stuff _acts_ like an adapter) connects to a node,
+    // a node ends up making a call here to authorize the connection.  If successful the VS returns
+    // a ZPR address for the adapter, and an expiration time.
     //
-    // The ConnectRequest arg is populated as follows:
-    //       blobs: list of 1 (for now) 'AuthBlob'
-    //       claims: may include 'zpr.addr' if a specific address is requested, must include 'zpr.adapter.cn' to match blob cn.
-    //       substrateAddr: adapter substrate address
-    //       dockinterface: 0
-    //
-    // There are just two ways that an adapter can authenticated and that is reflected in
-    // the AuthBlob presented.
-    //
-    // (1) Adapter uses an RSA key that is shared with policy -- looked up by the adapter CN.
-    //
-    //     Note that the node has already verified that the CN in the blob matches the CN
-    //     presented over the link by the adapter.
-    //
-    //     The AuthBlob is a ZPRSelfSignedBlob
-    //       {
-    //         alg: ChallengeAlg::RsaSha256Pkcs1v15
-    //         challenge: <bytes> - The nodes challend to the adapter. Just opaque bytes to to the visa service.
-    //         cn: adapter CN value
-    //         timestamp: unix timestamp, seconds
-    //         signature: RSA SHA256 PKCS1v15 signature using adapter private key over (ts + cn + challenge)
-    //                    time is big-endian u64.
-    //       }
-    //
-    //     To verify the blob, the visa service looks up the public key in policy by CN,
-    //     and then verifies the signature.
-    //
-    //
-    // (2) It can present a token from an authentication server.
-    //
-    //     The AuthBlob is a AuthCodeBlob
-    //       {
-    //         asaAddr: IpAddr of the auth service
-    //         code: <string>
-    //         pkce: <string>
-    //         clientId: <string>
-    //       }
-    //
-    //     All this is used in the oauth flow between visa service and the auth server to verify
-    //     the adapter identity.
-    //
+    // TODO: How do we handle re-connect or re-auth?
     async fn authorize_connect(
         self: Rc<Self>,
         params: vsapi::v_s_handle::AuthorizeConnectParams,
@@ -932,46 +964,80 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let actor = match self
             .asm
             .cc
-            .authenticate_adapter(self.asm.clone(), creq, connect_via)
+            .authenticate_adapter_or_node(self.asm.clone(), creq, connect_via)
             .await
         {
             Ok(actor) => actor,
             Err(e) => {
-                warn!(target: API, "adapter connection authorization failed for node {:?}: {}", connect_via, e);
+                warn!(target: API, "connection authorization failed for node {:?}: {}", connect_via, e);
                 let mut err_builder = results.get().init_resp().init_error();
                 write_error(
                     &mut err_builder,
                     vsapi::ErrorCode::AuthError,
                     format!("adapter authorization failed: {}", e).as_str(),
                 );
+                self.asm.counters.incr(CounterType::AuthorizeConnectFailed);
                 return Ok(());
             }
         };
 
         let actor_addr = actor.get_zpr_addr().unwrap().clone(); // MUST have an addr by now.
 
-        // Have an actor. Will have a ZPR address at this point.
-        if let Err(e) = self
-            .asm
-            .actor_mgr
-            .add_adapter_via_node(&actor, &connect_via)
-            .await
-        {
-            error!(target: API, "failed to add authenticated adapter {:?} to actor db: {}", actor.get_cn(), e);
+        if actor.is_node() {
+            if let Err(add_err) = self
+                .asm
+                .topo_mgr
+                .add_linked_node(
+                    &self.asm.policy_mgr,
+                    &self.asm.actor_mgr,
+                    &actor,
+                    &connect_via,
+                    &actor_addr,
+                )
+                .await
+            {
+                warn!(target: API, "failed to add connecting node {:?} to during authorize_connect: {}", actor.get_cn(), add_err);
 
-            if self.asm.net_mgr.is_managed_address(&actor_addr) {
-                if let Err(e) = self.asm.net_mgr.release_zpr_addr(actor_addr) {
-                    warn!(target: API, "failed to release adapter address {}: {}", actor_addr, e);
+                if self.asm.net_mgr.is_managed_address(&actor_addr) {
+                    if let Err(e) = self.asm.net_mgr.release_zpr_addr(actor_addr) {
+                        warn!(target: API, "failed to release node address in error handler, actor={}: {}", actor_addr, e);
+                    }
                 }
-            }
 
-            let mut err_builder = results.get().init_resp().init_error();
-            write_error(
-                &mut err_builder,
-                vsapi::ErrorCode::Internal,
-                "state update failed",
-            );
-            return Ok(());
+                let mut err_builder = results.get().init_resp().init_error();
+                write_error(
+                    &mut err_builder,
+                    vsapi::ErrorCode::Internal,
+                    "state update failed",
+                );
+                self.asm.counters.incr(CounterType::AuthorizeConnectFailed);
+                return Ok(());
+            }
+        } else {
+            // Have an actor. Will have a ZPR address at this point.
+            if let Err(e) = self
+                .asm
+                .actor_mgr
+                .add_adapter_via_node(&actor, &connect_via)
+                .await
+            {
+                error!(target: API, "failed to add authenticated adapter {:?} to actor db: {}", actor.get_cn(), e);
+
+                if self.asm.net_mgr.is_managed_address(&actor_addr) {
+                    if let Err(e) = self.asm.net_mgr.release_zpr_addr(actor_addr) {
+                        warn!(target: API, "failed to release adapter address {}: {}", actor_addr, e);
+                    }
+                }
+
+                let mut err_builder = results.get().init_resp().init_error();
+                write_error(
+                    &mut err_builder,
+                    vsapi::ErrorCode::Internal,
+                    "state update failed",
+                );
+                self.asm.counters.incr(CounterType::AuthorizeConnectFailed);
+                return Ok(());
+            }
         }
 
         let addr_attr = actor.get_attribute(key::ZPR_ADDR).unwrap();
@@ -979,9 +1045,9 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             let expires_utc: DateTime<Utc> = addr_attr.get_expires().into();
             info!(
                 target: API,
-                "successfully authorized adapter {:?} with address {} (expires {})",
+                "successfully authorized {} {:?} with address {actor_addr} (expires {})",
+                if actor.is_node() { "node" } else { "adapter" },
                 actor.get_cn(),
-                actor_addr,
                 expires_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
             );
         }
@@ -993,6 +1059,13 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         if let Err(e) = self.asm.event_mgr.record_event(evt).await {
             warn!(target: API, "failed to record actor joins event for adapter {:?}: {}", actor.get_cn(), e);
         }
+
+        // TODO: How does the linked node get its node<->VSAPI visa? When creating this visa it will also set up the visas needed along the path.
+
+        // TODO: Is this counter name misleading?  We use node-connection-success for VSAPI node-authorization calls.
+        // This success is for the VSAPI authorize_connect call which could be authorizing an
+        // actor with role node or adapter.
+        self.asm.counters.incr(CounterType::AuthorizeConnectSuccess);
 
         Ok(())
     }
@@ -1302,7 +1375,7 @@ mod tests {
             let asm = Arc::new(new_assembly_for_tests(None).await);
             let addr: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
 
-            asm.router.add_node(&addr).unwrap();
+            asm.topo_mgr.add_node(addr).unwrap();
 
             let mut undo = AuthenticateUndo::default();
             undo.added_node_to_router(&addr);
@@ -1310,7 +1383,7 @@ mod tests {
 
             // Node was removed, so add_node must succeed again.
             assert!(
-                asm.router.add_node(&addr).is_ok(),
+                asm.topo_mgr.add_node(addr).is_ok(),
                 "node should have been removed from router by undo"
             );
         }
@@ -1343,7 +1416,7 @@ mod tests {
                 make_node_actor_defexp(&addr.to_string(), "test-node-2", "[fd5a:5052::101]:1234");
 
             asm.actor_mgr.add_node(&actor, false).await.unwrap();
-            asm.router.add_node(&addr).unwrap();
+            asm.topo_mgr.add_node(addr).unwrap();
 
             let mut undo = AuthenticateUndo::default();
             undo.took_zpr_addr(&addr);
@@ -1352,10 +1425,10 @@ mod tests {
             undo.undo(&asm).await;
 
             assert!(
-                asm.router.add_node(&addr).is_ok(),
+                asm.topo_mgr.add_node(addr).is_ok(),
                 "node should have been removed from router"
             );
-            asm.router.remove_node(&addr);
+            asm.topo_mgr.remove_node(&addr);
 
             let actor_result = asm.actor_mgr.get_actor_by_zpr_addr(&addr).await.unwrap();
             assert!(

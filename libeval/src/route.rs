@@ -29,14 +29,15 @@ pub struct Route {
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeId(pub String);
+pub struct NodeId(pub IpAddr);
 
+/// Link IDs are strings assigned by the compiler.
 #[derive(Debug, Serialize, Clone, PartialEq, Eq, Hash)]
 pub struct LinkId(pub String);
 
 #[derive(Debug, Serialize, Clone)]
 pub enum RouteKind {
-    /// Not even a route - adapaters are connected to the same node.
+    /// Not even a route - adapters are connected to the same node.
     DirectSameNode {
         node_id: NodeId,
     },
@@ -45,25 +46,31 @@ pub enum RouteKind {
 
 impl From<IpAddr> for NodeId {
     fn from(addr: IpAddr) -> Self {
-        NodeId(addr.to_string())
+        NodeId(addr)
     }
 }
 
 impl From<&IpAddr> for NodeId {
     fn from(addr: &IpAddr) -> Self {
-        NodeId(addr.to_string())
+        NodeId(*addr)
     }
 }
 
-impl From<&str> for NodeId {
-    fn from(s: &str) -> Self {
-        NodeId(s.to_string())
+impl From<NodeId> for IpAddr {
+    fn from(node_id: NodeId) -> Self {
+        node_id.0
     }
 }
 
 impl From<&str> for LinkId {
     fn from(s: &str) -> Self {
         LinkId(s.to_string())
+    }
+}
+
+impl From<String> for LinkId {
+    fn from(s: String) -> Self {
+        LinkId(s)
     }
 }
 
@@ -75,5 +82,14 @@ impl Route {
 
     pub fn hop_count(&self) -> usize {
         self.links.len()
+    }
+
+    /// The "direct" route isn't really a route at all. It means that the client and service are on the same node, so no links need to be traversed.
+    pub fn new_direct(node_id: NodeId) -> Self {
+        Route {
+            kind: RouteKind::DirectSameNode { node_id },
+            links: vec![],
+            cost: 0,
+        }
     }
 }

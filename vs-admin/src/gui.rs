@@ -340,25 +340,28 @@ impl Gui {
             if row_max_lens.0 < idstr.len() as u16 {
                 row_max_lens.0 = idstr.len() as u16;
             }
-            if row_max_lens.1 < vrec.source_addr.len() as u16 {
-                row_max_lens.1 = vrec.source_addr.len() as u16;
+            if row_max_lens.1 < vrec.source_addr.as_ref().unwrap_or(&"-".into()).len() as u16 {
+                row_max_lens.1 = vrec.source_addr.as_ref().unwrap_or(&"-".into()).len() as u16;
             }
-            if row_max_lens.2 < vrec.dest_addr.len() as u16 {
-                row_max_lens.2 = vrec.dest_addr.len() as u16;
+            if row_max_lens.2 < vrec.dest_addr.as_ref().unwrap_or(&"-".into()).len() as u16 {
+                row_max_lens.2 = vrec.dest_addr.as_ref().unwrap_or(&"-".into()).len() as u16;
             }
         }
 
         let rows = self.visas.iter().map(|vrec| {
             let dt: DateTime<Utc> = vrec.expires.into();
 
+            let source_addr = vrec.source_addr.as_ref().unwrap_or(&"-".into()).clone();
+            let dest_addr = vrec.dest_addr.as_ref().unwrap_or(&"-".into()).clone();
+
             let idstr = format!("{}", vrec.id);
             let expstr = dt.to_rfc3339_opts(SecondsFormat::Secs, true);
 
             let cells = [
                 Cell::from(idstr).style(self.visa_id_style),
-                Cell::from(vrec.source_addr.clone()).style(self.zpr_addr_style),
+                Cell::from(source_addr).style(self.zpr_addr_style),
                 Cell::from("->".light_magenta()),
-                Cell::from(vrec.dest_addr.clone()).style(self.zpr_addr_style),
+                Cell::from(dest_addr).style(self.zpr_addr_style),
                 Cell::from(expstr),
             ];
             Row::new(cells)

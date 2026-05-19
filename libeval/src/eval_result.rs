@@ -97,7 +97,7 @@ impl PartialEvalResult {
 }
 
 impl Hit {
-    /// Create Hit without a signal.
+    /// Create Hit without a signal and without a route.
     pub fn new_no_signal(index: usize, direction: Direction) -> Self {
         Hit {
             match_idx: index,
@@ -107,8 +107,8 @@ impl Hit {
             route: None,
         }
     }
-    /// Create Hit with a signal.
-    #[allow(dead_code)]
+
+    /// Create Hit with a signal and no route.
     pub fn new_with_signal(index: usize, direction: Direction, signal: Signal) -> Self {
         Hit {
             match_idx: index,

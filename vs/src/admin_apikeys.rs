@@ -73,7 +73,7 @@ impl ReloadableApiKeys {
             match toml::from_str(&std::fs::read_to_string(&path)?) {
                 Ok(kf) => kf,
                 Err(e) => {
-                    return Err(ServiceError::AdminKeyError(format!(
+                    return Err(ServiceError::AdminKey(format!(
                         "failed to parse keys file: {e}"
                     )));
                 }
@@ -81,7 +81,7 @@ impl ReloadableApiKeys {
         } else if allow_missing {
             KeysFile::empty()
         } else {
-            return Err(ServiceError::AdminKeyError(format!(
+            return Err(ServiceError::AdminKey(format!(
                 "keys file not found: {}",
                 path.display()
             )));
@@ -103,11 +103,11 @@ impl ReloadableApiKeys {
                     *keys_file = kf;
                     Ok(())
                 }
-                Err(e) => Err(ServiceError::AdminKeyError(format!(
+                Err(e) => Err(ServiceError::AdminKey(format!(
                     "failed to parse keys file: {e}"
                 ))),
             },
-            Err(e) => Err(ServiceError::AdminKeyError(format!(
+            Err(e) => Err(ServiceError::AdminKey(format!(
                 "failed to read keys file: {e}"
             ))),
         }
@@ -121,7 +121,7 @@ impl ReloadableApiKeys {
         if let Some(record) = keys_file.keys.get(&apikey.key_id_hex()) {
             if record.status == KeyStatus::Active {
                 let secret_hash = sha256_hex(apikey.secret_bytes())
-                    .map_err(|e| ServiceError::AdminKeyError(format!("failed to hash key: {e}")))?;
+                    .map_err(|e| ServiceError::AdminKey(format!("failed to hash key: {e}")))?;
                 if secret_hash == record.secret_hash {
                     Ok(Some(record.permission.clone()))
                 } else {

@@ -41,6 +41,8 @@ rustls-pemfile = "2"
 serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
+strum = { version = "0.28.0", features = ["derive"] }
+strum_macros = "0.28"
 thiserror.workspace = true
 tokio = { version = "1.48.0", features = ["full", "test-util"] }
 tokio-rustls = "0.26.4"

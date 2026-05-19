@@ -11,7 +11,7 @@ use crate::db::DbConnection;
 use crate::event_mgr::EventMgr;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::PolicyMgr;
-use crate::router::Router;
+use crate::topology_mgr::TopologyMgr;
 use crate::visa_mgr::VisaMgr;
 use crate::vss_mgr::VssMgr;
 
@@ -30,7 +30,7 @@ pub struct Assembly {
     pub net_mgr: Arc<NetMgr>,
     pub event_mgr: EventMgr,
     pub admin_api_keys: Arc<ReloadableApiKeys>,
-    pub router: Router,
+    pub topo_mgr: TopologyMgr,
 }
 
 impl Assembly {
@@ -122,7 +122,7 @@ pub mod tests {
             net_mgr: Arc::new(NetMgr::new_v6().expect("failed to create NetMgr")),
             event_mgr: EventMgr::new(event_tx),
             admin_api_keys: Arc::new(ReloadableApiKeys::default()),
-            router: Router::new(),
+            topo_mgr: TopologyMgr::new(),
         }
     }
 }

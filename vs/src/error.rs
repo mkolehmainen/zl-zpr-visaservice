@@ -59,7 +59,10 @@ pub enum ServiceError {
     VsapiType(#[from] VsapiTypeError),
 
     #[error("admin key error: {0}")]
-    AdminKeyError(String),
+    AdminKey(String),
+
+    #[error("topology error: {0}")]
+    Topology(#[from] TopologyError),
 }
 
 #[derive(Debug, Error)]
@@ -142,6 +145,9 @@ pub enum TopologyError {
 
     #[error("node not found: {0}")]
     NodeNotFound(String),
+
+    #[error("link not found: {0}")]
+    LinkNotFound(String),
 }
 
 impl From<ApiResponseError> for VssSyncError {

@@ -177,6 +177,7 @@ impl VisaRequestJob {
 
     /// Complete this job by sending a result to the requester.
     /// Logs a warning if the requester has dropped the receiver.
+    ///
     pub fn complete(self, result: VisaRequestResult) {
         if let Err(_) = self.response_chan.send(result) {
             // Means the requester has dropped the receiver.
@@ -252,12 +253,14 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         },
     };
 
-    let Some(default_route) = asm.router.get_best_route(&node_addr_a, &node_addr_b) else {
+    // When the evaluator does not care about the route, we use the "best" route.
+    // And if there is no route at all then we don't bother evaluating.
+    let Some(default_route) = asm.topo_mgr.get_best_route(&node_addr_a, &node_addr_b) else {
         info!(target: VREQ,
             "visa request from {:?} denied: no route between {:?} and {:?}",
             job.requesting_node, node_addr_a, node_addr_b
         );
-        return Ok(VisaDecision::Deny(DenyCode::NoReason)); // TODO: Update to the NoRoute code when available in vsapi
+        return Ok(VisaDecision::Deny(DenyCode::NoRoute));
     };
 
     let policy = asm.policy_mgr.get_current();
@@ -273,9 +276,6 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         }
     };
 
-    // TODO: drop eval context?
-    // Do I need eval context in the residual evaluator? I do unless we copied relevant policy out of it.
-
     match decision {
         PartialEvalResult::Deny(FinalDeny::NoMatch(message)) => {
             info!(target: VREQ,
@@ -285,7 +285,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
             Ok(VisaDecision::Deny(DenyCode::NoMatch))
         }
         PartialEvalResult::AllowWithoutRoute(hits) => {
-            visa_from_allow(&asm, job, &hits, &policy, default_route).await
+            visa_from_allow(&asm, job, &hits, &policy, Some(default_route)).await
         }
         PartialEvalResult::Deny(FinalDeny::Deny(_hits)) => {
             info!(target: VREQ,
@@ -296,12 +296,14 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         }
         PartialEvalResult::NeedsRoute(residual_evaluator) => {
             let hint = residual_evaluator.hint();
-            let routes = asm.router.get_routes(source_zpr_addr, dest_zpr_addr, hint);
+            let routes = asm
+                .topo_mgr
+                .get_routes(source_zpr_addr, dest_zpr_addr, hint);
 
-            match residual_evaluator.eval_routes(&routes, &asm.router) {
+            match residual_evaluator.eval_routes(&routes, &asm.topo_mgr) {
                 // TODO: Note that when we get a match using routes, the route it returned in the hit.
                 Ok(FinalEvalResult::Allow(hits)) => {
-                    visa_from_allow(&asm, job, &hits, &policy, default_route).await
+                    visa_from_allow(&asm, job, &hits, &policy, None).await
                 }
                 Ok(FinalEvalResult::Deny(_hits)) => {
                     info!(target: VREQ,
@@ -358,12 +360,18 @@ fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
 
 /// Given that we have an ALLOW decision, pass the hist list in here and we will pick the first
 /// hit and create a visa based on it.
+///
+/// If the hit has a route, we use that, otherwise we use the default route passed in. If there
+/// is no default route and no route in the hit the create fails.
+///
+/// `hits` - Positive hits from the evaluator. We choose the first one.
+/// `default_route` - A default route for the visa, only used if there is no route on the first hit.
 async fn visa_from_allow(
     asm: &Assembly,
     job: &VisaRequestJob,
     hits: &[Hit],
     policy: &Policy,
-    default_route: Route,
+    default_route: Option<Route>,
 ) -> Result<VisaDecision, ServiceError> {
     debug_assert!(!hits.is_empty(), "allow decision with no hits"); // should never happen.
     let policy_version = policy.get_version().unwrap_or(0);
@@ -375,18 +383,29 @@ async fn visa_from_allow(
 
     let allowed_route: Route = match hits[0].route.as_ref() {
         Some(route) => route.clone(),
-        None => default_route,
+        None => default_route.ok_or_else(|| {
+            ServiceError::Internal(
+                "policy allowed visa but no route in hit and no default route".into(),
+            )
+        })?,
     };
 
     let visa = asm
         .visa_mgr
         .create_visa(
+            asm,
             &job.requesting_node,
             &job.packet_desc,
             &hits[0],
+            &allowed_route,
             zpl,
             policy_version,
         )
+        .await?;
+
+    let visa = asm
+        .visa_mgr
+        .actualize_visa_for_target_node(visa, &job.requesting_node, hits[0].direction)
         .await?;
 
     Ok(VisaDecision::Allow(visa, allowed_route))
@@ -544,7 +563,7 @@ mod tests {
     use libeval::attribute::ROLE_ADAPTER;
     use libeval::eval_result::Direction;
     use libeval::policy::Policy;
-    use libeval::route::{LinkId, RouteKind};
+    use libeval::route::LinkId;
     use std::time::{Duration, SystemTime};
     use zpr::policy_types::{JoinPolicy, PFlags, Scope, Service, ServiceType};
     use zpr::write_to::WriteTo;
@@ -589,11 +608,11 @@ mod tests {
         let asm_inner = new_assembly_for_tests(Some(vreq_tx)).await;
         let src_zpr: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
         let dst_zpr: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
-        asm_inner.router.add_node(&src_zpr).unwrap();
-        asm_inner.router.add_node(&dst_zpr).unwrap();
+        asm_inner.topo_mgr.add_node(src_zpr).unwrap();
+        asm_inner.topo_mgr.add_node(dst_zpr).unwrap();
         asm_inner
-            .router
-            .add_link(&src_zpr, &dst_zpr, &LinkId("test-link".into()), &[], 1)
+            .topo_mgr
+            .add_link(src_zpr, dst_zpr, LinkId("test-link".into()), vec![], 1)
             .unwrap();
         let asm = Arc::new(asm_inner);
 
@@ -630,13 +649,9 @@ mod tests {
 
         let hits = vec![Hit::new_no_signal(0, Direction::Forward)];
         let policy = Policy::new_empty();
-        let route = Route {
-            kind: RouteKind::Multihop,
-            links: vec![],
-            cost: 0,
-        };
+        let route = Route::new_direct(requesting_node.into());
 
-        let result = visa_from_allow(&asm, &job, &hits, &policy, route).await;
+        let result = visa_from_allow(&asm, &job, &hits, &policy, Some(route)).await;
         assert!(matches!(result, Ok(VisaDecision::Allow(_, _))));
     }
 
@@ -839,16 +854,16 @@ mod tests {
         let node_b = make_node_actor_defexp("fd5a:5052:3000::2", "node-b", "10.0.0.2:1002");
         asm.actor_mgr.add_node(&node_a, false).await.unwrap();
         asm.actor_mgr.add_node(&node_b, false).await.unwrap();
-        asm.router.add_node(&node_a_addr).unwrap();
-        asm.router.add_node(&node_b_addr).unwrap();
+        asm.topo_mgr.add_node(node_a_addr).unwrap();
+        asm.topo_mgr.add_node(node_b_addr).unwrap();
 
         if with_link {
-            asm.router
+            asm.topo_mgr
                 .add_link(
-                    &node_a_addr,
-                    &node_b_addr,
-                    &LinkId("link-ab".into()),
-                    &[],
+                    node_a_addr,
+                    node_b_addr,
+                    LinkId("link-ab".into()),
+                    vec![],
                     1,
                 )
                 .unwrap();
@@ -892,7 +907,7 @@ mod tests {
     }
 
     // An AAA source with no route between the docking node and the auth service docking node
-    // is denied NoReason (not SourceNotFound), confirming the docking check passed.
+    // is denied NoRoute (not SourceNotFound), confirming the docking check passed.
     #[tokio::test]
     async fn process_visa_request_aaa_source_no_route_denied() {
         let asm = build_aaa_test_asm(false).await;
@@ -906,7 +921,7 @@ mod tests {
         .unwrap();
         let (job, _rx) = VisaRequestJob::new(requesting_node, pkt);
         let result = process_visa_request(asm, &job).await.unwrap();
-        assert!(matches!(result, VisaDecision::Deny(DenyCode::NoReason)));
+        assert!(matches!(result, VisaDecision::Deny(DenyCode::NoRoute)));
     }
 
     // An AAA destination actor with the AAA table pre-populated reaches policy evaluation.

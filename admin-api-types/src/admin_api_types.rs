@@ -76,11 +76,11 @@ pub struct VisaDescriptor {
     pub policy_id: String,
     pub zpl: String,
     pub direction: VisaMatchDirection,
-    pub requesting_node: String, // ZPR address
-    pub source_addr: String,     // ZPR address
-    pub dest_addr: String,       // ZPR address
-    pub source_port: u16,
-    pub dest_port: u16,
+    pub requesting_node: String,     // ZPR address
+    pub source_addr: Option<String>, // ZPR address
+    pub dest_addr: Option<String>,   // ZPR address
+    pub source_port: Option<u16>,
+    pub dest_port: Option<u16>,
     pub proto: String,
     pub signals: Vec<String>,
     pub session_key: ApiKeySet,
@@ -130,11 +130,11 @@ impl fmt::Display for VisaDescriptor {
         write!(
             f,
             "{}:{} {} {}:{}  ",
-            self.source_addr.yellow(),
-            self.source_port,
+            self.source_addr.as_ref().unwrap_or(&"-".into()).yellow(),
+            self.source_port.unwrap_or(0),
             "->".bold().green(),
-            self.dest_addr.yellow(),
-            self.dest_port,
+            self.dest_addr.as_ref().unwrap_or(&"-".into()).yellow(),
+            self.dest_port.unwrap_or(0),
         )?;
         write!(f, "{} {}  ", "proto:".dimmed(), self.proto)?;
         write!(
@@ -714,10 +714,10 @@ mod tests {
             zpl: "zpl".to_string(),
             direction: VisaMatchDirection::Forward,
             requesting_node: "fd5a::1".to_string(),
-            source_addr: "fd5a::2".to_string(),
-            dest_addr: "fd5a::3".to_string(),
-            source_port: 80,
-            dest_port: 443,
+            source_addr: Some("fd5a::2".to_string()),
+            dest_addr: Some("fd5a::3".to_string()),
+            source_port: Some(80),
+            dest_port: Some(443),
             proto: "TCP".to_string(),
             signals: vec![],
             session_key: ApiKeySet::default(),

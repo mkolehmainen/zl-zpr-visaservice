@@ -112,7 +112,6 @@ impl ActorMgr {
         Ok(())
     }
 
-    /// TODO: Support for reconnects (where we still have state).
     pub async fn add_node(&self, actor: &Actor, reconnect: bool) -> Result<(), ServiceError> {
         if !actor.is_node() {
             return Err(ServiceError::Internal(

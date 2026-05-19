@@ -171,6 +171,15 @@ impl DbConnection for RedisDb {
                 } => {
                     piper.hset(hash_key, field, value);
                 }
+                DbOp::HSetMultiple {
+                    hash_key,
+                    field_values,
+                } => {
+                    piper.hset_multiple(hash_key, field_values);
+                }
+                DbOp::Expire { key, seconds } => {
+                    piper.expire(key, *seconds);
+                }
             }
         }
         let _: () = piper.query_async(&mut conn).await?;

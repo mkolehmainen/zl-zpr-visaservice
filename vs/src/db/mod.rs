@@ -85,7 +85,7 @@ impl LockDescriptor {
     /// Create LockDescriptor.
     ///
     /// The `ident` is a string that identifies the owner of the lock.  It can be any string,
-    /// but should be unique to the owner (e.g. a UUID or hostname).  
+    /// but should be unique to the owner (e.g. a UUID or hostname).
     ///
     /// The `timeout` is how long the lock should be held before it expires and can be acquired
     /// by someone else.
@@ -126,6 +126,14 @@ pub enum DbOp {
         hash_key: String,
         field: String,
         value: String,
+    },
+    HSetMultiple {
+        hash_key: String,
+        field_values: Vec<(String, String)>,
+    },
+    Expire {
+        key: String,
+        seconds: i64,
     },
 }
 

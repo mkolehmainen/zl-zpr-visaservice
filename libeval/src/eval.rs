@@ -194,11 +194,6 @@ impl EvalContext {
     ///
     /// This does not set `zpr.addr` unless one is specified in policy (TODO).
     ///
-    /// If caller is checking a node connection then zpr.role:NODE attribute must be set
-    /// on the `unauthenticated_claims`.  Connection will then fail if policy does not establish
-    /// that the actor is a node. If policy establishes that the actor is a node, and zpr.role:NODE
-    /// is not set in the `unauthenticated_claims`, then the connection fails also.
-    ///
     /// If the peer is requesting a specific ZPR address, then zpr.addr:<addr> should
     /// be included in the `unauthenticated_claims`. Connection request will fail if the
     /// policy specifies a different address for the actor.  Caller should scrub ZPR address
@@ -252,24 +247,6 @@ impl EvalContext {
                     services.insert(s.clone());
                 }
             }
-        }
-
-        let node_expected = if let Some(unauth_claims) = unauthenticated_claims {
-            // Look for key:ROLE in the unauthenticated claims.
-            unauth_claims
-                .iter()
-                .any(|a| a.get_key() == key::ROLE && a.is_single_value(ROLE_NODE))
-        } else {
-            false
-        };
-
-        if node_expected && !flags.contains(JFlag::IsNode) {
-            debug!(target: EVAL, "connection rejected: node role expected but not established by policy");
-            return Err(EvalError::InvalidClaim(key::ROLE.into()));
-        }
-        if !node_expected && flags.contains(JFlag::IsNode) {
-            debug!(target: EVAL, "connection rejected: node role established by policy but not indicated by caller");
-            return Err(EvalError::ClaimMissing(key::ROLE.into()));
         }
 
         let mut actor = Actor::new();
@@ -954,7 +931,6 @@ mod test {
         authenticated_claims.push(Attribute::builder(key::CN).value("node.zpr.org"));
 
         unauthenticated_claims.push(Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::1"));
-        unauthenticated_claims.push(Attribute::builder(key::ROLE).value(ROLE_NODE));
 
         let actor = ctx
             .approve_connection(
@@ -984,7 +960,6 @@ mod test {
         authenticated_claims.push(Attribute::builder(key::CN).value("nobody.zpr.org"));
 
         unauthenticated_claims.push(Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::1"));
-        unauthenticated_claims.push(Attribute::builder(key::ROLE).value(ROLE_NODE));
 
         match ctx.approve_connection(
             Some(authenticated_claims.as_slice()),

@@ -29,6 +29,7 @@ mod packet;
 mod policy_mgr;
 mod router;
 mod signal_worker;
+mod topology_mgr;
 mod visa_mgr;
 mod visareq_worker;
 mod vsapi_worker;
@@ -52,7 +53,7 @@ use crate::logging::enable_logging;
 use crate::logging::targets::MAIN;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::PolicyMgr;
-use crate::router::Router;
+use crate::topology_mgr::TopologyMgr;
 use crate::visa_mgr::VisaMgr;
 use crate::vss_mgr::VssMgr;
 
@@ -285,7 +286,7 @@ async fn main() -> std::process::ExitCode {
         net_mgr: Arc::new(net_mgr),
         event_mgr: EventMgr::new(event_tx),
         admin_api_keys: Arc::new(admin_api_keys),
-        router: Router::new(),
+        topo_mgr: TopologyMgr::new(),
     });
 
     js.spawn_local(signal_worker::launch(asm.clone()));

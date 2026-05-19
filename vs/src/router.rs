@@ -10,8 +10,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::RwLock;
 
-use libeval::attribute::{AttrMatch, Attribute};
-use libeval::eval_route::{RouteHint, TopologyQueryApi};
+use libeval::attribute::Attribute;
+use libeval::eval_route::RouteHint;
 use libeval::route::{LinkId, NodeId, Route, RouteKind};
 
 use crate::error::TopologyError;
@@ -145,11 +145,17 @@ impl Router {
     ///
     /// ## Errors
     /// - If node already exists then this returns [TopologyError::NodeExists]
-    pub fn add_node(&self, node_addr: &IpAddr) -> Result<(), TopologyError> {
+    pub fn add_node(&self, node_addr: IpAddr) -> Result<(), TopologyError> {
         let mut inner = self.inner.write().unwrap();
         inner.topology.add_node(node_addr)?;
         inner.topo_generation += 1;
         Ok(())
+    }
+
+    /// TRUE if node exists in the network graph.
+    pub fn has_node(&self, node_addr: &IpAddr) -> bool {
+        let inner = self.inner.read().unwrap();
+        inner.topology.nodes.contains_key(&node_addr.into())
     }
 
     /// Removes a node and all its incident links from the topology.
@@ -203,13 +209,12 @@ impl Router {
     /// - If a or b do not exist returns [TopologyError::NodeNotFound]
     /// - If link id already exists then this returns [TopologyError::LinkExists]
     ///
-    #[allow(dead_code)]
     pub fn add_link(
         &self,
-        zpr_addr_a: &IpAddr,
-        zpr_addr_b: &IpAddr,
-        id: &LinkId,
-        attributes: &[Attribute],
+        zpr_addr_a: IpAddr,
+        zpr_addr_b: IpAddr,
+        id: LinkId,
+        attributes: Vec<Attribute>,
         cost: u32,
     ) -> Result<(), TopologyError> {
         let mut inner = self.inner.write().unwrap();
@@ -222,11 +227,62 @@ impl Router {
         inner.route_cache.clear();
         inner.link_to_cache_keys.clear();
 
-        inner
-            .topology
-            .add_link(a, b, id.clone(), attributes.to_vec(), cost)?;
+        inner.topology.add_link(a, b, id, attributes, cost)?;
         inner.topo_generation += 1;
         Ok(())
+    }
+
+    /// Given a route, return the ordered sequence of NodeIds that must be traversed to follow the route,
+    /// including the starting node as the first element.
+    ///
+    /// The passed `starting_node` is used to get the direction of the path correct.
+    ///
+    /// ## Errors
+    /// - If any of the links in the route are not found in the topology then this returns [TopologyError::LinkNotFound]
+    /// - If any of the links in the route do not connect to the current node in the path then this returns [TopologyError::NodeNotFound]
+    pub fn route_to_path(
+        &self,
+        route: &Route,
+        starting_node: &NodeId,
+    ) -> Result<Vec<NodeId>, TopologyError> {
+        match &route.kind {
+            RouteKind::DirectSameNode { node_id: nid } => {
+                // For sanity, make sure that the node_id embedded in the RouteKind matches our starting node.
+                if nid != starting_node {
+                    return Err(TopologyError::NodeNotFound(format!(
+                        "route_to_path: starting node {:?} does not match direct-route node {:?}",
+                        starting_node, nid
+                    )));
+                }
+                Ok(vec![starting_node.clone()])
+            }
+            RouteKind::Multihop => {
+                let inner = self.inner.read().unwrap();
+                let mut path = vec![starting_node.clone()];
+                let mut current_node = starting_node.clone();
+                for link_id in &route.links {
+                    let Some(link) = inner.topology.link(link_id) else {
+                        return Err(TopologyError::LinkNotFound(format!(
+                            "route_to_path: link {:?} not found",
+                            link_id
+                        )));
+                    };
+                    let next_node = if link.a == current_node {
+                        link.b.clone()
+                    } else if link.b == current_node {
+                        link.a.clone()
+                    } else {
+                        return Err(TopologyError::NodeNotFound(format!(
+                            "route_to_path: link {:?} does not connect to current node {:?}",
+                            link_id, current_node
+                        )));
+                    };
+                    path.push(next_node.clone());
+                    current_node = next_node;
+                }
+                Ok(path)
+            }
+        }
     }
 
     /// Remove a link by its id. If the link does not exist this is a no-op.
@@ -252,8 +308,23 @@ impl Router {
         inner.topo_generation += 1;
     }
 
+    /// Given a node address, return the connected peers.
+    pub fn get_peers(&self, zpr_addr: &IpAddr) -> Vec<IpAddr> {
+        let inner = self.inner.read().unwrap();
+        let node_id: NodeId = zpr_addr.into();
+        inner
+            .topology
+            .neighbors(&node_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|nid| nid.into())
+            .collect()
+    }
+
     /// "Best" route is defined as the route with the lowest cost. If there is a tie, one is picked arbitrarily.
     /// These routes are cached and only updated when topology changes.
+    ///
+    /// Note `addr_a` and `addr_b` are NODE addresses (not adapters).
     pub fn get_best_route(&self, addr_a: &IpAddr, addr_b: &IpAddr) -> Option<Route> {
         let a: NodeId = addr_a.into();
         let b: NodeId = addr_b.into();
@@ -360,13 +431,6 @@ impl Router {
     }
 }
 
-impl TopologyQueryApi for Router {
-    /// TODO: We do not yet support policy on link attributes and [AttrMatch] is not yet defined. This alwayes returns false.
-    fn link_has_attr(&self, _link_id: &LinkId, _attr: &AttrMatch) -> bool {
-        false
-    }
-}
-
 #[derive(Debug)]
 struct Node {
     edges: HashSet<LinkId>,
@@ -398,7 +462,7 @@ impl Graph {
 
         // If node exists call that an error.
         if self.nodes.contains_key(&nid) {
-            return Err(TopologyError::NodeExists(nid.0));
+            return Err(TopologyError::NodeExists(nid.0.to_string()));
         }
 
         self.nodes.insert(
@@ -447,7 +511,7 @@ impl Graph {
         }
 
         if self.edges.contains_key(&id) {
-            return Err(TopologyError::LinkExists(id.0));
+            return Err(TopologyError::LinkExists(id.0)); // Well the ID exists anyway...
         }
 
         self.edges.insert(
@@ -712,9 +776,9 @@ mod tests {
         let b = ip("10.0.0.2");
         let c = ip("10.0.0.3");
         let r = Router::new();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
-        r.add_node(&c).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_node(c).unwrap();
         (r, a, b, c)
     }
 
@@ -732,7 +796,7 @@ mod tests {
     fn test_direct_same_node() {
         let a = ip("10.0.0.1");
         let r = Router::new();
-        r.add_node(&a).unwrap();
+        r.add_node(a).unwrap();
         let route = r.get_best_route(&a, &a).unwrap();
         assert!(route.is_direct());
         assert_eq!(route.cost, 0);
@@ -744,9 +808,9 @@ mod tests {
         let a = ip("10.0.0.1");
         let b = ip("10.0.0.2");
         let r = Router::new();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 5).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 5).unwrap();
         let route = r.get_best_route(&a, &b).unwrap();
         assert!(!route.is_direct());
         assert_eq!(route.cost, 5);
@@ -756,8 +820,8 @@ mod tests {
     #[test]
     fn test_multihop() {
         let (r, a, b, c) = make_router_abc();
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 1).unwrap();
-        r.add_link(&b, &c, &LinkId("bc".into()), &[], 1).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
         let route = r.get_best_route(&a, &c).unwrap();
         assert!(!route.is_direct());
         assert_eq!(route.cost, 2);
@@ -767,10 +831,10 @@ mod tests {
     #[test]
     fn test_prefers_lower_cost() {
         let (r, a, b, c) = make_router_abc();
-        r.add_link(&a, &b, &LinkId("ab-direct".into()), &[], 10)
+        r.add_link(a, b, LinkId("ab-direct".into()), vec![], 10)
             .unwrap();
-        r.add_link(&a, &c, &LinkId("ac".into()), &[], 3).unwrap();
-        r.add_link(&c, &b, &LinkId("cb".into()), &[], 3).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 3).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 3).unwrap();
         let route = r.get_best_route(&a, &b).unwrap();
         assert_eq!(route.cost, 6);
         assert_eq!(route.links, vec![LinkId("ac".into()), LinkId("cb".into())]);
@@ -781,9 +845,9 @@ mod tests {
         // Verifies the u64 fix: with saturating_add the old code would compute
         // u32::MAX + 1 == u32::MAX and fail the < guard, silently dropping node b.
         let (r, a, b, c) = make_router_abc();
-        r.add_link(&a, &c, &LinkId("ac".into()), &[], u32::MAX)
+        r.add_link(a, c, LinkId("ac".into()), vec![], u32::MAX)
             .unwrap();
-        r.add_link(&c, &b, &LinkId("cb".into()), &[], 1).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], 1).unwrap();
         let route = r.get_best_route(&a, &b).unwrap();
         assert_eq!(route.links, vec![LinkId("ac".into()), LinkId("cb".into())]);
     }
@@ -795,10 +859,10 @@ mod tests {
         // both to u32::MAX and pick arbitrarily).
         let (r, a, b, c) = make_router_abc();
         let half = u32::MAX / 2 + 1;
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], u32::MAX - 1)
+        r.add_link(a, b, LinkId("ab".into()), vec![], u32::MAX - 1)
             .unwrap();
-        r.add_link(&a, &c, &LinkId("ac".into()), &[], half).unwrap();
-        r.add_link(&c, &b, &LinkId("cb".into()), &[], half).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], half).unwrap();
+        r.add_link(c, b, LinkId("cb".into()), vec![], half).unwrap();
         let route = r.get_best_route(&a, &b).unwrap();
         assert_eq!(route.links, vec![LinkId("ab".into())]);
         assert_eq!(route.cost, u32::MAX - 1);
@@ -809,8 +873,8 @@ mod tests {
         let a = ip("10.0.0.1");
         let b = ip("10.0.0.2");
         let r = Router::new();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
         assert!(r.get_best_route(&a, &b).is_none());
     }
 
@@ -818,9 +882,9 @@ mod tests {
     fn test_compute_routes_returns_all_paths() {
         // A-B, B-C, A-C: routes from A to C should include both A-B-C and A-C.
         let (r, a, b, c) = make_router_abc();
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 1).unwrap();
-        r.add_link(&b, &c, &LinkId("bc".into()), &[], 1).unwrap();
-        r.add_link(&a, &c, &LinkId("ac".into()), &[], 5).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 5).unwrap();
         let hint = no_hint();
         let routes = r.get_routes(&a, &c, Some(&hint));
         assert_eq!(routes.len(), 2);
@@ -840,9 +904,9 @@ mod tests {
         let a = ip("10.0.0.1");
         let b = ip("10.0.0.2");
         let r = Router::new();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 1).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         let hint = no_hint();
         assert_eq!(r.get_routes(&a, &b, Some(&hint)).len(), 1);
         r.remove_link(&LinkId("ab".into()));
@@ -855,11 +919,11 @@ mod tests {
         let a = ip("10.0.0.1");
         let b = ip("10.0.0.2");
         let r = Router::new();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
         let hint = no_hint();
         assert_eq!(r.get_routes(&a, &b, Some(&hint)).len(), 0);
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 1).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         assert_eq!(r.get_routes(&a, &b, Some(&hint)).len(), 1);
     }
 
@@ -870,11 +934,11 @@ mod tests {
         let b = ip("10.0.0.2");
         let c = ip("10.0.0.3");
         let r = Router::new();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
-        r.add_node(&c).unwrap();
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 1).unwrap();
-        r.add_link(&b, &c, &LinkId("bc".into()), &[], 1).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_node(c).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
         let hint = no_hint();
         assert_eq!(r.get_routes(&a, &c, Some(&hint)).len(), 1);
         r.remove_node(&b);
@@ -888,12 +952,12 @@ mod tests {
         let b = ip("10.0.0.2");
         let d = ip("10.0.0.4");
         let r = Router::new();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 1).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         let hint = no_hint();
         assert_eq!(r.get_routes(&a, &b, Some(&hint)).len(), 1);
-        r.add_node(&d).unwrap();
+        r.add_node(d).unwrap();
         // Route a->b still valid and served from cache.
         assert_eq!(r.get_routes(&a, &b, Some(&hint)).len(), 1);
         // New isolated node d has no routes to a.
@@ -908,12 +972,12 @@ mod tests {
         let c = ip("10.0.0.3");
         let d = ip("10.0.0.4");
         let r = Router::new();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
-        r.add_node(&c).unwrap();
-        r.add_node(&d).unwrap();
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 1).unwrap();
-        r.add_link(&c, &d, &LinkId("cd".into()), &[], 1).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_node(c).unwrap();
+        r.add_node(d).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(c, d, LinkId("cd".into()), vec![], 1).unwrap();
         let hint = no_hint();
         // Warm both cache entries.
         assert_eq!(r.get_routes(&a, &b, Some(&hint)).len(), 1);
@@ -930,13 +994,13 @@ mod tests {
         let a = ip("10.0.0.1");
         let b = ip("10.0.0.2");
         let r = Router::new();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
         let hint = no_hint();
         // Warm cache with empty result (no path exists yet).
         assert_eq!(r.get_routes(&a, &b, Some(&hint)).len(), 0);
         // Adding a link between a and b must bust the stale empty entry.
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 1).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         assert_eq!(r.get_routes(&a, &b, Some(&hint)).len(), 1);
     }
 
@@ -950,27 +1014,153 @@ mod tests {
         let a = ip("10.0.0.1");
         let b = ip("10.0.0.2");
         let r = Router::new();
-        r.add_node(&x).unwrap();
-        r.add_node(&y).unwrap();
-        r.add_node(&a).unwrap();
-        r.add_node(&b).unwrap();
+        r.add_node(x).unwrap();
+        r.add_node(y).unwrap();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
         // Direct x-y link and dormant legs x-a and b-y; no a-b yet.
-        r.add_link(&x, &y, &LinkId("xy".into()), &[], 10).unwrap();
-        r.add_link(&x, &a, &LinkId("xa".into()), &[], 1).unwrap();
-        r.add_link(&b, &y, &LinkId("by".into()), &[], 1).unwrap();
+        r.add_link(x, y, LinkId("xy".into()), vec![], 10).unwrap();
+        r.add_link(x, a, LinkId("xa".into()), vec![], 1).unwrap();
+        r.add_link(b, y, LinkId("by".into()), vec![], 1).unwrap();
         let hint = no_hint();
         // Warm the cache: only the direct x-y route exists.
         assert_eq!(r.get_routes(&x, &y, Some(&hint)).len(), 1);
         // Adding the bridge a-b creates a second path x→a→b→y.
-        r.add_link(&a, &b, &LinkId("ab".into()), &[], 1).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
         // Cache must be invalidated; both routes should now be returned.
         assert_eq!(r.get_routes(&x, &y, Some(&hint)).len(), 2);
+    }
+
+    // --- route_to_path tests ---
+
+    #[test]
+    fn test_route_to_path_direct_same_node_returns_self() {
+        // A same-node route produces a path containing only the starting node.
+        let a = ip("10.0.0.1");
+        let r = Router::new();
+        r.add_node(a).unwrap();
+        let route = r.get_best_route(&a, &a).unwrap();
+        let na: NodeId = (&a).into();
+        assert_eq!(r.route_to_path(&route, &na).unwrap(), vec![na]);
+    }
+
+    #[test]
+    fn test_route_to_path_multihop_empty_links_returns_starting_node() {
+        // A Multihop route with no links produces a path containing only the starting node.
+        let a = ip("10.0.0.1");
+        let r = Router::new();
+        r.add_node(a).unwrap();
+        let na: NodeId = (&a).into();
+        let route = Route {
+            kind: RouteKind::Multihop,
+            links: vec![],
+            cost: 0,
+        };
+        assert_eq!(r.route_to_path(&route, &na).unwrap(), vec![na.clone()]);
+    }
+
+    #[test]
+    fn test_route_to_path_single_hop_forward() {
+        // A one-link A→B route starting from A should yield [A, B].
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let r = Router::new();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        let route = r.get_best_route(&a, &b).unwrap();
+        let na: NodeId = (&a).into();
+        let nb: NodeId = (&b).into();
+        assert_eq!(r.route_to_path(&route, &na).unwrap(), vec![na, nb]);
+    }
+
+    #[test]
+    fn test_route_to_path_single_hop_reverse() {
+        // The same link traversed starting from B should yield [B, A].
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let r = Router::new();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        let route = r.get_best_route(&b, &a).unwrap();
+        let na: NodeId = (&a).into();
+        let nb: NodeId = (&b).into();
+        assert_eq!(r.route_to_path(&route, &nb).unwrap(), vec![nb, na]);
+    }
+
+    #[test]
+    fn test_route_to_path_multihop_forward() {
+        // A two-hop A→B→C route starting from A should yield [A, B, C] in traversal order.
+        let (r, a, b, c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
+        let route = r.get_best_route(&a, &c).unwrap();
+        let na: NodeId = (&a).into();
+        let nb: NodeId = (&b).into();
+        let nc: NodeId = (&c).into();
+        assert_eq!(r.route_to_path(&route, &na).unwrap(), vec![na, nb, nc]);
+    }
+
+    #[test]
+    fn test_route_to_path_multihop_reverse() {
+        // The same topology traversed from C should yield [C, B, A].
+        let (r, a, b, c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
+        let route = r.get_best_route(&c, &a).unwrap();
+        let na: NodeId = (&a).into();
+        let nb: NodeId = (&b).into();
+        let nc: NodeId = (&c).into();
+        assert_eq!(r.route_to_path(&route, &nc).unwrap(), vec![nc, nb, na]);
+    }
+
+    #[test]
+    fn test_route_to_path_link_not_found_returns_error() {
+        // A route referencing a link_id absent from the topology returns LinkNotFound.
+        let a = ip("10.0.0.1");
+        let r = Router::new();
+        r.add_node(a).unwrap();
+        let na: NodeId = (&a).into();
+        let route = Route {
+            kind: RouteKind::Multihop,
+            links: vec![LinkId("ghost".into())],
+            cost: 0,
+        };
+        assert!(matches!(
+            r.route_to_path(&route, &na),
+            Err(TopologyError::LinkNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_route_to_path_disconnected_link_returns_error() {
+        // A link that does not touch the current node returns NodeNotFound.
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let c = ip("10.0.0.3");
+        let r = Router::new();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_node(c).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
+        // Route claims to start at `a` but the only link connects b and c.
+        let na: NodeId = (&a).into();
+        let route = Route {
+            kind: RouteKind::Multihop,
+            links: vec![LinkId("bc".into())],
+            cost: 0,
+        };
+        assert!(matches!(
+            r.route_to_path(&route, &na),
+            Err(TopologyError::NodeNotFound(_))
+        ));
     }
 
     // --- Graph unit tests ---
 
     fn nid(s: &str) -> NodeId {
-        NodeId(s.into())
+        NodeId(s.parse().unwrap())
     }
 
     fn lid(s: &str) -> LinkId {
@@ -979,9 +1169,9 @@ mod tests {
 
     fn make_graph_abc() -> Graph {
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        g.add_node("b").unwrap();
-        g.add_node("c").unwrap();
+        g.add_node(ip("10.0.0.1")).unwrap();
+        g.add_node(ip("10.0.0.2")).unwrap();
+        g.add_node(ip("10.0.0.3")).unwrap();
         g
     }
 
@@ -989,8 +1179,8 @@ mod tests {
     fn test_graph_add_node_success() {
         // Adding a new node returns its NodeId and stores the node.
         let mut g = Graph::default();
-        let nid = g.add_node("a").unwrap();
-        assert_eq!(nid, NodeId("a".into()));
+        let nid = g.add_node(ip("10.0.0.1")).unwrap();
+        assert_eq!(nid, NodeId(ip("10.0.0.1")));
         assert!(g.nodes.contains_key(&nid));
     }
 
@@ -998,62 +1188,77 @@ mod tests {
     fn test_graph_add_node_duplicate_errors() {
         // Adding a node whose ID already exists returns an error.
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        assert!(g.add_node("a").is_err());
+        g.add_node(ip("10.0.0.1")).unwrap();
+        assert!(g.add_node(ip("10.0.0.1")).is_err());
     }
 
     #[test]
     fn test_graph_add_link_inserts_into_both_nodes() {
         // A new link is stored in the edges map and in both endpoint nodes' edge sets.
         let mut g = make_graph_abc();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
         assert!(g.edges.contains_key(&lid("ab")));
-        assert!(g.nodes[&nid("a")].edges.contains(&lid("ab")));
-        assert!(g.nodes[&nid("b")].edges.contains(&lid("ab")));
+        assert!(g.nodes[&nid("10.0.0.1")].edges.contains(&lid("ab")));
+        assert!(g.nodes[&nid("10.0.0.2")].edges.contains(&lid("ab")));
     }
 
     #[test]
     fn test_graph_add_link_self_loop_errors() {
         // A link whose two endpoints are the same node is rejected.
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        assert!(g.add_link("a", "a", lid("aa"), vec![], 1).is_err());
+        g.add_node(ip("10.0.0.1")).unwrap();
+        assert!(
+            g.add_link(ip("10.0.0.1"), ip("10.0.0.1"), lid("aa"), vec![], 1)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_graph_add_link_missing_node_a_errors() {
         // A link referencing a non-existent source node is rejected.
         let mut g = Graph::default();
-        g.add_node("b").unwrap();
-        assert!(g.add_link("a", "b", lid("ab"), vec![], 1).is_err());
+        g.add_node(ip("10.0.0.2")).unwrap();
+        assert!(
+            g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_graph_add_link_missing_node_b_errors() {
         // A link referencing a non-existent destination node is rejected.
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        assert!(g.add_link("a", "b", lid("ab"), vec![], 1).is_err());
+        g.add_node(ip("10.0.0.1")).unwrap();
+        assert!(
+            g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_graph_add_link_duplicate_id_errors() {
         // Inserting two links with the same ID is rejected.
         let mut g = make_graph_abc();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
-        assert!(g.add_link("a", "b", lid("ab"), vec![], 2).is_err());
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
+        assert!(
+            g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 2)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_graph_remove_link_cleans_up() {
         // Removing a link returns it and clears it from both nodes' edge sets.
         let mut g = make_graph_abc();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
         let removed = g.remove_link(&lid("ab"));
         assert!(removed.is_some());
         assert!(!g.edges.contains_key(&lid("ab")));
-        assert!(!g.nodes[&nid("a")].edges.contains(&lid("ab")));
-        assert!(!g.nodes[&nid("b")].edges.contains(&lid("ab")));
+        assert!(!g.nodes[&nid("10.0.0.1")].edges.contains(&lid("ab")));
+        assert!(!g.nodes[&nid("10.0.0.2")].edges.contains(&lid("ab")));
     }
 
     #[test]
@@ -1067,58 +1272,68 @@ mod tests {
     fn test_graph_remove_node_removes_incident_links() {
         // Removing a node removes it along with all its incident links and clears peer edge sets.
         let mut g = make_graph_abc();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
-        g.add_link("a", "c", lid("ac"), vec![], 1).unwrap();
-        g.remove_node(&nid("a"));
-        assert!(!g.nodes.contains_key(&nid("a")));
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.3"), lid("ac"), vec![], 1)
+            .unwrap();
+        g.remove_node(&nid("10.0.0.1"));
+        assert!(!g.nodes.contains_key(&nid("10.0.0.1")));
         assert!(!g.edges.contains_key(&lid("ab")));
         assert!(!g.edges.contains_key(&lid("ac")));
-        assert!(g.nodes[&nid("b")].edges.is_empty());
-        assert!(g.nodes[&nid("c")].edges.is_empty());
+        assert!(g.nodes[&nid("10.0.0.2")].edges.is_empty());
+        assert!(g.nodes[&nid("10.0.0.3")].edges.is_empty());
     }
 
     #[test]
     fn test_graph_remove_node_not_found_returns_none() {
         // Removing a node that does not exist succeeds with Ok(None).
         let mut g = Graph::default();
-        assert!(g.remove_node(&nid("x")).is_none());
+        assert!(g.remove_node(&nid("10.0.0.99")).is_none());
     }
 
     #[test]
     fn test_graph_neighbors_returns_connected_nodes() {
         // neighbors() returns all nodes directly connected by a link.
         let mut g = make_graph_abc();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
-        g.add_link("a", "c", lid("ac"), vec![], 1).unwrap();
-        let mut nbrs = g.neighbors(&nid("a")).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.3"), lid("ac"), vec![], 1)
+            .unwrap();
+        let mut nbrs = g.neighbors(&nid("10.0.0.1")).unwrap();
         nbrs.sort();
-        assert_eq!(nbrs, vec![nid("b"), nid("c")]);
+        assert_eq!(nbrs, vec![nid("10.0.0.2"), nid("10.0.0.3")]);
     }
 
     #[test]
     fn test_graph_neighbors_unknown_node_returns_none() {
         // neighbors() returns None when the node does not exist.
         let g = Graph::default();
-        assert!(g.neighbors(&nid("x")).is_none());
+        assert!(g.neighbors(&nid("10.0.0.99")).is_none());
     }
 
     #[test]
     fn test_graph_no_path_returns_none() {
         // get_low_cost_path returns None when no links connect the two nodes.
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        g.add_node("b").unwrap();
-        assert!(g.get_low_cost_path(&nid("a"), &nid("b")).is_none());
+        g.add_node(ip("10.0.0.1")).unwrap();
+        g.add_node(ip("10.0.0.2")).unwrap();
+        assert!(
+            g.get_low_cost_path(&nid("10.0.0.1"), &nid("10.0.0.2"))
+                .is_none()
+        );
     }
 
     #[test]
     fn test_graph_single_link_path() {
         // A direct one-link path is found with the correct cost and link sequence.
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        g.add_node("b").unwrap();
-        g.add_link("a", "b", lid("ab"), vec![], 7).unwrap();
-        let (path, cost) = g.get_low_cost_path(&nid("a"), &nid("b")).unwrap();
+        g.add_node(ip("10.0.0.1")).unwrap();
+        g.add_node(ip("10.0.0.2")).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 7)
+            .unwrap();
+        let (path, cost) = g
+            .get_low_cost_path(&nid("10.0.0.1"), &nid("10.0.0.2"))
+            .unwrap();
         assert_eq!(cost, 7);
         assert_eq!(path, vec![lid("ab")]);
     }
@@ -1127,11 +1342,16 @@ mod tests {
     fn test_graph_path_is_symmetric() {
         // The cost of a→b and b→a are equal (graph is undirected).
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        g.add_node("b").unwrap();
-        g.add_link("a", "b", lid("ab"), vec![], 4).unwrap();
-        let (_, fwd) = g.get_low_cost_path(&nid("a"), &nid("b")).unwrap();
-        let (_, rev) = g.get_low_cost_path(&nid("b"), &nid("a")).unwrap();
+        g.add_node(ip("10.0.0.1")).unwrap();
+        g.add_node(ip("10.0.0.2")).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 4)
+            .unwrap();
+        let (_, fwd) = g
+            .get_low_cost_path(&nid("10.0.0.1"), &nid("10.0.0.2"))
+            .unwrap();
+        let (_, rev) = g
+            .get_low_cost_path(&nid("10.0.0.2"), &nid("10.0.0.1"))
+            .unwrap();
         assert_eq!(fwd, rev);
     }
 
@@ -1139,9 +1359,13 @@ mod tests {
     fn test_graph_multihop_path() {
         // A two-hop path through an intermediate node is returned in traversal order.
         let mut g = make_graph_abc();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
-        g.add_link("b", "c", lid("bc"), vec![], 1).unwrap();
-        let (path, cost) = g.get_low_cost_path(&nid("a"), &nid("c")).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.2"), ip("10.0.0.3"), lid("bc"), vec![], 1)
+            .unwrap();
+        let (path, cost) = g
+            .get_low_cost_path(&nid("10.0.0.1"), &nid("10.0.0.3"))
+            .unwrap();
         assert_eq!(cost, 2);
         assert_eq!(path, vec![lid("ab"), lid("bc")]);
     }
@@ -1150,10 +1374,15 @@ mod tests {
     fn test_graph_prefers_lower_cost_path() {
         // Dijkstra chooses the cheaper multi-hop route over a costlier direct link.
         let mut g = make_graph_abc();
-        g.add_link("a", "b", lid("ab-direct"), vec![], 10).unwrap();
-        g.add_link("a", "c", lid("ac"), vec![], 3).unwrap();
-        g.add_link("c", "b", lid("cb"), vec![], 3).unwrap();
-        let (path, cost) = g.get_low_cost_path(&nid("a"), &nid("b")).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab-direct"), vec![], 10)
+            .unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.3"), lid("ac"), vec![], 3)
+            .unwrap();
+        g.add_link(ip("10.0.0.3"), ip("10.0.0.2"), lid("cb"), vec![], 3)
+            .unwrap();
+        let (path, cost) = g
+            .get_low_cost_path(&nid("10.0.0.1"), &nid("10.0.0.2"))
+            .unwrap();
         assert_eq!(cost, 6);
         assert_eq!(path, vec![lid("ac"), lid("cb")]);
     }
@@ -1162,35 +1391,51 @@ mod tests {
     fn test_graph_remove_link_invalidates_route() {
         // After the only link between two nodes is removed, no path remains.
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        g.add_node("b").unwrap();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
-        assert!(g.get_low_cost_path(&nid("a"), &nid("b")).is_some());
+        g.add_node(ip("10.0.0.1")).unwrap();
+        g.add_node(ip("10.0.0.2")).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
+        assert!(
+            g.get_low_cost_path(&nid("10.0.0.1"), &nid("10.0.0.2"))
+                .is_some()
+        );
         g.remove_link(&lid("ab"));
-        assert!(g.get_low_cost_path(&nid("a"), &nid("b")).is_none());
+        assert!(
+            g.get_low_cost_path(&nid("10.0.0.1"), &nid("10.0.0.2"))
+                .is_none()
+        );
     }
 
     #[test]
     fn test_graph_remove_intermediate_node_invalidates_route() {
         // Removing the only intermediate node on a path leaves the endpoints unreachable.
         let mut g = make_graph_abc();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
-        g.add_link("b", "c", lid("bc"), vec![], 1).unwrap();
-        assert!(g.get_low_cost_path(&nid("a"), &nid("c")).is_some());
-        g.remove_node(&nid("b"));
-        assert!(g.get_low_cost_path(&nid("a"), &nid("c")).is_none());
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.2"), ip("10.0.0.3"), lid("bc"), vec![], 1)
+            .unwrap();
+        assert!(
+            g.get_low_cost_path(&nid("10.0.0.1"), &nid("10.0.0.3"))
+                .is_some()
+        );
+        g.remove_node(&nid("10.0.0.2"));
+        assert!(
+            g.get_low_cost_path(&nid("10.0.0.1"), &nid("10.0.0.3"))
+                .is_none()
+        );
     }
 
     #[test]
     fn test_graph_link_accessor() {
         // link() returns the stored link with correct endpoints and cost.
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        g.add_node("b").unwrap();
-        g.add_link("a", "b", lid("ab"), vec![], 9).unwrap();
+        g.add_node(ip("10.0.0.1")).unwrap();
+        g.add_node(ip("10.0.0.2")).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 9)
+            .unwrap();
         let l = g.link(&lid("ab")).unwrap();
-        assert_eq!(l.a, nid("a"));
-        assert_eq!(l.b, nid("b"));
+        assert_eq!(l.a, nid("10.0.0.1"));
+        assert_eq!(l.b, nid("10.0.0.2"));
         assert_eq!(l.cost, 9);
     }
 
@@ -1207,10 +1452,13 @@ mod tests {
         // Triangle a-b, b-c, a-c: node c is reachable from a via a direct link
         // and via b, so get_all_paths must return exactly two paths.
         let mut g = make_graph_abc();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
-        g.add_link("b", "c", lid("bc"), vec![], 1).unwrap();
-        g.add_link("a", "c", lid("ac"), vec![], 5).unwrap();
-        let paths = sorted_paths(g.get_all_paths(&nid("a"), &nid("c")));
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.2"), ip("10.0.0.3"), lid("bc"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.3"), lid("ac"), vec![], 5)
+            .unwrap();
+        let paths = sorted_paths(g.get_all_paths(&nid("10.0.0.1"), &nid("10.0.0.3")));
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&vec![lid("ab"), lid("bc")]));
         assert!(paths.contains(&vec![lid("ac")]));
@@ -1222,15 +1470,19 @@ mod tests {
         // vertex-disjoint paths.  The DFS must not revisit nodes and must
         // enumerate both routes exactly once each.
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        g.add_node("b").unwrap();
-        g.add_node("c").unwrap();
-        g.add_node("d").unwrap();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
-        g.add_link("a", "c", lid("ac"), vec![], 1).unwrap();
-        g.add_link("b", "d", lid("bd"), vec![], 1).unwrap();
-        g.add_link("c", "d", lid("cd"), vec![], 1).unwrap();
-        let paths = sorted_paths(g.get_all_paths(&nid("a"), &nid("d")));
+        g.add_node(ip("10.0.0.1")).unwrap();
+        g.add_node(ip("10.0.0.2")).unwrap();
+        g.add_node(ip("10.0.0.3")).unwrap();
+        g.add_node(ip("10.0.0.4")).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.3"), lid("ac"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.2"), ip("10.0.0.4"), lid("bd"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.3"), ip("10.0.0.4"), lid("cd"), vec![], 1)
+            .unwrap();
+        let paths = sorted_paths(g.get_all_paths(&nid("10.0.0.1"), &nid("10.0.0.4")));
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&vec![lid("ab"), lid("bd")]));
         assert!(paths.contains(&vec![lid("ac"), lid("cd")]));
@@ -1244,16 +1496,21 @@ mod tests {
         // This verifies that the iterative DFS correctly backtracks through cycles
         // without revisiting any node.
         let mut g = Graph::default();
-        g.add_node("a").unwrap();
-        g.add_node("b").unwrap();
-        g.add_node("c").unwrap();
-        g.add_node("d").unwrap();
-        g.add_link("a", "b", lid("ab"), vec![], 1).unwrap();
-        g.add_link("b", "c", lid("bc"), vec![], 1).unwrap();
-        g.add_link("c", "d", lid("cd"), vec![], 1).unwrap();
-        g.add_link("d", "a", lid("da"), vec![], 1).unwrap();
-        g.add_link("a", "c", lid("ac"), vec![], 3).unwrap();
-        let paths = sorted_paths(g.get_all_paths(&nid("a"), &nid("c")));
+        g.add_node(ip("10.0.0.1")).unwrap();
+        g.add_node(ip("10.0.0.2")).unwrap();
+        g.add_node(ip("10.0.0.3")).unwrap();
+        g.add_node(ip("10.0.0.4")).unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.2"), lid("ab"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.2"), ip("10.0.0.3"), lid("bc"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.3"), ip("10.0.0.4"), lid("cd"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.4"), ip("10.0.0.1"), lid("da"), vec![], 1)
+            .unwrap();
+        g.add_link(ip("10.0.0.1"), ip("10.0.0.3"), lid("ac"), vec![], 3)
+            .unwrap();
+        let paths = sorted_paths(g.get_all_paths(&nid("10.0.0.1"), &nid("10.0.0.3")));
         assert_eq!(paths.len(), 3);
         assert!(paths.contains(&vec![lid("ab"), lid("bc")]));
         assert!(paths.contains(&vec![lid("ac")]));

@@ -25,7 +25,7 @@ use std::usize;
 use tracing::{debug, error, info, warn};
 
 use libeval::actor::{Actor, Role};
-use libeval::attribute::{Attribute, ROLE_ADAPTER, ROLE_NODE, key};
+use libeval::attribute::{Attribute, key};
 use libeval::eval::EvalContext;
 use libeval::policy::Policy;
 
@@ -55,7 +55,6 @@ struct JwtClaims {
 }
 
 pub struct ConnectionControl {
-    vs_ident: String,
     jwt_key: jwt::EncodingKey,
     authority: String,
 }
@@ -78,7 +77,6 @@ impl ConnectionControl {
 
         ConnectionControl {
             authority: format!("vs.zpr/{}", &vs_ident),
-            vs_ident,
             jwt_key,
         }
     }
@@ -118,6 +116,19 @@ impl ConnectionControl {
     ///
     /// This does not update our actor database, or do anything with the nodes services.
     ///
+    /// TODO: This needs more thought. This code path which is via the VSAPI 'authenticate' endpoint
+    /// is only available to nodes, and this code assumes the node has bootstrap auth.  It is theoretically
+    /// possible for a node to use external auth -- as long as it isn't the first node.
+    ///
+    /// This is a little odd mostly because this VSAPI authentication is the way that the
+    /// first node establishes its identity (since before that there is no access to a vias service).
+    ///
+    /// However, it feels like once we have done that, future nodes should not have to actually
+    /// authenticate with the VSAPI since they should have already authenticated just like an adapter
+    /// does.
+    ///
+    /// See https://github.com/org-zpr/zpr-visaservice/issues/205
+    ///
     pub async fn authenticate_node(
         &self,
         asm: Arc<Assembly>,
@@ -128,83 +139,51 @@ impl ConnectionControl {
         remote: SocketAddr,
         node_req_addr: IpAddr,
     ) -> Result<Actor, ServiceError> {
-        // We need to be aware that the policy could be updated in the manager at any time.
-        let policy = asm.policy_mgr.get_current();
+        // Massage this node authentication request into something that looks like a generic
+        // adapter request.
 
-        // TODO: Remove this placeholder code once we have keys in policy.
-        let bootstrap_key = match policy.get_bootstrap_key_by_cn(cn) {
-            Some(k) => k,
-            None => return Err(ServiceError::AuthenticationFailed("key not found".into())),
-        };
-
-        // The node challenge response is an rsa signature of
-        // concatination of (timestamp_big_endian, cn, challenge_presented)
-
-        if !auth::verify_rsa_sha256_signature(
-            bootstrap_key,
-            challenge_response,
-            &[&timestamp.to_be_bytes(), cn.as_bytes(), challenge_presented],
-        )? {
-            info!(target: CC, "signature verification failed for cn {}", cn);
-            return Err(ServiceError::AuthenticationFailed(
-                "invalid signature".into(),
-            ));
-        }
-
-        // The policy sees everything as a bunch of claims.
         let mut authd_claims: Vec<Attribute> = Vec::new();
-
         authd_claims.push(Attribute::builder(key::SUBSTRATE_ADDR).value(remote.to_string()));
 
-        // We passed our RSA auth, so we set ourselves as authority and add our own ident.
-        let node_jwt = self.gen_jwt(format!("node/{}", cn))?;
-        authd_claims.push(
-            Attribute::builder(ATTR_KEY_VS_IDENT)
-                .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
-                .value(node_jwt),
-        );
+        let mut unauthd_claims: Vec<Attribute> = Vec::new();
+        unauthd_claims.push(Attribute::builder(key::ZPR_ADDR).value(node_req_addr.to_string()));
+        unauthd_claims.push(Attribute::builder(key::CN).value(cn.to_string()));
+
+        let ss_blob = SelfSignedBlob {
+            alg: ChallengeAlg::RsaSha256Pkcs1v15,
+            challenge: challenge_presented.to_vec(),
+            cn: cn.to_string(),
+            timestamp,
+            signature: challenge_response.to_vec(),
+        };
+
+        // We are the authority since we are checking RSA locally.
         authd_claims.push(
             Attribute::builder(key::AUTHORITY)
                 .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
-                .value(format!("vs.zpr/{}", self.vs_ident)),
+                .value(&self.authority),
         );
 
-        // Technically we don't know if the node claim is authenticated until it passes policy check.
-        let mut unauthd_claims = Vec::new();
-        unauthd_claims.push(Attribute::builder(key::ROLE).value(ROLE_NODE));
-        unauthd_claims.push(Attribute::builder(key::ZPR_ADDR).value(node_req_addr.to_string()));
+        let node_actor = self
+            .authenticate_zpr_entity_rsa(asm, &ss_blob, unauthd_claims, authd_claims, 0)
+            .await?;
 
-        // Now that we have checked auth, we need to check policy.
-        //
-        // There may in the future be additional network I/O in the next step
-        // for example if VS needs to talk to attribute service.
-
-        //let ectx = EvalContext::new(policy);
-
-        let node_actor = match self
-            .authorize_connection(asm, &policy, cn, unauthd_claims, authd_claims, 0)
-            .await
-        {
-            Ok(actor) => {
-                // Make sure policy verified that the actor is in fact a node.
-                if !actor.is_node() {
-                    info!(target: CC, "connection not approved for cn {}: not a node", cn);
-                    return Err(ServiceError::AuthenticationFailed("not authorized".into()));
-                }
-                actor
-            }
-            Err(e) => {
-                info!(target: CC, "connection not approved for cn {}: {}", cn, e);
-                return Err(e.into());
-            }
-        };
+        // We only let nodes in here.
+        if !node_actor.is_node() {
+            info!(target: CC, "connection not approved for cn {}: not a node", cn);
+            return Err(ServiceError::AuthenticationFailed("not authorized".into()));
+        }
 
         Ok(node_actor)
     }
 
-    /// Confirm adapter authentication and then get policy authorization, resulting in an Actor if
+    /// Confirm adapter/node authentication and then get policy authorization, resulting in an Actor if
     /// everything checks out.
-    pub async fn authenticate_adapter(
+    ///
+    /// This is used during a connection attempt to ZPR (as opposed to the VSAPI connection which right
+    /// now is serviced by [ConnectionControl::authenticate_node]).
+    ///
+    pub async fn authenticate_adapter_or_node(
         &self,
         asm: Arc<Assembly>,
         req: ConnectRequest,
@@ -213,7 +192,9 @@ impl ConnectionControl {
         if req.blobs.is_empty() || req.blobs.len() > 1 {
             return Err(ServiceError::Param("expected exactly one auth blob".into()));
         }
-        check_adapter_required_claims(&req)?;
+
+        check_required_claims(&req.claims, &[key::CN])?;
+
         let scrubbed_claims = scrub_adapter_claims(req.claims)?;
 
         let mut authd_claims = Vec::new();
@@ -221,10 +202,17 @@ impl ConnectionControl {
         authd_claims
             .push(Attribute::builder(key::SUBSTRATE_ADDR).value(req.substrate_addr.to_string()));
 
-        let adapter_actor = match &req.blobs[0] {
+        let actor = match &req.blobs[0] {
             AuthBlob::SS(ssb) => match ssb.alg {
                 ChallengeAlg::RsaSha256Pkcs1v15 => {
-                    self.authenticate_adapter_rsa(
+                    // We are the authority since we are checking RSA locally.
+                    authd_claims.push(
+                        Attribute::builder(key::AUTHORITY)
+                            .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
+                            .value(&self.authority),
+                    );
+
+                    self.authenticate_zpr_entity_rsa(
                         asm,
                         ssb,
                         scrubbed_claims,
@@ -241,12 +229,7 @@ impl ConnectionControl {
             }
         };
 
-        // Sanity check:
-        if adapter_actor.is_node() {
-            warn!(target: CC, "authenticate_adapter returns a node actor: cn {}", adapter_actor.get_cn().unwrap());
-            return Err(ServiceError::AuthenticationFailed("not an adapter".into()));
-        }
-        Ok(adapter_actor)
+        Ok(actor)
     }
 
     pub async fn authenticate_visa_service(
@@ -272,13 +255,14 @@ impl ConnectionControl {
         Ok(vs_actor)
     }
 
-    /// Preform authentication of the adapter credentials, then run through policy.
-    async fn authenticate_adapter_rsa(
+    /// Preform authentication of an adapter or a node, then run through policy.
+    /// `unauthed_claims` - must include CN.
+    async fn authenticate_zpr_entity_rsa(
         &self,
         asm: Arc<Assembly>,
         ssb: &SelfSignedBlob,
-        mut unauthd_claims: Vec<Attribute>,
-        mut authd_claims: Vec<Attribute>,
+        unauthd_claims: Vec<Attribute>,
+        authd_claims: Vec<Attribute>,
         dock_interface: u8,
     ) -> Result<Actor, ServiceError> {
         // a) is the auth correct (check policy for CN, check sig.)
@@ -287,66 +271,68 @@ impl ConnectionControl {
         // Note that (b) is also needed for the AC type auth.
 
         {
-            let adapter_cn = unauthd_claims
+            // Make sure there is a CN attribute.
+            if !unauthd_claims.iter().any(|c| c.get_key() == key::CN) {
+                warn!(target: CC, "adapter auth blob missing cn claim");
+                return Err(ServiceError::AuthenticationFailed(
+                    "cn claim is required".into(),
+                ));
+            }
+            let claimed_cn = unauthd_claims
                 .iter()
                 .find(|c| c.get_key() == key::CN)
                 .unwrap()
                 .get_single_value()
                 .unwrap(); // ok becuase checked earlier
 
-            if adapter_cn != ssb.cn {
-                warn!(target: CC, "adapter cn mismatch: claim '{}' != blob '{}'", adapter_cn, ssb.cn);
+            if claimed_cn != ssb.cn {
+                warn!(target: CC, "cn mismatch: claim '{}' != blob '{}'", claimed_cn, ssb.cn);
                 return Err(ServiceError::AuthenticationFailed(
                     "cn mismatch between claim and blob".into(),
                 ));
             }
         }
 
-        // Pull the public key from policy.
-
         let policy = asm.policy_mgr.get_current();
-
         let pubkey = policy.get_bootstrap_key_by_cn(&ssb.cn).ok_or_else(|| {
             ServiceError::AuthenticationFailed(format!("no key found in policy for cn {}", ssb.cn))
         })?;
 
         if !auth::verify_ss_blob_signature(&ssb.cn, ssb, pubkey)? {
-            info!(target: CC, "adapter signature verification failed for cn {}", ssb.cn);
+            info!(target: CC, "blob signature verification failed for cn {}", ssb.cn);
             return Err(ServiceError::AuthenticationFailed(
                 "invalid signature".into(),
             ));
         }
 
-        // In prototype we make a JWT here and use that as an identity attribute.
-        // TODO: implement jwt creation.
+        // Ok checks out -- now run through policy.
+        let mut actor = self
+            .authorize_connection(
+                asm,
+                &policy,
+                &ssb.cn,
+                unauthd_claims,
+                authd_claims,
+                dock_interface,
+            )
+            .await?;
 
-        authd_claims.push(
-            Attribute::builder(key::AUTHORITY)
-                .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
-                .value(&self.authority),
-        );
-        let adapter_jwt = self.gen_jwt(format!("adapter/{}", ssb.cn))?;
-        authd_claims.push(
+        let actor_jwt = if actor.is_node() {
+            self.gen_jwt(format!("node/{}", ssb.cn))?
+        } else {
+            self.gen_jwt(format!("adapter/{}", ssb.cn))?
+        };
+        let _ = actor.add_attribute(
             Attribute::builder(ATTR_KEY_VS_IDENT)
                 .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
-                .value(adapter_jwt),
+                .value(actor_jwt),
         );
+        let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
 
-        unauthd_claims.push(Attribute::builder(key::ROLE).value(ROLE_ADAPTER));
-
-        // Ok checks out -- now run through policy.
-        self.authorize_connection(
-            asm,
-            &policy,
-            &ssb.cn,
-            unauthd_claims,
-            authd_claims,
-            dock_interface,
-        )
-        .await
+        Ok(actor)
     }
 
-    /// Use policy to authorize the adapter connection request.
+    /// Use policy to authorize the connection request. Works for adapters and nodes.
     /// If successful you get an authorized Actor back.
     ///
     /// Does not alter our actor databases.
@@ -357,7 +343,7 @@ impl ConnectionControl {
         &self,
         asm: Arc<Assembly>,
         current_policy: &Arc<Policy>,
-        adapter_cn: &str,
+        endpoint_cn: &str,
         unauthd_claims: Vec<Attribute>,
         mut authd_claims: Vec<Attribute>,
         _dock_interface: u8,
@@ -367,7 +353,7 @@ impl ConnectionControl {
         // Actor may be denied by CN -- we can detect that before calling into policy.
         // In the future actor may be denied if the credential associated with the auth service is revoked.
 
-        authd_claims.push(Attribute::builder(key::CN).value(adapter_cn));
+        authd_claims.push(Attribute::builder(key::CN).value(endpoint_cn));
         authd_claims.push(
             Attribute::builder(key::CONFIG_ID)
                 .value(format!("{}", current_policy.get_version().unwrap_or(0))),
@@ -378,6 +364,9 @@ impl ConnectionControl {
 
         let ectx = EvalContext::new(current_policy.clone());
 
+        // TODO: Need to go in to eval and fix the approve_connection logic w/respect to the ROLE claim.
+        // We won't know a priori if this is a node or adapter. Though sometimes we do know it's a node.
+        // Anyway, best to let VS sort it out and do not do it in libeval.
         let mut authd_actor = match ectx.approve_connection(
             Some(&authd_claims),
             Some(&unauthd_claims),
@@ -385,13 +374,10 @@ impl ConnectionControl {
         ) {
             Ok(actor) => actor,
             Err(e) => {
-                info!(target: CC, "connection not approved for cn {}: {}", adapter_cn, e);
+                info!(target: CC, "connection not approved for cn {}: {}", endpoint_cn, e);
                 return Err(e.into());
             }
         };
-
-        // Use our own ident key as identity key if present.
-        let _ = authd_actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
 
         let actor_role = if authd_actor.is_node() {
             Role::Node
@@ -400,7 +386,7 @@ impl ConnectionControl {
         };
 
         if let Some(addr) = authd_actor.get_zpr_addr() {
-            info!(target: CC, "authorized adapter/{actor_role:?} cn {} with ZPR addr {}", adapter_cn, addr);
+            info!(target: CC, "authorized connection of {actor_role:?} cn {} with ZPR addr {}", endpoint_cn, addr);
         } else {
             match asm.net_mgr.get_next_zpr_addr(&actor_role) {
                 Ok(addr) => {
@@ -409,10 +395,10 @@ impl ConnectionControl {
                             .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
                             .value(addr.to_string()),
                     )?;
-                    info!(target: CC, "authorized adapter/{actor_role:?} cn {} assigned ZPR addr {}", adapter_cn, addr);
+                    info!(target: CC, "authorized adapter/{actor_role:?} cn {} assigned ZPR addr {}", endpoint_cn, addr);
                 }
                 Err(e) => {
-                    error!(target: CC, "failed to assign ZPR addr to authorized adapter/{actor_role:?} cn {}: {}", adapter_cn, e);
+                    error!(target: CC, "failed to assign ZPR addr to authorized adapter/{actor_role:?} cn {}: {}", endpoint_cn, e);
                     return Err(ServiceError::Internal("address assignment failed".into()));
                 }
             }
@@ -448,7 +434,7 @@ impl ConnectionControl {
 
         if let Some(actor) = maybe_actor {
             if actor.is_node() {
-                asm.router.remove_node(&zpr_addr);
+                asm.topo_mgr.remove_node(&zpr_addr);
                 if let Some(vss_hndl) = asm.vss_mgr.get_handle(&zpr_addr) {
                     if let Err(e) = vss_hndl.stop().await {
                         error!(target: CC, "failed to stop VSS worker for disconnected node at addr {zpr_addr}: {}", e);
@@ -503,23 +489,33 @@ impl ConnectionControl {
     }
 }
 
-/// Check that required claims are present, or return an error.
-///
-/// Only required claim is CN.
-fn check_adapter_required_claims(req: &ConnectRequest) -> Result<(), ServiceError> {
-    let mut cn_found = false;
-    for c in &req.claims {
-        if c.key == key::CN {
-            if c.value.is_empty() {
-                return Err(ServiceError::Param("cn claim cannot be empty".into()));
+/// Required claims must be present and non-empty.
+fn check_required_claims(claims: &[Claim], required: &[&str]) -> Result<(), ServiceError> {
+    let mut required_set = std::collections::HashSet::new();
+    for rc in required {
+        required_set.insert(*rc);
+    }
+
+    for claim in claims {
+        if required_set.contains(claim.key.as_str()) {
+            if claim.value.is_empty() {
+                return Err(ServiceError::Param(format!(
+                    "{} claim cannot be empty",
+                    claim.key
+                )));
             }
-            cn_found = true;
-            break;
+            required_set.remove(claim.key.as_str());
         }
     }
-    if !cn_found {
-        return Err(ServiceError::Param("cn claim is required".into()));
+
+    if !required_set.is_empty() {
+        let missing: Vec<&str> = required_set.into_iter().collect();
+        return Err(ServiceError::Param(format!(
+            "missing required claims: {:?}",
+            missing
+        )));
     }
+
     Ok(())
 }
 
@@ -597,13 +593,13 @@ mod tests {
     #[test]
     fn new_preserves_valid_ident_chars() {
         let cc = make_cc("valid-ident_1.2");
-        assert_eq!(cc.vs_ident, "valid-ident_1.2");
+        assert_eq!(cc.authority, "vs.zpr/valid-ident_1.2");
     }
 
     #[test]
     fn new_sanitizes_special_chars() {
         let cc = make_cc("test@host:port/path");
-        assert_eq!(cc.vs_ident, "test_host_port_path");
+        assert_eq!(cc.authority, "vs.zpr/test_host_port_path");
     }
 
     #[test]
