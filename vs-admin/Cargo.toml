@@ -1,7 +1,8 @@
 [package]
 name = "vs-admin"
-version = "0.7.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 admin-api-types = { path = "../admin-api-types" }

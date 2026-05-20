@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "admin-api-types"
-version = "0.1.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "colored",
@@ -2103,7 +2103,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libeval"
-version = "0.1.0"
+version = "0.13.0"
 dependencies = [
  "bytes",
  "capnp",
@@ -4387,7 +4387,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vs"
-version = "0.1.0"
+version = "0.13.0"
 dependencies = [
  "admin-api-types",
  "arc-swap",
@@ -4440,7 +4440,7 @@ dependencies = [
 
 [[package]]
 name = "vs-admin"
-version = "0.7.0"
+version = "0.13.0"
 dependencies = [
  "admin-api-types",
  "base64",
@@ -5256,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "zpt"
-version = "0.1.0"
+version = "0.13.0"
 dependencies = [
  "bytes",
  "capnp",

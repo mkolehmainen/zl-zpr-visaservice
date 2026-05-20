@@ -1,8 +1,8 @@
 [package]
 name = "zpt"
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Command line tool for interacting with the visa service evaluator library"
 
 [dependencies]
