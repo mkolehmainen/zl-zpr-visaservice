@@ -81,6 +81,9 @@ pub const VSS_MAX_PING_FAILURES: usize = 3;
 /// In cases where we create visas ourselves or if no timeout is specified, use this default.
 pub const DEFAULT_VISA_REQ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Max number of visas the node can request at a time
+pub const MAX_NUM_VISA_REQUEST: usize = 20;
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields, default)]
 pub struct VSConfig {

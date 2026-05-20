@@ -1243,6 +1243,147 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         res_builder.set_ok(());
         Ok(())
     }
+
+    async fn visa_ids_request(
+        self: Rc<Self>,
+        _req: vsapi::v_s_handle::VisaIdsRequestParams,
+        mut res: vsapi::v_s_handle::VisaIdsRequestResults,
+    ) -> Result<(), capnp::Error> {
+        debug!(target: API, "visa_ids_request from {:?}", self.node.get_cn());
+
+        let requestor_addr = self
+            .node
+            .get_zpr_addr()
+            .expect("programming error - node must have an address");
+        self.update_last_seen_time(requestor_addr).await;
+
+        let installed_visas_res = self
+            .asm
+            .visa_mgr
+            .get_installed_visa_ids_for_node(requestor_addr)
+            .await;
+
+        let res_builder = res.get().init_res();
+
+        match installed_visas_res {
+            Ok(installed_visas) => {
+                let mut ok_builder = res_builder.initn_ok(installed_visas.len() as u32);
+
+                for (i, id) in installed_visas.iter().enumerate() {
+                    ok_builder.set(i as u32, *id);
+                }
+            }
+            Err(_) => {
+                let mut err_builder = res_builder.init_error();
+                write_error(
+                    &mut err_builder,
+                    vsapi::ErrorCode::Internal,
+                    "failed to retrieve visa ids",
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn visa_request_by_id(
+        self: Rc<Self>,
+        req: vsapi::v_s_handle::VisaRequestByIdParams,
+        mut res: vsapi::v_s_handle::VisaRequestByIdResults,
+    ) -> Result<(), capnp::Error> {
+        debug!(target: API, "visa_request_by_id from {:?}", self.node.get_cn());
+
+        let requestor_addr = self
+            .node
+            .get_zpr_addr()
+            .expect("programming error - node must have an address");
+        self.update_last_seen_time(requestor_addr).await;
+
+        let ids_list_rdr = req.get()?.get_req()?;
+        let ids: Vec<u64> = ids_list_rdr.iter().collect();
+
+        let res_builder = res.get().init_res();
+
+        if ids.len() > config::MAX_NUM_VISA_REQUEST {
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::Internal,
+                format!(
+                    "Node can only request {} visas at a time",
+                    config::MAX_NUM_VISA_REQUEST
+                )
+                .as_str(),
+            );
+
+            return Ok(());
+        }
+
+        // Have to know what visas the node is actually allowed to know about
+        // TODO would it be better to make a function that gets a visa by id but only if it is installed on a given node?
+        // I don't think so because I think this would result in more db access than the current strategy
+        let installed_visas_res = self
+            .asm
+            .visa_mgr
+            .get_installed_visa_ids_for_node(requestor_addr)
+            .await;
+
+        match installed_visas_res {
+            Ok(installed_visas) => {
+                // Remove all ids that are not installed on the node
+                let installed_set: std::collections::HashSet<u64> =
+                    installed_visas.into_iter().collect();
+                let filtered_ids: Vec<u64> = ids
+                    .into_iter()
+                    .filter(|id| installed_set.contains(id))
+                    .collect();
+
+                // Create vec of actualized visas
+                let mut visas = Vec::new();
+                for id in filtered_ids.iter() {
+                    match self.asm.visa_mgr.get_visa_with_metadata_by_id(*id).await {
+                        Ok(Some(visa_with_metadata)) => {
+                            match self
+                                .asm
+                                .visa_mgr
+                                .actualize_visa_for_target_node(
+                                    visa_with_metadata.visa,
+                                    requestor_addr,
+                                    visa_with_metadata.metadata.direction,
+                                )
+                                .await
+                            {
+                                Ok(v) => visas.push(v),
+                                Err(_) => {
+                                    debug!(target: API, "Node {requestor_addr} requested visa {id} but actualization failed")
+                                }
+                            };
+                        }
+                        _ => {
+                            debug!(target: API, "Node {requestor_addr} requested visa {id} but not found")
+                        }
+                    }
+                }
+
+                let mut ok_builder = res_builder.initn_ok(visas.len() as u32);
+
+                for (i, v) in visas.iter().enumerate() {
+                    let mut visa_bldr = ok_builder.reborrow().get(i as u32);
+                    v.write_to(&mut visa_bldr);
+                }
+            }
+            Err(_) => {
+                let mut err_builder = res_builder.init_error();
+                write_error(
+                    &mut err_builder,
+                    vsapi::ErrorCode::Internal,
+                    "failed to retrieve visa ids",
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Parse no more than `limit` params out of the connect request.
