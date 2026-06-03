@@ -1349,7 +1349,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                                 .actualize_visa_for_target_node(
                                     visa_with_metadata.visa,
                                     requestor_addr,
-                                    visa_with_metadata.metadata.direction,
                                 )
                                 .await
                             {

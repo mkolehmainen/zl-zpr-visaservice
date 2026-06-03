@@ -2,11 +2,17 @@
 
 #![cfg(test)]
 
+use async_trait::async_trait;
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, ROLE_ADAPTER, ROLE_NODE, key};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::SystemTime;
 use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, TcpUdpPep, Visa};
+
+use crate::error::ResolverError;
+use crate::policy_mgr::DnsResolver;
 
 const DEFAULT_EXPIRES: Duration = Duration::from_secs(3600);
 
@@ -105,6 +111,34 @@ pub fn make_actor_with_services_defexp(
     cn: &str,
 ) -> Actor {
     make_actor_with_services(role, zpr_addr, services, cn, DEFAULT_EXPIRES)
+}
+
+/// A DNS resolver for tests. IP-only peerings short-circuit before calling this,
+/// so an empty map suffices for tests that use only IP-addressed peers.
+/// Populate the map to test hostname-resolution paths.
+pub struct FakeResolver {
+    entries: HashMap<(String, u16), SocketAddr>,
+}
+
+impl FakeResolver {
+    pub fn new(entries: HashMap<(String, u16), SocketAddr>) -> Self {
+        FakeResolver { entries }
+    }
+
+    /// A resolver with no hostname entries — suitable for tests that only use IP peers.
+    pub fn ip_only() -> Self {
+        FakeResolver::new(HashMap::new())
+    }
+}
+
+#[async_trait]
+impl DnsResolver for FakeResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, ResolverError> {
+        self.entries
+            .get(&(host.to_string(), port))
+            .copied()
+            .ok_or_else(|| ResolverError::NoAddresses(host.to_string()))
+    }
 }
 
 /// Build a [Visa] with the provided ID and expiry offset.

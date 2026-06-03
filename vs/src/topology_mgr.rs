@@ -1,4 +1,5 @@
 //! Topology manager - maintains the graph of nodes and links, and provides pathfinding and route selection.
+//! Note that this topology as it exists. For toplogy as it is intended to be you need to look at policy.
 use std::net::IpAddr;
 use tracing::{error, warn};
 

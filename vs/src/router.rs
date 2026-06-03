@@ -308,7 +308,8 @@ impl Router {
         inner.topo_generation += 1;
     }
 
-    /// Given a node address, return the connected peers.
+    /// Given a node address, return the connected peers,
+    /// or empty list if the node is not in the graph or has no peers.
     pub fn get_peers(&self, zpr_addr: &IpAddr) -> Vec<IpAddr> {
         let inner = self.inner.read().unwrap();
         let node_id: NodeId = zpr_addr.into();
@@ -790,6 +791,51 @@ mod tests {
             no_link_has: vec![],
             all_links_have: vec![],
         }
+    }
+
+    #[test]
+    fn test_get_peers_unknown_node_returns_empty() {
+        // Node not in the graph: get_peers returns empty vec rather than panicking.
+        let r = Router::new();
+        let unknown = ip("10.0.0.99");
+        assert!(r.get_peers(&unknown).is_empty());
+    }
+
+    #[test]
+    fn test_get_peers_no_links_returns_empty() {
+        // Node exists but has no links: get_peers returns empty vec.
+        let a = ip("10.0.0.1");
+        let r = Router::new();
+        r.add_node(a).unwrap();
+        assert!(r.get_peers(&a).is_empty());
+    }
+
+    #[test]
+    fn test_get_peers_single_link() {
+        // Node connected to one other node: get_peers returns exactly that peer.
+        let (r, a, b, _c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        let peers_a = r.get_peers(&a);
+        assert_eq!(peers_a, vec![b]);
+        // Symmetry: b also sees a as its peer.
+        let peers_b = r.get_peers(&b);
+        assert_eq!(peers_b, vec![a]);
+    }
+
+    #[test]
+    fn test_get_peers_multiple_links() {
+        // Node connected to two peers: get_peers returns both, regardless of order.
+        let (r, a, b, c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        let mut peers = r.get_peers(&a);
+        peers.sort();
+        let mut expected = vec![b, c];
+        expected.sort();
+        assert_eq!(peers, expected);
+        // b and c are not connected to each other.
+        assert_eq!(r.get_peers(&b), vec![a]);
+        assert_eq!(r.get_peers(&c), vec![a]);
     }
 
     #[test]

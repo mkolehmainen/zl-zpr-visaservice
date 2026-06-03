@@ -57,6 +57,7 @@ pub mod tests {
     use crate::db::FakeDb;
     use crate::db::{ActorRepo, NodeRepo, PolicyRepo, VisaRepo};
     use crate::policy_mgr::PolicyMgr;
+    use crate::test_helpers::FakeResolver;
     use crate::visa_mgr::VisaMgr;
     use crate::visareq_worker::VisaRequestJob;
     use crate::vss_mgr::VssMgr;
@@ -111,9 +112,13 @@ pub mod tests {
             counters: counters.clone(),
             system_start_time: std::time::Instant::now(),
             cc: ConnectionControl::new("vs_ident".to_string()),
-            policy_mgr: PolicyMgr::new_with_initial_policy(initial_policy, policy_repo)
-                .await
-                .expect("failed to initialize PolicyMgr"),
+            policy_mgr: PolicyMgr::new_with_initial_policy(
+                initial_policy,
+                policy_repo,
+                Arc::new(FakeResolver::ip_only()),
+            )
+            .await
+            .expect("failed to initialize PolicyMgr"),
             actor_mgr: Arc::new(ActorMgr::new(actor_repo, node_repo, counters)),
             state_db: db_handle,
             vreq_chan: vreq_tx,

@@ -7,6 +7,7 @@ use tracing::{debug, error, warn};
 use crate::assembly::Assembly;
 use crate::config;
 use crate::db;
+use crate::db::VisaMetadata;
 use crate::error::{ServiceError, StoreError};
 use crate::logging::targets::VISA;
 use crate::packet::make_fivetuple_tcp;
@@ -38,6 +39,12 @@ enum VCtx {
     Egress,
 }
 
+impl VisaWithMetadata {
+    pub fn new(visa: Visa, metadata: db::VisaMetadata) -> Self {
+        VisaWithMetadata { visa, metadata }
+    }
+}
+
 impl VisaMgr {
     pub fn new(db: db::VisaRepo) -> Self {
         VisaMgr { repo: db }
@@ -55,7 +62,6 @@ impl VisaMgr {
         &self,
         mut visa: Visa,
         target_node: &IpAddr,
-        direction: Direction,
     ) -> Result<Visa, ServiceError> {
         let md = self.repo.get_visa_metadata_by_id(visa.issuer_id).await?;
 
@@ -67,42 +73,49 @@ impl VisaMgr {
             return Ok(visa);
         }
 
-        let vctx = if path.first().unwrap() == target_node {
-            match direction {
-                Direction::Forward => VCtx::Ingress,
-                Direction::Reverse => VCtx::Egress,
-            }
-        } else if path.last().unwrap() == target_node {
-            match direction {
-                Direction::Forward => VCtx::Egress,
-                Direction::Reverse => VCtx::Ingress,
-            }
-        } else {
-            VCtx::Intermediary
-        };
+        // Metadata includes the requesting node addr.
+        // If our `target_node` is first or last then we are in an ingress or egress context.
+        // If target_node is requesting_node then this is ingress, else this is egress.
+
+        let vctx =
+            if (path.first().unwrap() == target_node) || (path.last().unwrap() == target_node) {
+                if target_node == &md.requesting_node {
+                    VCtx::Ingress
+                } else {
+                    VCtx::Egress
+                }
+            } else {
+                VCtx::Intermediary
+            };
 
         match vctx {
             VCtx::Ingress => {
                 // We already know path is at least 2 so there is a forwarding instruction.
-                if let Some(next_hop) = next_hop_in_path(path, target_node, direction) {
-                    let fwd_pep = FwdPep {
-                        next_hop: *next_hop,
-                        style: FwdPepStyle::OneWay, // TODO: Not sure when to set this to symmetric.
-                    };
-                    visa.fwd_pep = Some(fwd_pep);
-                    return Ok(visa);
+                // We are ingress so we are at one end of the path, so next hop is trivial.
+                let next_hop = if path.first().unwrap() == target_node {
+                    path[1]
                 } else {
-                    error!(target: VISA, "error actualizing visa for ingress node {target_node} on path is {path:?}: no next_hop found");
-                    return Err(ServiceError::Internal(format!("failed to actualize visa")));
-                }
+                    path[path.len() - 2]
+                };
+                let fwd_pep = FwdPep {
+                    next_hop: next_hop,
+                    style: FwdPepStyle::OneWay, // TODO: Not sure when to set this to symmetric.
+                };
+                visa.fwd_pep = Some(fwd_pep);
+                return Ok(visa);
             }
             VCtx::Egress => {
                 // Just return the full visa.
                 return Ok(visa);
             }
             VCtx::Intermediary => {
+                // We are an intermediate node, but are we going forward on the path or backwards?
+                //
+                // Given path [A, B, C, D] and and the fact that A requested the visa (and so is ingress) then,
+                // Node D is egress.  Node B needs to forward to C, and C to D.
+
                 // Build a forwardingOnly visa ...
-                match next_hop_in_path(path, target_node, direction) {
+                match next_hop_in_path(path, target_node, &md.requesting_node) {
                     Some(next_hop) => {
                         let fpep = FwdPep {
                             next_hop: *next_hop,
@@ -145,10 +158,7 @@ impl VisaMgr {
         // Start with any visas that may already be pending.
         if let Ok(pendings) = self.get_pending_visas_for_node(node_addr).await {
             for v in pendings {
-                let md = self.repo.get_visa_metadata_by_id(v.issuer_id).await?;
-                let av = self
-                    .actualize_visa_for_target_node(v, node_addr, md.direction)
-                    .await?;
+                let av = self.actualize_visa_for_target_node(v, node_addr).await?;
                 visas.push(av);
             }
         }
@@ -293,7 +303,7 @@ impl VisaMgr {
         route: &Route,
         source_zpl: impl Into<String>,
         policy_version: u64,
-    ) -> Result<Visa, ServiceError> {
+    ) -> Result<VisaWithMetadata, ServiceError> {
         let expiration_time = std::time::SystemTime::now()
             .checked_add(config::DEFAULT_VISA_EXPIRATION)
             .ok_or_else(|| {
@@ -397,11 +407,11 @@ impl VisaMgr {
 
         // The store also updates the visa state along the path.
         self.repo
-            .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
+            .store_visa(&visa, metadata.clone(), db::NodeVisaState::PendingInstall)
             .await?;
 
         info!("created visa {visa_id}");
-        Ok(visa)
+        Ok(VisaWithMetadata::new(visa, metadata))
     }
 
     pub async fn get_pending_visas_for_node(
@@ -532,6 +542,20 @@ impl VisaMgr {
             Err(e) => Err(ServiceError::from(e)),
         }
     }
+
+    /// Get just the visa metadata using the visa ID.
+    /// Returns None if not found.
+    #[allow(dead_code)]
+    pub async fn get_visa_metadata_by_id(
+        &self,
+        visa_id: u64,
+    ) -> Result<Option<VisaMetadata>, ServiceError> {
+        match self.repo.get_visa_metadata_by_id(visa_id).await {
+            Ok(md) => Ok(Some(md)),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(ServiceError::from(e)),
+        }
+    }
 }
 
 fn ep_from_dir(dir: &Direction) -> EndpointT {
@@ -552,17 +576,21 @@ fn to_forwarding_visa(mut visa: Visa, fwd_pep: FwdPep) -> Visa {
 }
 
 /// Returns the adjacent node after `target_node` in `path`, stepping forward or backward
-/// according to `direction`. Returns None if `target_node` is not in the path or there is
-/// no neighbor in the requested direction.
+/// according to the specified ingress node.
+///
+/// ### Panics
+/// - if `ingress_node` is not either the first or last node in the path.
 fn next_hop_in_path<'a>(
     path: &'a [IpAddr],
     target_node: &IpAddr,
-    direction: Direction,
+    ingress_node: &IpAddr,
 ) -> Option<&'a IpAddr> {
+    assert!(path.first()? == ingress_node || path.last()? == ingress_node);
     let pos = path.iter().position(|n| n == target_node)?;
-    match direction {
-        Direction::Forward => path.get(pos + 1),
-        Direction::Reverse => pos.checked_sub(1).and_then(|i| path.get(i)),
+    if path.first()? == ingress_node {
+        path.get(pos + 1)
+    } else {
+        pos.checked_sub(1).and_then(|i| path.get(i))
     }
 }
 
@@ -585,6 +613,52 @@ mod tests {
     const NODE_ADDR: &str = "fd5a:5052::1";
     const SRC_ADDR: &str = "fd5a:5052::10";
     const DST_ADDR: &str = "fd5a:5052::20";
+
+    #[test]
+    fn test_next_hop_empty() {
+        let path = vec![];
+        let ingress = "fd5a:5052::1".parse().unwrap();
+        let target = "fd5a:5052::2".parse().unwrap();
+        assert_eq!(next_hop_in_path(&path, &target, &ingress), None);
+    }
+
+    #[test]
+    fn test_next_hop_one_elem() {
+        let n0 = "fd5a:5052::1".parse().unwrap();
+        let n1 = "fd5a:5052::2".parse().unwrap();
+        let path = vec![n0];
+        assert_eq!(next_hop_in_path(&path, &n0, &n0), None);
+        assert_eq!(next_hop_in_path(&path, &n1, &n0), None);
+    }
+
+    #[test]
+    fn test_next_hop_two_elem() {
+        let n0 = "fd5a:5052::1".parse().unwrap();
+        let n1 = "fd5a:5052::2".parse().unwrap();
+        let path = vec![n0, n1];
+        assert_eq!(next_hop_in_path(&path, &n0, &n0), Some(&n1));
+        assert_eq!(next_hop_in_path(&path, &n1, &n0), None);
+        assert_eq!(next_hop_in_path(&path, &n1, &n1), Some(&n0));
+        assert_eq!(next_hop_in_path(&path, &n0, &n1), None);
+    }
+
+    #[test]
+    fn test_next_hop_three_elem() {
+        let n0 = "fd5a:5052::1".parse().unwrap();
+        let n1 = "fd5a:5052::2".parse().unwrap();
+        let n2 = "fd5a:5052::3".parse().unwrap();
+        let unknown = "fd5a:5052::4".parse().unwrap();
+        let path = vec![n0, n1, n2];
+        assert_eq!(next_hop_in_path(&path, &n0, &n0), Some(&n1));
+        assert_eq!(next_hop_in_path(&path, &n1, &n0), Some(&n2));
+        assert_eq!(next_hop_in_path(&path, &n2, &n0), None);
+
+        assert_eq!(next_hop_in_path(&path, &n0, &n2), None);
+        assert_eq!(next_hop_in_path(&path, &n1, &n2), Some(&n0));
+        assert_eq!(next_hop_in_path(&path, &n2, &n2), Some(&n1));
+
+        assert_eq!(next_hop_in_path(&path, &unknown, &n2), None);
+    }
 
     #[tokio::test]
     async fn test_get_node_visa_by_five_tuple_found() {
@@ -750,6 +824,27 @@ mod tests {
         visa
     }
 
+    async fn store_test_visa_with_reqesting_node(
+        mgr: &VisaMgr,
+        id: u64,
+        path: Option<Vec<IpAddr>>,
+        requesting_node: IpAddr,
+    ) -> Visa {
+        let visa = make_visa(id, Duration::from_secs(60));
+        let metadata = db::VisaMetadata::new(
+            requesting_node,
+            0,
+            "zpl".to_string(),
+            Direction::Forward,
+            path,
+        );
+        mgr.repo
+            .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
+            .await
+            .unwrap();
+        visa
+    }
+
     /// No path in metadata → visa returned unchanged with no fwd_pep.
     #[tokio::test]
     async fn test_actualize_no_path_returns_unchanged() {
@@ -758,7 +853,7 @@ mod tests {
         let visa = store_test_visa(&mgr, 1, None).await;
 
         let result = mgr
-            .actualize_visa_for_target_node(visa, &node_addr, Direction::Forward)
+            .actualize_visa_for_target_node(visa, &node_addr)
             .await
             .unwrap();
         assert_eq!(result.issuer_id, 1);
@@ -773,7 +868,7 @@ mod tests {
         let visa = store_test_visa(&mgr, 1, Some(vec![node_addr.clone()])).await;
 
         let result = mgr
-            .actualize_visa_for_target_node(visa, &node_addr, Direction::Forward)
+            .actualize_visa_for_target_node(visa, &node_addr)
             .await
             .unwrap();
         assert_eq!(result.issuer_id, 1);
@@ -789,7 +884,7 @@ mod tests {
         let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
 
         let result = mgr
-            .actualize_visa_for_target_node(visa, &node_a, Direction::Forward)
+            .actualize_visa_for_target_node(visa, &node_a)
             .await
             .unwrap();
         let fwd_pep = result.fwd_pep.expect("expected fwd_pep on ingress visa");
@@ -805,7 +900,7 @@ mod tests {
         let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
 
         let result = mgr
-            .actualize_visa_for_target_node(visa, &node_c, Direction::Forward)
+            .actualize_visa_for_target_node(visa, &node_c)
             .await
             .unwrap();
         assert!(result.fwd_pep.is_none());
@@ -818,10 +913,11 @@ mod tests {
         let mgr = make_mgr().await;
         let node_b: IpAddr = PATH_NODE_B.parse().unwrap();
         let node_c: IpAddr = PATH_NODE_C.parse().unwrap();
-        let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+        let visa =
+            store_test_visa_with_reqesting_node(&mgr, 1, Some(three_node_path()), node_c).await;
 
         let result = mgr
-            .actualize_visa_for_target_node(visa, &node_c, Direction::Reverse)
+            .actualize_visa_for_target_node(visa, &node_c)
             .await
             .unwrap();
         let fwd_pep = result
@@ -839,11 +935,14 @@ mod tests {
     #[tokio::test]
     async fn test_actualize_egress_reverse_returns_full_visa() {
         let mgr = make_mgr().await;
+        let requesting_node: IpAddr = PATH_NODE_C.parse().unwrap();
         let node_a: IpAddr = PATH_NODE_A.parse().unwrap();
-        let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
+        let visa =
+            store_test_visa_with_reqesting_node(&mgr, 1, Some(three_node_path()), requesting_node)
+                .await;
 
         let result = mgr
-            .actualize_visa_for_target_node(visa, &node_a, Direction::Reverse)
+            .actualize_visa_for_target_node(visa, &node_a)
             .await
             .unwrap();
         assert!(result.fwd_pep.is_none());
@@ -864,7 +963,7 @@ mod tests {
         let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
 
         let result = mgr
-            .actualize_visa_for_target_node(visa, &node_b, Direction::Forward)
+            .actualize_visa_for_target_node(visa, &node_b)
             .await
             .unwrap();
         assert_eq!(result.visa_type, VisaType::ForwardOnly);
@@ -886,7 +985,7 @@ mod tests {
         let visa = store_test_visa(&mgr, 1, Some(three_node_path())).await;
 
         let result = mgr
-            .actualize_visa_for_target_node(visa, &node_b, Direction::Forward)
+            .actualize_visa_for_target_node(visa, &node_b)
             .await
             .unwrap();
         assert_eq!(result.visa_type, VisaType::ForwardOnly);
@@ -945,7 +1044,7 @@ mod tests {
         let hit = Hit::new_no_signal(0, Direction::Forward);
         let route = asm.topo_mgr.get_best_route(&src, &dst).unwrap(); // route between the nodes
 
-        let visa = asm
+        let visawmd = asm
             .visa_mgr
             .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0)
             .await
@@ -954,7 +1053,7 @@ mod tests {
         let metadata = asm
             .visa_mgr
             .repo
-            .get_visa_metadata_by_id(visa.issuer_id)
+            .get_visa_metadata_by_id(visawmd.visa.issuer_id)
             .await
             .unwrap();
         assert_eq!(metadata.path, Some(vec![src, mid, dst]));
@@ -973,13 +1072,13 @@ mod tests {
         let hit = Hit::new_no_signal(0, Direction::Forward);
         let route = asm.topo_mgr.get_best_route(&src, &dst).unwrap();
 
-        let visa = asm
+        let visawmd = asm
             .visa_mgr
             .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0)
             .await
             .unwrap();
 
-        let visa_id = visa.issuer_id;
+        let visa_id = visawmd.visa.issuer_id;
         let pending_src = asm.visa_mgr.get_pending_visas_for_node(&src).await.unwrap();
         let pending_mid = asm.visa_mgr.get_pending_visas_for_node(&mid).await.unwrap();
         let pending_dst = asm.visa_mgr.get_pending_visas_for_node(&dst).await.unwrap();
@@ -1019,7 +1118,7 @@ mod tests {
         let hit = Hit::new_no_signal(0, Direction::Reverse);
         let route = asm.topo_mgr.get_best_route(&dst, &src).unwrap();
 
-        let visa = asm
+        let visawmd = asm
             .visa_mgr
             .create_visa(&asm, &dst, &pdesc, &hit, &route, "", 0)
             .await
@@ -1028,7 +1127,7 @@ mod tests {
         // dst is the ingress for reverse traffic; it must get fwd_pep pointing to mid.
         let actualized = asm
             .visa_mgr
-            .actualize_visa_for_target_node(visa, &dst, Direction::Reverse)
+            .actualize_visa_for_target_node(visawmd.visa.clone(), &dst)
             .await
             .unwrap();
 
@@ -1058,7 +1157,7 @@ mod tests {
         let hit = Hit::new_no_signal(0, Direction::Forward);
         let route = asm.topo_mgr.get_best_route(&src, &dst).unwrap();
 
-        let visa = asm
+        let visawmd = asm
             .visa_mgr
             .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0)
             .await
@@ -1066,7 +1165,7 @@ mod tests {
 
         let actualized = asm
             .visa_mgr
-            .actualize_visa_for_target_node(visa, &src, Direction::Forward)
+            .actualize_visa_for_target_node(visawmd.visa.clone(), &src)
             .await
             .unwrap();
 

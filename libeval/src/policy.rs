@@ -260,6 +260,11 @@ impl Policy {
             .map(|v| v.as_slice())
     }
 
+    /// Returns an iterator over node addresses that have peers (empty if none).
+    pub fn all_peered_nodes(&self) -> impl Iterator<Item = &IpAddr> + '_ {
+        self.peer_table.iter().flat_map(|table| table.keys())
+    }
+
     /// A link may have attributes on it, this returns them.
     pub fn get_link_attrs(&self, link_id: &str) -> Option<&[AttrExp]> {
         self.link_attrs.as_ref()?.get(link_id).map(|v| v.as_slice())

@@ -63,6 +63,9 @@ pub enum ServiceError {
 
     #[error("topology error: {0}")]
     Topology(#[from] TopologyError),
+
+    #[error("resolver error: {0}")]
+    Resolver(#[from] ResolverError),
 }
 
 #[derive(Debug, Error)]
@@ -148,6 +151,15 @@ pub enum TopologyError {
 
     #[error("link not found: {0}")]
     LinkNotFound(String),
+}
+
+#[derive(Debug, Error)]
+pub enum ResolverError {
+    #[error("no addresses found for {0}")]
+    NoAddresses(String),
+
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<ApiResponseError> for VssSyncError {

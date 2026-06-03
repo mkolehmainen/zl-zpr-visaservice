@@ -818,7 +818,7 @@ mod test {
         let policy = make_policy_with_services(vec![auth_service, regular_service]);
 
         let asm = new_assembly_for_tests(None).await;
-        asm.policy_mgr.update_policy(policy).unwrap();
+        asm.policy_mgr.update_policy(policy).await.unwrap();
         let asm = Arc::new(asm);
 
         let mut services = mgr.get_auth_services_list(asm).await.unwrap();
@@ -858,7 +858,7 @@ mod test {
         let policy = make_policy_with_services(vec![regular_service]);
 
         let asm = new_assembly_for_tests(None).await;
-        asm.policy_mgr.update_policy(policy).unwrap();
+        asm.policy_mgr.update_policy(policy).await.unwrap();
         let asm = Arc::new(asm);
 
         let services = mgr.get_auth_services_list(asm).await.unwrap();

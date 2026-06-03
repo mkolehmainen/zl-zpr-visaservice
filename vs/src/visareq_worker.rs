@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures::StreamExt;
-use futures::future::FutureExt;
+use futures::future::{FutureExt, join_all};
 
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, ROLE_ADAPTER, key};
@@ -42,6 +42,7 @@ use crate::assembly::Assembly;
 use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
+use crate::visa_mgr::VisaWithMetadata;
 use crate::{config, net_mgr};
 
 pub enum VisaDecision {
@@ -285,7 +286,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
             Ok(VisaDecision::Deny(DenyCode::NoMatch))
         }
         PartialEvalResult::AllowWithoutRoute(hits) => {
-            visa_from_allow(&asm, job, &hits, &policy, Some(default_route)).await
+            visa_from_allow(asm.clone(), job, &hits, &policy, Some(default_route)).await
         }
         PartialEvalResult::Deny(FinalDeny::Deny(_hits)) => {
             info!(target: VREQ,
@@ -303,7 +304,7 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
             match residual_evaluator.eval_routes(&routes, &asm.topo_mgr) {
                 // TODO: Note that when we get a match using routes, the route it returned in the hit.
                 Ok(FinalEvalResult::Allow(hits)) => {
-                    visa_from_allow(&asm, job, &hits, &policy, None).await
+                    visa_from_allow(asm.clone(), job, &hits, &policy, None).await
                 }
                 Ok(FinalEvalResult::Deny(_hits)) => {
                     info!(target: VREQ,
@@ -366,8 +367,10 @@ fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
 ///
 /// `hits` - Positive hits from the evaluator. We choose the first one.
 /// `default_route` - A default route for the visa, only used if there is no route on the first hit.
+/// Creates and returns the visa for the requesting node, then spawns a background task to
+/// push actualized copies to any other nodes on the multihop path.
 async fn visa_from_allow(
-    asm: &Assembly,
+    asm: Arc<Assembly>,
     job: &VisaRequestJob,
     hits: &[Hit],
     policy: &Policy,
@@ -390,10 +393,10 @@ async fn visa_from_allow(
         })?,
     };
 
-    let visa = asm
+    let visawmd = asm
         .visa_mgr
         .create_visa(
-            asm,
+            &asm,
             &job.requesting_node,
             &job.packet_desc,
             &hits[0],
@@ -403,12 +406,90 @@ async fn visa_from_allow(
         )
         .await?;
 
+    // Clone the visa for the requesting node before moving visawmd into the background task.
+    let visa_for_requester = visawmd.visa.clone();
+    let req_node = job.requesting_node;
+    let asm_bg = asm.clone();
+    tokio::spawn(async move {
+        distribute_visa_on_path(asm_bg, visawmd, req_node).await;
+    });
+
     let visa = asm
         .visa_mgr
-        .actualize_visa_for_target_node(visa, &job.requesting_node, hits[0].direction)
+        .actualize_visa_for_target_node(visa_for_requester, &job.requesting_node)
         .await?;
-
     Ok(VisaDecision::Allow(visa, allowed_route))
+}
+
+/// Pushes actualized copies of a visa to all non-requesting nodes on the path.
+/// Runs all pushes concurrently. Intended to be called as a background task after the
+/// requesting node has already received its visa.
+///
+/// Note that if these fail the visas should have already been marked as pending-install
+/// for the target nodes before calling this, so the vss worker will pick up on that
+/// during housekeeping.
+async fn distribute_visa_on_path(
+    asm: Arc<Assembly>,
+    visa_with_metadata: VisaWithMetadata,
+    requesting_node: IpAddr,
+) {
+    let issuer_id = visa_with_metadata.visa.issuer_id;
+
+    let Some(ref path) = visa_with_metadata.metadata.path else {
+        return;
+    };
+
+    // Build one future per non-requesting path node and drive them all concurrently.
+    // Each node has its own VssHandle (independent channel), so there is no contention.
+    let push_futures: Vec<_> = path
+        .iter()
+        .filter(|node_addr| **node_addr != requesting_node)
+        .map(|node_addr| {
+            let asm = asm.clone();
+            let onpath_visa = visa_with_metadata.visa.clone();
+            let node_addr = *node_addr;
+            async move {
+                match asm
+                    .visa_mgr
+                    .actualize_visa_for_target_node(onpath_visa, &node_addr)
+                    .await
+                {
+                    Ok(onpath_visa) => {
+                        if let Some(vss_handle) = asm.vss_mgr.get_handle(&node_addr) {
+                            match vss_handle.push_visas(vec![onpath_visa]).await {
+                                Ok(1) => {
+                                    if let Err(e) =
+                                        asm.visa_mgr.visa_installed(issuer_id, &node_addr).await
+                                    {
+                                        warn!(target: VREQ,
+                                            "error marking visa {issuer_id} as installed for node {node_addr}: {e}"
+                                        );
+                                    }
+                                }
+                                Ok(_) => {
+                                    warn!(target: VREQ,
+                                        "failed to push visa {issuer_id} to node {node_addr}"
+                                    );
+                                }
+                                Err(e) => {
+                                    debug!(target: VREQ,
+                                        "error pushing visa {issuer_id} for node {node_addr} in VSS: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        warn!(target: VREQ,
+                            "error actualizing visa {issuer_id} for node {node_addr}"
+                        );
+                    }
+                }
+            }
+        })
+        .collect();
+
+    join_all(push_futures).await;
 }
 
 /// Resolves a pair of optional actors into concrete actors, handling the case where one is
@@ -641,7 +722,7 @@ mod tests {
     // Verifies that visa_from_allow issues a visa and returns Allow when given a valid hit and route.
     #[tokio::test]
     async fn visa_from_allow_issues_visa_on_allow() {
-        let asm = new_assembly_for_tests(None).await;
+        let asm = Arc::new(new_assembly_for_tests(None).await);
         let requesting_node: IpAddr = "fd5a:5052:3000::ff".parse().unwrap();
         let pkt_data =
             PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80).unwrap();
@@ -651,7 +732,7 @@ mod tests {
         let policy = Policy::new_empty();
         let route = Route::new_direct(requesting_node.into());
 
-        let result = visa_from_allow(&asm, &job, &hits, &policy, Some(route)).await;
+        let result = visa_from_allow(asm, &job, &hits, &policy, Some(route)).await;
         assert!(matches!(result, Ok(VisaDecision::Allow(_, _))));
     }
 
@@ -747,6 +828,7 @@ mod tests {
         asm_inner
             .policy_mgr
             .update_policy(make_policy_with_auth_service("svc:auth"))
+            .await
             .unwrap();
 
         let asm = Arc::new(asm_inner);
@@ -809,6 +891,7 @@ mod tests {
         asm_inner
             .policy_mgr
             .update_policy(make_policy_with_auth_service("svc:auth"))
+            .await
             .unwrap();
 
         let asm = Arc::new(asm_inner);
@@ -882,6 +965,7 @@ mod tests {
 
         asm.policy_mgr
             .update_policy(make_policy_with_auth_service("svc:auth"))
+            .await
             .unwrap();
 
         Arc::new(asm)

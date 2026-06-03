@@ -831,13 +831,13 @@ mod tests {
         let route = Route::new_direct(node_addr.into());
 
         // Add a visa.
-        let v = asm
+        let vwmd = asm
             .visa_mgr
             .create_visa(&asm, &node_addr, &pdesc, &hit, &route, "", 0)
             .await
             .unwrap();
 
-        let created_id = v.issuer_id;
+        let created_id = vwmd.visa.issuer_id;
         assert!(created_id > 0);
 
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
@@ -896,7 +896,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut created_ids = vec![v0.issuer_id, v1.issuer_id, v2.issuer_id];
+        let mut created_ids = vec![v0.visa.issuer_id, v1.visa.issuer_id, v2.visa.issuer_id];
         created_ids.sort_unstable();
 
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
@@ -1138,7 +1138,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri(&format!("/admin/visas/{}", v.issuer_id))
+                    .uri(&format!("/admin/visas/{}", v.visa.issuer_id))
                     .header("X-API-Key", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -1150,7 +1150,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let vd: VisaDescriptor = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(vd.id, v.issuer_id);
+        assert_eq!(vd.id, v.visa.issuer_id);
         assert_eq!(vd.policy_id, "42");
         assert_eq!(vd.zpl, zpl_str);
         assert_eq!(vd.direction, VisaMatchDirection::Forward);
@@ -1184,7 +1184,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri(&format!("/admin/visas/{}", v.issuer_id))
+                    .uri(&format!("/admin/visas/{}", v.visa.issuer_id))
                     .header("X-API-Key", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -1228,7 +1228,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri(&format!("/admin/visas/{}", v.issuer_id))
+                    .uri(&format!("/admin/visas/{}", v.visa.issuer_id))
                     .header("X-API-Key", &api_key)
                     .body(Body::empty())
                     .unwrap(),

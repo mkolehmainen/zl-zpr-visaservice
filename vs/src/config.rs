@@ -75,6 +75,9 @@ pub const VSS_START_DELAY: std::time::Duration = std::time::Duration::from_secs(
 /// VSS worker pings the node VSS API at this interval.
 pub const VSS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(7);
 
+/// VSS wakes up to check for visas or other housekeeping this often.
+pub const VSS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(800);
+
 /// Number of allowed consecutive VSS ping failures before we drop the node.
 pub const VSS_MAX_PING_FAILURES: usize = 3;
 

@@ -33,7 +33,9 @@ mod topology_mgr;
 mod visa_mgr;
 mod visareq_worker;
 mod vsapi_worker;
+mod vss;
 mod vss_mgr;
+mod vss_worker;
 
 #[cfg(test)]
 mod test_helpers;
@@ -52,7 +54,7 @@ use crate::event_mgr::VsEvent;
 use crate::logging::enable_logging;
 use crate::logging::targets::MAIN;
 use crate::net_mgr::NetMgr;
-use crate::policy_mgr::PolicyMgr;
+use crate::policy_mgr::{PolicyMgr, SystemResolver};
 use crate::topology_mgr::TopologyMgr;
 use crate::visa_mgr::VisaMgr;
 use crate::vss_mgr::VssMgr;
@@ -221,9 +223,20 @@ async fn main() -> std::process::ExitCode {
 
     let policy_mgr_res = match initial_policy {
         Some(p) => {
-            PolicyMgr::new_with_initial_policy(p, db::PolicyRepo::new(db_handle.clone())).await
+            PolicyMgr::new_with_initial_policy(
+                p,
+                db::PolicyRepo::new(db_handle.clone()),
+                Arc::new(SystemResolver),
+            )
+            .await
         }
-        None => PolicyMgr::new_from_state(db::PolicyRepo::new(db_handle.clone())).await,
+        None => {
+            PolicyMgr::new_from_state(
+                db::PolicyRepo::new(db_handle.clone()),
+                Arc::new(SystemResolver),
+            )
+            .await
+        }
     };
 
     let net_mgr = NetMgr::new_v6().expect("failed to create NetMgr");

@@ -744,6 +744,7 @@ mod tests {
         let (_, pubkey_der) = gen_rsa_test_keypair();
         asm.policy_mgr
             .update_policy(make_policy_with_bootstrap_key(cn, &pubkey_der))
+            .await
             .unwrap();
         let cc = make_cc("test-vs");
         let result = cc
@@ -767,6 +768,7 @@ mod tests {
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
         asm.policy_mgr
             .update_policy(make_policy_with_bootstrap_key(cn, &pubkey_der))
+            .await
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
@@ -826,6 +828,7 @@ mod tests {
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
         asm.policy_mgr
             .update_policy(make_policy_with_bootstrap_key(cn, &pubkey_der))
+            .await
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
@@ -852,6 +855,7 @@ mod tests {
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
         asm.policy_mgr
             .update_policy(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
