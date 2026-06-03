@@ -627,6 +627,36 @@ impl fmt::Display for CnEntry {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NetworkDetails {
+    pub network: Vec<NodeConnections>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NodeConnections {
+    pub node: String,
+    pub connections: Vec<String>,
+}
+
+impl fmt::Display for NetworkDetails {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.network.is_empty() {
+            writeln!(f, "No network")?;
+        }
+        for node in &self.network {
+            writeln!(
+                f,
+                "{} {}  {} {:?}",
+                "actor:".dimmed(),
+                node.node.yellow(),
+                "connected to:".dimmed(),
+                node.connections
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

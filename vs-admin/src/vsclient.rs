@@ -5,8 +5,8 @@ use reqwest;
 use reqwest::tls::Certificate;
 
 use admin_api_types::{
-    ActorDescriptor, AuthRevokeDescriptor, CnEntry, ListEntry, NamedListEntry, PolicyBundle,
-    Revokes, ServiceDescriptor, VisaDescriptor, reason_for,
+    ActorDescriptor, AuthRevokeDescriptor, CnEntry, ListEntry, NamedListEntry, NetworkDetails,
+    PolicyBundle, Revokes, ServiceDescriptor, VisaDescriptor, reason_for,
 };
 
 use crate::error::VsaError;
@@ -323,6 +323,14 @@ impl VsClient {
         requrl.path_segments_mut().unwrap().push(id);
         let resp = self.ht_post(requrl.as_str())?;
         let entry: ListEntry = resp.json()?;
+        Ok(entry)
+    }
+
+    /// `GET <api_url>/admin/network`
+    pub fn get_network(&self) -> Result<NetworkDetails, VsaError> {
+        let req = reqwest::Url::parse(&format!("{}/admin/network", self.api_url))?;
+        let resp = self.ht_get(req.as_str())?;
+        let entry: NetworkDetails = resp.json()?;
         Ok(entry)
     }
 }

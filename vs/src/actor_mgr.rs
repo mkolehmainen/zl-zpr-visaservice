@@ -178,6 +178,13 @@ impl ActorMgr {
         Ok(())
     }
 
+    pub async fn get_node_last_seen(
+        &self,
+        node_addr: &IpAddr,
+    ) -> Result<Option<SystemTime>, ServiceError> {
+        Ok(self.node_db.get_last_seen_time(node_addr).await?)
+    }
+
     /// Update vss socket for given node in the DB.
     pub async fn set_node_vss(
         &self,
@@ -267,6 +274,14 @@ impl ActorMgr {
         match self.actor_db.get_actor_by_zpr_addr(zpra).await {
             Ok(actor) => Ok(Some(actor)),
             Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(ServiceError::from(e)),
+        }
+    }
+
+    /// Returns only the CN for the actor at the given ZPR address, without loading the full actor.
+    pub async fn get_cn_by_zpr_addr(&self, zpra: &IpAddr) -> Result<String, ServiceError> {
+        match self.actor_db.get_cn_by_zpr_addr(zpra).await {
+            Ok(cn) => Ok(cn),
             Err(e) => Err(ServiceError::from(e)),
         }
     }

@@ -112,6 +112,11 @@ impl Executor {
         Ok(())
     }
 
+    pub fn do_cmd_network(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.get_network()?;
+        Ok(())
+    }
+
     fn get_policies(&self) -> Result<(), Box<dyn std::error::Error>> {
         let entries = self.vs_cli.get_policies()?;
         for (i, entry) in entries.iter().enumerate() {
@@ -284,6 +289,13 @@ impl Executor {
     fn add_revoke(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let entry = self.vs_cli.add_revoke(id)?;
         println!("{entry}");
+        Ok(())
+    }
+
+    fn get_network(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let network = self.vs_cli.get_network()?;
+
+        println!("{network}");
         Ok(())
     }
 }

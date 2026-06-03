@@ -513,6 +513,26 @@ impl ActorRepo {
         Ok(actor)
     }
 
+    /// Returns only the CN for the actor at the given ZPR address, without loading the full actor.
+    ///
+    /// Returns `StoreError::NotFound` if no actor exists for the address or the actor has no CN attribute.
+    pub async fn get_cn_by_zpr_addr(&self, zpra: &IpAddr) -> Result<String, StoreError> {
+        let base_key = actor_key_for(zpra);
+        let exists: bool = self.db.exists(&base_key).await?;
+        if !exists {
+            return Err(StoreError::NotFound(format!("actor not found: {}", zpra)));
+        }
+        let mut attrs = self.get_actor_attrs(zpra, &[key::CN]).await?;
+        if attrs.is_empty() {
+            return Err(StoreError::NotFound(format!("actor at {} has no CN", zpra)));
+        }
+        let cn_attr = attrs.remove(0);
+        match cn_attr.get_single_value() {
+            Ok(cn_val) => Ok(cn_val.to_string()),
+            Err(_) => Ok(cn_attr.get_value_as_string()),
+        }
+    }
+
     /// Look up actor by CN attribute. Uses our cache.
     ///
     /// ## Errors
@@ -827,5 +847,50 @@ mod test {
         adapter_services.sort();
 
         assert_eq!(adapter_services, vec!["svc:three".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_get_cn_by_zpr_addr_returns_cn() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let actor = make_actor_defexp(&[
+            (key::ROLE, ROLE_NODE),
+            (key::CN, "my-node"),
+            (key::ZPR_ADDR, "fd5a:5052::10"),
+        ]);
+        repo.add_actor(&actor).await.unwrap();
+
+        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let cn = repo.get_cn_by_zpr_addr(&addr).await.unwrap();
+        assert_eq!(cn, "my-node");
+    }
+
+    #[tokio::test]
+    async fn test_get_cn_by_zpr_addr_not_found() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+
+        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let err = repo.get_cn_by_zpr_addr(&addr).await.unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_cn_by_zpr_addr_matches_get_actor_get_cn() {
+        //  Both get_cn_by_zpr_addr and get_actor_by_zpr_addr().get_cn() must return the same CN.
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let actor = make_actor_defexp(&[
+            (key::ROLE, ROLE_NODE),
+            (key::CN, "roundtrip-node"),
+            (key::ZPR_ADDR, "fd5a:5052::10"),
+        ]);
+        repo.add_actor(&actor).await.unwrap();
+
+        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let cn_direct = repo.get_cn_by_zpr_addr(&addr).await.unwrap();
+        let loaded = repo.get_actor_by_zpr_addr(&addr).await.unwrap();
+        let cn_via_actor = loaded.get_cn().unwrap();
+        assert_eq!(cn_direct, cn_via_actor);
     }
 }

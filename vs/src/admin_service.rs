@@ -43,8 +43,8 @@ use crate::logging::targets::ADMIN;
 
 use admin_api_types::{
     ActorDescriptor, ApiAttribute, ApiKeyFormat, ApiKeySet, AuthRevokeDescriptor, CnEntry,
-    ListEntry, NamedListEntry, NodeRecordBrief, PolicyBundle, Revokes, ServiceDescriptor,
-    VisaDescriptor,
+    ListEntry, NamedListEntry, NetworkDetails, NodeConnections, NodeRecordBrief, PolicyBundle,
+    Revokes, ServiceDescriptor, VisaDescriptor,
 };
 
 // Must use tokio RwLock here becuase we need state to be Send.
@@ -172,6 +172,7 @@ fn admin_app(state: SharedState) -> Router {
         .route("/admin/authrevoke/{capture}", post(add_revoke))
         .route("/admin/authrevoke/clear", post(clear_revokes))
         .route("/admin/authrevoke/{capture}", delete(remove_revoke))
+        .route("/admin/network", get(get_network))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -497,6 +498,7 @@ async fn build_node_record_brief(
     let counters = asm.counters.clone();
     let actor_mgr = asm.actor_mgr.clone();
     let visa_mgr = &asm.visa_mgr;
+    let topo_mgr = &asm.topo_mgr;
 
     let zpr_addr = match actor.get_zpr_addr() {
         Some(addr) => addr,
@@ -504,6 +506,10 @@ async fn build_node_record_brief(
     };
     let pending_install = visa_mgr
         .get_num_pending_install_visas(zpr_addr)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let last_contact = actor_mgr
+        .get_node_last_seen(zpr_addr)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let visa_requests = counters
@@ -520,7 +526,16 @@ async fn build_node_record_brief(
         .get_adapter_cns_connected_to_node(zpr_addr)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    // TODO I don't think we have connected nodes yet, since we don't yet have multi-node
+    let mut links: Vec<String> = Vec::new();
+    for peer_addr in topo_mgr.get_peers(zpr_addr) {
+        match actor_mgr.get_cn_by_zpr_addr(&peer_addr).await {
+            Ok(cn) => links.push(cn),
+            Err(e) => {
+                warn!(target: ADMIN, "error {} getting CN for peer with addr {}", e, peer_addr);
+                links.push(format!("cn_missing:{}", peer_addr))
+            }
+        }
+    }
     let visas = visa_mgr
         .get_installed_visa_ids_for_node(zpr_addr)
         .await
@@ -544,7 +559,7 @@ async fn build_node_record_brief(
 
     Ok(NodeRecordBrief {
         pending_install,
-        last_contact: None, // TODO don't think we currently store last contact
+        last_contact,
         visa_requests,
         connect_requests: 0, // TODO blocked on tracking calls to authorize_connect
         in_sync,
@@ -552,7 +567,7 @@ async fn build_node_record_brief(
         denied_vreqs,
         last_vreq,
         adapters,
-        links: Vec::new(), // TODO blocked on multi-node support
+        links,
         visas,
         visas_enqueued,
         pending_revocation,
@@ -671,6 +686,52 @@ async fn add_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
 
     let le = ListEntry { id: 0 };
     (StatusCode::OK, Json(le)).into_response()
+}
+
+async fn get_network(
+    Extension(perm): Extension<Permission>,
+    State(state): State<SharedState>,
+) -> Result<Json<NetworkDetails>, StatusCode> {
+    if !perm.can_read() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    info!(target: ADMIN, "GET /admin/network");
+    let rstate = state.read().await;
+
+    let node_addrs = match rstate.asm.actor_mgr.list_node_addrs().await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            error!(target: ADMIN, "Error {} getting node list", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    let mut network: Vec<NodeConnections> = Vec::new();
+
+    for node_addr in node_addrs {
+        let node = match rstate.asm.actor_mgr.get_cn_by_zpr_addr(&node_addr).await {
+            Ok(cn) => cn,
+            Err(e) => {
+                error!(target: ADMIN, "error {} getting CN for node with addr {}", e, node_addr);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+
+        let mut connections: Vec<String> = Vec::new();
+        for peer_addr in rstate.asm.topo_mgr.get_peers(&node_addr) {
+            match rstate.asm.actor_mgr.get_cn_by_zpr_addr(&peer_addr).await {
+                Ok(cn) => connections.push(cn),
+                Err(e) => {
+                    warn!(target: ADMIN, "error {} getting CN for peer with addr {}", e, peer_addr);
+                    connections.push(format!("cn_missing:{}", peer_addr))
+                }
+            }
+        }
+
+        network.push(NodeConnections { node, connections });
+    }
+
+    Ok(Json(NetworkDetails { network }))
 }
 
 fn to_api_attribute(attr: &Attribute) -> ApiAttribute {
@@ -1200,5 +1261,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_network_empty() {
+        // No nodes
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/network")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let details: NetworkDetails = serde_json::from_slice(&body).unwrap();
+        assert!(details.network.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_network_one_node_no_peers() {
+        // One node with no links
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_key(&asm);
+
+        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let actor = make_node_actor_defexp("fd5a:5052::10", "node-a", "[fd5a:5052::100]:1234");
+        asm.actor_mgr.add_node(&actor, false).await.unwrap();
+        asm.topo_mgr.add_node(addr).unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/network")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let details: NetworkDetails = serde_json::from_slice(&body).unwrap();
+        assert_eq!(details.network.len(), 1);
+        assert_eq!(details.network[0].node, "node-a");
+        assert!(details.network[0].connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_network_two_nodes_linked() {
+        // Two nodes linked to each other
+        use libeval::route::LinkId;
+
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_key(&asm);
+
+        let addr_a: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let addr_b: IpAddr = "fd5a:5052::11".parse().unwrap();
+        let actor_a = make_node_actor_defexp("fd5a:5052::10", "node-a", "[fd5a:5052::100]:1234");
+        let actor_b = make_node_actor_defexp("fd5a:5052::11", "node-b", "[fd5a:5052::101]:1234");
+
+        asm.actor_mgr.add_node(&actor_a, false).await.unwrap();
+        asm.actor_mgr.add_node(&actor_b, false).await.unwrap();
+        asm.topo_mgr.add_node(addr_a).unwrap();
+        asm.topo_mgr.add_node(addr_b).unwrap();
+        asm.topo_mgr
+            .add_link(addr_a, addr_b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/network")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let details: NetworkDetails = serde_json::from_slice(&body).unwrap();
+        assert_eq!(details.network.len(), 2);
+
+        let mut network = details.network;
+        network.sort_by(|a, b| a.node.cmp(&b.node));
+        assert_eq!(network[0].node, "node-a");
+        assert_eq!(network[0].connections, vec!["node-b".to_string()]);
+        assert_eq!(network[1].node, "node-b");
+        assert_eq!(network[1].connections, vec!["node-a".to_string()]);
     }
 }

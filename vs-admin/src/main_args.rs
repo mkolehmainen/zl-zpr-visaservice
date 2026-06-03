@@ -98,6 +98,9 @@ pub enum SubCmd {
         remove: bool,
     },
 
+    #[command()]
+    Network,
+
     /// Enter GUI mode
     #[command()]
     Gui,

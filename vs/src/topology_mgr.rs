@@ -132,6 +132,10 @@ impl TopologyMgr {
     ) -> Result<Vec<NodeId>, TopologyError> {
         self.router.route_to_path(route, starting)
     }
+
+    pub fn get_peers(&self, zpr_addr: &IpAddr) -> Vec<IpAddr> {
+        self.router.get_peers(zpr_addr)
+    }
 }
 
 impl TopologyQueryApi for TopologyMgr {

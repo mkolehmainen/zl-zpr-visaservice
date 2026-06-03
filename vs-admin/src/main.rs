@@ -95,6 +95,8 @@ fn main() {
 
         Some(SubCmd::Gui) => gui::enter_gui(&args.svc_url, ca_cert, api_key),
 
+        Some(SubCmd::Network) => exec.do_cmd_network(),
+
         None => Err("no command specified".into()),
     }
     .unwrap_or_else(|e| {

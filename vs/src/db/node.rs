@@ -121,6 +121,20 @@ impl NodeRepo {
         Ok(())
     }
 
+    /// Get the last seen time for the node, if recorded.
+    pub async fn get_last_seen_time(
+        &self,
+        node_zpr_addr: &IpAddr,
+    ) -> Result<Option<SystemTime>, StoreError> {
+        let Some(ts_str) = self.db.get(&lastseen_key_for_node(node_zpr_addr)).await? else {
+            return Ok(None);
+        };
+        let dt = chrono::DateTime::parse_from_rfc3339(&ts_str).map_err(|e| {
+            StoreError::InvalidData(format!("failed to parse last-seen timestamp: {}", e))
+        })?;
+        Ok(Some(SystemTime::from(dt)))
+    }
+
     /// Add state that an adapter is connected to a node.
     pub async fn add_connected_adater(
         &self,
@@ -557,6 +571,71 @@ mod test {
         db.set("node:bad-zaddr", "junk").await.unwrap();
 
         let err = repo.list_node_addrs().await.unwrap_err();
+        match err {
+            StoreError::InvalidData(_) => {}
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_last_seen_time_none_before_update() {
+        // Checks that get_last_seen_time returns None if there is no timestamp
+        let db = Arc::new(FakeDb::new());
+        let repo = NodeRepo::new(db);
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+
+        let result = repo.get_last_seen_time(&node_addr).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_last_seen_time_exact_value() {
+        // Insert a time into the db and ensure get_last_seen time gets correct time
+        let db = Arc::new(FakeDb::new());
+        let repo = NodeRepo::new(db.clone());
+        let node_addr: IpAddr = "fd5a:5052::64".parse().unwrap();
+
+        db.set(
+            &lastseen_key_for_node(&node_addr),
+            "2024-01-15T10:30:00+00:00",
+        )
+        .await
+        .unwrap();
+
+        let expected = SystemTime::from(
+            chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00+00:00").unwrap(),
+        );
+        let result = repo.get_last_seen_time(&node_addr).await.unwrap().unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn test_get_last_seen_time_after_update() {
+        // Checks that when we update the db between two known times, last seen time is between those two times
+        let db = Arc::new(FakeDb::new());
+        let repo = NodeRepo::new(db);
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+
+        let before = SystemTime::now();
+        repo.update_last_seen_time(&node_addr).await.unwrap();
+        let after = SystemTime::now();
+
+        let last_seen = repo.get_last_seen_time(&node_addr).await.unwrap().unwrap();
+        assert!(last_seen >= before && last_seen <= after);
+    }
+
+    #[tokio::test]
+    async fn test_get_last_seen_time_invalid_data() {
+        // Returns an error when the stored timestamp is malformed.
+        let db = Arc::new(FakeDb::new());
+        let repo = NodeRepo::new(db.clone());
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+
+        db.set(&lastseen_key_for_node(&node_addr), "not-a-timestamp")
+            .await
+            .unwrap();
+
+        let err = repo.get_last_seen_time(&node_addr).await.unwrap_err();
         match err {
             StoreError::InvalidData(_) => {}
             other => panic!("unexpected error: {:?}", other),
