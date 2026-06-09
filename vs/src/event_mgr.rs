@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use zpr::vsapi::v1::DisconnectReason;
 use zpr::vsapi_types::ServiceDescriptor;
@@ -23,6 +23,9 @@ pub enum VsEvent {
     /// Use when we get a signal from remote that actor is disconnected/disconnecting.
     /// EventManager takes care of state updates.
     ActorLeaves(IpAddr, DisconnectReason),
+
+    /// Indicates that policy has been successfully updated. Pass the new `vinst`.
+    PolicyUpdated(u64),
 }
 
 pub struct EventMgr {
@@ -56,6 +59,11 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
             VsEvent::ActorLeaves(actor, reason) => {
                 if let Err(e) = handle_actor_leaves(&asm, actor, reason).await {
                     error!(target: EVENT, "failed to handle actor leave event: {}", e);
+                }
+            }
+            VsEvent::PolicyUpdated(vinst) => {
+                if let Err(e) = handle_policy_updated(&asm, vinst).await {
+                    error!(target: EVENT, "failed to handle policy updated event: {}", e);
                 }
             }
         }
@@ -157,5 +165,36 @@ async fn set_services_all_nodes(
             }
         })
         .await;
+    Ok(())
+}
+
+async fn handle_policy_updated(_asm: &Arc<Assembly>, vinst: u64) -> Result<(), ServiceError> {
+    /*
+
+    https://github.com/org-zpr/zpr-visaservice/issues/219
+
+
+    When we get here we have already updated policy.
+
+    - are there any existing visas that need to be revoked.
+       - do we have the 5-tuple or whatever so that we can check them? NO, this is a TODO.
+
+    - check our existing topology.
+       - Are all the nodes and links still valid?
+
+    - request re-auth all nodes.
+
+    - services -> ensure all services being offered are still allowed by policy.
+       - What if an already connected adapter has a new service -> will need to re-connect?
+       - We can do a basic check to see that all the services we have do exist in policy.
+          - But that won't detect if a service has altered its provider.
+          - TO BE SAFE: expire auth from all services - force re-auth of all existing services (after removing non-existing ones)
+
+    - all connected adapters.  Are they still allowed?
+       - Well we could expire all the auth, but that seems drastic.
+       - Instead we will have already killed visas. Probably ok to let them be connected but unable to do anything.
+
+     */
+    warn!(target: EVENT, "policy updated event vinst={vinst} (not implemented)");
     Ok(())
 }

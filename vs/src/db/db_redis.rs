@@ -161,6 +161,9 @@ impl DbConnection for RedisDb {
                 DbOp::Del(key) => {
                     piper.del(key);
                 }
+                DbOp::SetBin { key, value } => {
+                    piper.set(key, value.as_slice());
+                }
                 DbOp::SRem { set_key, member } => {
                     piper.srem(set_key, member);
                 }

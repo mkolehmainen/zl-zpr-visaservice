@@ -161,6 +161,7 @@ impl Policy {
         self.policy_rdr.clone()
     }
 
+    /// Returns the serialized Cap'n Proto `Policy` struct that created this [Policy].
     pub fn get_serialized(&self) -> &Bytes {
         &self.serialized
     }
@@ -380,7 +381,7 @@ mod test {
     fn read_policy_from_test_file(filename: &str) -> Policy {
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
         let fpath = PathBuf::from(manifest_dir).join("test-data").join(filename);
-        load_policy(&fpath, MIN_COMPILER_VERSION).unwrap()
+        load_policy(&fpath, &MIN_COMPILER_VERSION).unwrap()
     }
 
     /// Build a Policy from a list of ZPL source strings by constructing a capnp

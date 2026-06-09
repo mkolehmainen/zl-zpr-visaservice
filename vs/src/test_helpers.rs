@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::SystemTime;
+use zpr::policy::v1 as capnp_policy;
 use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, TcpUdpPep, Visa};
 
 use crate::error::ResolverError;
@@ -153,4 +154,21 @@ pub fn make_visa(visa_id: u64, expires_in: Duration) -> Visa {
         KeySet::new(b"ingress", b"egress"),
         None,
     )
+}
+
+/// Build the Cap'n Proto encoded bytes of a `PolicyContainer` with the given
+/// compiler version and (arbitrary) policy payload, for use as test input.
+pub fn make_container_bytes(maj: u32, min: u32, patch: u32, policy: &[u8]) -> Vec<u8> {
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut container = msg.init_root::<capnp_policy::policy_container::Builder>();
+        container.set_zplc_ver_major(maj);
+        container.set_zplc_ver_minor(min);
+        container.set_zplc_ver_patch(patch);
+        container.set_policy(policy);
+        container.set_signature(&[]);
+    }
+    let mut buf = Vec::new();
+    capnp::serialize::write_message(&mut buf, &msg).unwrap();
+    buf
 }

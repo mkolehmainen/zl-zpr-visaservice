@@ -17,15 +17,16 @@ impl fmt::Display for Version {
     }
 }
 
-/// Load policy from file. Checks the version of the compiler against the passed
-/// minimum version.  This will not allow loading policies if the major version
-/// is not the same as specified in the minimum version.
-pub fn load_policy(fpath: &Path, min_version: Version) -> Result<Policy, PolicyError> {
-    let encoded = std::fs::read(fpath)?;
-    let encoded_container_bytes = Bytes::from(encoded);
-
+/// Returns the contained policy from the Cap'n Proto `PolicyContainer` struct.
+///
+/// `policy_container_bytes` - bytes of the Cap'n Proto `PolicyContainer` struct.
+/// `min_version` - minimum compiler version accepted. Note that the container includes the compiler version used to create it.
+pub fn load_policy_from_container(
+    policy_container_bytes: &[u8],
+    min_version: &Version,
+) -> Result<Policy, PolicyError> {
     let container_reader = capnp::serialize::read_message(
-        encoded_container_bytes.reader(),
+        policy_container_bytes.reader(),
         capnp::message::ReaderOptions::new(),
     )?;
 
@@ -51,6 +52,17 @@ pub fn load_policy(fpath: &Path, min_version: Version) -> Result<Policy, PolicyE
     let p = Policy::new_from_policy_bytes(Bytes::copy_from_slice(policy_bytes))?;
     info!(target: PIO, "loaded policy created by compiler version {comp_version}");
     Ok(p)
+}
+
+/// Load policy from file. Checks the version of the compiler against the passed
+/// minimum version.  This will not allow loading policies if the major version
+/// is not the same as specified in the minimum version.
+///
+/// `fpath` - path to policy container (bin2) file.
+pub fn load_policy(fpath: &Path, min_version: &Version) -> Result<Policy, PolicyError> {
+    let encoded = std::fs::read(fpath)?;
+    let encoded_container_bytes = Bytes::from(encoded);
+    load_policy_from_container(&encoded_container_bytes, min_version)
 }
 
 /// Returns an error if the `found_version` is not compatible with the `min_version`.

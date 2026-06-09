@@ -12,7 +12,7 @@ clap.workspace = true
 clap_complete = { version = "4.5.57", optional = true}
 colored.workspace = true
 crossterm = "0.29.0"
-flate2 = "1.0.34"
+flate2.workspace = true
 futures-io = "0.3.31"
 reqwest = { workspace = true, features = ["json", "blocking"] }
 ratatui = "0.30.0"

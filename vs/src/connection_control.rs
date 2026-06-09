@@ -572,7 +572,8 @@ fn scrub_adapter_claims(claims: Vec<Claim>) -> Result<Vec<Attribute>, ServiceErr
 mod tests {
     use super::*;
 
-    use bytes::Bytes;
+    use crate::test_helpers::make_container_bytes;
+    use libeval::pio;
     use openssl::hash::MessageDigest;
     use openssl::pkey::{PKey, Private};
     use openssl::rsa::Rsa;
@@ -694,7 +695,8 @@ mod tests {
         signer.sign_to_vec().unwrap()
     }
 
-    fn make_policy_with_bootstrap_key(cn: &str, pubkey_der: &[u8]) -> libeval::policy::Policy {
+    /// Returns container bytes for Capn Proto `PolicyContainer`
+    fn make_policy_with_bootstrap_key(cn: &str, pubkey_der: &[u8]) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy_bldr = msg.init_root::<v1::policy::Builder>();
@@ -714,10 +716,27 @@ mod tests {
         }
         let mut bytes: Vec<u8> = Vec::new();
         capnp::serialize::write_message(&mut bytes, &msg).unwrap();
-        libeval::policy::Policy::new_from_policy_bytes(Bytes::copy_from_slice(&bytes)).unwrap()
+        let container = make_container_bytes(
+            config::POLICY_MIN_COMPILER_MAJOR,
+            config::POLICY_MIN_COMPILER_MINOR,
+            config::POLICY_MIN_COMPILER_PATCH,
+            &bytes,
+        );
+        container
     }
 
     // --- authenticate_node tests ---
+
+    #[tokio::test]
+    async fn test_make_policy_with_bootstrap_key() {
+        // Make sure our helper serializes Capn Proto properly.
+        let cn = "test-node.zpr";
+        let (_privkey, pubkey_der) = gen_rsa_test_keypair();
+        let container_bytes = make_policy_with_bootstrap_key(cn, &pubkey_der);
+
+        pio::load_policy_from_container(&container_bytes, &config::POLICY_MIN_VERSION)
+            .expect("should load policy from container bytes");
+    }
 
     #[tokio::test]
     async fn authenticate_node_unknown_cn() {
@@ -742,10 +761,15 @@ mod tests {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cn = "test-node.zpr";
         let (_, pubkey_der) = gen_rsa_test_keypair();
-        asm.policy_mgr
-            .update_policy(make_policy_with_bootstrap_key(cn, &pubkey_der))
+        match asm
+            .policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_bootstrap_key(cn, &pubkey_der))
             .await
-            .unwrap();
+        {
+            Ok(_vinst) => (),
+            Err(e) => panic!("failed to update policy for test: {}", e),
+        }
+
         let cc = make_cc("test-vs");
         let result = cc
             .authenticate_node(
@@ -767,7 +791,7 @@ mod tests {
         let cn = "test-node.zpr";
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
         asm.policy_mgr
-            .update_policy(make_policy_with_bootstrap_key(cn, &pubkey_der))
+            .update_policy_from_container_bytes(make_policy_with_bootstrap_key(cn, &pubkey_der))
             .await
             .unwrap();
         let cc = make_cc("test-vs");
@@ -788,7 +812,7 @@ mod tests {
         assert!(matches!(result, Err(ServiceError::AuthenticationFailed(_))));
     }
 
-    fn make_policy_with_node_join_policy(cn: &str, pubkey_der: &[u8]) -> libeval::policy::Policy {
+    fn make_policy_with_node_join_policy(cn: &str, pubkey_der: &[u8]) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy_bldr = msg.init_root::<v1::policy::Builder>();
@@ -818,7 +842,12 @@ mod tests {
         }
         let mut bytes: Vec<u8> = Vec::new();
         capnp::serialize::write_message(&mut bytes, &msg).unwrap();
-        libeval::policy::Policy::new_from_policy_bytes(Bytes::copy_from_slice(&bytes)).unwrap()
+        make_container_bytes(
+            config::POLICY_MIN_COMPILER_MAJOR,
+            config::POLICY_MIN_COMPILER_MINOR,
+            config::POLICY_MIN_COMPILER_PATCH,
+            &bytes,
+        )
     }
 
     #[tokio::test]
@@ -827,7 +856,7 @@ mod tests {
         let cn = "test-node.zpr";
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
         asm.policy_mgr
-            .update_policy(make_policy_with_bootstrap_key(cn, &pubkey_der))
+            .update_policy_from_container_bytes(make_policy_with_bootstrap_key(cn, &pubkey_der))
             .await
             .unwrap();
         let cc = make_cc("test-vs");
@@ -854,7 +883,7 @@ mod tests {
         let cn = "test-node.zpr";
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
         asm.policy_mgr
-            .update_policy(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
             .await
             .unwrap();
         let cc = make_cc("test-vs");

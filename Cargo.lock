@@ -12,12 +12,17 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "admin-api-types"
 version = "0.13.0"
 dependencies = [
+ "base64",
+ "bytes",
+ "capnp",
  "chrono",
  "colored",
+ "flate2",
  "reqwest",
  "serde",
  "serde_json",
  "serde_with",
+ "zpr",
 ]
 
 [[package]]
@@ -4401,6 +4406,7 @@ dependencies = [
  "clap",
  "dashmap",
  "enum-map",
+ "flate2",
  "futures",
  "futures-util",
  "hex",

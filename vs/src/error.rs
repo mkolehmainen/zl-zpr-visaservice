@@ -105,6 +105,9 @@ pub enum StoreError {
 
     #[error("vsapi error: {0}")]
     VsapiType(#[from] VsapiTypeError),
+
+    #[error("crypto error: {0}")]
+    Crypto(#[from] CryptoError),
 }
 
 #[derive(Debug, Error)]

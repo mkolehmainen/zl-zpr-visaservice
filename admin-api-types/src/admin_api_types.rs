@@ -31,23 +31,6 @@ impl fmt::Display for NamedListEntry {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct PolicyBundle {
-    pub config_id: u64,  // ignored when installing
-    pub version: String, // use empty string if you don't care
-    pub format: String,
-    pub container: String,
-}
-
-impl fmt::Display for PolicyBundle {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} {}  ", "id:".dimmed(), self.config_id)?;
-        write!(f, "{} {}  ", "version:".dimmed(), self.version)?;
-        write!(f, "{} {}  ", "format:".dimmed(), self.format)?;
-        write!(f, "{} {}\n", "container:".dimmed(), self.container)
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum VisaMatchDirection {

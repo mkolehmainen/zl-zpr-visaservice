@@ -602,7 +602,7 @@ mod test {
     use crate::db::{ActorRepo, FakeDb, NodeRepo};
     use crate::test_helpers::{
         make_actor_defexp, make_actor_with_services_defexp, make_adapter_actor_defexp,
-        make_node_actor_defexp,
+        make_container_bytes, make_node_actor_defexp,
     };
 
     use bytes::Bytes;
@@ -610,6 +610,7 @@ mod test {
     use libeval::policy::Policy;
     use std::net::{IpAddr, SocketAddr};
     use std::sync::Arc;
+    use zpr::policy::v1 as capnp_policy;
     use zpr::policy_types::{JoinPolicy, PFlags, Service};
     use zpr::write_to::WriteTo;
 
@@ -620,10 +621,11 @@ mod test {
         ActorMgr::new(actor_repo, node_repo, Arc::new(Counters::default()))
     }
 
-    fn make_policy_with_services(services: Vec<Service>) -> Policy {
+    /// Returns `(Policy, container_bytes)`
+    fn make_policy_with_services(services: Vec<Service>) -> (Policy, Vec<u8>) {
         let mut msg = capnp::message::Builder::new_default();
         {
-            let mut policy_bldr = msg.init_root::<zpr::policy::v1::policy::Builder>();
+            let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
             policy_bldr.set_created("2024-01-01T00:00:00Z");
             policy_bldr.set_version(1);
             policy_bldr.set_metadata("");
@@ -639,7 +641,18 @@ mod test {
         }
         let mut bytes = Vec::new();
         capnp::serialize::write_message(&mut bytes, &msg).unwrap();
-        Policy::new_from_policy_bytes(Bytes::copy_from_slice(&bytes)).unwrap()
+
+        let container = make_container_bytes(
+            config::POLICY_MIN_COMPILER_MAJOR,
+            config::POLICY_MIN_COMPILER_MINOR,
+            config::POLICY_MIN_COMPILER_PATCH,
+            &bytes,
+        );
+
+        (
+            Policy::new_from_policy_bytes(Bytes::copy_from_slice(&bytes)).unwrap(),
+            container,
+        )
     }
 
     #[tokio::test]
@@ -815,10 +828,14 @@ mod test {
             }],
             kind: ServiceType::Regular,
         };
-        let policy = make_policy_with_services(vec![auth_service, regular_service]);
+        let (_policy, container_bytes) =
+            make_policy_with_services(vec![auth_service, regular_service]);
 
         let asm = new_assembly_for_tests(None).await;
-        asm.policy_mgr.update_policy(policy).await.unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(container_bytes)
+            .await
+            .unwrap();
         let asm = Arc::new(asm);
 
         let mut services = mgr.get_auth_services_list(asm).await.unwrap();
@@ -855,10 +872,13 @@ mod test {
             }],
             kind: ServiceType::Regular, // NOT an auth service
         };
-        let policy = make_policy_with_services(vec![regular_service]);
+        let (_policy, container_bytes) = make_policy_with_services(vec![regular_service]);
 
         let asm = new_assembly_for_tests(None).await;
-        asm.policy_mgr.update_policy(policy).await.unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(container_bytes)
+            .await
+            .unwrap();
         let asm = Arc::new(asm);
 
         let services = mgr.get_auth_services_list(asm).await.unwrap();

@@ -8,7 +8,6 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use libeval::attribute::{ROLE_ADAPTER, key};
-use libeval::pio;
 
 mod actor_mgr;
 mod admin_apikeys;
@@ -23,6 +22,7 @@ mod db;
 mod db_worker;
 mod error;
 mod event_mgr;
+mod loaded_policy;
 mod logging;
 mod net_mgr;
 mod packet;
@@ -140,25 +140,21 @@ async fn main() -> std::process::ExitCode {
 
     // If a policy path was provided, attempt to load it here. If not provided, we set this None
     // and then later the policy_mgr will attempt to load the current policy from the database.
-    let initial_policy = {
-        if let Some(ref policy_path) = cli.policy {
-            match pio::load_policy(
-                policy_path,
-                pio::Version(
-                    config::POLICY_MIN_COMPILER_MAJOR,
-                    config::POLICY_MIN_COMPILER_MINOR,
-                    config::POLICY_MIN_COMPILER_PATCH,
-                ),
-            ) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    error!(target: MAIN, "failed to load initial policy from {}: {}", policy_path.display(), e);
-                    return std::process::ExitCode::FAILURE;
-                }
+    let initial_policy_bytes = if let Some(policy_path) = &cli.policy {
+        match std::fs::read(policy_path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                error!(
+                    target: MAIN,
+                    "failed to load initial policy from {}: {}",
+                    policy_path.display(),
+                    e
+                );
+                return std::process::ExitCode::FAILURE;
             }
-        } else {
-            None
         }
+    } else {
+        None
     };
 
     let local_set = tokio::task::LocalSet::new();
@@ -221,21 +217,31 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    let policy_mgr_res = match initial_policy {
-        Some(p) => {
-            PolicyMgr::new_with_initial_policy(
-                p,
-                db::PolicyRepo::new(db_handle.clone()),
-                Arc::new(SystemResolver),
-            )
-            .await
-        }
-        None => {
-            PolicyMgr::new_from_state(
-                db::PolicyRepo::new(db_handle.clone()),
-                Arc::new(SystemResolver),
-            )
-            .await
+    // Initialize the policy manager either from provided policy-container or from database.
+    let policy_mgr = {
+        let policy_mgr_res = match initial_policy_bytes {
+            Some(p) => {
+                PolicyMgr::new_with_initial_policy(
+                    p,
+                    db::PolicyRepo::new(db_handle.clone()),
+                    Arc::new(SystemResolver),
+                )
+                .await
+            }
+            None => {
+                PolicyMgr::new_from_state(
+                    db::PolicyRepo::new(db_handle.clone()),
+                    Arc::new(SystemResolver),
+                )
+                .await
+            }
+        };
+        match policy_mgr_res {
+            Ok(pm) => pm,
+            Err(e) => {
+                error!(target: MAIN, "failed to instantiate policy manager: {}", e);
+                return std::process::ExitCode::FAILURE;
+            }
         }
     };
 
@@ -248,14 +254,6 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     }
-
-    let policy_mgr = match policy_mgr_res {
-        Ok(pm) => pm,
-        Err(e) => {
-            error!(target: MAIN, "failed to instantiate policy manager: {}", e);
-            return std::process::ExitCode::FAILURE;
-        }
-    };
 
     let visa_repo = match db::VisaRepo::new(db_handle.clone(), config::INITIAL_VISA_ID).await {
         Ok(vr) => vr,

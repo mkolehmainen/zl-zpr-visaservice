@@ -77,6 +77,15 @@ impl FakeDb {
         Ok(())
     }
 
+    /// Set a binary value without taking the outer lock (caller holds it).
+    async fn set_bin_with_lock(&self, key: &str, value: &[u8]) -> DbResult<()> {
+        self.store.insert(
+            key.to_string(),
+            Entry::new(FakeDbValue::Bin(value.to_vec())),
+        );
+        Ok(())
+    }
+
     async fn hset_with_lock(&self, key: &str, field: &str, value: &str) -> DbResult<()> {
         let entry = self
             .store
@@ -198,11 +207,7 @@ impl DbConnection for FakeDb {
     /// Set a binary value.
     async fn set_bin(&self, key: &str, value: &[u8]) -> DbResult<()> {
         let _rlock = self.lock.read().await;
-        self.store.insert(
-            key.to_string(),
-            Entry::new(FakeDbValue::Bin(value.to_vec())),
-        );
-        Ok(())
+        self.set_bin_with_lock(key, value).await
     }
 
     /// Set a binary value with expiration.
@@ -430,6 +435,9 @@ impl DbConnection for FakeDb {
             match op {
                 DbOp::Del(key) => {
                     self.del_with_lock(key).await?;
+                }
+                DbOp::SetBin { key, value } => {
+                    self.set_bin_with_lock(key, value).await?;
                 }
                 DbOp::SRem { set_key, member } => {
                     self.srem_with_lock(set_key, member).await?;

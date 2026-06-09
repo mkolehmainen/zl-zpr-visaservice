@@ -40,6 +40,9 @@ pub mod key {
 
     /// Policy install version when actor last authenticated/permitted.
     pub const VINST: &str = "zpr.vinst";
+
+    /// Link cost
+    pub const LINK_COST: &str = "link.zpr.cost";
 }
 
 #[derive(Debug, Error)]

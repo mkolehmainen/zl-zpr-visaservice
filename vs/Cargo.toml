@@ -21,6 +21,7 @@ chrono.workspace = true
 clap.workspace = true
 dashmap = "6.1.0"
 enum-map = "2.7.3"
+flate2.workspace = true
 futures = "0.3.31"
 futures-util = "0.3.31"
 hex = "0.4.3"

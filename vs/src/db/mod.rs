@@ -42,6 +42,9 @@ pub trait DbConnection: Send + Sync {
     async fn set(&self, key: &str, value: &str) -> DbResult<()>;
     async fn get(&self, key: &str) -> DbResult<Option<String>>;
 
+    /// Set a binary value directly. For atomic writes alongside other ops, use
+    /// `DbOp::SetBin` in an `atomic_pipeline` instead.
+    #[allow(dead_code)]
     async fn set_bin(&self, key: &str, value: &[u8]) -> DbResult<()>;
     async fn set_bin_ex(&self, key: &str, value: &[u8], seconds: u64) -> DbResult<()>;
     async fn get_bin(&self, key: &str) -> DbResult<Vec<u8>>;
@@ -118,6 +121,11 @@ impl Eq for LockDescriptor {}
 
 pub enum DbOp {
     Del(String),
+    /// Set a binary value at `key`. Lets binary blobs join an atomic pipeline.
+    SetBin {
+        key: String,
+        value: Vec<u8>,
+    },
     SRem {
         set_key: String,
         member: String,

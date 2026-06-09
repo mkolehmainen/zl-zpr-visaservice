@@ -639,8 +639,9 @@ mod tests {
 
     use crate::assembly::Assembly;
     use crate::assembly::tests::new_assembly_for_tests;
-    use crate::test_helpers::{make_actor_with_services_defexp, make_node_actor_defexp};
-    use bytes::Bytes;
+    use crate::test_helpers::{
+        make_actor_with_services_defexp, make_container_bytes, make_node_actor_defexp,
+    };
     use libeval::attribute::ROLE_ADAPTER;
     use libeval::eval_result::Direction;
     use libeval::policy::Policy;
@@ -650,7 +651,7 @@ mod tests {
     use zpr::write_to::WriteTo;
 
     /// Builds a Policy that declares one Authentication service with the given id.
-    fn make_policy_with_auth_service(service_id: &str) -> Policy {
+    fn make_policy_with_auth_service(service_id: &str) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy_bldr = msg.init_root::<zpr::policy::v1::policy::Builder>();
@@ -678,7 +679,12 @@ mod tests {
         }
         let mut bytes = Vec::new();
         capnp::serialize::write_message(&mut bytes, &msg).unwrap();
-        Policy::new_from_policy_bytes(Bytes::copy_from_slice(&bytes)).unwrap()
+        make_container_bytes(
+            config::POLICY_MIN_COMPILER_MAJOR,
+            config::POLICY_MIN_COMPILER_MINOR,
+            config::POLICY_MIN_COMPILER_PATCH,
+            &bytes,
+        )
     }
 
     // This test just runs a request through the pipeline. There is no real policy here
@@ -827,7 +833,7 @@ mod tests {
             .unwrap();
         asm_inner
             .policy_mgr
-            .update_policy(make_policy_with_auth_service("svc:auth"))
+            .update_policy_from_container_bytes(make_policy_with_auth_service("svc:auth"))
             .await
             .unwrap();
 
@@ -890,7 +896,7 @@ mod tests {
             .unwrap();
         asm_inner
             .policy_mgr
-            .update_policy(make_policy_with_auth_service("svc:auth"))
+            .update_policy_from_container_bytes(make_policy_with_auth_service("svc:auth"))
             .await
             .unwrap();
 
@@ -964,7 +970,7 @@ mod tests {
             .unwrap();
 
         asm.policy_mgr
-            .update_policy(make_policy_with_auth_service("svc:auth"))
+            .update_policy_from_container_bytes(make_policy_with_auth_service("svc:auth"))
             .await
             .unwrap();
 

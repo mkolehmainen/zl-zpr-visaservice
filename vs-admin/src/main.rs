@@ -63,12 +63,7 @@ fn main() {
     let exec = Executor::new(args.svc_url.clone(), ca_cert.clone(), api_key.clone());
 
     match args.command {
-        Some(SubCmd::Policies {
-            id,
-            version,
-            path,
-            curr,
-        }) => exec.do_cmd_policies(id, version, path, curr),
+        Some(SubCmd::Policies { id, path, curr }) => exec.do_cmd_policies(id, path, curr),
 
         Some(SubCmd::Visas { id, revoke }) => exec.do_cmd_visas(id, revoke),
 

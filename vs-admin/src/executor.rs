@@ -1,12 +1,8 @@
 //! "Executes" all the commands kicked off in main (except gui).
 
-use base64::prelude::*;
 use colored::Colorize;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use std::fs::File;
 use std::io::Read;
-use std::io::prelude::*;
 use std::path::Path;
 
 use admin_api_types::{ListEntry, PolicyBundle};
@@ -27,7 +23,6 @@ impl Executor {
     pub fn do_cmd_policies(
         &self,
         id: Option<u64>,
-        version: Option<String>,
         path: Option<String>,
         curr: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -35,10 +30,8 @@ impl Executor {
             Some(id) => self.get_policy(id)?,
             None => match curr {
                 true => self.get_curr_policy()?,
-                false => match (version, path) {
-                    (Some(version), Some(path)) => {
-                        self.install_policy(version.as_str(), Path::new(&path))?
-                    }
+                false => match path {
+                    Some(path) => self.install_policy(Path::new(&path))?,
                     _ => self.get_policies()?,
                 },
             },
@@ -143,47 +136,22 @@ impl Executor {
     // passed here through the API is only used to catch potential problems early. The
     // visa service will open the policy file and check the actual version itself.
     //
-    fn install_policy(
-        &self,
-        compiler_version: &str,
-        policy: &Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn install_policy(&self, policy: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let mut policy_buf = Vec::new();
         File::open(policy)?.read_to_end(&mut policy_buf)?;
 
-        let raw_len = policy_buf.len();
-
-        // compress policy data with gzip
-        let mut gz_w = GzEncoder::new(Vec::new(), Compression::default());
-        gz_w.write_all(&policy_buf)?;
-        let gz_bytes = gz_w.finish()?;
-
-        let gz_len = gz_bytes.len();
-
-        // encode the compressed data as base64
-        let container = BASE64_STANDARD.encode(&gz_bytes);
-
-        println!(
-            "{}",
-            format!(
-                "sending policy: container size {} bytes (raw {} / {} compressed)",
-                container.len(),
-                raw_len,
-                gz_len
-            )
-            .magenta()
-        );
-
-        let bundle = PolicyBundle {
-            config_id: 0,
-            version: "".to_string(),
-            format: format!("base64;zip;{}", compiler_version),
-            container,
-        };
-
-        let entry: ListEntry = self.vs_cli.install_policy(&bundle)?;
-        println!("{entry}");
-        Ok(())
+        match PolicyBundle::new_from_policy_container(0, &policy_buf) {
+            Ok(pb) => {
+                println!("{}", "sending policy container".magenta());
+                let entry: ListEntry = self.vs_cli.install_policy(&pb)?;
+                println!("{entry}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("{} {}", "Error creating policy bundle:".red(), e);
+                return Err(e.into());
+            }
+        }
     }
 
     fn get_visas(&self) -> Result<(), Box<dyn std::error::Error>> {

@@ -30,6 +30,14 @@ pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
 pub const POLICY_MIN_COMPILER_MINOR: u32 = 11;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 1;
 
+/// Minimum policy compiler version this build will load.
+
+pub const POLICY_MIN_VERSION: libeval::pio::Version = libeval::pio::Version(
+    POLICY_MIN_COMPILER_MAJOR,
+    POLICY_MIN_COMPILER_MINOR,
+    POLICY_MIN_COMPILER_PATCH,
+);
+
 /// Default VSAPI port - must be in sync with compiler since it adds policy for that.
 pub const VSAPI_PORT: u16 = 5002;
 
@@ -160,24 +168,6 @@ impl VSConfig {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_override_one_field_deserialize() {
-        let cfg: VSConfig = toml::from_str(
-            r#"
-        [core]
-        vsapi_port = 9999
-        "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.core.vk_uri, Some(VALKEY_URI.to_string()));
-        assert_eq!(cfg.core.vsapi_port, Some(9999));
-    }
-}
-
 // Return the path to the data home directory.
 pub fn get_data_home() -> PathBuf {
     let mut dh = match env::var("XDG_DATA_HOME") {
@@ -198,4 +188,22 @@ pub fn get_data_home() -> PathBuf {
     };
     dh.push("zpr");
     dh
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_override_one_field_deserialize() {
+        let cfg: VSConfig = toml::from_str(
+            r#"
+        [core]
+        vsapi_port = 9999
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.core.vk_uri, Some(VALKEY_URI.to_string()));
+        assert_eq!(cfg.core.vsapi_port, Some(9999));
+    }
 }

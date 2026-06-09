@@ -30,16 +30,13 @@ pub enum SubCmd {
     #[command()]
     Policies {
         /// See more information on a specific policy
-        #[arg(long, short = 'i', conflicts_with_all = ["version", "path", "curr"])]
+        #[arg(long, short = 'i', conflicts_with_all = ["path", "curr"])]
         id: Option<u64>,
-        /// Version number of compiled policy when installing a new policy. If version is provided, path must be as well
-        #[arg(long, short = 'v', requires = "path", conflicts_with_all = ["id", "curr"])]
-        version: Option<String>,
         /// Path to compiled policy when installing a new policy. If path is provided, version must be as well
-        #[arg(long, short = 'p', requires = "version", conflicts_with_all = ["id", "curr"])]
+        #[arg(long, short = 'p', conflicts_with_all = ["id", "curr"])]
         path: Option<String>,
         /// See the current policy in the VS
-        #[arg(long, short = 'c', conflicts_with_all = ["version", "path", "id"])]
+        #[arg(long, short = 'c', conflicts_with_all = ["path", "id"])]
         curr: bool,
     },
 
