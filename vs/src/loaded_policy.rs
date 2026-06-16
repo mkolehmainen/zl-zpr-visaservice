@@ -1,6 +1,7 @@
 //! Policy is kept together with its container. This does that.
 //!
 //! - [PolicyContainerBytes]: encoded Cap'n Proto `PolicyContainer` bytes.
+//!   See https://github.com/org-zpr/zpr-common/blob/main/src/policy_types/policy_bundle.rs
 //! - [LoadedPolicy]: a decoded [Policy] paired with the exact container bytes it
 //!   was decoded from, so the two can never drift apart.
 //!
@@ -10,43 +11,12 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
-
 use libeval::pio;
 use libeval::policy::{Policy, PolicyError};
 use openssl::hash::{Hasher, MessageDigest};
+use zpr::policy_types::PolicyContainerBytes;
 
 use crate::error::CryptoError;
-
-/// Encoded Cap'n Proto `PolicyContainer` bytes.
-///
-/// A cheap-to-clone newtype over [bytes::Bytes] that documents, at the type
-/// level, that the wrapped bytes are a policy *container* (compiler version
-/// metadata, signature, and the inner policy) rather than raw policy bytes or
-/// unrelated binary data.
-#[derive(Clone, Debug)]
-pub struct PolicyContainerBytes(Bytes);
-
-impl PolicyContainerBytes {
-    /// Borrow the raw container bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl From<Vec<u8>> for PolicyContainerBytes {
-    /// Take ownership of `Vec<u8>` container bytes (zero-copy via `Bytes::from`).
-    fn from(v: Vec<u8>) -> Self {
-        PolicyContainerBytes(Bytes::from(v))
-    }
-}
-
-impl From<Bytes> for PolicyContainerBytes {
-    /// Wrap already-shared `Bytes` container bytes.
-    fn from(b: Bytes) -> Self {
-        PolicyContainerBytes(b)
-    }
-}
 
 /// A decoded [Policy] paired with the exact container bytes it came from.
 ///

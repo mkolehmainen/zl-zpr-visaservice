@@ -12,17 +12,12 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "admin-api-types"
 version = "0.13.0"
 dependencies = [
- "base64",
- "bytes",
- "capnp",
  "chrono",
  "colored",
- "flate2",
  "reqwest",
  "serde",
  "serde_json",
  "serde_with",
- "zpr",
 ]
 
 [[package]]
@@ -5245,16 +5240,21 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zpr"
-version = "0.17.1"
-source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.17.1#8292918d0c193f4d4c4f0c2b2388f39309ad2b58"
+version = "0.18.1"
+source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.18.1#90dcac76eecad9abb6cd1d6cca667e14c1d98f6b"
 dependencies = [
+ "base64",
+ "bytes",
  "capnp",
  "capnpc",
+ "colored",
  "criterion",
+ "flate2",
  "ip_network_table-deps-treebitmap",
  "open-enum",
  "rand 0.10.1",
  "range-set-blaze",
+ "serde",
  "thiserror 1.0.69",
  "url",
  "zerocopy",

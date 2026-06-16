@@ -22,13 +22,13 @@ use libeval::attribute::Attribute;
 use libeval::attribute::key;
 use libeval::policy::{Peer, Policy};
 
-use zpr::policy_types::{NetAddr, NetworkHost};
+use zpr::policy_types::{NetAddr, NetworkHost, PolicyContainerBytes};
 use zpr::vsapi_types::{Link, LinkRole, SockAddr};
 
 use crate::config;
 use crate::db;
 use crate::error::{ResolverError, ServiceError, TopologyError};
-use crate::loaded_policy::{LoadedPolicy, PolicyContainerBytes};
+use crate::loaded_policy::LoadedPolicy;
 use crate::logging::targets::MAIN;
 
 /// Abstracts DNS hostname resolution so it can be swapped out in tests.

@@ -21,6 +21,7 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tower_service::Service;
 
+use zpr::policy_types::PolicyBundle;
 use zpr::vsapi_types::{DockPepType, KeyFormat, KeySet, Visa};
 
 use libeval::attribute::{Attribute, ROLE_NODE, key};
@@ -43,8 +44,8 @@ use crate::policy_mgr::DEFAULT_POLICY_ID;
 
 use admin_api_types::{
     ActorDescriptor, ApiAttribute, ApiKeyFormat, ApiKeySet, AuthRevokeDescriptor, CnEntry,
-    ListEntry, NamedListEntry, NetworkDetails, NodeConnections, NodeRecordBrief, PolicyBundle,
-    Revokes, ServiceDescriptor, VisaDescriptor,
+    ListEntry, NamedListEntry, NetworkDetails, NodeConnections, NodeRecordBrief, Revokes,
+    ServiceDescriptor, VisaDescriptor,
 };
 
 // Must use tokio RwLock here becuase we need state to be Send.
@@ -270,7 +271,7 @@ async fn get_policy_by_id(asm: &Assembly, id: u64) -> Result<Json<PolicyBundle>,
     let bundle = {
         let pmgr = &asm.policy_mgr;
         let container = pmgr.get_current_container();
-        match PolicyBundle::new_from_policy_container(0, container.as_bytes()) {
+        match PolicyBundle::new_from_policy_container(0, container) {
             Ok(pb) => pb,
             Err(e) => {
                 error!(target: ADMIN, "error creating policy bundle for policy {id}: {}", e);
@@ -890,7 +891,7 @@ mod tests {
             crate::config::POLICY_MIN_COMPILER_PATCH,
             &inner,
         );
-        PolicyBundle::new_from_policy_container(0, &container).unwrap()
+        PolicyBundle::new_from_policy_container(0, container.into()).unwrap()
     }
 
     /// GET /admin/policies returns the single current policy id (0) with a read key.

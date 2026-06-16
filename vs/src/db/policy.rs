@@ -13,11 +13,12 @@
 use libeval::pio;
 use std::sync::Arc;
 use tracing::debug;
+use zpr::policy_types::PolicyContainerBytes;
 
 use crate::db;
 use crate::db::{DbConnection, DbOp};
 use crate::error::StoreError;
-use crate::loaded_policy::{LoadedPolicy, PolicyContainerBytes};
+use crate::loaded_policy::LoadedPolicy;
 use crate::logging::targets::DB;
 
 const KEY_POLICIES: &str = "policies";

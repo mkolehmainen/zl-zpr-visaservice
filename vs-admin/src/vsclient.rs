@@ -4,9 +4,11 @@ use colored::Colorize;
 use reqwest;
 use reqwest::tls::Certificate;
 
+use zpr::policy_types::PolicyBundle;
+
 use admin_api_types::{
     ActorDescriptor, AuthRevokeDescriptor, CnEntry, ListEntry, NamedListEntry, NetworkDetails,
-    PolicyBundle, Revokes, ServiceDescriptor, VisaDescriptor, reason_for,
+    Revokes, ServiceDescriptor, VisaDescriptor, reason_for,
 };
 
 use crate::error::VsaError;
