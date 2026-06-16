@@ -179,6 +179,7 @@ impl VisaMgr {
             let cres = self
                 .create_vs_to_node_vss_visa(asm.clone(), node_addr, vss_addr.port())
                 .await?;
+            let cres = self.actualize_visa_for_target_node(cres, node_addr).await?;
             visas.push(cres);
         } else {
             debug!(
@@ -252,7 +253,7 @@ impl VisaMgr {
         self.create_visa_for_packet(asm, pkt_data, node_addr).await
     }
 
-    /// TODO: Update this to create a chain of visas or at any rate to set up the visa installation chain.    /// `requesting_node_addr` - The visa is created as if this node has requested it.
+    /// `requesting_node_addr` - The visa is created as if this node has requested it.
     ///
     /// The returned visa is a full visa (TODO: return route info).
     /// The visa needs to be crunched through PATH to determine what is sent to `requesting_node_addr` node.

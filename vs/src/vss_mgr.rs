@@ -172,7 +172,6 @@ impl VssHandle {
     }
 
     /// Send visas to the node.
-    #[allow(dead_code)]
     pub async fn push_visas(&self, visas: Vec<Visa>) -> Result<usize, VssSyncError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VssCmd::PushVisas(visas, resp_tx);
@@ -199,7 +198,6 @@ impl VssHandle {
     }
 
     /// Tell the node about authentication services connected to the ZPRnet.
-    #[allow(dead_code)]
     pub async fn set_services(&self, services: Vec<ServiceDescriptor>) -> Result<(), VssSyncError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VssCmd::SetServices(services, resp_tx);

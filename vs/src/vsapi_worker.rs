@@ -1060,7 +1060,11 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             warn!(target: API, "failed to record actor joins event for adapter {:?}: {}", actor.get_cn(), e);
         }
 
-        // TODO: How does the linked node get its node<->VSAPI visa? When creating this visa it will also set up the visas needed along the path.
+        // If a node just connected, the next thing it will try to do is open a connection
+        // to VSAPI. We do not generate a visa since we currently have no mechanism to
+        // hand the visa down to the new node. Instead, we plan to let the new node issue
+        // a request (like an adapter) to its new peer which will need to somehow get the
+        // visa installed on the node node (not link an adapter).
 
         // TODO: Is this counter name misleading?  We use node-connection-success for VSAPI node-authorization calls.
         // This success is for the VSAPI authorize_connect call which could be authorizing an
