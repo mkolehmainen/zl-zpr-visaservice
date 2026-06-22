@@ -13,8 +13,6 @@ obj2="$("${PROG_CMD[@]}" | sed -n '2p')"
 echo "TESTING CONNECT SHUOULD SUCCEED"
 jq -e '.kind=="APPROVE_CONNECTION" and .actor.provider==true' >/dev/null <<<"$obj1"
 echo "TEST OK"
-echo "TESTING CONNECT SHOULD FAIL"
-jq -e '.error=="no match"' >/dev/null <<<"$obj2"
 
 echo "OK"
 

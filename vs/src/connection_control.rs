@@ -852,6 +852,8 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_node_policy_denied() {
+        // Test a valid node, but policy lacking a join policy for it.
+        // So join is allowed but node role is denied.
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cn = "test-node.zpr";
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
@@ -874,7 +876,11 @@ mod tests {
                 "fd5a:5052::1".parse().unwrap(),
             )
             .await;
-        assert!(matches!(result, Err(ServiceError::Eval(_))));
+        assert!(
+            matches!(result, Err(ServiceError::AuthenticationFailed(_))),
+            "expected failure got {:?}",
+            result
+        );
     }
 
     #[tokio::test]

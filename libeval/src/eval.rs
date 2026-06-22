@@ -215,21 +215,26 @@ impl EvalContext {
         let mut query_claims = Vec::new();
         query_claims.extend_from_slice(authenticated_claims);
 
-        // If a zpr.addr is present in auth claims, we use that to match
-        // policy too.
-        if let Some(unauth_claims) = unauthenticated_claims {
-            for ua_attr in unauth_claims {
+        // Collect any requested zpr.addr from the unauth claims. These are used
+        // for join-policy matching, but only committed to the final actor if a
+        // join policy actually matches (and thereby validates them).
+        let mut unauth_claims = Vec::new();
+        if let Some(uc) = unauthenticated_claims {
+            for ua_attr in uc {
                 if ua_attr.get_key() == key::ZPR_ADDR {
-                    query_claims.push(ua_attr.clone());
+                    unauth_claims.push(ua_attr.clone());
                 }
             }
         }
+        query_claims.extend_from_slice(&unauth_claims);
 
-        // Query to see if the authenticated claims match any join policies.
+        // Query to see if the claims match any join policies.
         let matching_jps = self.policy.match_join_policies(&query_claims);
-        if matching_jps.is_empty() {
-            return Err(EvalError::NoMatch);
-        }
+        // If nothing matched, the unauth claims are unvalidated and must be
+        // scrubbed from the actor: otherwise a bootstrap-authenticated peer with
+        // no matching join policy could claim an arbitrary or already-used ZPR
+        // address and overwrite/disconnect that actor.
+        let matched_join_policy = !matching_jps.is_empty();
         debug!(
             target: EVAL,
             "found {} matching join policies",
@@ -251,9 +256,24 @@ impl EvalContext {
 
         let mut actor = Actor::new();
 
-        for attr in &query_claims {
+        // Always commit the authenticated claims. Commit the unauth claims only
+        // if a join policy matched; otherwise scrub them.
+        let final_claims: &[Attribute] = if matched_join_policy {
+            &query_claims
+        } else {
+            if !unauth_claims.is_empty() {
+                warn!(
+                    target: EVAL,
+                    "scrubbing {} unauthenticated claim(s) from actor: no matching join policy",
+                    unauth_claims.len()
+                );
+            }
+            authenticated_claims
+        };
+
+        for attr in final_claims {
             if let Err(e) = actor.add_attribute(attr.clone()) {
-                warn!(target: EVAL, "dropping invalid authenticated claim attribute: {}", e);
+                warn!(target: EVAL, "dropping invalid claim attribute: {}", e);
             }
         }
 
@@ -949,7 +969,7 @@ mod test {
     }
 
     #[test]
-    fn test_connect_fail() {
+    fn test_connect_allowed_even_with_no_allows() {
         setup();
         let pol = load_policy("basic.bin2");
         let ctx = EvalContext::new(Arc::new(pol));
@@ -966,8 +986,14 @@ mod test {
             Some(unauthenticated_claims.as_slice()),
             Duration::from_secs(1000),
         ) {
-            Err(_) => {}
-            Ok(actor) => panic!("expected connection approval to fail, got {:?}", actor),
+            Err(e) => panic!("expected connection approval to succeed, got {:?}", e),
+            Ok(actor) => {
+                assert!(!actor.is_node());
+                assert!(actor.has_attribute_value(key::ROLE, ROLE_ADAPTER));
+                // No join policy matched, so the requested (unauthenticated)
+                // zpr.addr must have been scrubbed from the actor.
+                assert!(actor.get_zpr_addr().is_none());
+            }
         };
     }
 }
