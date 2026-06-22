@@ -290,15 +290,36 @@ async fn main() -> std::process::ExitCode {
         cc: ConnectionControl::new(identity),
         policy_mgr: policy_mgr,
         actor_mgr: Arc::new(actor_mgr),
-        state_db: db_handle,
+        state_db: db_handle.clone(),
         vreq_chan: vreq_tx,
         visa_mgr: VisaMgr::new(visa_repo),
         vss_mgr: VssMgr::new(),
         net_mgr: Arc::new(net_mgr),
         event_mgr: EventMgr::new(event_tx),
         admin_api_keys: Arc::new(admin_api_keys),
-        topo_mgr: TopologyMgr::new(),
+        topo_mgr: TopologyMgr::new(db::LinkRepo::new(db_handle)),
     });
+
+    // Rebuild the in-memory router topology from persisted state. This runs after
+    // synchronize_state/refresh_state (above) has pruned expired nodes, so those nodes
+    // are excluded from node_addrs and their persisted edges get GC'd during restore.
+    // Startup must load state completely or fail -- if there is garbage in there the
+    // admin needs to startup again with clean state.
+    let node_addrs = match asm.actor_mgr.list_node_addrs().await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            error!(target: MAIN, "failed to list node addresses for topology restore: {}", e);
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = asm
+        .topo_mgr
+        .restore_from_state(&asm.policy_mgr, &node_addrs)
+        .await
+    {
+        error!(target: MAIN, "failed to restore topology state: {}", e);
+        return std::process::ExitCode::FAILURE;
+    }
 
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(db_worker::launch(asm.clone(), vslock_desc));

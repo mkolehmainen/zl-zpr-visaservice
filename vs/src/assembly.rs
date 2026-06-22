@@ -56,7 +56,7 @@ pub mod tests {
     use crate::config;
     use crate::connection_control::ConnectionControl;
     use crate::db::FakeDb;
-    use crate::db::{ActorRepo, NodeRepo, PolicyRepo, VisaRepo};
+    use crate::db::{ActorRepo, LinkRepo, NodeRepo, PolicyRepo, VisaRepo};
     use crate::policy_mgr::PolicyMgr;
     use crate::test_helpers::FakeResolver;
     use crate::test_helpers::make_container_bytes;
@@ -125,14 +125,14 @@ pub mod tests {
             .await
             .expect("failed to initialize PolicyMgr"),
             actor_mgr: Arc::new(ActorMgr::new(actor_repo, node_repo, counters)),
-            state_db: db_handle,
+            state_db: db_handle.clone(),
             vreq_chan: vreq_tx,
             visa_mgr: VisaMgr::new(visa_repo),
             vss_mgr: VssMgr::new(),
             net_mgr: Arc::new(NetMgr::new_v6().expect("failed to create NetMgr")),
             event_mgr: EventMgr::new(event_tx),
             admin_api_keys: Arc::new(ReloadableApiKeys::default()),
-            topo_mgr: TopologyMgr::new(),
+            topo_mgr: TopologyMgr::new(LinkRepo::new(db_handle)),
         }
     }
 }

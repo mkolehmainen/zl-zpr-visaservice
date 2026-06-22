@@ -193,10 +193,15 @@ impl DbConnection for RedisDb {
         let mut conn = self.mgr.clone();
         let mut results = Vec::new();
 
+        // Redis SCAN_MATCH can return duplicate keys so we de-dupe before returning.
+        let mut seen = HashSet::new();
+
         let mut iter: redis::AsyncIter<String> = conn.scan_match(pattern).await?;
-        while let Some(svc_key_res) = iter.next_item().await {
-            let svc_key = svc_key_res?;
-            results.push(svc_key);
+        while let Some(key_res) = iter.next_item().await {
+            let key = key_res?;
+            if seen.insert(key.clone()) {
+                results.push(key);
+            }
         }
 
         Ok(results)

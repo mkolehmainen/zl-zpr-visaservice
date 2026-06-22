@@ -22,10 +22,11 @@ use zpr::write_to::WriteTo;
 use crate::assembly::Assembly;
 use crate::config;
 use crate::counters::CounterType;
-use crate::error::{ServiceError, TopologyError};
+use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
 use crate::logging::targets::API;
 use crate::net_mgr;
+use crate::topology_mgr::{AddLinkedNodeError, TopologyMgr};
 use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
 // During node authentication we keep track in here of what state we have
@@ -48,14 +49,25 @@ impl AuthenticateUndo {
         self.actor_mgr_add_node = Some(addr.clone());
     }
 
-    /// We added a node to the router.
-    fn added_node_to_router(&mut self, addr: &IpAddr) {
-        self.added_node_to_router = Some(addr.clone());
+    /// Add a node to the router. If it was not already there then note the fact that we
+    /// added it in our undo state.
+    ///
+    /// Returns `true` if the node was added. False if it already existed.
+    fn add_node_to_router_and_track_if_added(
+        &mut self,
+        topo_mgr: &TopologyMgr,
+        addr: IpAddr,
+    ) -> bool {
+        let added_node_to_router = topo_mgr.add_node_if_not_exists(addr);
+        if added_node_to_router {
+            self.added_node_to_router = Some(addr);
+        }
+        added_node_to_router
     }
 
     async fn undo(self, asm: &Assembly) {
         if let Some(addr) = self.added_node_to_router {
-            asm.topo_mgr.remove_node(&addr);
+            asm.topo_mgr.remove_node(&addr).await;
         }
         if let Some(addr) = self.actor_mgr_add_node {
             let _ = asm.actor_mgr.remove_node(&addr).await;
@@ -715,7 +727,8 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                     "failed to clear node state",
                 );
             }
-            self.asm.topo_mgr.remove_node(&node_zpr_addr);
+            // A fresh connect explicitly clears stale router topology, including persisted edges.
+            self.asm.topo_mgr.remove_node(&node_zpr_addr).await;
         }
 
         // The add_node call will clean up after ifself if it fails.
@@ -771,31 +784,11 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             }
         }
 
-        // Add the node to the router.
-        match self.asm.topo_mgr.add_node(node_zpr_addr) {
-            Ok(()) => (),
-            Err(TopologyError::NodeExists(_)) => {
-                // Attempt to remove and re-add.
-                warn!(target: API, "node {:?} already exists in router, attempting to remove and re-add", &node_cn);
-                self.asm.topo_mgr.remove_node(&node_zpr_addr);
-                if let Err(e) = self.asm.topo_mgr.add_node(node_zpr_addr) {
-                    // Failed to add the node to the router. We won't be able to route visas through this node.
-                    // Best to just abort this connect.
-                    error!(target: API, "router: failed to add node {} to router after removing existing: {}", node_zpr_addr, e);
-                    undo.undo(&self.asm).await;
-                    return self.ok_with_authenticate_error(
-                        results,
-                        vsapi::ErrorCode::Internal,
-                        "router update failed",
-                    );
-                }
-            }
-            Err(e) => {
-                unreachable!("unexpected error adding node to router: {}", e);
-            }
+        // Add the node to the router, preserving restored links if it already exists.
+        if !undo.add_node_to_router_and_track_if_added(&self.asm.topo_mgr, node_zpr_addr) {
+            // Node exists already.
+            info!(target: API, "node {:?} already present in router on (re)connect; keeping existing node and links", &node_cn);
         }
-
-        undo.added_node_to_router(&node_zpr_addr);
 
         let evt = VsEvent::ActorJoins(node_zpr_addr);
         if let Err(e) = self.asm.event_mgr.record_event(evt).await {
@@ -998,7 +991,12 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             {
                 warn!(target: API, "failed to add connecting node {:?} to during authorize_connect: {}", actor.get_cn(), add_err);
 
-                if self.asm.net_mgr.is_managed_address(&actor_addr) {
+                // Only release the address if THIS call created the node. For a
+                // pre-existing node the address is still live in actor/router state, so
+                // releasing it would corrupt the allocator.
+                if matches!(add_err, AddLinkedNodeError::NewNodeFailed(_))
+                    && self.asm.net_mgr.is_managed_address(&actor_addr)
+                {
                     if let Err(e) = self.asm.net_mgr.release_zpr_addr(actor_addr) {
                         warn!(target: API, "failed to release node address in error handler, actor={}: {}", actor_addr, e);
                     }
@@ -1519,16 +1517,38 @@ mod tests {
             let asm = Arc::new(new_assembly_for_tests(None).await);
             let addr: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
 
-            asm.topo_mgr.add_node(addr).unwrap();
-
             let mut undo = AuthenticateUndo::default();
-            undo.added_node_to_router(&addr);
+            assert!(
+                undo.add_node_to_router_and_track_if_added(&asm.topo_mgr, addr),
+                "new router node should be reported as added"
+            );
             undo.undo(&asm).await;
 
             // Node was removed, so add_node must succeed again.
             assert!(
                 asm.topo_mgr.add_node(addr).is_ok(),
                 "node should have been removed from router by undo"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_add_node_to_router_does_not_undo_preexisting_node() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let addr: IpAddr = "fd5a:5052:90de:1::3".parse().unwrap();
+
+            asm.topo_mgr.add_node(addr).unwrap();
+
+            let mut undo = AuthenticateUndo::default();
+            let added = undo.add_node_to_router_and_track_if_added(&asm.topo_mgr, addr);
+
+            assert!(
+                !added,
+                "pre-existing router node should not be reported as newly added"
+            );
+            undo.undo(&asm).await;
+            assert!(
+                asm.topo_mgr.add_node(addr).is_err(),
+                "undo must not remove a node it did not add"
             );
         }
 
@@ -1560,19 +1580,21 @@ mod tests {
                 make_node_actor_defexp(&addr.to_string(), "test-node-2", "[fd5a:5052::101]:1234");
 
             asm.actor_mgr.add_node(&actor, false).await.unwrap();
-            asm.topo_mgr.add_node(addr).unwrap();
 
             let mut undo = AuthenticateUndo::default();
             undo.took_zpr_addr(&addr);
             undo.added_node_to_actor_mgr(&addr);
-            undo.added_node_to_router(&addr);
+            assert!(
+                undo.add_node_to_router_and_track_if_added(&asm.topo_mgr, addr),
+                "new router node should be reported as added"
+            );
             undo.undo(&asm).await;
 
             assert!(
                 asm.topo_mgr.add_node(addr).is_ok(),
                 "node should have been removed from router"
             );
-            asm.topo_mgr.remove_node(&addr);
+            asm.topo_mgr.remove_node(&addr).await;
 
             let actor_result = asm.actor_mgr.get_actor_by_zpr_addr(&addr).await.unwrap();
             assert!(
