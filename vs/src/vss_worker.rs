@@ -61,14 +61,13 @@ impl VssState {
         self.services_state.mark_synced();
     }
 
-    /// TODO: This is not yet tracking policy changes. So only returns TRUE first time it is created.
     fn needs_set_topology(&self) -> bool {
         self.topology_state.needs_sync()
     }
 
     /// If topology effecting this node has been updated, indicate that here.
-    /// TODO: Not used yet.
-    #[allow(dead_code)]
+    /// Marking it updated makes housekeeping re-send topology if the inline
+    /// set-topology RPC fails, so the node never sticks with stale topology.
     fn mark_topology_updated(&mut self) {
         self.topology_state.last_update = Instant::now();
     }
@@ -172,6 +171,13 @@ pub async fn vss_worker_loop(
                         VssCmd::Configure(params, resp_tx) => {
                             if let Err(e) = resp_tx.send(vss_do_configure(&vss_handle, params).await) {
                                 error!(target: VSS, "failed to send response for configure command: {:?}", e);
+                                asm.counters.incr(CounterType::VssErrors);
+                            }
+                        }
+                        VssCmd::SetTopology(links, resp_tx) => {
+                            state.mark_topology_updated();
+                            if let Err(e) = resp_tx.send(vss_do_set_topology(&vss_handle, &links).await) {
+                                error!(target: VSS, "failed to send response for set-topology command: {:?}", e);
                                 asm.counters.incr(CounterType::VssErrors);
                             }
                         }

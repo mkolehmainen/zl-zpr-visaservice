@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 use tokio::task::LocalSet;
 use tracing::{debug, info};
 
-use zpr::vsapi_types::{ServiceDescriptor, Visa};
+use zpr::vsapi_types::{Link, ServiceDescriptor, Visa};
 
 use crate::assembly::Assembly;
 use crate::error::VssSyncError;
@@ -201,6 +201,14 @@ impl VssHandle {
     pub async fn set_services(&self, services: Vec<ServiceDescriptor>) -> Result<(), VssSyncError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VssCmd::SetServices(services, resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VssSyncError::ConnClosed)?
+    }
+
+    /// Send a `setTopology` message to the node.
+    pub async fn set_topology(&self, links: Vec<Link>) -> Result<(), VssSyncError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VssCmd::SetTopology(links, resp_tx);
         self.send_command(cmd).await?;
         resp_rx.await.map_err(|_| VssSyncError::ConnClosed)?
     }

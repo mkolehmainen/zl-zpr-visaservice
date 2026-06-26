@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use zpr::vsapi::v1::DisconnectReason;
 use zpr::vsapi_types::ServiceDescriptor;
@@ -168,7 +168,7 @@ async fn set_services_all_nodes(
     Ok(())
 }
 
-async fn handle_policy_updated(_asm: &Arc<Assembly>, vinst: u64) -> Result<(), ServiceError> {
+async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), ServiceError> {
     /*
 
     https://github.com/org-zpr/zpr-visaservice/issues/219
@@ -184,6 +184,8 @@ async fn handle_policy_updated(_asm: &Arc<Assembly>, vinst: u64) -> Result<(), S
 
     - request re-auth all nodes.
 
+    - clear revocation list? May make more sense to keep it and make admin clear manually.
+
     - services -> ensure all services being offered are still allowed by policy.
        - What if an already connected adapter has a new service -> will need to re-connect?
        - We can do a basic check to see that all the services we have do exist in policy.
@@ -195,6 +197,54 @@ async fn handle_policy_updated(_asm: &Arc<Assembly>, vinst: u64) -> Result<(), S
        - Instead we will have already killed visas. Probably ok to let them be connected but unable to do anything.
 
      */
-    warn!(target: EVENT, "policy updated event vinst={vinst} (not implemented)");
+
+    // Grab one consistent policy snapshot and use it for the entire synchronize-to-policy
+    // pass below, so revalidation and per-node link computation all read the same view.
+    let psnap = asm.policy_mgr.get_current_snapshot();
+
+    // PolicyUpdated(vinst) is a trigger, not a guarantee that this handler reconciles that
+    // exact revision. If updates queue faster than we process them we reconcile against the
+    // latest snapshot.
+    let snapshot_vinst = psnap.vinst();
+    if snapshot_vinst != vinst {
+        info!(
+            target: EVENT,
+            "policy update event called with vinst={vinst}, using current snapshot vinst={snapshot_vinst}"
+        );
+    }
+
+    info!(target: EVENT, "policy updated vinst={vinst}: TODO revalidate connected nodes");
+    let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
+
+    // TODO: Check existing nodes against policy.
+    // Until then  we just assume has not changed.
+    // Once validated the `connected_node_addrs` will be in sync with policy. And we should have already removed the stale
+    // nodes from the actor_mgr state, disconnected from VSS, etc.
+
+    info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology");
+    let report = asm
+        .topo_mgr
+        .revalidate_against_policy(&psnap, &connected_node_addrs)
+        .await?;
+    info!(
+        target: EVENT,
+        "topology revalidated vinst={vinst}: removed={} updated={} repaired={} orphaned={}",
+        report.links_removed,
+        report.links_updated,
+        report.links_repaired,
+        report.orphaned_nodes.len()
+    );
+
+    // Queue up setTopology messages in parallel.
+    let futs = connected_node_addrs.iter().filter_map(|naddr| {
+        let links = psnap.links_for_node(naddr);
+        asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
+            if let Err(e) = vss_handle.set_topology(links).await {
+                error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
+            }
+        })
+    });
+    futures::future::join_all(futs).await;
+
     Ok(())
 }

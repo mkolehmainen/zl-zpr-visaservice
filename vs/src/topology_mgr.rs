@@ -14,17 +14,38 @@ use crate::actor_mgr::ActorMgr;
 use crate::db::LinkRepo;
 use crate::error::{ServiceError, TopologyError};
 use crate::logging::targets::TOPO;
-use crate::policy_mgr::{LinkDescription, PolicyMgr};
-use crate::router::Router;
+use crate::policy_mgr::{LinkDescription, PolicySnapshot};
+use crate::router::{LinkSpec, Router};
 
 use libeval::actor::Actor;
-use libeval::attribute::{AttrMatch, Attribute};
+use libeval::attribute::{AttrMatch, Attribute, attributes_equivalent};
 use libeval::eval_route::{RouteHint, TopologyQueryApi};
 use libeval::route::{LinkId, NodeId, Route};
 
 pub struct TopologyMgr {
     router: Router,
     link_repo: LinkRepo,
+}
+
+/// The fate of a persisted/live edge when validated against the current policy.
+enum EdgeDecision {
+    /// Policy still describes this link; install/refresh it with this description.
+    Install(LinkDescription),
+    /// Policy no longer describes this link (or an endpoint is gone); garbage-collect it.
+    Gc,
+}
+
+/// Summary of what [TopologyMgr::revalidate_against_policy] changed, for logging by the caller.
+#[derive(Debug, Default)]
+pub struct RevalidationReport {
+    /// Links removed because policy no longer describes them.
+    pub links_removed: usize,
+    /// Links whose id/attrs/cost were refreshed to match policy.
+    pub links_updated: usize,
+    /// Links re-installed/re-persisted to repair router/persistence drift.
+    pub links_repaired: usize,
+    /// Known nodes left with no remaining links. Detected and reported only.
+    pub orphaned_nodes: Vec<IpAddr>,
 }
 
 /// Special error returned by [TopologyMgr::add_linked_node] that records
@@ -110,30 +131,16 @@ impl TopologyMgr {
     /// error, so we never report failure while leaving a router edge behind.
     pub async fn add_linked_node(
         &self,
-        policy_mgr: &PolicyMgr,
+        snapshot: &PolicySnapshot,
         actor_mgr: &ActorMgr,
         actor: &Actor,
         connect_via: &IpAddr,
         new_node_addr: &IpAddr,
     ) -> Result<(), AddLinkedNodeError> {
-        // I think we need to add the node.
-        // But I'm not sure that the actor-mgr needs to know about links.
-        // It does know about tethers.  So maybe is should?  But the router has the
-        // actual graph. So maybe we add redis backing to the router???
-        //
-        // Is this node already in our graph over another link?
-        //
-        // QUESTION - how to tell if this node is just making a link or if it is reconnecting and we need to restore state?
-        //
-        // If a node is already connected to ZPR why does it need to authenticate again?
-        // Well, it may not be allowed to make the link for one thing.
-        //
-        // Computed before describe_link so even an early policy failure is classified
-        // (new vs pre-existing node) for the caller's address-release decision.
         let peer_node_addrs = self.router.get_peers(new_node_addr);
         let preexisting_node = self.router.has_node(new_node_addr);
 
-        let link_desc = match policy_mgr.describe_link(connect_via, new_node_addr) {
+        let link_desc = match snapshot.describe_link(connect_via, new_node_addr) {
             Ok(d) => d,
             Err(e) => return Err(AddLinkedNodeError::new(preexisting_node, e)),
         };
@@ -216,7 +223,7 @@ impl TopologyMgr {
     /// startup fails the service rather than silently deleting valid persisted edges.
     pub async fn restore_from_state(
         &self,
-        policy_mgr: &PolicyMgr,
+        snapshot: &PolicySnapshot,
         node_addrs: &[IpAddr],
     ) -> Result<(), ServiceError> {
         // In this code path there should be no cases for errors from add_node.
@@ -227,36 +234,240 @@ impl TopologyMgr {
         let known: HashSet<IpAddr> = node_addrs.iter().copied().collect();
 
         for (a, b) in self.link_repo.list_edges().await? {
-            // GC edges whose endpoints are no longer known nodes.
-            if !known.contains(&a) || !known.contains(&b) {
-                info!(target: TOPO, "restore: GC stale edge {} <-> {} (endpoint no longer a known node)", a, b);
-                if let Err(e) = self.link_repo.remove_edge(&a, &b).await {
-                    warn!(target: TOPO, "restore: failed to GC stale edge {} <-> {}: {}", a, b, e);
+            // Decide the edge's fate against the current policy + known-node set. Any
+            // error other than the precise not-described case is propagated, so a
+            // transient policy/DB problem fails startup rather than deleting valid edges.
+            match Self::decide_edge(snapshot, &known, &a, &b)? {
+                EdgeDecision::Install(link_desc) => {
+                    match self.install_router_link(&a, &b, link_desc) {
+                        Ok(()) | Err(TopologyError::LinkExists(_)) => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
-                continue;
-            }
-
-            // Edges are stored undirected, so try describing the link in either
-            // direction before concluding the policy no longer describes it.
-            match Self::describe_policy_link_either(policy_mgr, &a, &b) {
-                Ok(link_desc) => match self.install_router_link(&a, &b, link_desc) {
-                    Ok(()) | Err(TopologyError::LinkExists(_)) => {}
-                    Err(e) => return Err(e.into()),
-                },
-                // Policy no longer describes this link in either direction: GC it.
-                Err(ServiceError::Topology(TopologyError::LinkNotFound(_))) => {
-                    info!(target: TOPO, "restore: GC stale edge {} <-> {} (policy no longer describes link)", a, b);
+                EdgeDecision::Gc => {
+                    info!(target: TOPO, "restore: GC stale edge {} <-> {}", a, b);
                     if let Err(e) = self.link_repo.remove_edge(&a, &b).await {
                         warn!(target: TOPO, "restore: failed to GC stale edge {} <-> {}: {}", a, b, e);
                     }
                 }
-                // Any other error (policy not loaded, resolver failure, etc.) must NOT
-                // GC the edge: fail startup instead of silently deleting valid edges.
-                Err(e) => return Err(e),
             }
         }
 
         Ok(())
+    }
+
+    /// Decide whether an edge should be installed (policy still describes it) or
+    /// garbage-collected (an endpoint is no longer a known node, or policy no longer
+    /// describes the link in either direction).
+    ///
+    /// Preserves the "load completely or fail" rule: only the precise
+    /// `LinkNotFound`-in-policy case yields `Gc`; any other error propagates so a
+    /// transient policy/DB failure never silently deletes a valid edge.
+    fn decide_edge(
+        snapshot: &PolicySnapshot,
+        known: &HashSet<IpAddr>,
+        a: &IpAddr,
+        b: &IpAddr,
+    ) -> Result<EdgeDecision, ServiceError> {
+        if !known.contains(a) || !known.contains(b) {
+            return Ok(EdgeDecision::Gc);
+        }
+        // Edges are stored undirected, so try describing the link in either direction
+        // before concluding the policy no longer describes it.
+        match Self::describe_policy_link_either(snapshot, a, b) {
+            Ok(desc) => Ok(EdgeDecision::Install(desc)),
+            Err(ServiceError::Topology(TopologyError::LinkNotFound(_))) => Ok(EdgeDecision::Gc),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Revalidate the live topology against the current policy after a policy
+    /// update.
+    ///
+    /// Unlike [TopologyMgr::restore_from_state], which rebuilds an empty router
+    /// at startup, this reconciles the live router plus the persisted edge set.
+    /// Per edge we either prune it (policy no longer describes it), refresh its
+    /// attrs/cost (policy changed), or repair router/persistence drift. Nodes
+    /// left with no links are detected and reported but not torn down — node
+    /// membership is governed by the passed in `node_addrs` (the authoritative
+    /// known-node set), not by edge count.
+    ///
+    /// Validation always runs against the current policy. The pass is
+    /// idempotent, so a policy update racing mid-pass simply produces another
+    /// pass.
+    pub async fn revalidate_against_policy(
+        &self,
+        snapshot: &PolicySnapshot,
+        node_addrs: &[IpAddr],
+    ) -> Result<RevalidationReport, ServiceError> {
+        let mut report = RevalidationReport::default();
+        let known: HashSet<IpAddr> = node_addrs.iter().copied().collect();
+
+        // Actor/node state is the authoritative live-node set; make sure each such node
+        // exists in the router before repairing its links.
+        for addr in node_addrs {
+            self.add_node_if_not_exists(*addr);
+        }
+
+        // Reconcile the union of persisted and live-router edges: either store may hold
+        // an edge the other is missing.
+        let persisted_edges = self.link_repo.list_edges().await?;
+        let router_links = self.router.link_snapshot();
+        let persisted_set: HashSet<(IpAddr, IpAddr)> = persisted_edges
+            .iter()
+            .map(|(a, b)| Self::canonical_pair(*a, *b))
+            .collect();
+        let mut work_edges: HashSet<(IpAddr, IpAddr)> = persisted_set.clone();
+        for link in &router_links {
+            work_edges.insert(Self::canonical_pair(link.a, link.b));
+        }
+
+        // Reconcile in two phases: decide every edge first, then mutate. A policy update
+        // can move a link id from one edge to another; doing the work edge-by-edge would
+        // let an install collide with the id's prior holder when `work_edges` (a HashSet)
+        // happens to visit the new edge first, aborting the whole pass nondeterministically.
+        // Deciding first lets us free every reassigned id before installing any, and lets
+        // us reject a genuinely invalid policy (two surviving edges claiming one id)
+        // up front so the live topology is left untouched rather than half-rewritten.
+
+        /// How a surviving edge's router link must change to match policy.
+        enum Action {
+            /// Router already matches policy; nothing to install.
+            Keep,
+            /// Router missing the link (drift) — install fresh.
+            Fresh,
+            /// Router link differs (id/cost/attrs changed) — vacate this old id, then reinstall.
+            Replace(LinkId),
+        }
+        struct Surviving {
+            a: IpAddr,
+            b: IpAddr,
+            persisted: bool,
+            desc: LinkDescription,
+            action: Action,
+        }
+        struct Removal {
+            a: IpAddr,
+            b: IpAddr,
+            persisted: bool,
+            old_id: Option<LinkId>,
+        }
+
+        let mut surviving: Vec<Surviving> = Vec::new();
+        let mut removals: Vec<Removal> = Vec::new();
+        for (a, b) in work_edges {
+            let persisted = persisted_set.contains(&(a, b));
+            let router_link = self.router.link_between(&a, &b);
+            match Self::decide_edge(snapshot, &known, &a, &b)? {
+                EdgeDecision::Gc => removals.push(Removal {
+                    a,
+                    b,
+                    persisted,
+                    old_id: router_link.map(|rl| rl.id),
+                }),
+                EdgeDecision::Install(desc) => {
+                    let action = match &router_link {
+                        None => Action::Fresh,
+                        Some(rl) => {
+                            let changed = rl.id.0 != desc.link_id
+                                || rl.cost != desc.cost
+                                || !attributes_equivalent(&rl.attributes, &desc.attrs);
+                            if changed {
+                                Action::Replace(rl.id.clone())
+                            } else {
+                                Action::Keep
+                            }
+                        }
+                    };
+                    surviving.push(Surviving {
+                        a,
+                        b,
+                        persisted,
+                        desc,
+                        action,
+                    });
+                }
+            }
+        }
+
+        // Reject genuine id collisions (two surviving edges want the same id) before any
+        // mutation. A surviving edge's final id is always its policy `link_id`.
+        let mut claimed: HashSet<&str> = HashSet::new();
+        for e in &surviving {
+            if !claimed.insert(e.desc.link_id.as_str()) {
+                return Err(TopologyError::LinkExists(e.desc.link_id.clone()).into());
+            }
+        }
+
+        // Do all fallible async persistence before touching the router, so a persistence
+        // failure returns with the live graph untouched rather than half-rewritten.
+        // Repair persistence drift: router knows the link but Redis missed it.
+        for e in &surviving {
+            if !e.persisted {
+                self.persist_edge(&e.a, &e.b).await?;
+                report.links_repaired += 1;
+            }
+        }
+        for r in &removals {
+            if r.persisted {
+                // Best-effort, same as restore: a surviving stale edge is
+                // re-validated on the next pass / restart.
+                if let Err(e) = self.link_repo.remove_edge(&r.a, &r.b).await {
+                    warn!(target: TOPO, "revalidate: failed to GC edge {} <-> {}: {}", r.a, r.b, e);
+                }
+            }
+            if r.old_id.is_some() || r.persisted {
+                info!(target: TOPO, "revalidate: removed edge {} <-> {} (policy no longer describes link)", r.a, r.b);
+                report.links_removed += 1;
+            }
+        }
+
+        // Collect every router mutation and apply it as one atomic batch: no concurrent
+        // visa route can observe a half-rewritten graph, and a rejected install rolls back
+        // instead of leaving moved ids vacated. Removals (GC'd edges plus the old id of
+        // every changed edge) are listed first so each reassigned id is free before reuse.
+        let mut removal_ids: Vec<LinkId> =
+            removals.iter().filter_map(|r| r.old_id.clone()).collect();
+        let mut additions: Vec<LinkSpec> = Vec::new();
+        for e in surviving {
+            let spec = LinkSpec {
+                a: e.a,
+                b: e.b,
+                id: e.desc.link_id.into(),
+                attributes: e.desc.attrs,
+                cost: e.desc.cost,
+            };
+            match e.action {
+                Action::Keep => {}
+                Action::Fresh => {
+                    additions.push(spec);
+                    report.links_repaired += 1;
+                }
+                Action::Replace(old) => {
+                    removal_ids.push(old);
+                    additions.push(spec);
+                    report.links_updated += 1;
+                }
+            }
+        }
+        self.router.apply_link_batch(&removal_ids, additions)?;
+
+        // Detect + report orphans. An orphan node is a legitimate state and stays in the
+        // topology so long as it remains a known node; removing it belongs to the
+        // node-leave / re-auth path, not here.
+        for addr in node_addrs {
+            if self.router.get_peers(addr).is_empty() {
+                warn!(target: TOPO, "revalidate: node {} has no remaining valid links (orphaned)", addr);
+                report.orphaned_nodes.push(*addr);
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Return an ordered undirected key so router and LinkRepo edges compare the same way.
+    fn canonical_pair(a: IpAddr, b: IpAddr) -> (IpAddr, IpAddr) {
+        if a <= b { (a, b) } else { (b, a) }
     }
 
     /// Describe a link defined in policy in either direction. Edges are stored undirected, so a stored
@@ -264,13 +475,13 @@ impl TopologyMgr {
     /// `LinkNotFound` only when neither direction matches; any other error from the
     /// first lookup is returned as-is.
     fn describe_policy_link_either(
-        policy_mgr: &PolicyMgr,
+        snapshot: &PolicySnapshot,
         a: &IpAddr,
         b: &IpAddr,
     ) -> Result<LinkDescription, ServiceError> {
-        match policy_mgr.describe_link(a, b) {
+        match snapshot.describe_link(a, b) {
             Err(ServiceError::Topology(TopologyError::LinkNotFound(_))) => {
-                policy_mgr.describe_link(b, a)
+                snapshot.describe_link(b, a)
             }
             other => other,
         }
@@ -368,46 +579,65 @@ mod tests {
     use std::sync::Arc;
 
     use zpr::policy::v1 as policy_capnp;
-    use zpr::policy_types::{NetAddr, Peering};
+    use zpr::policy_types::{AttrExp, AttrOp, NetAddr, Peering};
     use zpr::write_to::WriteTo;
 
     use crate::config;
     use crate::counters::Counters;
     use crate::db::{ActorRepo, DbConnection, FakeDb, LinkRepo, NodeRepo, PolicyRepo};
+    use crate::policy_mgr::PolicyMgr;
     use crate::test_helpers::{FakeResolver, make_container_bytes, make_node_actor_defexp};
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
 
-    /// Build a Policy containing a single peering between `node_a` and `node_b`.
-    /// Substrate addresses use the node IPs with port 0 so the IP-only resolver works.
-    fn policy_with_link(node_a: IpAddr, node_b: IpAddr, link_id: &str) -> Vec<u8> {
-        let peering = Peering {
+    /// Build a single peering between `node_a` and `node_b` carrying the given link
+    /// attributes. Substrate addresses use the node IPs with port 0 so the IP-only
+    /// resolver works.
+    fn peering(node_a: IpAddr, node_b: IpAddr, link_id: &str, attributes: Vec<AttrExp>) -> Peering {
+        Peering {
             link_id: link_id.to_string(),
             node_a,
             substrate_a: NetAddr::new_for_ip_or_host(&node_a.to_string(), 0),
             node_b,
             substrate_b: NetAddr::new_for_ip_or_host(&node_b.to_string(), 0),
-            attributes: vec![],
-        };
+            attributes,
+        }
+    }
+
+    /// A `link.zpr.cost` attribute carrying the given cost, for exercising the cost path.
+    fn cost_attr(cost: u32) -> AttrExp {
+        AttrExp {
+            key: "link.zpr.cost".to_string(),
+            op: AttrOp::Eq,
+            value: vec![cost.to_string()],
+        }
+    }
+
+    /// Serialize a policy whose topology is exactly the given peerings.
+    fn policy_bytes_from_peerings(peerings: &[Peering]) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
             policy.reborrow().set_created("1970-01-01T00:00:00Z");
-            let mut topo = policy.reborrow().init_topology(1);
-            peering.write_to(&mut topo.reborrow().get(0));
+            let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
+            for (i, p) in peerings.iter().enumerate() {
+                p.write_to(&mut topo.reborrow().get(i as u32));
+            }
         }
         let mut bytes = Vec::new();
         capnp::serialize::write_message(&mut bytes, &msg).unwrap();
-        // Policy::new_from_policy_bytes(Bytes::from(bytes)).unwrap()
         bytes
     }
 
-    /// Create a PolicyMgr over the given db preloaded with a single-link policy.
-    async fn make_policy_mgr(db: Arc<FakeDb>, a: IpAddr, b: IpAddr, link_id: &str) -> PolicyMgr {
-        let pol_bytes = policy_with_link(a, b, link_id);
+    /// Build a Policy containing a single attribute-free peering between `node_a` and `node_b`.
+    fn policy_with_link(node_a: IpAddr, node_b: IpAddr, link_id: &str) -> Vec<u8> {
+        policy_bytes_from_peerings(&[peering(node_a, node_b, link_id, vec![])])
+    }
 
+    /// Create a PolicyMgr over the given db preloaded with the given policy bytes.
+    async fn make_policy_mgr_from_bytes(db: Arc<FakeDb>, pol_bytes: Vec<u8>) -> PolicyMgr {
         let repo = PolicyRepo::new(db);
         PolicyMgr::new_with_initial_policy(
             make_container_bytes(
@@ -421,6 +651,11 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Create a PolicyMgr over the given db preloaded with a single-link policy.
+    async fn make_policy_mgr(db: Arc<FakeDb>, a: IpAddr, b: IpAddr, link_id: &str) -> PolicyMgr {
+        make_policy_mgr_from_bytes(db, policy_with_link(a, b, link_id)).await
     }
 
     /// Build an ActorMgr over the given db.
@@ -446,9 +681,15 @@ mod tests {
         topo.add_node(a).unwrap();
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
 
-        topo.add_linked_node(&policy_mgr, &actor_mgr, &actor_b, &a, &b)
-            .await
-            .unwrap();
+        topo.add_linked_node(
+            &policy_mgr.get_current_snapshot(),
+            &actor_mgr,
+            &actor_b,
+            &a,
+            &b,
+        )
+        .await
+        .unwrap();
 
         let edges = LinkRepo::new(db).list_edges().await.unwrap();
         assert_eq!(edges.len(), 1);
@@ -481,9 +722,15 @@ mod tests {
 
         // Re-adding the same link hits the already-connected path and repairs Redis.
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
-        topo.add_linked_node(&policy_mgr, &actor_mgr, &actor_b, &a, &b)
-            .await
-            .unwrap();
+        topo.add_linked_node(
+            &policy_mgr.get_current_snapshot(),
+            &actor_mgr,
+            &actor_b,
+            &a,
+            &b,
+        )
+        .await
+        .unwrap();
 
         let edges = LinkRepo::new(db).list_edges().await.unwrap();
         assert_eq!(edges.len(), 1);
@@ -506,7 +753,13 @@ mod tests {
         db.set("topology:edges", "junk").await.unwrap();
 
         let result = topo
-            .add_linked_node(&policy_mgr, &actor_mgr, &actor_b, &a, &b)
+            .add_linked_node(
+                &policy_mgr.get_current_snapshot(),
+                &actor_mgr,
+                &actor_b,
+                &a,
+                &b,
+            )
             .await;
         // A brand-new node's failure must be reported as a new-node failure so the
         // caller releases the freshly allocated address.
@@ -551,7 +804,13 @@ mod tests {
 
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
         let result = topo
-            .add_linked_node(&policy_mgr, &actor_mgr, &actor_b, &a, &b)
+            .add_linked_node(
+                &policy_mgr.get_current_snapshot(),
+                &actor_mgr,
+                &actor_b,
+                &a,
+                &b,
+            )
             .await;
 
         assert!(
@@ -578,9 +837,15 @@ mod tests {
 
         topo.add_node(a).unwrap();
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
-        topo.add_linked_node(&policy_mgr, &actor_mgr, &actor_b, &a, &b)
-            .await
-            .unwrap();
+        topo.add_linked_node(
+            &policy_mgr.get_current_snapshot(),
+            &actor_mgr,
+            &actor_b,
+            &a,
+            &b,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             LinkRepo::new(db.clone()).list_edges().await.unwrap().len(),
             1
@@ -606,7 +871,9 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
-        topo.restore_from_state(&policy_mgr, &[a, b]).await.unwrap();
+        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
 
         // The link is back: a and b are peers and a route exists.
         assert_eq!(topo.get_peers(&a), vec![b]);
@@ -624,7 +891,9 @@ mod tests {
         // Persist an edge directly, then restore into a fresh topology to simulate restart.
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
-        topo.restore_from_state(&policy_mgr, &[a, b]).await.unwrap();
+        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
         assert_eq!(topo.get_peers(&a), vec![b], "precondition: link restored");
 
         let added = topo.add_node_if_not_exists(b);
@@ -654,7 +923,9 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &c).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
-        topo.restore_from_state(&policy_mgr, &[a, c]).await.unwrap();
+        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[a, c])
+            .await
+            .unwrap();
 
         assert!(
             topo.get_peers(&a).is_empty(),
@@ -677,7 +948,9 @@ mod tests {
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
         // Only `a` survived node-state refresh; `b` is gone.
-        topo.restore_from_state(&policy_mgr, &[a]).await.unwrap();
+        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[a])
+            .await
+            .unwrap();
 
         assert!(topo.get_peers(&a).is_empty());
         assert!(
@@ -697,11 +970,343 @@ mod tests {
         LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
         let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
 
-        topo.restore_from_state(&policy_mgr, &[]).await.unwrap();
+        topo.restore_from_state(&policy_mgr.get_current_snapshot(), &[])
+            .await
+            .unwrap();
 
         assert!(
             LinkRepo::new(db).list_edges().await.unwrap().is_empty(),
             "with no surviving nodes every edge is GC'd"
+        );
+    }
+
+    // --- revalidate_against_policy tests ---
+
+    /// A live + persisted link the new policy no longer describes is removed from both
+    /// the router and persisted state.
+    #[tokio::test]
+    async fn test_revalidate_removes_link_not_in_policy() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let c = ip("fd5a:5052::3");
+        // New policy only describes a<->b; the live a<->c link is now stale.
+        let policy_mgr = make_policy_mgr(db.clone(), a, b, "link-ab").await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(c).unwrap();
+        topo.add_link(a, c, LinkId("link-ac".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &c).await.unwrap();
+
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, c])
+            .await
+            .unwrap();
+
+        assert_eq!(report.links_removed, 1);
+        assert!(topo.get_peers(&a).is_empty(), "stale router link removed");
+        assert!(
+            LinkRepo::new(db).list_edges().await.unwrap().is_empty(),
+            "stale persisted edge GC'd"
+        );
+    }
+
+    /// A still-valid link whose policy cost changed is updated in the router.
+    #[tokio::test]
+    async fn test_revalidate_updates_changed_cost() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        // New policy describes a<->b with cost 9.
+        let policy_mgr = make_policy_mgr_from_bytes(
+            db.clone(),
+            policy_bytes_from_peerings(&[peering(a, b, "link-ab", vec![cost_attr(9)])]),
+        )
+        .await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        // Live router link still has the old cost of 1.
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+
+        assert_eq!(report.links_updated, 1);
+        assert_eq!(report.links_removed, 0);
+        assert_eq!(
+            topo.get_best_route(&a, &b).unwrap().cost,
+            9,
+            "router link cost refreshed from policy"
+        );
+    }
+
+    /// A persisted edge missing from the live router is re-installed (repair).
+    #[tokio::test]
+    async fn test_revalidate_repairs_missing_router_link() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr(db.clone(), a, b, "link-ab").await;
+        // Edge persisted but router is empty (drift).
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+
+        assert_eq!(report.links_repaired, 1);
+        assert_eq!(topo.get_peers(&a), vec![b], "router link re-installed");
+    }
+
+    /// A live router link missing from persisted state, still described by policy, has its
+    /// persisted edge repaired.
+    #[tokio::test]
+    async fn test_revalidate_repairs_missing_persisted_edge() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr(db.clone(), a, b, "link-ab").await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        // Router link present at the policy's default cost; nothing persisted.
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_link(a, b, LinkId("link-ab".into()), vec![], 1)
+            .unwrap();
+        assert!(
+            LinkRepo::new(db.clone())
+                .list_edges()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+
+        assert_eq!(report.links_repaired, 1);
+        assert_eq!(report.links_updated, 0, "matching link must not be updated");
+        assert_eq!(
+            LinkRepo::new(db).list_edges().await.unwrap().len(),
+            1,
+            "missing persisted edge repaired"
+        );
+    }
+
+    /// A live router link missing from persisted state that policy no longer describes is
+    /// removed from the router.
+    #[tokio::test]
+    async fn test_revalidate_removes_unpersisted_router_link_not_in_policy() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let c = ip("fd5a:5052::3");
+        // Policy describes a<->b only; the live (unpersisted) a<->c link is stale.
+        let policy_mgr = make_policy_mgr(db.clone(), a, b, "link-ab").await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(c).unwrap();
+        topo.add_link(a, c, LinkId("link-ac".into()), vec![], 1)
+            .unwrap();
+
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, c])
+            .await
+            .unwrap();
+
+        assert_eq!(report.links_removed, 1);
+        assert!(topo.get_peers(&a).is_empty());
+    }
+
+    /// A valid unchanged link is left intact and its edge preserved (idempotent pass).
+    #[tokio::test]
+    async fn test_revalidate_leaves_unchanged_link_intact() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr(db.clone(), a, b, "link-ab").await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        // First pass installs the link from policy.
+        topo.revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+
+        // Second pass must be a no-op.
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+
+        assert_eq!(report.links_removed, 0);
+        assert_eq!(report.links_updated, 0);
+        assert_eq!(report.links_repaired, 0);
+        assert_eq!(topo.get_peers(&a), vec![b]);
+        assert_eq!(LinkRepo::new(db).list_edges().await.unwrap().len(), 1);
+    }
+
+    /// A valid unchanged link with non-empty attributes must not be falsely updated:
+    /// policy rebuilds attrs with a fresh `expires_at`, but stable-content comparison
+    /// must treat them as equivalent.
+    #[tokio::test]
+    async fn test_revalidate_nonempty_attrs_not_falsely_updated() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let policy_mgr = make_policy_mgr_from_bytes(
+            db.clone(),
+            policy_bytes_from_peerings(&[peering(a, b, "link-ab", vec![cost_attr(5)])]),
+        )
+        .await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        // First pass installs the attribute-bearing link.
+        topo.revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+
+        // Second pass must not report a spurious update from rebuilt attrs.
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b])
+            .await
+            .unwrap();
+
+        assert_eq!(report.links_updated, 0, "rebuilt attrs must compare equal");
+        assert_eq!(report.links_repaired, 0);
+        assert_eq!(topo.get_best_route(&a, &b).unwrap().cost, 5);
+    }
+
+    /// A policy whose link id collides with another live router link's id makes the
+    /// replacement fail; the error propagates and the old link is left intact.
+    #[tokio::test]
+    async fn test_revalidate_id_collision_errors_and_preserves_link() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let c = ip("fd5a:5052::3");
+        let d = ip("fd5a:5052::4");
+        // Policy describes a<->b and c<->d both under link id "shared".
+        let policy_mgr = make_policy_mgr_from_bytes(
+            db.clone(),
+            policy_bytes_from_peerings(&[
+                peering(a, b, "shared", vec![]),
+                peering(c, d, "shared", vec![]),
+            ]),
+        )
+        .await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_node(c).unwrap();
+        topo.add_node(d).unwrap();
+        // a<->b currently has a different id; c<->d already holds "shared".
+        topo.add_link(a, b, LinkId("old-ab".into()), vec![], 1)
+            .unwrap();
+        topo.add_link(c, d, LinkId("shared".into()), vec![], 1)
+            .unwrap();
+
+        let result = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b, c, d])
+            .await;
+
+        assert!(result.is_err(), "id collision must surface as an error");
+        // The old a<->b link must survive the rejected replacement.
+        assert!(
+            topo.get_best_route(&a, &b).is_some(),
+            "old link must be left intact after a failed replacement"
+        );
+    }
+
+    /// A policy update that reassigns link ids between two still-valid edges must
+    /// reconcile successfully. Here a<->b and c<->d swap ids: each id stays unique in
+    /// the new policy, but during the single reconciliation pass the target id is still
+    /// held by the other live edge that hasn't been processed yet. Because `work_edges`
+    /// is a HashSet, neither processing order can avoid the in-pass collision, so this
+    /// fails deterministically today (replace_link_between returns LinkExists and the
+    /// whole pass aborts) — the deterministic instance of the move/reuse class flagged
+    /// in review.
+    #[tokio::test]
+    async fn test_revalidate_swaps_link_ids_between_valid_edges() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let c = ip("fd5a:5052::3");
+        let d = ip("fd5a:5052::4");
+        // New policy keeps both edges but swaps their link ids.
+        let policy_mgr = make_policy_mgr_from_bytes(
+            db.clone(),
+            policy_bytes_from_peerings(&[
+                peering(a, b, "link-2", vec![]),
+                peering(c, d, "link-1", vec![]),
+            ]),
+        )
+        .await;
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+        topo.add_node(a).unwrap();
+        topo.add_node(b).unwrap();
+        topo.add_node(c).unwrap();
+        topo.add_node(d).unwrap();
+        // Live router currently has the ids the policy is about to swap.
+        topo.add_link(a, b, LinkId("link-1".into()), vec![], 1)
+            .unwrap();
+        topo.add_link(c, d, LinkId("link-2".into()), vec![], 1)
+            .unwrap();
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        LinkRepo::new(db.clone()).add_edge(&c, &d).await.unwrap();
+
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b, c, d])
+            .await
+            .expect("id reassignment between valid edges must reconcile, not abort");
+
+        assert_eq!(report.links_updated, 2, "both edges' ids refreshed");
+        assert_eq!(report.links_removed, 0, "neither edge is stale");
+        assert_eq!(
+            topo.router.link_between(&a, &b).unwrap().id.0,
+            "link-2",
+            "a<->b took the new id"
+        );
+        assert_eq!(
+            topo.router.link_between(&c, &d).unwrap().id.0,
+            "link-1",
+            "c<->d took the new id"
+        );
+    }
+
+    /// A known node whose links were all pruned is reported as orphaned (but not removed).
+    #[tokio::test]
+    async fn test_revalidate_reports_orphaned_node() {
+        let db = Arc::new(FakeDb::new());
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        let c = ip("fd5a:5052::3");
+        let policy_mgr = make_policy_mgr(db.clone(), a, b, "link-ab").await;
+        LinkRepo::new(db.clone()).add_edge(&a, &b).await.unwrap();
+        let topo = TopologyMgr::new(LinkRepo::new(db.clone()));
+
+        // `c` is a known node with no links.
+        let report = topo
+            .revalidate_against_policy(&policy_mgr.get_current_snapshot(), &[a, b, c])
+            .await
+            .unwrap();
+
+        assert!(
+            report.orphaned_nodes.contains(&c),
+            "linkless known node must be reported orphaned"
+        );
+        assert!(!report.orphaned_nodes.contains(&a));
+        assert!(
+            topo.add_node(c).is_err(),
+            "orphaned node must remain in the topology"
         );
     }
 }

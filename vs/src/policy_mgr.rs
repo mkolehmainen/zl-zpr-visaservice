@@ -70,6 +70,73 @@ pub struct LinkDescription {
     pub cost: u32,
 }
 
+/// A consistent, owned snapshot of policy, source container, and resolved topology,
+/// all captured in a single atomic load. Cheap to clone (a refcount bump) and safe to
+/// hold across awaits: it pins the holder to one coherent view until dropped, so policy
+/// and links can never drift apart for the duration of a multi-step operation (e.g.
+/// topology revalidation after a policy update).
+#[derive(Clone)]
+pub struct PolicySnapshot(Arc<PolicyState>);
+
+impl PolicySnapshot {
+    /// The policy captured by this snapshot.
+    pub fn policy(&self) -> &Policy {
+        &self.0.policy
+    }
+
+    /// A clone of the policy Arc captured by this snapshot.
+    pub fn policy_arc(&self) -> Arc<Policy> {
+        self.0.policy.clone()
+    }
+
+    /// The version instance number of the captured policy.
+    pub fn vinst(&self) -> u64 {
+        self.policy().vinst()
+    }
+
+    /// A clone of the source container bytes captured by this snapshot.
+    pub fn container(&self) -> PolicyContainerBytes {
+        self.0.container.clone()
+    }
+
+    /// The resolved links for `node` as captured by this snapshot.
+    pub fn links_for_node(&self, node: &IpAddr) -> Vec<Link> {
+        self.0.links_by_node.get(node).cloned().unwrap_or_default()
+    }
+
+    /// Describe the link between `node_a` and `node_b` against the captured policy.
+    /// Both arguments are ZPR addresses.
+    ///
+    /// ## Errors
+    /// - `TopologyError::LinkNotFound` if there is no link between `node_a` and `node_b`
+    ///   in the captured policy.
+    pub fn describe_link(
+        &self,
+        node_a: &IpAddr,
+        node_b: &IpAddr,
+    ) -> Result<LinkDescription, ServiceError> {
+        let policy = self.policy();
+        if let Some(peers) = policy.get_peers_for_node(node_a) {
+            for peer in peers {
+                if &peer.remote_zpr_addr == node_b {
+                    let attrs = get_attributes_for_link(policy, &peer.link_id);
+                    let cost = if !attrs.is_empty() {
+                        get_link_cost(&attrs, DEFAULT_LINK_COST)
+                    } else {
+                        DEFAULT_LINK_COST
+                    };
+                    return Ok(LinkDescription {
+                        link_id: peer.link_id.clone(),
+                        attrs,
+                        cost,
+                    });
+                }
+            }
+        }
+        Err(TopologyError::LinkNotFound(format!("{node_a} <-> {node_b}")).into())
+    }
+}
+
 /// Production resolver that uses the OS/system resolver via `tokio::net::lookup_host`.
 pub struct SystemResolver;
 
@@ -224,63 +291,49 @@ impl PolicyMgr {
         Ok(vinst)
     }
 
-    /// Callers should drop the policy as quickly as possible to avoid missing a policy update.
+    /// A consistent snapshot of policy, container, and resolved links taken in
+    /// one atomic load. Holding it does not block updates, but it pins the
+    /// holder to an older view until dropped. Use this when a multi-step
+    /// operation must see one coherent policy/links pair; otherwise the
+    /// single-shot accessors below suffice.
     ///
-    /// Currently there is no way to get a consistent view of policy AND the node resolution cache.
-    /// If we find we need that we can add a snapshot mechanism.
+    /// `ArcSwap::load_full` is just a refcount bump, and the resulting owned
+    /// `Arc<PolicyState>` outlives the load `Guard` so the snapshot is safe to
+    /// hold across awaits.
+    pub fn get_current_snapshot(&self) -> PolicySnapshot {
+        PolicySnapshot(self.state.load_full())
+    }
+
+    /// Callers should drop the policy as quickly as possible to avoid missing a policy update.
     pub fn get_current(&self) -> Arc<Policy> {
-        self.state.load().policy.clone()
+        self.get_current_snapshot().policy_arc()
     }
 
     /// Get the source container bytes for the current policy (for the admin API).
     pub fn get_current_container(&self) -> PolicyContainerBytes {
-        self.state.load().container.clone()
+        self.get_current_snapshot().container()
     }
 
     /// When policy is updated, all the peer tables have their DNS names resolved and cached.
     /// Use this to get the links specified by policy for a node.
-    ///
-    /// Currently there is no way to get a consistent view of policy AND the node resolution cache.
-    /// If we find we need that we can add a snapshot mechanism.
-    ///
     pub fn resolved_links_for_node(&self, node: &IpAddr) -> Vec<Link> {
-        self.state
-            .load()
-            .links_by_node
-            .get(node)
-            .cloned()
-            .unwrap_or_default()
+        self.get_current_snapshot().links_for_node(node)
     }
 
     /// Consult policy to get a description of the link between `node_a` and `node_b`.
-    /// Both arguments are ZPR addresses.
+    /// Both arguments are ZPR addresses. A convenience single-shot wrapper over
+    /// [PolicySnapshot::describe_link]; callers needing a consistent multi-step view
+    /// should take a snapshot and call its method directly.
     ///
     /// ## Errors
     /// - `TopologyError::LinkNotFound` if there is no link between `node_a` and `node_b` in the policy.
+    #[allow(dead_code)]
     pub fn describe_link(
         &self,
         node_a: &IpAddr,
         node_b: &IpAddr,
     ) -> Result<LinkDescription, ServiceError> {
-        let policy = self.get_current();
-        if let Some(peers) = policy.get_peers_for_node(node_a) {
-            for peer in peers {
-                if &peer.remote_zpr_addr == node_b {
-                    let attrs = get_attributes_for_link(&policy, &peer.link_id);
-                    let cost = if !attrs.is_empty() {
-                        get_link_cost(&attrs, DEFAULT_LINK_COST)
-                    } else {
-                        DEFAULT_LINK_COST
-                    };
-                    return Ok(LinkDescription {
-                        link_id: peer.link_id.clone(),
-                        attrs,
-                        cost,
-                    });
-                }
-            }
-        }
-        Err(TopologyError::LinkNotFound(format!("{node_a} <-> {node_b}")).into())
+        self.get_current_snapshot().describe_link(node_a, node_b)
     }
 }
 
@@ -682,6 +735,50 @@ mod tests {
             .unwrap();
         assert_eq!(result.attrs.len(), 1);
         assert_eq!(result.attrs[0].get_key(), "link.class");
+    }
+
+    /// A snapshot is an internally-consistent, stable, owned view: its policy vinst and
+    /// resolved links agree at capture time, and a later update does not mutate a
+    /// snapshot already held.
+    #[tokio::test]
+    async fn test_snapshot_is_consistent_and_stable_across_update() {
+        let a = ip("fd5a:5052::1");
+        let b = ip("fd5a:5052::2");
+        // Start from a policy with one IP-resolvable link (vinst 1).
+        let mgr = make_policy_mgr(policy_with_peerings(&[make_peering(
+            a,
+            b,
+            "link-ab",
+            vec![],
+        )]))
+        .await;
+
+        // The captured policy vinst and links agree at capture time.
+        let snap = mgr.get_current_snapshot();
+        assert_eq!(snap.vinst(), 1);
+        assert!(
+            !snap.links_for_node(&a).is_empty(),
+            "snapshot must see the link its policy describes"
+        );
+
+        // Update to a fresh no-topology policy (vinst 2).
+        let new_vinst = mgr
+            .update_policy_from_container_bytes(policy_no_topology())
+            .await
+            .unwrap();
+        assert_eq!(new_vinst, 2);
+
+        // The already-held snapshot is unchanged: still vinst 1, still has the old link.
+        assert_eq!(snap.vinst(), 1, "held snapshot must not see the new vinst");
+        assert!(
+            !snap.links_for_node(&a).is_empty(),
+            "held snapshot must retain its captured links"
+        );
+
+        // A freshly taken snapshot reflects the update.
+        let snap2 = mgr.get_current_snapshot();
+        assert_eq!(snap2.vinst(), 2);
+        assert!(snap2.links_for_node(&a).is_empty());
     }
 
     fn ip_peer(link_id: &str, ip: IpAddr, port: u16) -> Peer {

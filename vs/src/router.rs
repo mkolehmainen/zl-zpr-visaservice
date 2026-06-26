@@ -121,6 +121,26 @@ impl RouterInner {
     }
 }
 
+/// A snapshot of a single live link in the router, used by topology revalidation to
+/// compare the live router graph against what policy currently describes.
+#[derive(Debug, Clone)]
+pub struct RouterLink {
+    pub a: IpAddr,
+    pub b: IpAddr,
+    pub id: LinkId,
+    pub attributes: Vec<Attribute>,
+    pub cost: u32,
+}
+
+/// One link to install as part of an [Router::apply_link_batch] reconciliation.
+pub struct LinkSpec {
+    pub a: IpAddr,
+    pub b: IpAddr,
+    pub id: LinkId,
+    pub attributes: Vec<Attribute>,
+    pub cost: u32,
+}
+
 pub struct Router {
     inner: RwLock<RouterInner>,
 }
@@ -232,6 +252,42 @@ impl Router {
         Ok(())
     }
 
+    /// Atomically apply a batch of link removals followed by additions under a single
+    /// write lock, so no concurrent route observes a partially-rewritten graph.
+    pub fn apply_link_batch(
+        &self,
+        removals: &[LinkId],
+        additions: Vec<LinkSpec>,
+    ) -> Result<(), TopologyError> {
+        let mut inner = self.inner.write().unwrap();
+        for id in removals {
+            inner.topology.remove_link(id);
+        }
+        let mut added: Vec<LinkId> = Vec::with_capacity(additions.len());
+        for spec in additions {
+            if let Err(e) =
+                inner
+                    .topology
+                    .add_link(spec.a, spec.b, spec.id.clone(), spec.attributes, spec.cost)
+            {
+                for done in added.iter().rev() {
+                    inner.topology.remove_link(done);
+                }
+                inner.route_cache.clear();
+                inner.link_to_cache_keys.clear();
+                inner.topo_generation += 1;
+                return Err(e);
+            }
+            added.push(spec.id);
+        }
+        // A reconcile touches arbitrary edges, so a full cache flush is the only sound
+        // invalidation; targeted eviction is not worth the bookkeeping on this cold path.
+        inner.route_cache.clear();
+        inner.link_to_cache_keys.clear();
+        inner.topo_generation += 1;
+        Ok(())
+    }
+
     /// Given a route, return the ordered sequence of NodeIds that must be traversed to follow the route,
     /// including the starting node as the first element.
     ///
@@ -306,6 +362,78 @@ impl Router {
 
         inner.topology.remove_link(id);
         inner.topo_generation += 1;
+    }
+
+    /// Current link between two node addrs, in either order (edges are undirected).
+    /// Returns `None` if no link connects them.
+    pub fn link_between(&self, a: &IpAddr, b: &IpAddr) -> Option<RouterLink> {
+        let inner = self.inner.read().unwrap();
+        let na: NodeId = a.into();
+        let nb: NodeId = b.into();
+        let id = inner.topology.link_id_between(&na, &nb)?;
+        let link = inner.topology.edges.get(&id)?;
+        Some(RouterLink {
+            a: link.a.0,
+            b: link.b.0,
+            id,
+            attributes: link.attributes.clone(),
+            cost: link.cost,
+        })
+    }
+
+    /// Snapshot of all live router links.
+    pub fn link_snapshot(&self) -> Vec<RouterLink> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .topology
+            .edges
+            .iter()
+            .map(|(id, link)| RouterLink {
+                a: link.a.0,
+                b: link.b.0,
+                id: id.clone(),
+                attributes: link.attributes.clone(),
+                cost: link.cost,
+            })
+            .collect()
+    }
+
+    /// Replace the existing link between two endpoints under a single router write lock.
+    ///
+    /// This validates fully before mutating, so a rejected replacement leaves the old
+    /// working link intact. It avoids the unsafe `remove_link(old)` + `add_link(new)`
+    /// sequence where the add can fail after the working link is already gone.
+    ///
+    /// ## Errors
+    /// - [TopologyError::LinkToSelf] if `a == b`.
+    /// - [TopologyError::NodeNotFound] if either endpoint is missing.
+    /// - [TopologyError::LinkNotFound] if no link currently connects `a` and `b`.
+    /// - [TopologyError::LinkExists] if `id` differs from the old id but is already used
+    ///   by another live edge.
+    // Retained as a tested Router primitive; revalidation now does remove-then-install
+    // so it has no live caller.
+    #[allow(dead_code)]
+    pub fn replace_link_between(
+        &self,
+        a: &IpAddr,
+        b: &IpAddr,
+        id: LinkId,
+        attributes: Vec<Attribute>,
+        cost: u32,
+    ) -> Result<(), TopologyError> {
+        let mut inner = self.inner.write().unwrap();
+        let na: NodeId = a.into();
+        let nb: NodeId = b.into();
+        inner
+            .topology
+            .replace_link(&na, &nb, id, attributes, cost)?;
+
+        // A link's id/cost change can affect arbitrary cached pairs (as with add_link),
+        // so conservatively flush the whole route cache.
+        inner.route_cache.clear();
+        inner.link_to_cache_keys.clear();
+        inner.topo_generation += 1;
+        Ok(())
     }
 
     /// Given a node address, return the connected peers,
@@ -536,6 +664,77 @@ impl Graph {
     #[allow(dead_code)]
     fn link(&self, id: &LinkId) -> Option<&Link> {
         self.edges.get(id)
+    }
+
+    /// Return the id of the link connecting `a` and `b` (in either order), or `None`.
+    /// Scans `a`'s incident edges for the one whose other endpoint is `b`.
+    fn link_id_between(&self, a: &NodeId, b: &NodeId) -> Option<LinkId> {
+        let node = self.nodes.get(a)?;
+        for link_id in &node.edges {
+            let link = self.edges.get(link_id)?;
+            let other = if &link.a == a { &link.b } else { &link.a };
+            if other == b {
+                return Some(link_id.clone());
+            }
+        }
+        None
+    }
+
+    /// Replace the link currently connecting `a` and `b` with one carrying the given id,
+    /// attributes, and cost. Validates fully before mutating so a rejected replacement
+    /// leaves the existing link untouched. See [Router::replace_link_between].
+    #[allow(dead_code)]
+    fn replace_link(
+        &mut self,
+        a: &NodeId,
+        b: &NodeId,
+        new_id: LinkId,
+        attributes: Vec<Attribute>,
+        cost: u32,
+    ) -> Result<(), TopologyError> {
+        if a == b {
+            return Err(TopologyError::LinkToSelf(
+                "replace_link: self-links are not allowed".into(),
+            ));
+        }
+        if !self.nodes.contains_key(a) {
+            return Err(TopologyError::NodeNotFound(format!(
+                "replace_link: node {:?} does not exist",
+                a
+            )));
+        }
+        if !self.nodes.contains_key(b) {
+            return Err(TopologyError::NodeNotFound(format!(
+                "replace_link: node {:?} does not exist",
+                b
+            )));
+        }
+        let old_id = self.link_id_between(a, b).ok_or_else(|| {
+            TopologyError::LinkNotFound(format!(
+                "replace_link: no existing link between {:?} and {:?}",
+                a, b
+            ))
+        })?;
+        // A new id colliding with a different live edge would corrupt that edge.
+        if new_id != old_id && self.edges.contains_key(&new_id) {
+            return Err(TopologyError::LinkExists(new_id.0));
+        }
+
+        // Validated: swap the edge in place, then recompute once.
+        self.remove_link_impl(&old_id);
+        self.edges.insert(
+            new_id.clone(),
+            Link {
+                a: a.clone(),
+                b: b.clone(),
+                attributes,
+                cost,
+            },
+        );
+        self.nodes.get_mut(a).unwrap().edges.insert(new_id.clone());
+        self.nodes.get_mut(b).unwrap().edges.insert(new_id);
+        self.recompute();
+        Ok(())
     }
 
     /// Look up a link by id for mutation. Returns `None` if not found.
@@ -1201,6 +1400,80 @@ mod tests {
             r.route_to_path(&route, &na),
             Err(TopologyError::NodeNotFound(_))
         ));
+    }
+
+    // --- link_between / link_snapshot / replace_link_between tests ---
+
+    #[test]
+    fn test_link_between_returns_link_in_either_order() {
+        // link_between finds the link regardless of argument order.
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let r = Router::new();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 7).unwrap();
+        let fwd = r.link_between(&a, &b).unwrap();
+        assert_eq!(fwd.id, LinkId("ab".into()));
+        assert_eq!(fwd.cost, 7);
+        // Reverse order finds the same link.
+        assert_eq!(r.link_between(&b, &a).unwrap().id, LinkId("ab".into()));
+    }
+
+    #[test]
+    fn test_link_between_none_when_absent() {
+        // link_between returns None when no link connects the two nodes.
+        let (r, a, b, _c) = make_router_abc();
+        assert!(r.link_between(&a, &b).is_none());
+    }
+
+    #[test]
+    fn test_link_snapshot_returns_all_links() {
+        // link_snapshot returns one entry per live link.
+        let (r, a, b, c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(b, c, LinkId("bc".into()), vec![], 1).unwrap();
+        let mut ids: Vec<String> = r.link_snapshot().into_iter().map(|l| l.id.0).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["ab".to_string(), "bc".to_string()]);
+    }
+
+    #[test]
+    fn test_replace_link_between_updates_cost() {
+        // Replacing a link with the same id but a new cost updates routing.
+        let a = ip("10.0.0.1");
+        let b = ip("10.0.0.2");
+        let r = Router::new();
+        r.add_node(a).unwrap();
+        r.add_node(b).unwrap();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.replace_link_between(&a, &b, LinkId("ab".into()), vec![], 42)
+            .unwrap();
+        assert_eq!(r.get_best_route(&a, &b).unwrap().cost, 42);
+        assert_eq!(r.link_between(&a, &b).unwrap().cost, 42);
+    }
+
+    #[test]
+    fn test_replace_link_between_id_collision_errors_and_preserves() {
+        // Replacing with an id already used by another live link is rejected, leaving the
+        // original link intact.
+        let (r, a, b, c) = make_router_abc();
+        r.add_link(a, b, LinkId("ab".into()), vec![], 1).unwrap();
+        r.add_link(a, c, LinkId("ac".into()), vec![], 1).unwrap();
+        let err = r.replace_link_between(&a, &b, LinkId("ac".into()), vec![], 5);
+        assert!(matches!(err, Err(TopologyError::LinkExists(_))));
+        // Original a-b link unchanged.
+        let link = r.link_between(&a, &b).unwrap();
+        assert_eq!(link.id, LinkId("ab".into()));
+        assert_eq!(link.cost, 1);
+    }
+
+    #[test]
+    fn test_replace_link_between_no_link_errors() {
+        // Replacing a link that does not exist returns LinkNotFound.
+        let (r, a, b, _c) = make_router_abc();
+        let err = r.replace_link_between(&a, &b, LinkId("ab".into()), vec![], 1);
+        assert!(matches!(err, Err(TopologyError::LinkNotFound(_))));
     }
 
     // --- Graph unit tests ---

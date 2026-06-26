@@ -209,6 +209,20 @@ impl Attribute {
     }
 }
 
+/// Compare attrs by stable policy content (key + values) only. Regular
+/// [Attribute] equality includes `expires_at`
+pub fn attributes_equivalent(a: &[Attribute], b: &[Attribute]) -> bool {
+    fn normalize(attrs: &[Attribute]) -> Vec<(&str, &[String])> {
+        let mut v: Vec<(&str, &[String])> = attrs
+            .iter()
+            .map(|at| (at.get_key(), at.get_value()))
+            .collect();
+        v.sort();
+        v
+    }
+    normalize(a) == normalize(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +267,96 @@ mod tests {
         assert_eq!(attr.get_value_as_string(), "");
         let attr = Attribute::builder("key").value("foo");
         assert_eq!(attr.get_value_as_string(), "foo");
+    }
+
+    /// Two empty attribute lists are equivalent.
+    #[test]
+    fn test_attributes_equivalent_both_empty() {
+        assert!(attributes_equivalent(&[], &[]));
+    }
+
+    /// Lists with the same key/value content are equivalent.
+    #[test]
+    fn test_attributes_equivalent_same_content() {
+        let a = vec![Attribute::builder("k").value("v")];
+        let b = vec![Attribute::builder("k").value("v")];
+        assert!(attributes_equivalent(&a, &b));
+    }
+
+    /// Equivalence ignores `expires_at`: same key/value with different
+    /// expirations must still compare equal.
+    #[test]
+    fn test_attributes_equivalent_ignores_expires_at() {
+        let a = vec![
+            Attribute::builder("k")
+                .expires_in(Duration::from_secs(60))
+                .value("v"),
+        ];
+        let b = vec![
+            Attribute::builder("k")
+                .expires_in(Duration::from_secs(99999))
+                .value("v"),
+        ];
+        assert!(attributes_equivalent(&a, &b));
+    }
+
+    /// Equivalence is independent of the order of attributes in the list,
+    /// because the lists are sorted before comparison.
+    #[test]
+    fn test_attributes_equivalent_order_independent() {
+        let a = vec![
+            Attribute::builder("a").value("1"),
+            Attribute::builder("b").value("2"),
+        ];
+        let b = vec![
+            Attribute::builder("b").value("2"),
+            Attribute::builder("a").value("1"),
+        ];
+        assert!(attributes_equivalent(&a, &b));
+    }
+
+    /// Multi-valued attributes with identical values in the same order are
+    /// equivalent.
+    #[test]
+    fn test_attributes_equivalent_multivalue_same() {
+        let a = vec![Attribute::builder("k").values(vec!["x", "y", "z"])];
+        let b = vec![Attribute::builder("k").values(vec!["x", "y", "z"])];
+        assert!(attributes_equivalent(&a, &b));
+    }
+
+    /// A differing key makes the lists non-equivalent.
+    #[test]
+    fn test_attributes_equivalent_different_key() {
+        let a = vec![Attribute::builder("k1").value("v")];
+        let b = vec![Attribute::builder("k2").value("v")];
+        assert!(!attributes_equivalent(&a, &b));
+    }
+
+    /// A differing value makes the lists non-equivalent.
+    #[test]
+    fn test_attributes_equivalent_different_value() {
+        let a = vec![Attribute::builder("k").value("v1")];
+        let b = vec![Attribute::builder("k").value("v2")];
+        assert!(!attributes_equivalent(&a, &b));
+    }
+
+    /// Lists of different lengths are not equivalent.
+    #[test]
+    fn test_attributes_equivalent_different_length() {
+        let a = vec![
+            Attribute::builder("a").value("1"),
+            Attribute::builder("b").value("2"),
+        ];
+        let b = vec![Attribute::builder("a").value("1")];
+        assert!(!attributes_equivalent(&a, &b));
+    }
+
+    /// Value order within a single attribute is significant: the values are
+    /// compared as ordered vectors, so reordering them breaks equivalence.
+    #[test]
+    fn test_attributes_equivalent_value_order_significant() {
+        let a = vec![Attribute::builder("k").values(vec!["x", "y"])];
+        let b = vec![Attribute::builder("k").values(vec!["y", "x"])];
+        assert!(!attributes_equivalent(&a, &b));
     }
 }

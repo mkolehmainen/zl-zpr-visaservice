@@ -977,11 +977,19 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let actor_addr = actor.get_zpr_addr().unwrap().clone(); // MUST have an addr by now.
 
         if actor.is_node() {
+            // Capture a policy snapshot right before installing the topology link so the
+            // link description is read from one consistent view.
+            //
+            // TODO: Plumb the auth-time policy vinst through this path and detect/retry if
+            // policy changed underneath us while adding a new node. Authentication reads
+            // policy earlier in authorize_connect, so this snapshot does not yet close that
+            // window. ( https://github.com/org-zpr/zpr-visaservice/issues/232 )
+            let psnap = self.asm.policy_mgr.get_current_snapshot();
             if let Err(add_err) = self
                 .asm
                 .topo_mgr
                 .add_linked_node(
-                    &self.asm.policy_mgr,
+                    &psnap,
                     &self.asm.actor_mgr,
                     &actor,
                     &connect_via,

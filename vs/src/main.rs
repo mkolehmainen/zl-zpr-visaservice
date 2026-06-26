@@ -312,11 +312,10 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    if let Err(e) = asm
-        .topo_mgr
-        .restore_from_state(&asm.policy_mgr, &node_addrs)
-        .await
-    {
+    // Capture one consistent policy snapshot for the whole restore pass so every edge is
+    // validated against the same policy/links view.
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    if let Err(e) = asm.topo_mgr.restore_from_state(&psnap, &node_addrs).await {
         error!(target: MAIN, "failed to restore topology state: {}", e);
         return std::process::ExitCode::FAILURE;
     }
