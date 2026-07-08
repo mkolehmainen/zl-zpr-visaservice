@@ -63,6 +63,12 @@ impl DbConnection for RedisDb {
         Ok(())
     }
 
+    async fn set_ex(&self, key: &str, value: &str, seconds: u64) -> DbResult<()> {
+        let mut conn = self.mgr.clone();
+        let _: () = conn.set_ex(key, value, seconds).await?;
+        Ok(())
+    }
+
     async fn get(&self, key: &str) -> DbResult<Option<String>> {
         let mut conn = self.mgr.clone();
         let res: Option<String> = conn.get(key).await?;

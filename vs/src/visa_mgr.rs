@@ -304,6 +304,7 @@ impl VisaMgr {
         route: &Route,
         source_zpl: impl Into<String>,
         policy_version: u64,
+        vinst: u64,
     ) -> Result<VisaWithMetadata, ServiceError> {
         let expiration_time = std::time::SystemTime::now()
             .checked_add(config::DEFAULT_VISA_EXPIRATION)
@@ -381,9 +382,11 @@ impl VisaMgr {
         let mut metadata = db::VisaMetadata::new(
             requesting_node.clone(),
             policy_version,
+            vinst,
             source_zpl.into(),
             hit.direction,
             path,
+            pdesc,
         );
         if let Some(sig) = hit.signal.as_ref() {
             metadata.signal_msgs.push(sig.message.clone());
@@ -600,7 +603,7 @@ mod tests {
     use super::*;
     use crate::db::{FakeDb, VisaRepo};
     use crate::packet::make_fivetuple_tcp;
-    use crate::test_helpers::make_visa;
+    use crate::test_helpers::{make_pdesc, make_visa};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -670,9 +673,11 @@ mod tests {
         let metadata = db::VisaMetadata::new(
             node_addr.clone(),
             0,
+            0,
             "zpl".to_string(),
             Direction::Forward,
             None,
+            &make_pdesc(),
         );
 
         mgr.repo
@@ -726,9 +731,11 @@ mod tests {
         let metadata = db::VisaMetadata::new(
             node_addr.clone(),
             0,
+            0,
             "zpl".to_string(),
             Direction::Forward,
             None,
+            &make_pdesc(),
         );
 
         mgr.repo
@@ -761,9 +768,11 @@ mod tests {
         let metadata = db::VisaMetadata::new(
             node_addr.clone(),
             0,
+            0,
             "zpl".to_string(),
             Direction::Forward,
             None,
+            &make_pdesc(),
         );
 
         mgr.repo
@@ -814,9 +823,11 @@ mod tests {
         let metadata = db::VisaMetadata::new(
             requesting_node,
             0,
+            0,
             "zpl".to_string(),
             Direction::Forward,
             path,
+            &make_pdesc(),
         );
         mgr.repo
             .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
@@ -835,9 +846,11 @@ mod tests {
         let metadata = db::VisaMetadata::new(
             requesting_node,
             0,
+            0,
             "zpl".to_string(),
             Direction::Forward,
             path,
+            &make_pdesc(),
         );
         mgr.repo
             .store_visa(&visa, metadata, db::NodeVisaState::PendingInstall)
@@ -1047,7 +1060,7 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0)
+            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0, 0)
             .await
             .unwrap();
 
@@ -1075,7 +1088,7 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0)
+            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0, 0)
             .await
             .unwrap();
 
@@ -1121,7 +1134,7 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &dst, &pdesc, &hit, &route, "", 0)
+            .create_visa(&asm, &dst, &pdesc, &hit, &route, "", 0, 0)
             .await
             .unwrap();
 
@@ -1160,7 +1173,7 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0)
+            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0, 0)
             .await
             .unwrap();
 

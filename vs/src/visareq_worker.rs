@@ -378,6 +378,7 @@ async fn visa_from_allow(
 ) -> Result<VisaDecision, ServiceError> {
     debug_assert!(!hits.is_empty(), "allow decision with no hits"); // should never happen.
     let policy_version = policy.get_version().unwrap_or(0);
+    let vinst = policy.vinst();
     // TODO: For now we pick the first hit.
     let zpl = policy
         .get_cpol_source(hits[0].match_idx)
@@ -403,6 +404,7 @@ async fn visa_from_allow(
             &allowed_route,
             zpl,
             policy_version,
+            vinst,
         )
         .await?;
 
@@ -725,7 +727,8 @@ mod tests {
         arena.abort();
     }
 
-    // Verifies that visa_from_allow issues a visa and returns Allow when given a valid hit and route.
+    // Verifies that visa_from_allow issues a visa and returns Allow when given a valid hit and route,
+    // and that the stored metadata records the installed policy vinst as both created/checked_vinst.
     #[tokio::test]
     async fn visa_from_allow_issues_visa_on_allow() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
@@ -735,11 +738,24 @@ mod tests {
         let (job, _rx) = VisaRequestJob::new(requesting_node, pkt_data);
 
         let hits = vec![Hit::new_no_signal(0, Direction::Forward)];
-        let policy = Policy::new_empty();
+        let mut policy = Policy::new_empty();
+        policy.set_vinst(7);
         let route = Route::new_direct(requesting_node.into());
 
-        let result = visa_from_allow(asm, &job, &hits, &policy, Some(route)).await;
-        assert!(matches!(result, Ok(VisaDecision::Allow(_, _))));
+        let result = visa_from_allow(asm.clone(), &job, &hits, &policy, Some(route)).await;
+        let visa = match result {
+            Ok(VisaDecision::Allow(visa, _)) => visa,
+            _ => panic!("expected Allow"),
+        };
+
+        let md = asm
+            .visa_mgr
+            .get_visa_metadata_by_id(visa.issuer_id)
+            .await
+            .unwrap()
+            .expect("metadata should be stored");
+        assert_eq!(md.created_vinst, 7);
+        assert_eq!(md.checked_vinst, 7);
     }
 
     // When both actors are None the request cannot proceed: deny the source immediately.

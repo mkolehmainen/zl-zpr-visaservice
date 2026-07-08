@@ -185,6 +185,16 @@ impl DbConnection for FakeDb {
         Ok(())
     }
 
+    /// Set a string value with expiration.
+    async fn set_ex(&self, key: &str, value: &str, seconds: u64) -> DbResult<()> {
+        let _rlock = self.lock.read().await;
+        self.store.insert(
+            key.to_string(),
+            Entry::new_ex(FakeDbValue::Str(value.to_string()), seconds),
+        );
+        Ok(())
+    }
+
     async fn get(&self, key: &str) -> DbResult<Option<String>> {
         let _rlock = self.lock.read().await;
         if !self.exists(key).await? {
@@ -582,6 +592,16 @@ mod test {
         tokio::time::advance(Duration::from_secs(2)).await;
         let exists = db.exists("bin:exp").await.unwrap();
         assert!(!exists);
+    }
+
+    /// Verifies a string value set with set_ex disappears after its TTL elapses.
+    #[tokio::test(start_paused = true)]
+    async fn test_fake_db_set_ex_expires() {
+        let db = FakeDb::new();
+        db.set_ex("str:exp", "data", 1).await.unwrap();
+        assert_eq!(db.get("str:exp").await.unwrap(), Some("data".to_string()));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!db.exists("str:exp").await.unwrap());
     }
 
     #[tokio::test]

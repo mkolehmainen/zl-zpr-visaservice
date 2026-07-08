@@ -42,6 +42,10 @@ pub trait DbConnection: Send + Sync {
 
     async fn exists(&self, key: &str) -> DbResult<bool>;
     async fn set(&self, key: &str, value: &str) -> DbResult<()>;
+
+    #[allow(dead_code)]
+    async fn set_ex(&self, key: &str, value: &str, seconds: u64) -> DbResult<()>;
+
     async fn get(&self, key: &str) -> DbResult<Option<String>>;
 
     /// Set a binary value directly. For atomic writes alongside other ops, use

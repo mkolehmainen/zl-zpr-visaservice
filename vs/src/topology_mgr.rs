@@ -14,12 +14,13 @@ use crate::actor_mgr::ActorMgr;
 use crate::db::LinkRepo;
 use crate::error::{ServiceError, TopologyError};
 use crate::logging::targets::TOPO;
-use crate::policy_mgr::{LinkDescription, PolicySnapshot};
+use crate::policy_mgr::PolicySnapshot;
 use crate::router::{LinkSpec, Router};
 
 use libeval::actor::Actor;
 use libeval::attribute::{AttrMatch, Attribute, attributes_equivalent};
 use libeval::eval_route::{RouteHint, TopologyQueryApi};
+use libeval::policy::LinkDescription;
 use libeval::route::{LinkId, NodeId, Route};
 
 pub struct TopologyMgr {

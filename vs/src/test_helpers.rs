@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::SystemTime;
 use zpr::policy::v1 as capnp_policy;
-use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, TcpUdpPep, Visa};
+use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Visa};
 
 use crate::error::ResolverError;
 use crate::policy_mgr::DnsResolver;
@@ -154,6 +154,12 @@ pub fn make_visa(visa_id: u64, expires_in: Duration) -> Visa {
         KeySet::new(b"ingress", b"egress"),
         None,
     )
+}
+
+/// Build a dummy TCP [PacketDesc] for tests that need a five-tuple but don't
+/// care about its contents.
+pub fn make_pdesc() -> PacketDesc {
+    PacketDesc::new_tcp("fd5a:5052::10", "fd5a:5052::20", 1234, 443).unwrap()
 }
 
 /// Build the Cap'n Proto encoded bytes of a `PolicyContainer` with the given
