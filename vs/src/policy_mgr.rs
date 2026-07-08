@@ -25,7 +25,7 @@ use zpr::vsapi_types::{Link, LinkRole, SockAddr};
 
 use crate::config;
 use crate::db;
-use crate::error::{ResolverError, ServiceError, TopologyError};
+use crate::error::{ResolverError, ServiceError, StoreError, TopologyError};
 use crate::loaded_policy::LoadedPolicy;
 use crate::logging::targets::MAIN;
 
@@ -143,7 +143,19 @@ impl PolicyMgr {
             PolicyContainerBytes::from(container_bytes),
             &config::POLICY_MIN_VERSION,
         )?;
-        loaded.set_vinst(1);
+        // Derive the vinst from any persisted identifier so it is monotonic
+        // across restarts. Same container (matching phash) is a plain restart:
+        // reuse its vinst. A different container (or a fresh DB) is a new policy
+        // install and gets the next vinst.
+        let ident = repo.get_current_identifier().await?;
+        let vinst = match &ident {
+            Some(i) if i.phash == loaded.hash_container_bytes()? => i.vinst,
+            Some(i) => i.vinst.checked_add(1).ok_or_else(|| {
+                StoreError::InvalidData("persisted vinst is u64::MAX; cannot advance".into())
+            })?,
+            None => 1,
+        };
+        loaded.set_vinst(vinst);
 
         let resolver = PolicyResolver::new(resolver);
 
@@ -151,7 +163,7 @@ impl PolicyMgr {
         // stored as the current policy. build_state borrows `loaded`, leaving it
         // available for the post-resolution persist below.
         let state = Self::build_state(&resolver, &loaded).await?;
-        let _db_updated = repo.set_current_policy(&loaded, false).await?;
+        repo.set_current_policy(&loaded, false).await?;
 
         debug!(target: MAIN, "policy manager initialized successfully");
         Ok(Self::from_state(state, repo, resolver))
@@ -170,9 +182,12 @@ impl PolicyMgr {
         resolver: Arc<dyn DnsResolver>,
     ) -> Result<Self, ServiceError> {
         debug!(target: MAIN, "initializing policy manager from state");
-        let loaded = repo
+        let mut loaded = repo
             .get_current_loaded_policy(&config::POLICY_MIN_VERSION)
             .await?;
+        // Restore the persisted vinst.
+        let ident = repo.get_current_identifier().await?;
+        loaded.set_vinst(ident.map_or(1, |i| i.vinst));
         {
             let policy = loaded.policy();
             info!(target: MAIN, "loaded policy from state version:{}, created:{}", policy.get_version().unwrap_or(0),
@@ -255,7 +270,7 @@ impl PolicyMgr {
         // the current policy, container, and topology untouched. The new policy,
         // container, and links swap in together as one PolicyState.
         let state = Self::build_state(&self.resolver, &loaded).await?;
-        let _db_updated = self.repo.set_current_policy(&loaded, false).await?;
+        self.repo.set_current_policy(&loaded, false).await?;
 
         self.state.store(Arc::new(state));
         Ok(vinst)
@@ -383,7 +398,7 @@ mod tests {
     use zpr::policy_types::{AttrExp, NetAddr, Peering};
     use zpr::write_to::WriteTo;
 
-    use crate::db::{FakeDb, PolicyRepo};
+    use crate::db::{DbConnection, FakeDb, PolicyRepo};
     use crate::test_helpers::FakeResolver;
 
     fn ip(s: &str) -> IpAddr {
@@ -666,6 +681,92 @@ mod tests {
         let result = presolver.peers_to_links(&[good, bad]).await;
 
         assert!(result.is_err());
+    }
+
+    /// After an update bumps vinst, a fresh PolicyMgr built from the same DB via
+    /// new_from_state restores that vinst rather than the decoded default.
+    #[tokio::test]
+    async fn test_new_from_state_restores_vinst() {
+        let db = Arc::new(FakeDb::new());
+        let mgr = PolicyMgr::new_with_initial_policy(
+            policy_no_topology(),
+            PolicyRepo::new(db.clone()),
+            Arc::new(FakeResolver::ip_only()),
+        )
+        .await
+        .unwrap();
+        // Update to a distinct container so vinst advances to 2.
+        let peering = make_peering(ip("fd5a:5052::1"), ip("fd5a:5052::2"), "link-1", vec![]);
+        mgr.update_policy_from_container_bytes(policy_with_peerings(&[peering]))
+            .await
+            .unwrap();
+
+        let restored =
+            PolicyMgr::new_from_state(PolicyRepo::new(db), Arc::new(FakeResolver::ip_only()))
+                .await
+                .unwrap();
+        assert_eq!(restored.get_current().vinst(), 2);
+    }
+
+    /// Rebooting with the same container reuses the persisted vinst (plain
+    /// restart); a different container advances it (new install).
+    #[tokio::test]
+    async fn test_new_with_initial_policy_vinst_from_persisted_identifier() {
+        let db = Arc::new(FakeDb::new());
+        let container = policy_no_topology();
+        // First boot: fresh DB → vinst 1.
+        let mgr = PolicyMgr::new_with_initial_policy(
+            container.clone(),
+            PolicyRepo::new(db.clone()),
+            Arc::new(FakeResolver::ip_only()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mgr.get_current().vinst(), 1);
+
+        // Reboot with the same container: same phash → vinst stays 1.
+        let same = PolicyMgr::new_with_initial_policy(
+            container,
+            PolicyRepo::new(db.clone()),
+            Arc::new(FakeResolver::ip_only()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(same.get_current().vinst(), 1);
+
+        // Reboot with a different container: new phash → vinst advances to 2.
+        let peering = make_peering(ip("fd5a:5052::1"), ip("fd5a:5052::2"), "link-1", vec![]);
+        let different = PolicyMgr::new_with_initial_policy(
+            policy_with_peerings(&[peering]),
+            PolicyRepo::new(db),
+            Arc::new(FakeResolver::ip_only()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(different.get_current().vinst(), 2);
+    }
+
+    /// A corrupt DB (policy present, no persisted vinst field) fails startup
+    /// rather than silently defaulting the vinst.
+    #[tokio::test]
+    async fn test_new_from_state_missing_vinst_errors() {
+        let db = Arc::new(FakeDb::new());
+        // Seed a current policy, then rewrite policy:current without a vinst
+        // field to mimic a corrupt state (the container blob is left intact).
+        PolicyMgr::new_with_initial_policy(
+            policy_no_topology(),
+            PolicyRepo::new(db.clone()),
+            Arc::new(FakeResolver::ip_only()),
+        )
+        .await
+        .unwrap();
+        let phash = db.hget("policy:current", "phash").await.unwrap().unwrap();
+        db.del("policy:current").await.unwrap();
+        db.hset("policy:current", "phash", &phash).await.unwrap();
+
+        let res =
+            PolicyMgr::new_from_state(PolicyRepo::new(db), Arc::new(FakeResolver::ip_only())).await;
+        assert!(res.is_err());
     }
 
     /// A hostname peer is resolved to the expected IP address via the FakeResolver.
