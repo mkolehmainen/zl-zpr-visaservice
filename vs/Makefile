@@ -9,6 +9,6 @@ test: build
 	cargo test --verbose
 
 check:
-	cargo fmt --check && cargo rustc --bins -- -D warnings
+	cargo fmt --check && RUSTFLAGS="-D warnings" cargo build --bins
 
 .DEFAULT_GOAL := all

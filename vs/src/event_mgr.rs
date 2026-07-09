@@ -3,7 +3,6 @@
 //! are not able to report back success/failure to the "caller".
 
 use futures::stream::{self, StreamExt};
-use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -23,6 +22,10 @@ pub enum VsEvent {
     /// Use when we get a signal from remote that actor is disconnected/disconnecting.
     /// EventManager takes care of state updates.
     ActorLeaves(IpAddr, DisconnectReason),
+
+    /// The set of authorized services may have changed (an auth-service provider
+    /// joined or left). Handler re-pushes the current auth-services list to all nodes.
+    AuthServiceChange,
 
     /// Indicates that policy has been successfully updated. Pass the new `vinst`.
     PolicyUpdated(u64),
@@ -61,6 +64,11 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
                     error!(target: EVENT, "failed to handle actor leave event: {}", e);
                 }
             }
+            VsEvent::AuthServiceChange => {
+                if let Err(e) = handle_auth_service_change(&asm).await {
+                    error!(target: EVENT, "failed to handle auth service change event: {}", e);
+                }
+            }
             VsEvent::PolicyUpdated(vinst) => {
                 if let Err(e) = handle_policy_updated(&asm, vinst).await {
                     error!(target: EVENT, "failed to handle policy updated event: {}", e);
@@ -71,67 +79,46 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
     info!(target: EVENT, "event manager shutting down");
 }
 
-// Maybe will call into topology routines from here eventually.
-async fn handle_actor_joins(asm: &Arc<Assembly>, actor_addr: IpAddr) -> Result<(), ServiceError> {
+/// TODO: Does not do anything yet.
+async fn handle_actor_joins(_asm: &Arc<Assembly>, actor_addr: IpAddr) -> Result<(), ServiceError> {
     info!(target: EVENT, "actor joined: {}", actor_addr);
-    let has_auth_services = match asm
-        .actor_mgr
-        .has_auth_services(asm.clone(), &actor_addr)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            error!(target: EVENT, "actor_mgr.has_auth_services failed: {}", e);
-            false
-        }
-    };
-
-    if has_auth_services {
-        //let service_list =
-        match asm.actor_mgr.get_auth_services_list(asm.clone()).await {
-            Ok(svcs) => set_services_all_nodes(&asm, &svcs).await?,
-            Err(e) => {
-                error!(
-                    target: EVENT,
-                    "actor_mgr.get_auth_services_list failed: {}", e
-                );
-            }
-        }
-    }
     Ok(())
 }
 
-// TODO: Not sure I love this idea of having these wide ranging functions in the 'event_mgr'.
-// Things could get quite messy.
-//
-// The goal is somewhere to centralize high level logic that imapacts all sorts of areas in the
-// visa service.
+/// TODO: Does not do anything yet.
 async fn handle_actor_leaves(
-    asm: &Arc<Assembly>,
+    _asm: &Arc<Assembly>,
     actor_addr: IpAddr,
     _reason: DisconnectReason,
 ) -> Result<(), ServiceError> {
     info!(target: EVENT, "actor left: {}", actor_addr);
-
-    let prev_auth_services: HashSet<ServiceDescriptor> = HashSet::from_iter(
-        asm.actor_mgr
-            .get_auth_services_list(asm.clone())
-            .await
-            .unwrap_or_default(),
-    );
-
-    if !prev_auth_services.is_empty() {
-        let new_auth_services: HashSet<ServiceDescriptor> =
-            HashSet::from_iter(asm.actor_mgr.get_auth_services_list(asm.clone()).await?); // will error out on DB error
-
-        // If there is a difference between previous and new authorized services, we need to update nodes.
-        if prev_auth_services != new_auth_services {
-            set_services_all_nodes(&asm, &new_auth_services.iter().cloned().collect::<Vec<_>>())
-                .await?;
-        }
-    }
-
     Ok(())
+}
+
+// Re-push the current authorized-services list to all connected nodes. Triggered by
+// `AuthServiceChange` when an auth-service provider has joined or left, so nodes always
+// see the up-to-date list.
+async fn handle_auth_service_change(asm: &Arc<Assembly>) -> Result<(), ServiceError> {
+    let auth_services = asm.actor_mgr.get_auth_services_list(asm.clone()).await?;
+    set_services_all_nodes(asm, &auth_services).await
+}
+
+/// Record an `AuthServiceChange` event, logging on failure. Call when the authorized
+/// service set may have changed so the current list gets re-pushed to all nodes.
+pub async fn record_auth_service_change(asm: &Arc<Assembly>) {
+    if let Err(e) = asm.event_mgr.record_event(VsEvent::AuthServiceChange).await {
+        error!(target: EVENT, "failed to record AuthServiceChange event: {}", e);
+    }
+}
+
+/// If `addr` provides an auth service (per current policy and DB state), record an
+/// `AuthServiceChange` event. Must be called while the actor is still present in the DB.
+pub async fn record_auth_change_if_provider(asm: &Arc<Assembly>, addr: &IpAddr) {
+    match asm.actor_mgr.has_auth_services(asm.clone(), addr).await {
+        Ok(true) => record_auth_service_change(asm).await,
+        Ok(false) => {}
+        Err(e) => error!(target: EVENT, "has_auth_services check failed for {}: {}", addr, e),
+    }
 }
 
 /// Helper to use the VSS on all connected nodes to update the auth services list.
