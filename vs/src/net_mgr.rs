@@ -226,8 +226,11 @@ impl AddrAllocator for Addr6Allocator {
         for _ in 0..10_000 {
             let host: u64 = self.rng.next_u64();
             if self.used.insert(host) {
-                let ip = self.net.hosts().nth(host as usize)?;
-                return Some(IpAddr::V6(ip));
+                // hosts() omits the network/broadcast slots, so a few offsets map
+                // to None — keep drawing instead of bailing out of the loop.
+                if let Some(ip) = self.net.hosts().nth(host as usize) {
+                    return Some(IpAddr::V6(ip));
+                }
             }
         }
         None
@@ -309,8 +312,11 @@ impl AddrAllocator for Addr4Allocator {
         for _ in 0..10_000 {
             let host: u32 = self.rng.next_u32() & mask;
             if self.used.insert(host) {
-                let ip = self.net.hosts().nth(host as usize)?;
-                return Some(IpAddr::V4(ip));
+                // hosts() omits the network/broadcast slots, so the top offsets
+                // in the masked range map to None — keep drawing instead of bailing.
+                if let Some(ip) = self.net.hosts().nth(host as usize) {
+                    return Some(IpAddr::V4(ip));
+                }
             }
         }
         None
