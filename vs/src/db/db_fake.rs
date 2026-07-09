@@ -59,6 +59,7 @@ impl Entry {
     }
 }
 
+#[allow(dead_code)]
 impl FakeDb {
     async fn exists_with_lock(&self, key: &str) -> DbResult<bool> {
         if let Some(entry) = self.store.get(key) {

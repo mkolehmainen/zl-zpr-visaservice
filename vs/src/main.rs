@@ -1,3 +1,8 @@
+// Code reachable only from the runtime `main` path looks unused when the bin
+// is compiled as a test harness (which replaces `main`). Suppress that noise;
+// real dead-code detection still applies to normal/release builds.
+#![cfg_attr(test, allow(dead_code))]
+
 use clap::Parser;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
