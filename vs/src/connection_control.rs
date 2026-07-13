@@ -407,7 +407,18 @@ impl ConnectionControl {
         Ok(authd_actor)
     }
 
-    /// Disconnect logic. Cleans up actor database and visas. Updates router.
+    /// Disconnect logic. Cleans up actor database, visas, and our view of topology. Updates router.
+    ///
+    /// This is used only for policy disconnect calls over the VSAPI or for a policy instigated disconnect.
+    /// In both cases, it is safe to remove all state for the disconnecting actor.
+    ///
+    /// ### Errors
+    /// Most cleanup failures are logged and swallowed (the caller can't act on them). Only these
+    /// propagate as `Err`:
+    /// - Looking up the actor (`get_actor_by_zpr_addr`) hits a backing-store error other than
+    ///   "not found" — i.e. the DB is unreachable/misbehaving.
+    /// - Removing a node record (`remove_node`) may fail on a backing-store error.
+    ///
     pub async fn disconnect(
         &self,
         asm: Arc<Assembly>,
@@ -425,7 +436,7 @@ impl ConnectionControl {
             Ok(()) => (),
             Err(e) => {
                 // Caller can't do anything with this. So just log and continue.
-                error!(target: CC, "failed to remove disconnected actor with addr {zpr_addr} from actor db: {}", e);
+                error!(target: CC, "failed to remove disconnected actor with addr {zpr_addr} from actor db: {e}");
             }
         };
 
@@ -437,7 +448,7 @@ impl ConnectionControl {
                 asm.topo_mgr.remove_node(&zpr_addr).await;
                 if let Some(vss_hndl) = asm.vss_mgr.get_handle(&zpr_addr) {
                     if let Err(e) = vss_hndl.stop().await {
-                        error!(target: CC, "failed to stop VSS worker for disconnected node at addr {zpr_addr}: {}", e);
+                        error!(target: CC, "failed to stop VSS worker for disconnected node at addr {zpr_addr}: {e}");
                     }
                 } else {
                     debug!(target: CC, "no VSS worker found for disconnected node at addr {zpr_addr}");
@@ -449,7 +460,7 @@ impl ConnectionControl {
                 {
                     Ok(addrs) => addrs,
                     Err(e) => {
-                        error!(target: CC, "failed to get connected adapters for disconnected node at addr {zpr_addr}: {}", e);
+                        error!(target: CC, "failed to get connected adapters for disconnected node at addr {zpr_addr}: {e}");
                         Vec::new()
                     }
                 };
@@ -460,30 +471,36 @@ impl ConnectionControl {
                         }
                         Err(e) => {
                             // Caller can't do anything with this. So just log and continue.
-                            error!(target: CC, "failed to remove disconnected adapter with addr {adapter_addr} from actor db: {}", e);
+                            error!(target: CC, "failed to remove disconnected adapter with addr {adapter_addr} from actor db: {e}");
                         }
                     };
                     if asm.net_mgr.is_managed_address(&adapter_addr) {
                         if let Err(s) = asm.net_mgr.release_zpr_addr(adapter_addr) {
-                            error!(target: CC, "failed to release ZPR addr {adapter_addr} for orphaned adapter: {}", s);
+                            error!(target: CC, "failed to release ZPR addr {adapter_addr} for orphaned adapter: {s}");
                         }
                     }
                 }
                 asm.actor_mgr.remove_node(&zpr_addr).await?;
-                asm.visa_mgr.remove_visas_for_node(&zpr_addr).await?;
+                if let Err(e) = asm.visa_mgr.remove_visas_for_node(&zpr_addr).await {
+                    error!(target: CC, "failed to remove visas for disconnected node at addr {zpr_addr}: {e}");
+                }
             }
         }
-
         if let Err(e) = asm
             .visa_mgr
             .remove_visas_for_actors(&removed_zpr_addrs)
             .await
         {
-            error!(target: CC, "failed to remove visas for disconnected actor at addr {zpr_addr}: {}", e);
+            error!(target: CC, "failed to remove visas for disconnected actor at addr {zpr_addr}: {e}");
         }
 
         if asm.net_mgr.is_managed_address(&zpr_addr) {
-            asm.net_mgr.release_zpr_addr(zpr_addr)?;
+            // De-allocating an address may error but it only indicates that the
+            // address is not part of our pool.  We just log that if it occurs
+            // and call the "disconnect" successful anyway.
+            if let Err(e) = asm.net_mgr.release_zpr_addr(zpr_addr) {
+                warn!(target: CC, "failed to release managed ZPR addr {zpr_addr} for actor disconnect: {e}");
+            }
         }
         Ok(())
     }

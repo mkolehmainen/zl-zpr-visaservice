@@ -2,18 +2,23 @@
 //! visa service system such as actor joins/leaves. Operations in here
 //! are not able to report back success/failure to the "caller".
 
+use futures::future::join_all;
 use futures::stream::{self, StreamExt};
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use zpr::vsapi::v1::DisconnectReason;
 use zpr::vsapi_types::ServiceDescriptor;
 
+use libeval::eval::EvalContext;
+
 use crate::assembly::Assembly;
 use crate::error::ServiceError;
 use crate::logging::targets::EVENT;
+use crate::policy_mgr::PolicySnapshot;
 
 pub enum VsEvent {
     /// Use _after_ actor has been authenticated and the datastore updated.
@@ -200,38 +205,310 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         );
     }
 
-    info!(target: EVENT, "policy updated vinst={vinst}: TODO revalidate connected nodes");
-    let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
+    // The new policy may invalidate some existing nodes. An error here will bail on the
+    // update handling.
+    let (connected_node_addrs, invalid_node_addrs) = revalidate_nodes(asm, &psnap).await?;
 
-    // TODO: Check existing nodes against policy.
-    // Until then  we just assume has not changed.
-    // Once validated the `connected_node_addrs` will be in sync with policy. And we should have already removed the stale
-    // nodes from the actor_mgr state, disconnected from VSS, etc.
+    // Disconnect the nodes that are no longer approved by the new policy.
+    for naddr in &invalid_node_addrs {
+        info!(target: EVENT, "connected node {naddr} is no longer approved by policy, disconnecting");
+        // Note that the following disconnect call will also update the topology manager.
+        if let Err(e) = asm
+            .cc
+            .disconnect(asm.clone(), *naddr, DisconnectReason::Admin)
+            .await
+        {
+            error!(target: EVENT, "error processing disconnect of {naddr}: {e}");
+            // In this case we do not send an actor-leaves event.
+            // What is the state of our topology manager now?
+            // Visa service is porbably hosed.
+        }
+        // TODO: If ActorLeaves event ever does anything we may need it here.
+    }
 
-    info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology");
-    let report = asm
-        .topo_mgr
-        .revalidate_against_policy(&psnap, &connected_node_addrs)
-        .await?;
-    info!(
-        target: EVENT,
-        "topology revalidated vinst={vinst}: removed={} updated={} repaired={} orphaned={}",
-        report.links_removed,
-        report.links_updated,
-        report.links_repaired,
-        report.orphaned_nodes.len()
-    );
+    // Only do these steps if we managed to get a set of connected nodes. If
+    // there actually are no nodes connected at the moment, then topology should
+    // have been (or will soon be) updated via other code paths.  The purpose of
+    // updating the topology when presented with a new policy is to verify that
+    // existing links are still allowed, and send out peer messages.
+    if !connected_node_addrs.is_empty() {
+        info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology ({} nodes)", connected_node_addrs.len());
+        let report = asm
+            .topo_mgr
+            .revalidate_against_policy(&psnap, &connected_node_addrs)
+            .await?;
+        info!(
+            target: EVENT,
+            "topology revalidated vinst={vinst}: removed={} updated={} repaired={} orphaned={}",
+            report.links_removed,
+            report.links_updated,
+            report.links_repaired,
+            report.orphaned_nodes.len()
+        );
 
-    // Queue up setTopology messages in parallel.
-    let futs = connected_node_addrs.iter().filter_map(|naddr| {
-        let links = psnap.links_for_node(naddr);
-        asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
-            if let Err(e) = vss_handle.set_topology(links).await {
-                error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
-            }
-        })
-    });
-    futures::future::join_all(futs).await;
+        // Queue up setTopology messages in parallel.
+        let futs = connected_node_addrs.iter().filter_map(|naddr| {
+            let links = psnap.links_for_node(naddr);
+            asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
+                if let Err(e) = vss_handle.set_topology(links).await {
+                    error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
+                }
+            })
+        });
+        join_all(futs).await;
+
+        // A policy update can change the authorized-service set (a provider was
+        // disconnected above, or policy reclassified a service). Re-push the current
+        // list so surviving nodes stay in sync.
+        if let Err(e) = handle_auth_service_change(asm).await {
+            error!(target: EVENT, "failed to refresh auth services after policy update: {e}");
+        }
+    }
 
     Ok(())
+}
+
+/// When we get a new policy, some nodes may no longer be valid. This checks each
+/// connected node against the policy and partitions them into `(valid, invalid)`
+/// addresses. It has no side effects -- disconnecting the invalid nodes is left to
+/// the caller.
+///
+/// Note that the best way to revalidate a node is to prompt it to
+/// re-authenticate. (TODO).
+///
+/// ### Errors
+/// - The only error you get from this will be an error from `list_node_addrs`.
+async fn revalidate_nodes(
+    asm: &Arc<Assembly>,
+    psnap: &PolicySnapshot,
+) -> Result<(Vec<IpAddr>, Vec<IpAddr>), ServiceError> {
+    let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
+
+    // Check existing nodes against policy.
+    let ectx = EvalContext::new(psnap.policy_arc());
+
+    let keep_flags = join_all(
+        connected_node_addrs
+            .iter()
+            .map(|naddr| node_still_valid(asm, &ectx, naddr)),
+    )
+    .await;
+
+    // Partition into still-valid and no-longer-valid nodes.
+    let (valid, invalid): (Vec<_>, Vec<_>) = connected_node_addrs
+        .into_iter()
+        .zip(keep_flags)
+        .partition(|(_, keep)| *keep);
+
+    let valid = valid.into_iter().map(|(naddr, _)| naddr).collect();
+    let invalid = invalid.into_iter().map(|(naddr, _)| naddr).collect();
+
+    Ok((valid, invalid))
+}
+
+/// Pure predicate helper for [revalidate_nodes].
+/// Loads the node `Actor` from the `actor_mgr` and uses the `EvalContext` to check that
+/// the actor is still permitted by policy. Note this does not check authentication -- just
+/// attributes that were authenticated under the previous policy.
+///
+/// Returns `true` if the node looks valid (including on any query/eval error, where we
+/// optimistically keep the node), and `false` only if policy affirmatively rejects it.
+async fn node_still_valid(asm: &Arc<Assembly>, ectx: &EvalContext, naddr: &IpAddr) -> bool {
+    match asm.actor_mgr.get_actor_by_zpr_addr(naddr).await {
+        Ok(Some(node_actor)) => match ectx.approve_connected(&node_actor) {
+            Ok(approved) => approved,
+            Err(e) => {
+                warn!(target: EVENT, "failed to evaluate connected node {naddr} against policy: {e}");
+                true
+            }
+        },
+        // No actor came back for this address, or the query failed. Optimistically keep it.
+        Ok(None) => true,
+        Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::assembly::tests::new_assembly_for_tests;
+    use crate::config;
+    use crate::test_helpers::{make_container_bytes, make_node_actor_defexp};
+
+    use libeval::attribute::{Attribute, key};
+    use std::time::Duration;
+    use zpr::policy::v1 as capnp_policy;
+    use zpr::policy_types::{JoinPolicy, PFlags, Scope, Service, ServiceType};
+    use zpr::write_to::WriteTo;
+
+    /// Build a policy container whose single join policy marks connections as
+    /// nodes. `provides` is the set of services a node must offer to stay valid
+    /// (`None` = no service requirement). Conditions are empty, so the policy
+    /// matches any actor's claims.
+    fn make_node_join_policy(provides: Option<Vec<Service>>) -> Vec<u8> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
+            policy_bldr.set_created("2024-01-01T00:00:00Z");
+            policy_bldr.set_version(1);
+            policy_bldr.set_metadata("");
+            let mut jp_list = policy_bldr.reborrow().init_join_policies(1);
+            let mut jp_bldr = jp_list.reborrow().get(0);
+            let jp = JoinPolicy {
+                conditions: Vec::new(),
+                flags: PFlags::node(false),
+                provides,
+            };
+            jp.write_to(&mut jp_bldr);
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+        make_container_bytes(
+            config::POLICY_MIN_COMPILER_MAJOR,
+            config::POLICY_MIN_COMPILER_MINOR,
+            config::POLICY_MIN_COMPILER_PATCH,
+            &bytes,
+        )
+    }
+
+    /// Build a single-endpoint regular [Service] with the given id, for use as a
+    /// policy-required service.
+    fn svc(id: &str) -> Service {
+        Service {
+            id: id.to_string(),
+            endpoints: vec![Scope {
+                protocol: 0,
+                flag: None,
+                port: Some(4000),
+                port_range: None,
+            }],
+            kind: ServiceType::Regular,
+        }
+    }
+
+    /// Sort a vec of addrs so results can be compared order-independently
+    /// (`list_node_addrs` order is not guaranteed).
+    fn sorted(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+        addrs.sort();
+        addrs
+    }
+
+    /// All connected nodes satisfy the policy: all are returned and none disconnected.
+    #[tokio::test]
+    async fn test_revalidate_nodes_all_valid() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        // Any node is valid: node flag set, no required services.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+
+        let a: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::2".parse().unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234"),
+                false,
+            )
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::2", "node-b", "[fd5a:5052::102]:1234"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let (valid, invalid) = revalidate_nodes(&asm, &psnap).await.unwrap();
+
+        assert_eq!(sorted(valid), sorted(vec![a, b]));
+        assert!(invalid.is_empty());
+    }
+
+    /// No node satisfies the default (join-policy-free) policy: the returned set is
+    /// empty and every node is disconnected/removed.
+    #[tokio::test]
+    async fn test_revalidate_nodes_all_invalid() {
+        // The default test-assembly policy has no join policies, so no node matches.
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+
+        let a: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::2".parse().unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234"),
+                false,
+            )
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::2", "node-b", "[fd5a:5052::102]:1234"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let (valid, invalid) = revalidate_nodes(&asm, &psnap).await.unwrap();
+
+        assert!(valid.is_empty());
+        assert_eq!(sorted(invalid), sorted(vec![a, b]));
+    }
+
+    /// Mixed set under one snapshot: policy allows service "svc-x". A node whose
+    /// services are a subset of the policy survives; a node offering an unlisted
+    /// service ("svc-y") is disconnected. Guards the keep-flag/retain index alignment.
+    #[tokio::test]
+    async fn test_revalidate_nodes_mixed() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+
+        let good: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let bad: IpAddr = "fd5a:5052::2".parse().unwrap();
+        // Node that provides the required service → stays valid.
+        let mut good_actor =
+            make_node_actor_defexp("fd5a:5052::1", "node-good", "[fd5a:5052::101]:1234");
+        good_actor
+            .add_attribute(
+                Attribute::builder(key::SERVICES)
+                    .expires_in(Duration::from_secs(3600))
+                    .value("svc-x"),
+            )
+            .unwrap();
+        asm.actor_mgr.add_node(&good_actor, false).await.unwrap();
+        // Node offering a service the policy does not allow → invalid → disconnected.
+        let mut bad_actor =
+            make_node_actor_defexp("fd5a:5052::2", "node-bad", "[fd5a:5052::102]:1234");
+        bad_actor
+            .add_attribute(
+                Attribute::builder(key::SERVICES)
+                    .expires_in(Duration::from_secs(3600))
+                    .value("svc-y"),
+            )
+            .unwrap();
+        asm.actor_mgr.add_node(&bad_actor, false).await.unwrap();
+
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let (valid, invalid) = revalidate_nodes(&asm, &psnap).await.unwrap();
+
+        assert_eq!(valid, vec![good]);
+        assert_eq!(invalid, vec![bad]);
+    }
+
+    /// No connected nodes at all: returns an empty set without error.
+    #[tokio::test]
+    async fn test_revalidate_nodes_empty() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let (valid, invalid) = revalidate_nodes(&asm, &psnap).await.unwrap();
+        assert!(valid.is_empty());
+        assert!(invalid.is_empty());
+    }
 }

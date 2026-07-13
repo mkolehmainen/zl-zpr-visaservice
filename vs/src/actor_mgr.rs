@@ -509,6 +509,9 @@ impl ActorMgr {
     }
 
     /// Return true if the actor exists and offers at least one authentication service.
+    /// Note that this consults the **current** policy to determine if the service is an auth service.
+    ///
+    /// TODO: May be better to keep that cached with the actor.
     pub async fn has_auth_services(
         &self,
         asm: Arc<Assembly>,

@@ -111,37 +111,8 @@ impl Policy {
         let services = load_services(&policy)?;
         let cpol_sources = load_cpol_sources(&policy)?;
         let peerings = load_peerings(&policy)?;
-
         let peer_table = if let Some(ref peerings) = peerings {
-            // We have links defined in policy. Organize into useful lookup table for visa service.
-            let mut table: HashMap<IpAddr, Vec<Peer>> = HashMap::new();
-            for p in peerings {
-                // Each "Peering" is an edge with two endpoints. We create entries in our peer table
-                // for each endpoint.
-                //
-                // From node_a's perspective: remote is node_b, reachable at substrate_b.
-                let peer_a_to_b = Peer {
-                    link_id: p.link_id.clone(),
-                    remote_zpr_addr: p.node_b,
-                    remote_substrate: p.substrate_b.clone(),
-                };
-                table
-                    .entry(p.node_a)
-                    .or_insert_with(Vec::new)
-                    .push(peer_a_to_b);
-
-                // From node_b's perspective: remote is node_a, reachable at substrate_a.
-                let peer_b_to_a = Peer {
-                    link_id: p.link_id.clone(),
-                    remote_zpr_addr: p.node_a,
-                    remote_substrate: p.substrate_a.clone(),
-                };
-                table
-                    .entry(p.node_b)
-                    .or_insert_with(Vec::new)
-                    .push(peer_b_to_a);
-            }
-            Some(table)
+            load_peer_table(peerings)
         } else {
             None
         };
@@ -314,6 +285,38 @@ impl Policy {
         }
         Err(PolicyError::LinkNotFound(format!("{node_a} <-> {node_b}")))
     }
+}
+
+fn load_peer_table(peerings: &[Peering]) -> Option<HashMap<IpAddr, Vec<Peer>>> {
+    // We have links defined in policy. Organize into useful lookup table for visa service.
+    let mut table: HashMap<IpAddr, Vec<Peer>> = HashMap::new();
+    for p in peerings {
+        // Each "Peering" is an edge with two endpoints. We create entries in our peer table
+        // for each endpoint.
+        //
+        // From node_a's perspective: remote is node_b, reachable at substrate_b.
+        let peer_a_to_b = Peer {
+            link_id: p.link_id.clone(),
+            remote_zpr_addr: p.node_b,
+            remote_substrate: p.substrate_b.clone(),
+        };
+        table
+            .entry(p.node_a)
+            .or_insert_with(Vec::new)
+            .push(peer_a_to_b);
+
+        // From node_b's perspective: remote is node_a, reachable at substrate_a.
+        let peer_b_to_a = Peer {
+            link_id: p.link_id.clone(),
+            remote_zpr_addr: p.node_a,
+            remote_substrate: p.substrate_a.clone(),
+        };
+        table
+            .entry(p.node_b)
+            .or_insert_with(Vec::new)
+            .push(peer_b_to_a);
+    }
+    Some(table)
 }
 
 /// Given policy and a link_id, return the libeval-style Attributes for that link.
