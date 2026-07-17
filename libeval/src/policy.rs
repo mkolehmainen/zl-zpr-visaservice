@@ -232,6 +232,10 @@ impl Policy {
             .collect()
     }
 
+    pub fn service_by_id(&self, id: &str) -> Option<&Service> {
+        self.services.get(id)
+    }
+
     /// Get the ZPL source for the communication policy by policy index.
     pub fn get_cpol_source(&self, idx: usize) -> Option<&str> {
         self.cpol_sources.get(idx).map(|s| s.as_str())

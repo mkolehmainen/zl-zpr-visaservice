@@ -45,13 +45,24 @@ impl Executor {
         &self,
         id: Option<u64>,
         revoke: bool,
+        on_node: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        match id {
-            Some(id) => match revoke {
+        match (id, on_node) {
+            (Some(id), _) => match revoke {
                 true => self.revoke_visa(id)?,
                 false => self.get_visa(id)?,
             },
-            None => self.get_visas()?,
+            (None, Some(cn)) => self.get_visas_on_node(&cn)?,
+            (None, None) => self.get_visas()?,
+        }
+        Ok(())
+    }
+
+    /// Prints the visa service statistics as name/value pairs.
+    pub fn do_cmd_stats(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let stats = self.vs_cli.get_stats()?;
+        for (name, value) in &stats.stats {
+            println!("{}: {}", name.bold(), value);
         }
         Ok(())
     }
@@ -205,6 +216,15 @@ impl Executor {
 
     fn get_related_visas(&self, cn: &str) -> Result<(), Box<dyn std::error::Error>> {
         let entries = self.vs_cli.get_related_visas(cn)?;
+        for (i, entry) in entries.iter().enumerate() {
+            println!("{} {entry}", format!("ENTRY {}", i).bold());
+        }
+        Ok(())
+    }
+
+    /// Prints the IDs of the visas currently installed on the node with the given CN.
+    fn get_visas_on_node(&self, cn: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let entries = self.vs_cli.get_visas_on_node(cn)?;
         for (i, entry) in entries.iter().enumerate() {
             println!("{} {entry}", format!("ENTRY {}", i).bold());
         }

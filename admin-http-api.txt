@@ -1,4 +1,4 @@
-Admin HTTP API  - Current as of 3/12/2026
+Admin HTTP API  - Current as of 7/12/2026
 -----------------------------------------
 
 This document describes the admin HTTPS API implemented by the server and
@@ -22,12 +22,17 @@ Content Type
 API KEY
 -------
   Every request requires passing the api key in the `X-API-Key` header.
+  Keys carry a permission (read or read/write). Read endpoints require read;
+  write endpoints (POST/DELETE) require read/write, else 403.
 
 Notes
 -----
-  - Some endpoints in admin_service return placeholder data or fixed responses
-    (for example: policies, revokes, some deletes).
-  - A few fields are currently hardcoded or not tracked yet; see endpoint notes.
+  - Some endpoints in admin_service still return placeholder or fixed data
+    (the authrevoke endpoints, DELETE visas, and DELETE actors). These are
+    marked "placeholder" below.
+  - A few fields are hardcoded or not tracked yet; see endpoint notes.
+  - All timestamps are integer seconds since the Unix epoch. Nullable
+    timestamps serialize as JSON null.
 
 
 Common Types
@@ -39,31 +44,67 @@ Common Types
 |                 |                                                          |
 | NamedListEntry  | { "id": string }                                         |
 |                 |                                                          |
+| CnEntry         | { "cn": string }                                         |
+|                 |                                                          |
 | PolicyBundle    | { "config_id": number, "version": string,                |
 |                 |   "format": string, "container": string }                |
+|                 |   format is e.g. "base64;zip;<compiler-version>";        |
+|                 |   container is the encoded policy container.             |
 |                 |                                                          |
 | VisaDescriptor  | { "id": number, "expires": number, "created": number,    |
-|                 |   "policy_id": string, "requesting_node": string,        |
-|                 |   "source_addr": string, "dest_addr": string,            |
-|                 |   "source_port": number, "dest_port": number,            |
-|                 |   "proto": string }                                      |
+|                 |   "policy_id": string, "zpl": string,                    |
+|                 |   "direction": "forward" | "reverse",                    |
+|                 |   "requesting_node": string,                             |
+|                 |   "source_addr": string | null,                          |
+|                 |   "dest_addr": string | null,                            |
+|                 |   "source_port": number | null,                          |
+|                 |   "dest_port": number | null,                            |
+|                 |   "proto": string, "signals": string[],                  |
+|                 |   "session_key": ApiKeySet }                             |
 |                 |                                                          |
-| Revokes         | { "id": string, "revoked": number[] }                    |
+| ApiKeySet       | { "format": "ZprKF01",                                   |
+|                 |   "ingress_key": string, "egress_key": string }          |
+|                 |   keys are base64-encoded (and encrypted) byte strings.  |
 |                 |                                                          |
 | ActorDescriptor | { "cn": string, "created": number, "ident": string,      |
 |                 |   "node": boolean, "zpr_addr": string,                   |
+|                 |   "attrs": ApiAttribute[],                               |
+|                 |   "auth_exp": number | null,                             |
 |                 |   "node_details": NodeRecordBrief | null }               |
 |                 |                                                          |
-| NodeRecordBrief | { "pending": number, "last_contact": number,             |
+| ApiAttribute    | { "key": string, "value": string[],                      |
+|                 |   "expires_at": number }                                 |
+|                 |                                                          |
+| NodeRecordBrief | { "pending_install": number,                             |
+|                 |   "last_contact": number | null,                         |
 |                 |   "visa_requests": number, "connect_requests": number,   |
-|                 |   "in_sync": boolean }                                   |
+|                 |   "in_sync": boolean,                                     |
+|                 |   "approved_vreqs": number, "denied_vreqs": number,      |
+|                 |   "last_vreq": number | null,                            |
+|                 |   "adapters": string[], "links": string[],               |
+|                 |   "visas": number[], "visas_enqueued": number[],         |
+|                 |   "pending_revocation": number,                          |
+|                 |   "vss_port": number | null }                            |
 |                 |                                                          |
 | ServiceDesc     | { "service_name": string, "actor_cn": string,            |
-|                 |   "zpr_addr": string, "dock_zpr_addr": string }          |
+|                 |   "zpr_addr": string, "dock_zpr_addr": string,           |
+|                 |   "service_kind": string, "service_endpoints": string }  |
+|                 |   service_endpoints is a comma-separated list of         |
+|                 |   "PROTO/port" or "PROTO/lo-hi" entries (e.g.             |
+|                 |   "TCP/80,UDP/53"); unknown protocols render as          |
+|                 |   "PROTO_<n>". Both fields are "" if the service is not  |
+|                 |   found in the current policy.                           |
+|                 |                                                          |
+| NetworkDetails  | { "network": NodeConnections[] }                         |
+|                 |                                                          |
+| NodeConnections | { "node": string, "connections": string[] }              |
+|                 |                                                          |
+| Revokes         | { "id": string, "revoked": number[] }                    |
 |                 |                                                          |
 | AuthRevokeDesc  | { "ty": string, "cn": string }                           |
 |                 |                                                          |
-| CnEntry         | { "cn": string }                                         |
+| Stats           | { "stats": { string: string } }                          |
+|                 |   a map of stat name to value (values are stringified).  |
 +-----------------+----------------------------------------------------------+
 
   Type name notes:
@@ -78,11 +119,12 @@ GET /admin/actors
   Summary
     Returns a list of actor common names.
   Query
-    role: node | adapter (optional)
+    role: node | adapter (optional; invalid value => 400)
   Request
     (none)
   Response
     200: CnEntry[]
+    400: invalid role query value
     403: permission denied (empty list)
     500: empty list
 
@@ -98,14 +140,14 @@ GET /admin/actors/{cn}
     404: not found
     500: server error
   Notes
-    created is seconds since epoch but is currently 0 (not tracked yet).
-    node_details is currently null (not tracked yet).
+    created is currently 0 (actor create time not tracked yet).
+    node_details is populated for node actors and null for adapters.
     Note that passed {cn} must be url path encoded.
 
 DELETE /admin/actors/{cn}
 -------------------------
   Summary
-    Revokes an actor. Currently returns a placeholder response.
+    Revokes an actor. Placeholder: returns a fixed response.
   Request
     (none)
   Response
@@ -116,13 +158,34 @@ DELETE /admin/actors/{cn}
 GET /admin/actors/{cn}/visas
 ----------------------------
   Summary
-    Returns visa IDs related to the actor. Currently returns a placeholder
-    list.
+    Returns the IDs of all visas whose five-tuple has this actor's ZPR
+    address as either the source or destination.
   Request
     (none)
   Response
     200: ListEntry[]
+    403: permission denied (empty list)
+    404: actor not found, or actor has no ZPR address (empty list)
+    500: server error (empty list)
   Notes
+    Note that passed {cn} must be url path encoded.
+    Currently scans every visa (O(n)); an index is pending a visa_mgr
+    rework. No pagination support yet.
+
+GET /admin/nodes/{cn}/visas
+---------------------------
+  Summary
+    Returns the IDs of the visas currently installed on the given node.
+  Request
+    (none)
+  Response
+    200: ListEntry[]
+    400: actor is not a node (empty list)
+    403: permission denied (empty list)
+    404: actor not found, or actor has no ZPR address (empty list)
+    500: server error (empty list)
+  Notes
+    {cn} must resolve to a node actor; non-node actors return 400.
     Note that passed {cn} must be url path encoded.
 
 GET /admin/services
@@ -137,7 +200,7 @@ GET /admin/services
     500: empty list
 
 GET /admin/services/{name}
-------------------------
+--------------------------
   Summary
     Returns details for a specific service by name.
   Request
@@ -146,8 +209,11 @@ GET /admin/services/{name}
     200: ServiceDescriptor
     403: permission denied
     404: not found
+    500: server error
   Notes
     Note that passed {name} must be url path encoded.
+    service_kind and service_endpoints are sourced from the current policy
+    (both "" if the service is not present in it).
 
 GET /admin/visas
 ----------------
@@ -159,6 +225,8 @@ GET /admin/visas
     200: ListEntry[]
     403: permission denied (empty list)
     500: empty list
+  Notes
+    No pagination support yet.
 
 GET /admin/visas/{id}
 ---------------------
@@ -172,62 +240,101 @@ GET /admin/visas/{id}
     404: not found
     500: server error
   Notes
-    expires is seconds since epoch.
-    created is seconds since epoch (from visa metadata).
-    policy_id is currently "0" (not tracked yet).
-    proto is currently "TCP" (fixed in server code).
+    expires and created are seconds since epoch.
+    policy_id is the policy version the visa was issued under.
+    proto is derived from the visa (TCP, UDP, ICMP, or N/A).
+    For UDP/TCP, source_port/dest_port are ports; for ICMP they carry the
+    ICMP type/code. All of source_addr, dest_addr, and the ports are null
+    when the visa has no dock_pep.
 
 DELETE /admin/visas/{id}
 ------------------------
   Summary
-    Revokes a visa. Currently returns a placeholder response.
+    Revokes a visa. Placeholder: returns a fixed response.
   Request
     (none)
   Response
     200: Revokes
 
-GET /admin/policies
--------------------
+GET /admin/network
+------------------
   Summary
-    Returns policy IDs. Currently returns placeholder data.
+    Returns all nodes and, for each, the CNs of its connected peers.
   Request
     (none)
   Response
-    200: ListEntry[]
+    200: NetworkDetails
+    403: permission denied
+    500: server error
+  Notes
+    A peer whose CN cannot be resolved appears as "cn_missing:<addr>".
+
+GET /admin/stats
+----------------
+  Summary
+    Returns service statistics as a map of stat name to value.
+  Request
+    (none)
+  Response
+    200: Stats
+    403: permission denied
+  Notes
+    Always includes "uptime" (seconds since service start). Remaining
+    entries are the service counters, keyed by counter name. All values
+    are stringified.
+
+GET /admin/policies
+-------------------
+  Summary
+    Returns the current policy id. Currently there is only one policy (id 0).
+  Request
+    (none)
+  Response
+    200: ListEntry (single object, not an array)
+    403: permission denied
 
 GET /admin/policies/{id}
 ------------------------
   Summary
-    Returns a policy bundle. Currently returns placeholder data.
+    Returns the policy bundle for the given id.
   Request
     (none)
   Response
     200: PolicyBundle
+    403: permission denied
+    404: not found (any id other than 0)
+    500: server error
 
 GET /admin/policies/curr
 ------------------------
   Summary
-    Returns the current policy bundle. Currently returns placeholder data.
+    Returns the current policy bundle (equivalent to id 0).
   Request
     (none)
   Response
     200: PolicyBundle
+    403: permission denied
+    500: server error
   Notes
-    Will probably rename this to "current".
+    May be renamed to "current".
 
 POST /admin/policies
 --------------------
   Summary
-    Installs a policy bundle.
+    Installs a policy bundle and makes it the current policy. Fires a
+    PolicyUpdated event on success.
   Request
-    Body: PolicyBundle (server ignores config_id when installing)
+    Body: PolicyBundle (config_id is ignored; the new policy is always id 0)
   Response
-    200: ListEntry
+    200: ListEntry (id of installed policy, always 0)
+    400: bundle container could not be decoded
+    403: permission denied (write permission required)
+    500: policy update failed
 
 GET /admin/authrevoke
 ---------------------
   Summary
-    Returns authorization revokes. Currently returns placeholder data.
+    Returns authorization revokes. Placeholder: returns a fixed list.
   Request
     (none)
   Response
@@ -239,7 +346,7 @@ GET /admin/authrevoke
 GET /admin/authrevoke/{id}
 --------------------------
   Summary
-    Returns a specific auth revoke. Currently returns placeholder data.
+    Returns a specific auth revoke. Placeholder: returns a fixed response.
   Request
     (none)
   Response
@@ -250,7 +357,7 @@ GET /admin/authrevoke/{id}
 POST /admin/authrevoke/{id}
 ---------------------------
   Summary
-    Adds an auth revoke.
+    Adds an auth revoke. Placeholder: returns a fixed response.
   Request
     (none)
   Response
@@ -261,7 +368,7 @@ POST /admin/authrevoke/{id}
 POST /admin/authrevoke/clear
 ----------------------------
   Summary
-    Clears auth revokes. Currently returns placeholder data.
+    Clears auth revokes. Placeholder: returns a fixed list.
   Request
     (none)
   Response
@@ -270,12 +377,10 @@ POST /admin/authrevoke/clear
 DELETE /admin/authrevoke/{id}
 -----------------------------
   Summary
-    Removes a specific auth revoke.
+    Removes a specific auth revoke. Placeholder: returns a fixed response.
   Request
     (none)
   Response
     200: ListEntry
   Notes
     Type of {id} is TBD.
-
-

@@ -1,5 +1,6 @@
 //! HTTPS admin service implementation.
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tower_service::Service;
 
-use zpr::policy_types::PolicyBundle;
+use zpr::policy_types::{PolicyBundle, Scope};
 use zpr::vsapi_types::{DockPepType, KeyFormat, KeySet, Visa};
 
 use libeval::attribute::{Attribute, ROLE_NODE, key};
@@ -41,11 +42,14 @@ use crate::db::Role;
 use crate::event_mgr::VsEvent;
 use crate::logging::targets::ADMIN;
 use crate::policy_mgr::DEFAULT_POLICY_ID;
+use crate::visa_mgr::VisaMgr;
+
+use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 
 use admin_api_types::{
     ActorDescriptor, ApiAttribute, ApiKeyFormat, ApiKeySet, AuthRevokeDescriptor, CnEntry,
     ListEntry, NamedListEntry, NetworkDetails, NodeConnections, NodeRecordBrief, Revokes,
-    ServiceDescriptor, VisaDescriptor,
+    ServiceDescriptor, Stats, VisaDescriptor,
 };
 
 // Must use tokio RwLock here becuase we need state to be Send.
@@ -166,6 +170,7 @@ fn admin_app(state: SharedState) -> Router {
         .route("/admin/actors/{capture}", get(get_actor))
         .route("/admin/actors/{capture}/visas", get(get_related_visas))
         .route("/admin/actors/{capture}", delete(revoke_actor))
+        .route("/admin/nodes/{capture}/visas", get(get_visas_on_node))
         .route("/admin/services", get(get_services))
         .route("/admin/services/{capture}", get(get_service))
         .route("/admin/authrevoke", get(get_revokes))
@@ -174,6 +179,7 @@ fn admin_app(state: SharedState) -> Router {
         .route("/admin/authrevoke/clear", post(clear_revokes))
         .route("/admin/authrevoke/{capture}", delete(remove_revoke))
         .route("/admin/network", get(get_network))
+        .route("/admin/stats", get(get_stats))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -654,9 +660,122 @@ async fn revoke_actor(EPath(cn): EPath<String>) -> impl IntoResponse {
     (StatusCode::OK, Json(r)).into_response()
 }
 
-async fn get_related_visas(EPath(cn): EPath<String>) -> impl IntoResponse {
+/// Resolve a CN to its ZPR address and a cloned (Arc-backed) visa manager, releasing the state
+/// read-lock before returning so callers can do longer work without blocking writers. When
+/// `require_node` is set, non-node actors are rejected with `BAD_REQUEST`. On any failure the
+/// appropriate `StatusCode` is returned for the caller to surface.
+async fn resolve_actor_addr(
+    state: &SharedState,
+    cn: &str,
+    require_node: bool,
+) -> Result<(IpAddr, VisaMgr), StatusCode> {
+    let rstate = state.read().await;
+
+    let actor = match rstate.asm.actor_mgr.get_actor_by_cn(cn).await {
+        Err(e) => {
+            error!(target: ADMIN, "error getting actor with cn {}: {}", cn, e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Ok(Some(actor)) => actor,
+    };
+
+    if require_node && !actor.is_node() {
+        warn!(target: ADMIN, "actor {} is not a node", cn);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let actor_addr = match actor.get_zpr_addr() {
+        None => {
+            warn!(target: ADMIN, "actor {} has no ZPR address", cn);
+            return Err(StatusCode::NOT_FOUND);
+        }
+        Some(addr) => *addr,
+    };
+
+    Ok((actor_addr, rstate.asm.visa_mgr.clone()))
+}
+
+/// List of visa IDs
+async fn get_related_visas(
+    Extension(perm): Extension<Permission>,
+    State(state): State<SharedState>,
+    EPath(cn): EPath<String>,
+) -> (StatusCode, Json<Vec<ListEntry>>) {
+    if !perm.can_read() {
+        return (StatusCode::FORBIDDEN, Json(Vec::<ListEntry>::new()));
+    }
     debug!(target: ADMIN, "GET /admin/actors/{}/visas", cn);
-    two_elem_list()
+
+    // TODO: Waiting on another PR which reworks how the visa_mgr stores visas, once that is in
+    // place we will add appropriate index for this query. Currently this needs to look at
+    // every visa.
+
+    let (actor_addr, visa_mgr) = match resolve_actor_addr(&state, &cn, false).await {
+        Ok(pair) => pair,
+        Err(code) => return (code, Json(Vec::<ListEntry>::new())),
+    };
+
+    let mut related_visas: Vec<ListEntry> = Vec::new();
+
+    let visa_ids = match visa_mgr.list_all_visa_ids().await {
+        Ok(ids) => ids,
+        Err(e) => {
+            error!(target: ADMIN, "list_all_visa_ids failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Vec::<ListEntry>::new()),
+            );
+        }
+    };
+    for visa_id in visa_ids {
+        // Only the five-tuple is needed here, so fetch the visa without its metadata.
+        match visa_mgr.get_visa_by_id(visa_id).await {
+            Ok(Some(visa)) => {
+                if let Some(ftup) = visa.five_tuple() {
+                    if ftup.source_addr == actor_addr || ftup.dest_addr == actor_addr {
+                        related_visas.push(ListEntry { id: visa_id });
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(target: ADMIN, "error getting visa with id {}: {}", visa_id, e);
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(related_visas))
+}
+
+/// List of visa IDs
+async fn get_visas_on_node(
+    Extension(perm): Extension<Permission>,
+    State(state): State<SharedState>,
+    EPath(cn): EPath<String>,
+) -> (StatusCode, Json<Vec<ListEntry>>) {
+    if !perm.can_read() {
+        return (StatusCode::FORBIDDEN, Json(Vec::<ListEntry>::new()));
+    }
+    debug!(target: ADMIN, "GET /admin/nodes/{}/visas", cn);
+
+    let (actor_addr, visa_mgr) = match resolve_actor_addr(&state, &cn, true).await {
+        Ok(pair) => pair,
+        Err(code) => return (code, Json(Vec::<ListEntry>::new())),
+    };
+
+    let visa_ids = match visa_mgr.get_installed_visa_ids_for_node(&actor_addr).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            error!(target: ADMIN, "get_installed_visa_ids_for_node failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Vec::<ListEntry>::new()),
+            );
+        }
+    };
+    let related_visas: Vec<ListEntry> = visa_ids.into_iter().map(|id| ListEntry { id }).collect();
+    (StatusCode::OK, Json(related_visas))
 }
 
 async fn get_services(
@@ -690,18 +809,18 @@ async fn get_services(
 async fn get_service(
     Extension(perm): Extension<Permission>,
     State(state): State<SharedState>,
-    EPath(cn): EPath<String>,
+    EPath(svc_name): EPath<String>,
 ) -> Result<Json<ServiceDescriptor>, StatusCode> {
     if !perm.can_read() {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    debug!(target: ADMIN, "GET /admin/service CN={}", cn);
+    debug!(target: ADMIN, "GET /admin/service name={}", svc_name);
     let rstate = state.read().await;
 
-    match rstate.asm.actor_mgr.get_service_detail(&cn).await {
+    match rstate.asm.actor_mgr.get_service_detail(&svc_name).await {
         Err(e) => {
-            error!(target: ADMIN, "error getting service detail for CN {}: {}", cn, e);
+            error!(target: ADMIN, "error getting service detail for service {}: {}", svc_name, e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Ok(opt_detail) => {
@@ -710,11 +829,24 @@ async fn get_service(
                     Some(cv_addr) => cv_addr.to_string(),
                     None => "".to_string(),
                 };
+                let cp = rstate.asm.policy_mgr.get_current();
+
+                let (svc_kind, svc_endpoints) = if let Some(psvc) = cp.service_by_id(&svc_name) {
+                    (
+                        format!("{:?}", psvc.kind),
+                        service_endpoints_to_string(&psvc.endpoints),
+                    )
+                } else {
+                    ("".to_string(), "".to_string())
+                };
+
                 let sd = ServiceDescriptor {
                     service_name: detail.service_name,
                     zpr_addr: detail.zpr_addr.to_string(),
                     actor_cn: detail.actor_cn,
                     dock_zpr_addr: connect_via,
+                    service_kind: svc_kind,
+                    service_endpoints: svc_endpoints,
                 };
                 Ok(Json(sd))
             } else {
@@ -722,6 +854,27 @@ async fn get_service(
             }
         }
     }
+}
+
+fn service_endpoints_to_string(endpoints: &[Scope]) -> String {
+    let mut ep_strs: Vec<String> = Vec::new();
+    for ep in endpoints {
+        let port_str = if let Some(port) = ep.port {
+            port.to_string()
+        } else if let Some(port_range) = ep.port_range {
+            format!("{}-{}", port_range.0, port_range.1)
+        } else {
+            "".to_string()
+        };
+        match ep.protocol {
+            ip_proto::TCP => ep_strs.push(format!("TCP/{}", port_str)),
+            ip_proto::UDP => ep_strs.push(format!("UDP/{}", port_str)),
+            ip_proto::ICMP => ep_strs.push(format!("ICMP/{}", port_str)),
+            ip_proto::IPV6_ICMP => ep_strs.push(format!("IPV6_ICMP/{}", port_str)),
+            _ => ep_strs.push(format!("PROTO_{}/{}", ep.protocol, port_str)),
+        }
+    }
+    ep_strs.join(",")
 }
 
 async fn get_revokes() -> impl IntoResponse {
@@ -801,6 +954,31 @@ async fn get_network(
     }
 
     Ok(Json(NetworkDetails { network }))
+}
+
+async fn get_stats(
+    Extension(perm): Extension<Permission>,
+    State(state): State<SharedState>,
+) -> Result<Json<Stats>, StatusCode> {
+    if !perm.can_read() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    debug!(target: ADMIN, "GET /admin/stats");
+
+    let mut stat_map = HashMap::new();
+
+    let rstate = state.read().await;
+
+    stat_map.insert(
+        "uptime".to_string(),
+        rstate.asm.get_uptime().as_secs().to_string(),
+    );
+    for (key, ref value) in &rstate.asm.counters.counters {
+        stat_map.insert(key.name().to_string(), value.get_count().to_string());
+    }
+
+    Ok(Json(Stats { stats: stat_map }))
 }
 
 fn to_api_attribute(attr: &Attribute) -> ApiAttribute {
@@ -1677,5 +1855,155 @@ mod tests {
         assert_eq!(network[0].connections, vec!["node-b".to_string()]);
         assert_eq!(network[1].node, "node-b");
         assert_eq!(network[1].connections, vec!["node-a".to_string()]);
+    }
+
+    /// Build a Scope with the given protocol, single port, and port range.
+    fn scope(protocol: u8, port: Option<u16>, port_range: Option<(u16, u16)>) -> Scope {
+        Scope {
+            protocol,
+            flag: None,
+            port,
+            port_range,
+        }
+    }
+
+    /// service_endpoints_to_string formats known protocols, port ranges, unknown
+    /// protocols, and the empty list as expected.
+    #[test]
+    fn test_service_endpoints_to_string() {
+        // Empty list -> empty string.
+        assert_eq!(service_endpoints_to_string(&[]), "");
+
+        // Single port with each known protocol.
+        assert_eq!(
+            service_endpoints_to_string(&[scope(ip_proto::TCP, Some(80), None)]),
+            "TCP/80"
+        );
+        assert_eq!(
+            service_endpoints_to_string(&[scope(ip_proto::UDP, Some(53), None)]),
+            "UDP/53"
+        );
+
+        // Port range.
+        assert_eq!(
+            service_endpoints_to_string(&[scope(ip_proto::TCP, None, Some((8000, 8080)))]),
+            "TCP/8000-8080"
+        );
+
+        // Unknown protocol falls back to PROTO_<n>.
+        assert_eq!(
+            service_endpoints_to_string(&[scope(200, Some(1), None)]),
+            "PROTO_200/1"
+        );
+
+        // Multiple endpoints are comma-joined in order.
+        assert_eq!(
+            service_endpoints_to_string(&[
+                scope(ip_proto::TCP, Some(80), None),
+                scope(ip_proto::UDP, Some(53), None),
+            ]),
+            "TCP/80,UDP/53"
+        );
+    }
+
+    /// GET /admin/nodes/{cn}/visas for a node with no installed visas returns OK
+    /// with an empty list.
+    #[tokio::test]
+    async fn test_get_visas_on_node_empty_ok() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::30", "node-1", "[fd5a:5052::130]:1234");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/nodes/node-1/visas")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let visas: Vec<ListEntry> = serde_json::from_slice(&body).unwrap();
+        assert!(visas.is_empty());
+    }
+
+    /// GET /admin/nodes/{cn}/visas for a non-node actor is rejected with BAD_REQUEST.
+    #[tokio::test]
+    async fn test_get_visas_on_node_non_node_bad_request() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::31", "node-1", "[fd5a:5052::131]:1234");
+        let adapter = make_adapter_actor_defexp("fd5a:5052::32", "adapter-1");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap())
+            .await
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/nodes/adapter-1/visas")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// GET /admin/nodes/{cn}/visas for an unknown CN returns NOT_FOUND.
+    #[tokio::test]
+    async fn test_get_visas_on_node_unknown_cn_not_found() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/nodes/does-not-exist/visas")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// GET /admin/actors/{cn}/visas for an unknown CN returns NOT_FOUND (exercises
+    /// the shared resolve_actor_addr helper with require_node = false).
+    #[tokio::test]
+    async fn test_get_related_visas_unknown_cn_not_found() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/actors/does-not-exist/visas")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

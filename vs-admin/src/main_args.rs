@@ -50,6 +50,9 @@ pub enum SubCmd {
         // TODO decide if it should be visas --revoke --id ID or if revoke should also take a u64 and be visas --revoke ID
         #[arg(long, short = 'r', requires = "id")]
         revoke: bool,
+        /// List the visas currently installed on the node with the given CN
+        #[arg(long, short = 'n', value_name = "CN", conflicts_with_all = ["id", "revoke"])]
+        on_node: Option<String>,
     },
 
     /// Commands related to actors, provide no additional arguments to see list of CNs of all actors
@@ -97,6 +100,10 @@ pub enum SubCmd {
 
     #[command()]
     Network,
+
+    /// Show visa service statistics
+    #[command()]
+    Stats,
 
     /// Enter GUI mode
     #[command()]

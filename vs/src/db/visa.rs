@@ -54,6 +54,7 @@ pub struct VisaMetadata {
     pub five_tuple: VsapiFiveTuple,
 }
 
+#[derive(Clone)]
 pub struct VisaRepo {
     db: Arc<dyn DbConnection>,
 }

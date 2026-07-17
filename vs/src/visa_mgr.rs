@@ -23,6 +23,7 @@ use zpr::vsapi_types::{
 
 use tracing::info;
 
+#[derive(Clone)]
 pub struct VisaMgr {
     repo: db::VisaRepo,
 }
@@ -542,6 +543,16 @@ impl VisaMgr {
                 Err(StoreError::NotFound(_)) => Ok(None),
                 Err(e) => Err(ServiceError::from(e)),
             },
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(ServiceError::from(e)),
+        }
+    }
+
+    /// Get just the visa (no metadata) using the visa ID.
+    /// Returns None if not found.
+    pub async fn get_visa_by_id(&self, visa_id: u64) -> Result<Option<Visa>, ServiceError> {
+        match self.repo.get_visa_by_id(visa_id).await {
+            Ok(visa) => Ok(Some(visa)),
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(e) => Err(ServiceError::from(e)),
         }

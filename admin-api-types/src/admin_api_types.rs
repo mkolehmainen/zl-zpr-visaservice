@@ -4,6 +4,8 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
 use serde_with::{TimestampSeconds, serde_as};
+
+use std::collections::HashMap;
 use std::fmt;
 use std::time::SystemTime;
 
@@ -290,6 +292,8 @@ pub struct ServiceDescriptor {
     pub actor_cn: String,
     pub zpr_addr: String,
     pub dock_zpr_addr: String,
+    pub service_kind: String,
+    pub service_endpoints: String,
 }
 
 impl PartialEq for ServiceDescriptor {
@@ -315,7 +319,9 @@ impl fmt::Display for ServiceDescriptor {
         write!(f, "{} {}  ", "name:".dimmed(), self.service_name)?;
         write!(f, "{} {}  ", "cn:".dimmed(), self.actor_cn)?;
         write!(f, "{} {}  ", "zpr_addr:".dimmed(), self.zpr_addr)?;
-        write!(f, "{} {}\n", "dock_zpr_addr:".dimmed(), self.dock_zpr_addr)
+        write!(f, "{} {}\n", "dock_zpr_addr:".dimmed(), self.dock_zpr_addr)?;
+        write!(f, "{} {}\n", "kind:".dimmed(), self.service_kind)?;
+        write!(f, "{} {}\n", "endpoints:".dimmed(), self.service_endpoints)
     }
 }
 
@@ -638,6 +644,11 @@ impl fmt::Display for NetworkDetails {
         }
         Ok(())
     }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Stats {
+    pub stats: HashMap<String, String>,
 }
 
 #[cfg(test)]

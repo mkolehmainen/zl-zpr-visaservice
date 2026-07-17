@@ -8,7 +8,7 @@ use zpr::policy_types::PolicyBundle;
 
 use admin_api_types::{
     ActorDescriptor, AuthRevokeDescriptor, CnEntry, ListEntry, NamedListEntry, NetworkDetails,
-    Revokes, ServiceDescriptor, VisaDescriptor, reason_for,
+    Revokes, ServiceDescriptor, Stats, VisaDescriptor, reason_for,
 };
 
 use crate::error::VsaError;
@@ -333,6 +333,24 @@ impl VsClient {
         let req = reqwest::Url::parse(&format!("{}/admin/network", self.api_url))?;
         let resp = self.ht_get(req.as_str())?;
         let entry: NetworkDetails = resp.json()?;
+        Ok(entry)
+    }
+
+    /// `GET <api_url>/admin/nodes/<cn>/visas`
+    ///
+    /// Returns the IDs of the visas currently installed on the given node.
+    pub fn get_visas_on_node(&self, cn: &str) -> Result<Vec<ListEntry>, VsaError> {
+        let mut requrl = reqwest::Url::parse(&format!("{}/admin/nodes", self.api_url))?;
+        requrl.path_segments_mut().unwrap().push(cn).push("visas");
+        let entry_vec = self.request_get_list_entries::<ListEntry>(requrl.as_str())?;
+        Ok(entry_vec)
+    }
+
+    /// `GET <api_url>/admin/stats`
+    pub fn get_stats(&self) -> Result<Stats, VsaError> {
+        let req = format!("{}/admin/stats", self.api_url);
+        let resp = self.ht_get(&req)?;
+        let entry: Stats = resp.json()?;
         Ok(entry)
     }
 }

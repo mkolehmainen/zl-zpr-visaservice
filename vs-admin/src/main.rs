@@ -65,7 +65,11 @@ fn main() {
     match args.command {
         Some(SubCmd::Policies { id, path, curr }) => exec.do_cmd_policies(id, path, curr),
 
-        Some(SubCmd::Visas { id, revoke }) => exec.do_cmd_visas(id, revoke),
+        Some(SubCmd::Visas {
+            id,
+            revoke,
+            on_node,
+        }) => exec.do_cmd_visas(id, revoke, on_node),
 
         Some(SubCmd::Actors {
             cn,
@@ -91,6 +95,8 @@ fn main() {
         Some(SubCmd::Gui) => gui::enter_gui(&args.svc_url, ca_cert, api_key),
 
         Some(SubCmd::Network) => exec.do_cmd_network(),
+
+        Some(SubCmd::Stats) => exec.do_cmd_stats(),
 
         None => Err("no command specified".into()),
     }

@@ -451,9 +451,6 @@ impl ActorMgr {
                 return Ok(None);
             }
 
-            //detail.service_name = service_name.to_string();
-            //detail.zpr_addr = addr;
-
             let mut val_cn = None;
             let mut val_connect_via = None;
 
