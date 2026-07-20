@@ -162,6 +162,8 @@ async fn main() -> std::process::ExitCode {
         None
     };
 
+    // NOTE: tasks spawned onto this LocalSet (spawn_local) are only queued; they
+    // do not start running until the LocalSet is driven by run_until below.
     let local_set = tokio::task::LocalSet::new();
     let _local_set_guard = local_set.enter();
 
@@ -208,6 +210,13 @@ async fn main() -> std::process::ExitCode {
     };
 
     let mut js = JoinSet::new();
+
+    // Spawn lock renewal immediately after acquisition so it covers hydration
+    // (VisaRepo::new) and the rest of startup — otherwise the lock runs on its
+    // un-renewed fuse (VALKEY_LOCK_TIMEOUT) through all of startup. This must be
+    // a plain spawn (not spawn_local): LocalSet tasks aren't polled until
+    // run_until, which is only reached after hydration completes.
+    js.spawn(db_worker::launch(db_handle.clone(), vslock_desc));
 
     let counters = Arc::new(Counters::default());
 
@@ -326,7 +335,6 @@ async fn main() -> std::process::ExitCode {
     }
 
     js.spawn_local(signal_worker::launch(asm.clone()));
-    js.spawn_local(db_worker::launch(asm.clone(), vslock_desc));
     js.spawn_local(event_mgr::launch(asm.clone(), event_rx));
 
     js.spawn_local(vsapi_worker::launch(
@@ -472,6 +480,8 @@ fn initialize_identity(
 }
 
 /// If we are starting with state in the DB, do any housekeeping needed to get in sync.
+///
+/// Loading of visa state happens in [db::VisaRepo::new].
 ///
 /// TODO: If we have state in the db, and we are loading a policy that differs from
 /// the saved "curent" policy, we may have visas that are not longer valid.

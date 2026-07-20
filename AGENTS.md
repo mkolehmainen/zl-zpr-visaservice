@@ -18,3 +18,4 @@ Rust workspace with main crate `vs` (visa service) and supporting crates:
 
 ## Project Note
 - ZPR addresses are IPv6 and must use prefix `fd5a:5052`.
+- This is early release code so we do not care about migrating existing database state.

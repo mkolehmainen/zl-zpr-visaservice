@@ -16,7 +16,7 @@ pub use policy::PolicyRepo;
 pub use visa::{NodeVisaState, VisaMetadata, VisaRepo};
 
 #[cfg(test)]
-pub use db_fake::FakeDb;
+pub use db_fake::{FakeDb, FaultMode};
 
 use chrono::Utc;
 use percent_encoding::CONTROLS;
@@ -35,6 +35,8 @@ pub enum LockType {
 
 pub type DbResult<T> = redis::RedisResult<T>;
 
+// TODO: At some point remove this dead code and remove the unused functions.
+#[allow(dead_code)]
 #[async_trait::async_trait]
 pub trait DbConnection: Send + Sync {
     /// May be called during a clean shutdown so that DB can do any necessary cleanup (e.g. releasing locks).
@@ -42,15 +44,11 @@ pub trait DbConnection: Send + Sync {
 
     async fn exists(&self, key: &str) -> DbResult<bool>;
     async fn set(&self, key: &str, value: &str) -> DbResult<()>;
-
-    #[allow(dead_code)]
     async fn set_ex(&self, key: &str, value: &str, seconds: u64) -> DbResult<()>;
-
     async fn get(&self, key: &str) -> DbResult<Option<String>>;
 
     /// Set a binary value directly. For atomic writes alongside other ops, use
     /// `DbOp::SetBin` in an `atomic_pipeline` instead.
-    #[allow(dead_code)]
     async fn set_bin(&self, key: &str, value: &[u8]) -> DbResult<()>;
     async fn set_bin_ex(&self, key: &str, value: &[u8], seconds: u64) -> DbResult<()>;
     async fn get_bin(&self, key: &str) -> DbResult<Vec<u8>>;
@@ -125,6 +123,7 @@ impl PartialEq for LockDescriptor {
 
 impl Eq for LockDescriptor {}
 
+#[allow(dead_code)]
 pub enum DbOp {
     Del(String),
     /// Set a binary value at `key`. Lets binary blobs join an atomic pipeline.

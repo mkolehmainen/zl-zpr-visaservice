@@ -297,6 +297,11 @@ async fn do_housekeeping(
         send_topology(state, asm, node_addr, vss_handle).await;
     }
 
+    // Drop any expired visas from the in-memory store before working the queues.
+    if let Err(e) = asm.visa_mgr.purge_expired_visas() {
+        warn!(target: VSS, "failed to purge expired visas: {e}");
+    }
+
     send_pending_visas(asm, node_addr, vss_handle).await;
 
     // TODO: Check for pending visa revocations.

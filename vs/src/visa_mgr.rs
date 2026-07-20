@@ -64,7 +64,7 @@ impl VisaMgr {
         mut visa: Visa,
         target_node: &IpAddr,
     ) -> Result<Visa, ServiceError> {
-        let md = self.repo.get_visa_metadata_by_id(visa.issuer_id).await?;
+        let md = self.repo.get_visa_metadata_by_id(visa.issuer_id)?;
 
         let Some(path) = md.path.as_ref() else {
             return Ok(visa);
@@ -200,8 +200,7 @@ impl VisaMgr {
     ) -> Result<Option<Visa>, ServiceError> {
         for visa in self
             .repo
-            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::Installed)
-            .await?
+            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::Installed)?
         {
             if visa.dock_pep.is_none() {
                 warn!(target: VISA, "found visa in store with no dock_pep ID={}", visa.issuer_id);
@@ -425,8 +424,7 @@ impl VisaMgr {
     ) -> Result<Vec<Visa>, ServiceError> {
         let visas = self
             .repo
-            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)
-            .await?;
+            .get_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?;
         Ok(visas)
     }
 
@@ -436,8 +434,7 @@ impl VisaMgr {
     ) -> Result<Vec<u64>, ServiceError> {
         let visa_ids = self
             .repo
-            .get_visa_ids_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)
-            .await?;
+            .get_visa_ids_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?;
         Ok(visa_ids)
     }
 
@@ -447,8 +444,7 @@ impl VisaMgr {
     ) -> Result<Vec<u64>, ServiceError> {
         let visa_ids = self
             .repo
-            .get_visa_ids_for_node_by_state(node_addr, db::NodeVisaState::Installed)
-            .await?;
+            .get_visa_ids_for_node_by_state(node_addr, db::NodeVisaState::Installed)?;
         Ok(visa_ids)
     }
 
@@ -458,8 +454,7 @@ impl VisaMgr {
     ) -> Result<u32, ServiceError> {
         let pending_revokes = self
             .repo
-            .get_count_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)
-            .await?;
+            .get_count_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingInstall)?;
         Ok(pending_revokes)
     }
 
@@ -469,8 +464,7 @@ impl VisaMgr {
     ) -> Result<u32, ServiceError> {
         let pending_revokes = self
             .repo
-            .get_count_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingRevoke)
-            .await?;
+            .get_count_visas_for_node_by_state(node_addr, db::NodeVisaState::PendingRevoke)?;
         Ok(pending_revokes)
     }
 
@@ -525,9 +519,15 @@ impl VisaMgr {
         Ok(())
     }
 
+    /// Drop expired visas from the in-memory store. Called by housekeeping.
+    pub fn purge_expired_visas(&self) -> Result<(), ServiceError> {
+        self.repo.purge_expired()?;
+        Ok(())
+    }
+
     /// Get all the visa IDs (non-expired).
     pub async fn list_all_visa_ids(&self) -> Result<Vec<u64>, ServiceError> {
-        let visa_ids = self.repo.list_visa_ids().await?;
+        let visa_ids = self.repo.list_visa_ids()?;
         Ok(visa_ids)
     }
 
@@ -537,8 +537,8 @@ impl VisaMgr {
         &self,
         visa_id: u64,
     ) -> Result<Option<VisaWithMetadata>, ServiceError> {
-        match self.repo.get_visa_by_id(visa_id).await {
-            Ok(visa) => match self.repo.get_visa_metadata_by_id(visa_id).await {
+        match self.repo.get_visa_by_id(visa_id) {
+            Ok(visa) => match self.repo.get_visa_metadata_by_id(visa_id) {
                 Ok(md) => Ok(Some(VisaWithMetadata { visa, metadata: md })),
                 Err(StoreError::NotFound(_)) => Ok(None),
                 Err(e) => Err(ServiceError::from(e)),
@@ -551,7 +551,7 @@ impl VisaMgr {
     /// Get just the visa (no metadata) using the visa ID.
     /// Returns None if not found.
     pub async fn get_visa_by_id(&self, visa_id: u64) -> Result<Option<Visa>, ServiceError> {
-        match self.repo.get_visa_by_id(visa_id).await {
+        match self.repo.get_visa_by_id(visa_id) {
             Ok(visa) => Ok(Some(visa)),
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(e) => Err(ServiceError::from(e)),
@@ -565,7 +565,7 @@ impl VisaMgr {
         &self,
         visa_id: u64,
     ) -> Result<Option<VisaMetadata>, ServiceError> {
-        match self.repo.get_visa_metadata_by_id(visa_id).await {
+        match self.repo.get_visa_metadata_by_id(visa_id) {
             Ok(md) => Ok(Some(md)),
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(e) => Err(ServiceError::from(e)),
@@ -1079,7 +1079,6 @@ mod tests {
             .visa_mgr
             .repo
             .get_visa_metadata_by_id(visawmd.visa.issuer_id)
-            .await
             .unwrap();
         assert_eq!(metadata.path, Some(vec![src, mid, dst]));
     }

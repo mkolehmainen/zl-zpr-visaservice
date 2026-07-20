@@ -9,12 +9,31 @@ use tokio::time::Instant;
 
 use crate::db::{DbConnection, DbOp, DbResult, LockDescriptor};
 
+/// Fault-injection mode for a specific write op, used by write-through tests.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FaultMode {
+    /// No fault: op behaves normally.
+    #[default]
+    None,
+    /// Return an error without applying the mutation.
+    Reject,
+    /// Apply the mutation but still return an error (simulates an ambiguous
+    /// commit where the reply was lost).
+    ApplyThenError,
+}
+
 #[allow(dead_code)]
 pub struct FakeDb {
     store: DashMap<String, Entry>,
 
     // All the operations take read lock except *_atomic ones which take write lock.
     lock: RwLock<()>,
+
+    // Sticky fault injected on the corresponding op until reset. std Mutex is
+    // fine: no await is held across it.
+    set_ex_fault: std::sync::Mutex<FaultMode>,
+    del_fault: std::sync::Mutex<FaultMode>,
 }
 
 #[allow(dead_code)]
@@ -37,8 +56,27 @@ impl FakeDb {
         FakeDb {
             store: DashMap::new(),
             lock: RwLock::new(()),
+            set_ex_fault: std::sync::Mutex::new(FaultMode::None),
+            del_fault: std::sync::Mutex::new(FaultMode::None),
         }
     }
+
+    /// Inject a fault mode on the next (and subsequent) `set_ex` calls.
+    #[allow(dead_code)]
+    pub fn set_set_ex_fault(&self, mode: FaultMode) {
+        *self.set_ex_fault.lock().unwrap() = mode;
+    }
+
+    /// Inject a fault mode on the next (and subsequent) `del` calls.
+    #[allow(dead_code)]
+    pub fn set_del_fault(&self, mode: FaultMode) {
+        *self.del_fault.lock().unwrap() = mode;
+    }
+}
+
+/// A generic redis-shaped error to surface an injected fault.
+fn injected_fault_err() -> redis::RedisError {
+    redis::RedisError::from((redis::ErrorKind::UnexpectedReturnType, "injected fault"))
 }
 
 impl Entry {
@@ -188,11 +226,18 @@ impl DbConnection for FakeDb {
 
     /// Set a string value with expiration.
     async fn set_ex(&self, key: &str, value: &str, seconds: u64) -> DbResult<()> {
+        let fault = *self.set_ex_fault.lock().unwrap();
+        if fault == FaultMode::Reject {
+            return Err(injected_fault_err());
+        }
         let _rlock = self.lock.read().await;
         self.store.insert(
             key.to_string(),
             Entry::new_ex(FakeDbValue::Str(value.to_string()), seconds),
         );
+        if fault == FaultMode::ApplyThenError {
+            return Err(injected_fault_err());
+        }
         Ok(())
     }
 
@@ -260,8 +305,16 @@ impl DbConnection for FakeDb {
 
     /// Delete a key.
     async fn del(&self, key: &str) -> DbResult<()> {
+        let fault = *self.del_fault.lock().unwrap();
+        if fault == FaultMode::Reject {
+            return Err(injected_fault_err());
+        }
         let _rlock = self.lock.read().await;
-        self.del_with_lock(key).await
+        self.del_with_lock(key).await?;
+        if fault == FaultMode::ApplyThenError {
+            return Err(injected_fault_err());
+        }
+        Ok(())
     }
 
     /// Get all members of a set.  Returns empty set if key does not exist.
@@ -441,6 +494,11 @@ impl DbConnection for FakeDb {
     /// To simulate atomic we take a lock that prevents all the other operations
     /// from running.
     async fn atomic_pipeline(&self, ops: &[DbOp]) -> DbResult<()> {
+        // Models Redis MULTI/EXEC atomicity: a Reject fails the whole pipeline
+        // before any op applies, so callers can test the all-or-nothing contract.
+        if *self.set_ex_fault.lock().unwrap() == FaultMode::Reject {
+            return Err(injected_fault_err());
+        }
         let _wlock = self.lock.write().await;
         for op in ops {
             match op {

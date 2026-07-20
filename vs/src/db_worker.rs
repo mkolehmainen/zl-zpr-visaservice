@@ -1,19 +1,30 @@
+//! Background worker for keeping the visa service database lock alive.
+//!
+//! The service uses a shared database-backed lock to make sure only one visa
+//! service instance is active at a time. This worker renews that lock while the
+//! process runs and terminates the process if the lock is lost or too close to
+//! expiry, preventing split-brain behavior where two instances might issue or
+//! mutate visas concurrently.
+
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{error, trace, warn};
 
-use crate::assembly::Assembly;
 use crate::config;
-use crate::db::LockDescriptor;
+use crate::db::{DbConnection, LockDescriptor};
 
-pub async fn launch(asm: Arc<Assembly>, vslock: LockDescriptor) {
+/// Renew the DB instance lock on a timer, shutting the process down if the lock
+/// is lost or renewal is failing so long that expiry is imminent. Takes the db
+/// handle directly (not the full Assembly) so it can be spawned immediately
+/// after lock acquisition, before the rest of startup.
+pub async fn launch(db: Arc<dyn DbConnection>, vslock: LockDescriptor) {
     let mut last_renewed = Instant::now();
     let mut delay = config::VALKEY_LOCK_REFRESH_SECS;
     loop {
         tokio::time::sleep(delay).await;
-        match asm.state_db.acquire_or_renew_lock(&vslock).await {
+        match db.acquire_or_renew_lock(&vslock).await {
             Ok(true) => {
                 last_renewed = Instant::now();
                 delay = config::VALKEY_LOCK_REFRESH_SECS;
