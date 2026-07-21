@@ -96,7 +96,7 @@ struct VisaRecord {
 #[derive(Debug, Clone)]
 struct NodeState {
     state: NodeVisaState,
-    revoke_vinst: Option<u64>, // TODO: will be stamped with a policy `vinst` when marked PendingRevoke
+    revoke_vinst: Option<u64>, // policy `vinst` stamped when the node was marked PendingRevoke
 }
 
 /// In-memory, authoritative copy of one visa.
@@ -119,13 +119,14 @@ struct VisaEntry {
 
 /// The in-memory store guarded by a single `RwLock`.
 ///
-/// INVARIANT C: `visas` and `by_node` must be updated under the same `store`
-/// write guard; a reader must never see one without the other. Today the single
-/// `store` lock gives this for free (both live behind one guard).
+/// INVARIANT C: `visas`, `by_node`, and `by_actor` must be updated under the
+/// same `store` write guard; a reader must never see one without the others.
+/// Today the single `store` lock gives this for free (all live behind one guard).
 #[derive(Default)]
 struct VisaStoreInner {
     visas: HashMap<u64, VisaEntry>,
     by_node: HashMap<IpAddr, HashSet<u64>>, // secondary index for per-node queries
+    by_actor: HashMap<IpAddr, HashSet<u64>>, // five-tuple src/dst endpoints
 }
 
 /// Cheap cloneable handle. `VisaRepo` owns the in-memory store, so it cannot be
@@ -219,11 +220,10 @@ impl VisaRepo {
     /// Remove all references to a visa: DEL the Redis key, then drop it from
     /// memory (Redis first so memory never claims state persistence lacks).
     ///
-    /// TODO: Will be used by future `remove_visa` function.
-    #[allow(dead_code)]
-    async fn clean_up(&self, visa_id: u64) -> Result<(), StoreError> {
+    pub async fn remove_visa(&self, visa_id: u64) -> Result<(), StoreError> {
         // INVARIANT A: backing held for the whole write.
         let _backing = self.inner.backing.lock().await;
+
         let key = visa_key_for_visa(visa_id);
         // Redis first. On an ApplyThenError-style ambiguous DEL we still return
         // the error and keep the memory entry; a later rewrite recreates the key.
@@ -388,44 +388,110 @@ impl VisaRepo {
         Ok(())
     }
 
-    /// Update the state for the given node/visa. Rewrites the record with the
-    /// remaining TTL (Redis first, memory second).
-    pub async fn update_node_visa_state(
-        &self,
-        node_addr: &IpAddr,
-        visa_id: u64,
-        new_state: NodeVisaState,
-    ) -> Result<(), StoreError> {
+    /// Snapshot of `(visa_id, metadata)` for all live entries, cloned under the
+    /// read lock. Used by policy-update sweep (when new policy installed).
+    pub async fn list_visa_metadata(&self) -> Vec<(u64, VisaMetadata)> {
+        let store = self.inner.store.read().unwrap();
+        store
+            .visas
+            .iter()
+            .filter(|(_, e)| remaining_secs(e.deadline) > 0)
+            .map(|(id, e)| (*id, e.metadata.clone()))
+            .collect()
+    }
+
+    /// Apply an allow verdict at policy generation `vinst`. This happens after a policy
+    /// update and we are checking all existing visas.
+    ///
+    /// No-ops (`Ok(false)`) when the visa is absent/expired or `vinst` is not
+    /// newer than `checked_vinst` (never lowered). Otherwise bumps
+    /// `checked_vinst` and cancels any queued revoke whose stamp predates
+    /// `vinst` (`PendingRevoke -> PendingInstall`, stamp cleared) in one rewrite.
+    pub async fn record_allow_verdict(&self, visa_id: u64, vinst: u64) -> Result<bool, StoreError> {
         // INVARIANT A: backing held for the whole write.
         let _backing = self.inner.backing.lock().await;
 
-        // Snapshot + build the record under a short read guard, run the
-        // not-found / ttl==0 checks, then drop the guard for the Redis I/O.
-        //
-        // INVARIANT B: safe to drop the read guard — backing blocks other
-        // writers, so this entry can't change under us before the apply.
-        let (json, ttl, new_states) = {
+        // Snapshot + decide under a short read guard, then drop it for the Redis
+        // I/O. INVARIANT B: backing blocks other writers, so the entry can't
+        // change between this check and the apply below.
+        let (json, ttl, new_metadata, new_states) = {
             let store = self.inner.store.read().unwrap();
-            let entry = live_entry(&store, visa_id).ok_or_else(|| {
-                StoreError::NotFound(format!("node-visa record not found: {node_addr} {visa_id}"))
-            })?;
-            if !entry.node_states.contains_key(node_addr) {
-                return Err(StoreError::NotFound(format!(
-                    "node-visa record not found: {node_addr} {visa_id}"
-                )));
+            let Some(entry) = live_entry(&store, visa_id) else {
+                return Ok(false);
+            };
+            if vinst <= entry.metadata.checked_vinst {
+                return Ok(false);
             }
             let ttl = remaining_secs(entry.deadline);
-            if ttl == 0 {
-                return Err(StoreError::NotFound(format!(
-                    "node-visa record not found: {node_addr} {visa_id}"
-                )));
-            }
+            let mut new_metadata = entry.metadata.clone();
+            new_metadata.checked_vinst = vinst;
             let mut new_states = entry.node_states.clone();
-            new_states.get_mut(node_addr).unwrap().state = new_state;
+            for ns in new_states.values_mut() {
+                if ns.state == NodeVisaState::PendingRevoke
+                    && ns.revoke_vinst.is_some_and(|rv| rv < vinst)
+                {
+                    // Was marked for revocation but now is allowed, flip it.
+                    ns.state = NodeVisaState::PendingInstall;
+                    ns.revoke_vinst = None;
+                }
+            }
+            let record = build_record(&entry.visa, &new_metadata, &new_states)?;
+            (
+                serde_json::to_string(&record)?,
+                ttl,
+                new_metadata,
+                new_states,
+            )
+        };
+        // Redis first.
+        self.inner
+            .db
+            .set_ex(&visa_key_for_visa(visa_id), &json, ttl)
+            .await?;
+        // Memory second. If purge_expired dropped the entry during the set_ex
+        // gap the visa expired mid-update; skipping the apply is correct.
+        if let Some(entry) = self.inner.store.write().unwrap().visas.get_mut(&visa_id) {
+            entry.metadata = new_metadata;
+            entry.node_states = new_states;
+        }
+        debug!(target: DB, "recorded allow verdict visa={visa_id} vinst={vinst}");
+        Ok(true)
+    }
+
+    /// Apply a deny verdict at policy generation `vinst`. This happens after a
+    /// policy update and we are checking all existing visas.
+    ///
+    /// No-ops (`Ok(false)`) when the visa is absent/expired or `vinst` is not
+    /// newer than `checked_vinst`. Otherwise marks every node `PendingRevoke`,
+    /// stamping `revoke_vinst = vinst` only where it exceeds the existing stamp
+    /// (a revoke decision overwrites `PendingInstall`/`Installed` freely). One
+    /// rewrite. `checked_vinst` is not bumped (only allow bumps it).
+    pub async fn record_deny_verdict(&self, visa_id: u64, vinst: u64) -> Result<bool, StoreError> {
+        // INVARIANT A: backing held for the whole write.
+        let _backing = self.inner.backing.lock().await;
+
+        // Snapshot + decide under a short read guard, then drop it for the Redis
+        // I/O. INVARIANT B: backing blocks other writers, so the entry can't
+        // change between this check and the apply below.
+        let (json, ttl, new_states) = {
+            let store = self.inner.store.read().unwrap();
+            let Some(entry) = live_entry(&store, visa_id) else {
+                return Ok(false);
+            };
+            if vinst <= entry.metadata.checked_vinst {
+                return Ok(false);
+            }
+            let ttl = remaining_secs(entry.deadline);
+            let mut new_states = entry.node_states.clone();
+            for ns in new_states.values_mut() {
+                ns.state = NodeVisaState::PendingRevoke;
+                if ns.revoke_vinst.is_none_or(|rv| vinst > rv) {
+                    ns.revoke_vinst = Some(vinst); // still revoked!
+                }
+            }
             let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
             (serde_json::to_string(&record)?, ttl, new_states)
         };
-
         // Redis first.
         self.inner
             .db
@@ -436,9 +502,144 @@ impl VisaRepo {
         if let Some(entry) = self.inner.store.write().unwrap().visas.get_mut(&visa_id) {
             entry.node_states = new_states;
         }
+        Ok(true)
+    }
 
-        debug!(target: DB, "updated nodevisa state node={node_addr} visa={visa_id} -> {new_state:?}");
-        Ok(())
+    /// Mark every node of a live visa `PendingRevoke`, unconditionally (no vinst
+    /// gate, no `checked_vinst` bump). For actor/node departure: the visa is
+    /// invalid regardless of policy, so leave each node's `revoke_vinst`
+    /// untouched -- a fresh revoke keeps `None`, which `record_allow_verdict`'s
+    /// `rv < vinst` test can never cancel, so a later allow cannot resurrect it.
+    /// No-ops (`Ok(false)`) when the visa is absent/expired.
+    pub async fn mark_visa_revoked(&self, visa_id: u64) -> Result<bool, StoreError> {
+        // INVARIANT A: backing held for the whole write.
+        let _backing = self.inner.backing.lock().await;
+
+        let (json, ttl, new_states) = {
+            let store = self.inner.store.read().unwrap();
+            let Some(entry) = live_entry(&store, visa_id) else {
+                return Ok(false);
+            };
+            let ttl = remaining_secs(entry.deadline);
+            let mut new_states = entry.node_states.clone();
+            for ns in new_states.values_mut() {
+                ns.state = NodeVisaState::PendingRevoke; // revoke_vinst left as-is
+            }
+            let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
+            (serde_json::to_string(&record)?, ttl, new_states)
+        };
+        // Redis first.
+        self.inner
+            .db
+            .set_ex(&visa_key_for_visa(visa_id), &json, ttl)
+            .await?;
+        // Memory second. A purge during the I/O gap means the visa expired;
+        // skipping the apply is correct.
+        if let Some(entry) = self.inner.store.write().unwrap().visas.get_mut(&visa_id) {
+            entry.node_states = new_states;
+        }
+        Ok(true)
+    }
+
+    /// Compare-and-swap one node's state: apply `new` only if the node is
+    /// currently in `expected`. Not-found/expired or state mismatch -> `Ok(false)`.
+    pub async fn transition_node_visa_state(
+        &self,
+        node_addr: IpAddr,
+        visa_id: u64,
+        expected: NodeVisaState,
+        new: NodeVisaState,
+    ) -> Result<bool, StoreError> {
+        // INVARIANT A: backing held for the whole write.
+        let _backing = self.inner.backing.lock().await;
+
+        // Snapshot + CAS-check under a short read guard, then drop it for the
+        // Redis I/O. INVARIANT B: backing blocks other writers, so the entry
+        // can't change between this check and the apply below.
+        let (json, ttl, new_states) = {
+            let store = self.inner.store.read().unwrap();
+            let Some(entry) = live_entry(&store, visa_id) else {
+                return Ok(false);
+            };
+            if entry
+                .node_states
+                .get(&node_addr)
+                .is_none_or(|ns| ns.state != expected)
+            {
+                return Ok(false);
+            }
+            let ttl = remaining_secs(entry.deadline);
+            let mut new_states = entry.node_states.clone();
+            new_states.get_mut(&node_addr).unwrap().state = new;
+            let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
+            (serde_json::to_string(&record)?, ttl, new_states)
+        };
+        // Redis first.
+        self.inner
+            .db
+            .set_ex(&visa_key_for_visa(visa_id), &json, ttl)
+            .await?;
+        // Memory second. If purge_expired dropped the entry during the set_ex
+        // gap the visa expired mid-update; skipping the apply is correct.
+        if let Some(entry) = self.inner.store.write().unwrap().visas.get_mut(&visa_id) {
+            entry.node_states = new_states;
+        }
+        debug!(target: DB, "transitioned node={node_addr} visa={visa_id} {expected:?} -> {new:?}");
+        Ok(true)
+    }
+
+    /// Conditional teardown: drop `node_addr` from the visa's `node_states` (and
+    /// the `by_node` index) only if its state is `PendingRevoke`. Rewrites the
+    /// record. Returns true if node was removed.
+    pub async fn remove_node_if_pending_revoke(
+        &self,
+        node_addr: IpAddr,
+        visa_id: u64,
+    ) -> Result<bool, StoreError> {
+        // INVARIANT A: backing held for the whole write.
+        let _backing = self.inner.backing.lock().await;
+
+        // Snapshot + check under a short read guard, then drop it for the Redis
+        // I/O. INVARIANT B: backing blocks other writers, so the entry can't
+        // change between this check and the apply below.
+        let (json, ttl, new_states) = {
+            let store = self.inner.store.read().unwrap();
+            let Some(entry) = live_entry(&store, visa_id) else {
+                return Ok(false);
+            };
+            if entry
+                .node_states
+                .get(&node_addr)
+                .is_none_or(|ns| ns.state != NodeVisaState::PendingRevoke)
+            {
+                return Ok(false);
+            }
+            let ttl = remaining_secs(entry.deadline);
+            let mut new_states = entry.node_states.clone();
+            new_states.remove(&node_addr);
+            let record = build_record(&entry.visa, &entry.metadata, &new_states)?;
+            (serde_json::to_string(&record)?, ttl, new_states)
+        };
+        // Redis first.
+        self.inner
+            .db
+            .set_ex(&visa_key_for_visa(visa_id), &json, ttl)
+            .await?;
+        // Memory second. If purge_expired dropped the entry during the set_ex
+        // gap the visa expired mid-update; skipping the apply is correct.
+        let mut store = self.inner.store.write().unwrap();
+        if let Some(entry) = store.visas.get_mut(&visa_id) {
+            entry.node_states = new_states;
+        }
+        unindex_node(&mut store, &node_addr, visa_id);
+        debug!(target: DB, "removed pending-revoke node={node_addr} from visa={visa_id}");
+        Ok(true)
+    }
+
+    /// Whether a given live visa still references any node.
+    pub async fn visa_has_node_refs(&self, visa_id: u64) -> bool {
+        let store = self.inner.store.read().unwrap();
+        live_entry(&store, visa_id).is_some_and(|e| !e.node_states.is_empty())
     }
 
     /// All visas for a node in the given state (blobs cloned from memory).
@@ -462,6 +663,42 @@ impl VisaRepo {
         let store = self.inner.store.read().unwrap();
         let mut ids = Vec::new();
         for_each_node_visa_in_state(&store, node_addr, state, |id, _| ids.push(id));
+        Ok(ids)
+    }
+
+    /// Live visa IDs having any of `actor_addrs` as a five-tuple endpoint.
+    /// O(matched visas), not O(all visas). Returns `Result` for signature
+    /// consistency with the `get_*` query family though it never errors.
+    pub fn get_visa_ids_for_actors(&self, actor_addrs: &[IpAddr]) -> Result<Vec<u64>, StoreError> {
+        let store = self.inner.store.read().unwrap();
+        // HashSet: a src/dst pair or overlapping input addrs can hit one id twice.
+        let mut ids = HashSet::new();
+        for addr in actor_addrs {
+            if let Some(set) = store.by_actor.get(addr) {
+                ids.extend(
+                    set.iter()
+                        .copied()
+                        .filter(|&id| live_entry(&store, id).is_some()),
+                );
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
+    /// All live visa IDs referencing this node, in any per-node state.
+    /// O(matched visas), not O(all visas).
+    pub fn get_all_visa_ids_for_node(&self, node_addr: &IpAddr) -> Result<Vec<u64>, StoreError> {
+        let store = self.inner.store.read().unwrap();
+        let ids = store
+            .by_node
+            .get(node_addr)
+            .map(|set| {
+                set.iter()
+                    .copied()
+                    .filter(|&id| live_entry(&store, id).is_some())
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(ids)
     }
 
@@ -706,33 +943,50 @@ fn for_each_node_visa_in_state<F: FnMut(u64, &VisaEntry)>(
     }
 }
 
-/// Insert an entry and index all its nodes in `by_node`.
+/// Insert an entry and index it in `by_node` (path nodes) and `by_actor`
+/// (five-tuple endpoints).
 fn insert_entry(inner: &mut VisaStoreInner, id: u64, entry: VisaEntry) {
     let nodes: Vec<IpAddr> = entry.node_states.keys().copied().collect();
+    let ft = &entry.metadata.five_tuple;
+    let actors = [ft.source_addr, ft.dest_addr];
     inner.visas.insert(id, entry);
     for node in nodes {
         inner.by_node.entry(node).or_default().insert(id);
     }
+    for actor in actors {
+        inner.by_actor.entry(actor).or_default().insert(id);
+    }
 }
 
-/// Remove an entry and unindex all its nodes.
+/// Remove an entry and unindex it from both `by_node` and `by_actor`.
 fn remove_entry(inner: &mut VisaStoreInner, id: u64) {
     if let Some(entry) = inner.visas.remove(&id) {
+        let ft = &entry.metadata.five_tuple;
+        for actor in [ft.source_addr, ft.dest_addr] {
+            unindex(&mut inner.by_actor, &actor, id);
+        }
         let nodes: Vec<IpAddr> = entry.node_states.keys().copied().collect();
         for node in nodes {
-            unindex_node(inner, &node, id);
+            unindex(&mut inner.by_node, &node, id);
         }
     }
 }
 
-/// Drop `id` from the `by_node` row for `node`, removing the row if it empties.
-fn unindex_node(inner: &mut VisaStoreInner, node: &IpAddr, id: u64) {
-    if let Some(set) = inner.by_node.get_mut(node) {
+/// Drop `id` from `index[key]`, removing the row if it empties.
+fn unindex(index: &mut HashMap<IpAddr, HashSet<u64>>, key: &IpAddr, id: u64) {
+    if let Some(set) = index.get_mut(key) {
         set.remove(&id);
         if set.is_empty() {
-            inner.by_node.remove(node);
+            index.remove(key);
         }
     }
+}
+
+/// Drop `id` from the `by_node` row for `node`. Thin wrapper over `unindex` so
+/// the state-mutation call sites (`clear_node_state`, `remove_node_if_pending_revoke`)
+/// don't churn.
+fn unindex_node(inner: &mut VisaStoreInner, node: &IpAddr, id: u64) {
+    unindex(&mut inner.by_node, node, id);
 }
 
 // Get number of seconds until the given SystemTime or zero if in the past.
@@ -823,9 +1077,16 @@ mod test {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].issuer_id, 42);
 
-        repo.update_node_visa_state(&node_addr, 42, NodeVisaState::Installed)
+        assert!(
+            repo.transition_node_visa_state(
+                node_addr,
+                42,
+                NodeVisaState::PendingInstall,
+                NodeVisaState::Installed
+            )
             .await
-            .unwrap();
+            .unwrap()
+        );
         let pending = repo
             .get_visas_for_node_by_state(&node_addr, NodeVisaState::PendingInstall)
             .unwrap();
@@ -836,19 +1097,6 @@ mod test {
             .unwrap();
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].issuer_id, 42);
-    }
-
-    #[tokio::test]
-    async fn test_update_node_visa_state_missing() {
-        let db = Arc::new(FakeDb::new());
-        let repo = VisaRepo::new(db, 1).await.unwrap();
-        let node_addr: IpAddr = "fd5a:5052::2".parse().unwrap();
-
-        let err = repo
-            .update_node_visa_state(&node_addr, 99, NodeVisaState::Installed)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StoreError::NotFound(_)));
     }
 
     /// clear_node_state drops the node from a visa's states and the by_node
@@ -939,26 +1187,6 @@ mod test {
         // Not written
         let store = repo.inner.store.read().unwrap();
         assert!(!store.visas.contains_key(&8));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_update_node_visa_state_after_expiry() {
-        let db = Arc::new(FakeDb::new());
-        let repo = VisaRepo::new(db, 1).await.unwrap();
-        let node_addr: IpAddr = "fd5a:5052::5".parse().unwrap();
-        let visa = make_visa(9, Duration::from_secs(5));
-
-        repo.store_visa(&visa, md(node_addr), NodeVisaState::PendingInstall)
-            .await
-            .unwrap();
-
-        tokio::time::advance(Duration::from_secs(6)).await;
-
-        let err = repo
-            .update_node_visa_state(&node_addr, 9, NodeVisaState::Installed)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StoreError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -1385,9 +1613,16 @@ mod test {
             .unwrap();
         assert_memory_matches_redis(&repo, &db, 300).await;
 
-        repo.update_node_visa_state(&node, 300, NodeVisaState::Installed)
+        assert!(
+            repo.transition_node_visa_state(
+                node,
+                300,
+                NodeVisaState::PendingInstall,
+                NodeVisaState::Installed
+            )
             .await
-            .unwrap();
+            .unwrap()
+        );
         assert_memory_matches_redis(&repo, &db, 300).await;
     }
 
@@ -1468,9 +1703,14 @@ mod test {
             .unwrap();
 
         db.set_set_ex_fault(FaultMode::ApplyThenError);
-        repo.update_node_visa_state(&node, 403, NodeVisaState::Installed)
-            .await
-            .unwrap_err();
+        repo.transition_node_visa_state(
+            node,
+            403,
+            NodeVisaState::PendingInstall,
+            NodeVisaState::Installed,
+        )
+        .await
+        .unwrap_err();
 
         // Memory kept the old state; Redis diverged to the new one.
         {
@@ -1499,9 +1739,16 @@ mod test {
 
         // A clean mutation converges both.
         db.set_set_ex_fault(FaultMode::None);
-        repo.update_node_visa_state(&node, 403, NodeVisaState::Installed)
+        assert!(
+            repo.transition_node_visa_state(
+                node,
+                403,
+                NodeVisaState::PendingInstall,
+                NodeVisaState::Installed
+            )
             .await
-            .unwrap();
+            .unwrap()
+        );
         assert_memory_matches_redis(&repo, &db, 403).await;
     }
 
@@ -1518,16 +1765,23 @@ mod test {
             .unwrap();
 
         db.set_del_fault(FaultMode::ApplyThenError);
-        repo.clean_up(404).await.unwrap_err();
+        repo.remove_visa(404).await.unwrap_err();
         // Redis key gone, memory keeps the entry.
         assert!(!db.exists("visa:404").await.unwrap());
         assert!(repo.inner.store.read().unwrap().visas.contains_key(&404));
 
         // A rewrite recreates the key.
         db.set_del_fault(FaultMode::None);
-        repo.update_node_visa_state(&node, 404, NodeVisaState::Installed)
+        assert!(
+            repo.transition_node_visa_state(
+                node,
+                404,
+                NodeVisaState::PendingInstall,
+                NodeVisaState::Installed
+            )
             .await
-            .unwrap();
+            .unwrap()
+        );
         assert!(db.exists("visa:404").await.unwrap());
 
         // The recreated key has a finite TTL: advancing past expiry removes it.
@@ -1572,7 +1826,7 @@ mod test {
             assert!(store.by_node.get(&node_c).unwrap().contains(&500));
         }
 
-        repo.clean_up(500).await.unwrap();
+        repo.remove_visa(500).await.unwrap();
         {
             let store = repo.inner.store.read().unwrap();
             assert!(store.visas.is_empty());
@@ -1606,5 +1860,349 @@ mod test {
         let store = repo.inner.store.read().unwrap();
         assert!(store.visas.is_empty());
         assert!(store.by_node.is_empty());
+    }
+
+    // --- Visa "sweep" (from policy update) / teardown tests ---
+
+    /// Store a three-node visa (requesting + two path nodes): requesting node is
+    /// `Installed`, path nodes `PendingInstall`. `vinst` seeds created/checked.
+    async fn store_three_node(
+        repo: &VisaRepo,
+        id: u64,
+        req: IpAddr,
+        b: IpAddr,
+        c: IpAddr,
+        vinst: u64,
+    ) {
+        let metadata = VisaMetadata::new(
+            req,
+            0,
+            vinst,
+            String::new(),
+            Direction::Forward,
+            Some(vec![req, b, c]),
+            &make_pdesc(),
+        );
+        let visa = make_visa(id, Duration::from_secs(60));
+        repo.store_visa(&visa, metadata, NodeVisaState::Installed)
+            .await
+            .unwrap();
+    }
+
+    /// An allow verdict cancels a queued revoke on every holder node
+    /// (`PendingRevoke -> PendingInstall`, stamp cleared) and bumps checked_vinst.
+    #[tokio::test]
+    async fn test_record_allow_cancels_queued_revokes() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let req: IpAddr = "fd5a:5052::c0".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::c1".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::c2".parse().unwrap();
+        store_three_node(&repo, 700, req, b, c, 5).await;
+
+        // Deny at 6 marks all nodes PendingRevoke (stamp 6).
+        assert!(repo.record_deny_verdict(700, 6).await.unwrap());
+        // Allow at 7 cancels them (6 < 7) and bumps checked_vinst.
+        assert!(repo.record_allow_verdict(700, 7).await.unwrap());
+
+        let store = repo.inner.store.read().unwrap();
+        let e = store.visas.get(&700).unwrap();
+        for n in [req, b, c] {
+            let ns = e.node_states.get(&n).unwrap();
+            assert_eq!(ns.state, NodeVisaState::PendingInstall);
+            assert_eq!(ns.revoke_vinst, None);
+        }
+        assert_eq!(e.metadata.checked_vinst, 7);
+    }
+
+    /// Stale verdicts no-op at the store boundary: checked_vinst is never lowered,
+    /// a stale revoke is not stamped, and a stale allow cannot cancel a newer revoke.
+    #[tokio::test]
+    async fn test_verdict_stale_guards() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let node: IpAddr = "fd5a:5052::d0".parse().unwrap();
+        let metadata = VisaMetadata::new(
+            node,
+            0,
+            5,
+            String::new(),
+            Direction::Forward,
+            None,
+            &make_pdesc(),
+        );
+        let visa = make_visa(710, Duration::from_secs(60));
+        repo.store_visa(&visa, metadata, NodeVisaState::Installed)
+            .await
+            .unwrap();
+
+        // Allow at 6 bumps checked to 6.
+        assert!(repo.record_allow_verdict(710, 6).await.unwrap());
+        // Not-newer allow (6) and stale deny (5) both no-op.
+        assert!(!repo.record_allow_verdict(710, 6).await.unwrap());
+        assert!(!repo.record_deny_verdict(710, 5).await.unwrap());
+        {
+            let store = repo.inner.store.read().unwrap();
+            let e = store.visas.get(&710).unwrap();
+            assert_eq!(e.metadata.checked_vinst, 6);
+            assert_eq!(
+                e.node_states.get(&node).unwrap().state,
+                NodeVisaState::Installed
+            );
+        }
+
+        // Deny at 7 stamps PendingRevoke; a stale allow (6) does not cancel it.
+        assert!(repo.record_deny_verdict(710, 7).await.unwrap());
+        assert!(!repo.record_allow_verdict(710, 6).await.unwrap());
+        let store = repo.inner.store.read().unwrap();
+        let ns = store
+            .visas
+            .get(&710)
+            .unwrap()
+            .node_states
+            .get(&node)
+            .unwrap();
+        assert_eq!(ns.state, NodeVisaState::PendingRevoke);
+        assert_eq!(ns.revoke_vinst, Some(7));
+    }
+
+    /// CAS transition applies only when the current state matches `expected`;
+    /// conditional teardown fires only on `PendingRevoke`.
+    #[tokio::test]
+    async fn test_transition_cas_and_conditional_teardown() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let node: IpAddr = "fd5a:5052::e0".parse().unwrap();
+        let visa = make_visa(720, Duration::from_secs(60));
+        repo.store_visa(&visa, md(node), NodeVisaState::PendingInstall)
+            .await
+            .unwrap();
+
+        // CAS PendingInstall -> Installed succeeds, then a repeat misses.
+        assert!(
+            repo.transition_node_visa_state(
+                node,
+                720,
+                NodeVisaState::PendingInstall,
+                NodeVisaState::Installed
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !repo
+                .transition_node_visa_state(
+                    node,
+                    720,
+                    NodeVisaState::PendingInstall,
+                    NodeVisaState::Installed
+                )
+                .await
+                .unwrap()
+        );
+
+        // Not PendingRevoke → teardown misses.
+        assert!(!repo.remove_node_if_pending_revoke(node, 720).await.unwrap());
+
+        // Deny → PendingRevoke, then teardown fires and clears the ref + index.
+        assert!(repo.record_deny_verdict(720, 1).await.unwrap());
+        assert!(repo.remove_node_if_pending_revoke(node, 720).await.unwrap());
+        assert!(!repo.visa_has_node_refs(720).await);
+        let store = repo.inner.store.read().unwrap();
+        assert!(!store.by_node.contains_key(&node));
+        assert!(store.visas.get(&720).unwrap().node_states.is_empty());
+    }
+
+    /// Expired visas are invisible to every Phase 2 method (before purge).
+    #[tokio::test(start_paused = true)]
+    async fn test_phase2_methods_ignore_expired() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let node: IpAddr = "fd5a:5052::f0".parse().unwrap();
+        let visa = make_visa(730, Duration::from_secs(5));
+        repo.store_visa(&visa, md(node), NodeVisaState::Installed)
+            .await
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        assert!(!repo.visa_has_node_refs(730).await);
+        assert!(
+            !repo
+                .transition_node_visa_state(
+                    node,
+                    730,
+                    NodeVisaState::Installed,
+                    NodeVisaState::PendingRevoke
+                )
+                .await
+                .unwrap()
+        );
+        assert!(!repo.record_allow_verdict(730, 99).await.unwrap());
+        assert!(!repo.record_deny_verdict(730, 99).await.unwrap());
+        assert!(repo.list_visa_metadata().await.is_empty());
+        // Still resident until purge.
+        assert!(repo.inner.store.read().unwrap().visas.contains_key(&730));
+    }
+
+    /// Verdict mutators write through (record matches memory) and a second repo
+    /// hydrated from the same DB reproduces states and revoke_vinst stamps.
+    #[tokio::test]
+    async fn test_verdict_write_through_and_hydration() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let req: IpAddr = "fd5a:5052::1a0".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::1a1".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::1a2".parse().unwrap();
+        store_three_node(&repo, 740, req, b, c, 0).await;
+
+        assert!(repo.record_deny_verdict(740, 3).await.unwrap());
+        assert_memory_matches_redis(&repo, &db, 740).await;
+        assert!(repo.remove_node_if_pending_revoke(b, 740).await.unwrap());
+        assert_memory_matches_redis(&repo, &db, 740).await;
+
+        let repo2 = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let store = repo2.inner.store.read().unwrap();
+        let e = store.visas.get(&740).unwrap();
+        assert!(e.node_states.get(&b).is_none());
+        for n in [req, c] {
+            let ns = e.node_states.get(&n).unwrap();
+            assert_eq!(ns.state, NodeVisaState::PendingRevoke);
+            assert_eq!(ns.revoke_vinst, Some(3));
+        }
+    }
+
+    /// Reject-mode fault on a verdict rewrite → error returned, memory unchanged.
+    #[tokio::test]
+    async fn test_verdict_reject_fault_leaves_memory() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let node: IpAddr = "fd5a:5052::1b0".parse().unwrap();
+        let visa = make_visa(750, Duration::from_secs(60));
+        repo.store_visa(&visa, md(node), NodeVisaState::Installed)
+            .await
+            .unwrap();
+
+        db.set_set_ex_fault(FaultMode::Reject);
+        let err = repo.record_deny_verdict(750, 5).await.unwrap_err();
+        assert!(matches!(err, StoreError::Redis(_)));
+
+        // Memory untouched: still Installed, checked_vinst still 0.
+        db.set_set_ex_fault(FaultMode::None);
+        let store = repo.inner.store.read().unwrap();
+        let e = store.visas.get(&750).unwrap();
+        assert_eq!(
+            e.node_states.get(&node).unwrap().state,
+            NodeVisaState::Installed
+        );
+        assert_eq!(e.metadata.checked_vinst, 0);
+    }
+
+    /// Build metadata whose five-tuple uses the given src/dst endpoint strings.
+    fn md_ft(node: IpAddr, src: &str, dst: &str) -> VisaMetadata {
+        let pdesc = PacketDesc::new_tcp(src, dst, 1234, 443).unwrap();
+        VisaMetadata::new(node, 0, 0, String::new(), Direction::Forward, None, &pdesc)
+    }
+
+    /// Two visas sharing the same endpoints both resolve for either endpoint;
+    /// removing one leaves the other resolvable and the removed id gone.
+    #[tokio::test]
+    async fn test_get_visa_ids_for_actors_shared_endpoint() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db, 1).await.unwrap();
+        let node: IpAddr = "fd5a:5052::100".parse().unwrap();
+        // md() five-tuple endpoints are ::10 (src) and ::20 (dst).
+        let src: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let dst: IpAddr = "fd5a:5052::20".parse().unwrap();
+
+        for id in [200u64, 201] {
+            let visa = make_visa(id, Duration::from_secs(60));
+            repo.store_visa(&visa, md(node), NodeVisaState::Installed)
+                .await
+                .unwrap();
+        }
+
+        for actor in [src, dst] {
+            let mut ids = repo.get_visa_ids_for_actors(&[actor]).unwrap();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![200, 201]);
+        }
+
+        repo.remove_visa(200).await.unwrap();
+        assert_eq!(repo.get_visa_ids_for_actors(&[src]).unwrap(), vec![201]);
+    }
+
+    /// An expired entry still sitting in `by_actor` (purge not yet run) is
+    /// filtered out of the query by the liveness check.
+    #[tokio::test(start_paused = true)]
+    async fn test_get_visa_ids_for_actors_filters_expired() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db, 1).await.unwrap();
+        let node: IpAddr = "fd5a:5052::101".parse().unwrap();
+        let src: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let visa = make_visa(210, Duration::from_secs(60));
+        repo.store_visa(&visa, md(node), NodeVisaState::Installed)
+            .await
+            .unwrap();
+
+        assert_eq!(repo.get_visa_ids_for_actors(&[src]).unwrap(), vec![210]);
+
+        // Age past expiry without running purge; the id lingers in by_actor.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(repo.get_visa_ids_for_actors(&[src]).unwrap().is_empty());
+    }
+
+    /// When one actor is both src and dst of a visa, it resolves to a single id
+    /// (no duplicate from the two by_actor rows collapsing to one).
+    #[tokio::test]
+    async fn test_get_visa_ids_for_actors_dedup() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db, 1).await.unwrap();
+        let node: IpAddr = "fd5a:5052::102".parse().unwrap();
+        let actor: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let visa = make_visa(220, Duration::from_secs(60));
+        repo.store_visa(
+            &visa,
+            md_ft(node, "fd5a:5052::10", "fd5a:5052::10"),
+            NodeVisaState::Installed,
+        )
+        .await
+        .unwrap();
+
+        // Same actor passed twice as well: still exactly one id.
+        assert_eq!(
+            repo.get_visa_ids_for_actors(&[actor, actor]).unwrap(),
+            vec![220]
+        );
+    }
+
+    /// `mark_visa_revoked` flips every node PendingRevoke (leaving revoke_vinst
+    /// untouched), keeps Redis and memory in agreement, and no-ops on a missing
+    /// id.
+    #[tokio::test]
+    async fn test_mark_visa_revoked_write_through() {
+        let db = Arc::new(FakeDb::new());
+        let repo = VisaRepo::new(db.clone(), 1).await.unwrap();
+        let req: IpAddr = "fd5a:5052::f0".parse().unwrap();
+        let b: IpAddr = "fd5a:5052::f1".parse().unwrap();
+        let c: IpAddr = "fd5a:5052::f2".parse().unwrap();
+        store_three_node(&repo, 800, req, b, c, 5).await;
+
+        assert!(repo.mark_visa_revoked(800).await.unwrap());
+        {
+            let store = repo.inner.store.read().unwrap();
+            let e = store.visas.get(&800).unwrap();
+            for n in [req, b, c] {
+                let ns = e.node_states.get(&n).unwrap();
+                assert_eq!(ns.state, NodeVisaState::PendingRevoke);
+                assert_eq!(ns.revoke_vinst, None); // no vinst stamp
+            }
+            // checked_vinst untouched (not a policy event).
+            assert_eq!(e.metadata.checked_vinst, 5);
+        }
+        assert_memory_matches_redis(&repo, &db, 800).await;
+
+        // Missing id is a no-op.
+        assert!(!repo.mark_visa_revoked(999).await.unwrap());
     }
 }

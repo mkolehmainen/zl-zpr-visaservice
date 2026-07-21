@@ -19,6 +19,7 @@ use crate::assembly::Assembly;
 use crate::error::ServiceError;
 use crate::logging::targets::EVENT;
 use crate::policy_mgr::PolicySnapshot;
+use crate::visa_mgr::VisaRecheck;
 
 pub enum VsEvent {
     /// Use _after_ actor has been authenticated and the datastore updated.
@@ -162,19 +163,12 @@ async fn set_services_all_nodes(
 
 async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), ServiceError> {
     /*
-
     https://github.com/org-zpr/zpr-visaservice/issues/219
 
 
     When we get here we have already updated policy.
 
-    - are there any existing visas that need to be revoked.
-       - do we have the 5-tuple or whatever so that we can check them? NO, this is a TODO.
-
-    - check our existing topology.
-       - Are all the nodes and links still valid?
-
-    - request re-auth all nodes.
+    - TODO: request re-auth all nodes.
 
     - clear revocation list? May make more sense to keep it and make admin clear manually.
 
@@ -187,7 +181,6 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     - all connected adapters.  Are they still allowed?
        - Well we could expire all the auth, but that seems drastic.
        - Instead we will have already killed visas. Probably ok to let them be connected but unable to do anything.
-
      */
 
     // Grab one consistent policy snapshot and use it for the entire synchronize-to-policy
@@ -265,6 +258,10 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         }
     }
 
+    // Re-check existing visas against the new policy. Runs last so route checks
+    // and the nodes' own link state already reflect the updated topology.
+    revalidate_visas_against_policy(asm, &psnap).await;
+
     Ok(())
 }
 
@@ -328,18 +325,108 @@ async fn node_still_valid(asm: &Arc<Assembly>, ectx: &EvalContext, naddr: &IpAdd
     }
 }
 
+/// Sweep every live visa and re-evaluate it against the updated policy
+/// snapshot. Allowed visas get their `checked_vinst` bumped (and any queued
+/// revoke canceled); denied visas are marked `PendingRevoke` on all their nodes
+/// so VSS housekeeping revokes them.
+///
+/// A visa already checked at/after `target_vinst` is skipped. Visas whose
+/// actors can't be resolved are skipped (not revoked). A deny is only applied
+/// while `target_vinst` is still the live policy generation — otherwise a newer
+/// sweep is coming and will decide.
+async fn revalidate_visas_against_policy(asm: &Arc<Assembly>, psnap: &PolicySnapshot) {
+    let target_vinst = psnap.vinst();
+    let snapshot = asm.visa_mgr.list_visa_metadata().await;
+
+    // Some numbers for logging purposes.
+    let total = snapshot.len();
+    let mut allowed = 0u32;
+    let mut revoked = 0u32;
+    let mut skipped_stale = 0u32;
+    let mut skipped_unresolved = 0u32;
+    let mut skipped_current = 0u32;
+
+    for (visa_id, metadata) in snapshot {
+        if metadata.checked_vinst >= target_vinst {
+            skipped_current += 1;
+            continue;
+        }
+        match asm
+            .visa_mgr
+            .recheck_visa_allowed(asm, &metadata, psnap)
+            .await
+        {
+            Ok(VisaRecheck::SkipUnresolvedActor) => {
+                skipped_unresolved += 1;
+                debug!(target: EVENT, "visa sweep: visa {visa_id} actor unresolved, skipping");
+            }
+            Ok(VisaRecheck::AllowSameRoute) => {
+                // Allowed. Only apply while target_vinst is still the live policy;
+                // otherwise an older sweep could cancel a newer revoke verdict.
+                if asm.policy_mgr.get_current_snapshot().vinst() != target_vinst {
+                    skipped_stale += 1;
+                    continue;
+                }
+                match asm
+                    .visa_mgr
+                    .record_allow_verdict(visa_id, target_vinst)
+                    .await
+                {
+                    Ok(_) => allowed += 1,
+                    Err(e) => {
+                        warn!(target: EVENT, "visa sweep: failed to record allow for visa {visa_id}: {e}")
+                    }
+                }
+            }
+            Ok(VisaRecheck::Revoke) => {
+                // Denied, or allowed but rerouted. Only apply while target_vinst
+                // is still the live policy; otherwise a newer sweep is coming and
+                // will make the decision.
+                if asm.policy_mgr.get_current_snapshot().vinst() != target_vinst {
+                    skipped_stale += 1;
+                    continue;
+                }
+                match asm
+                    .visa_mgr
+                    .record_deny_verdict(visa_id, target_vinst)
+                    .await
+                {
+                    Ok(_) => revoked += 1,
+                    Err(e) => {
+                        warn!(target: EVENT, "visa sweep: failed to record deny for visa {visa_id}: {e}")
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(target: EVENT, "visa sweep: error re-checking visa {visa_id}: {e}");
+            }
+        }
+    }
+
+    // Note that this sweep just manipulates the desired state of the visas. The
+    // actual revocations happen asynchronously in VSS housekeeping.
+    info!(
+        target: EVENT,
+        "visa sweep vinst={target_vinst}: total={total} allowed={allowed} revoked={revoked} skipped_stale={skipped_stale} skipped_unresolved={skipped_unresolved} skipped_current={skipped_current}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::assembly::tests::new_assembly_for_tests;
+    use crate::assembly::tests::{make_policy, new_assembly_for_tests};
     use crate::config;
-    use crate::test_helpers::{make_container_bytes, make_node_actor_defexp};
-
+    use crate::test_helpers::{
+        make_adapter_actor_defexp, make_container_bytes, make_node_actor_defexp,
+    };
     use libeval::attribute::{Attribute, key};
+    use libeval::eval_result::{Direction, Hit};
+    use libeval::route::{LinkId, Route};
     use std::time::Duration;
     use zpr::policy::v1 as capnp_policy;
     use zpr::policy_types::{JoinPolicy, PFlags, Scope, Service, ServiceType};
+    use zpr::vsapi_types::PacketDesc;
     use zpr::write_to::WriteTo;
 
     /// Build a policy container whose single join policy marks connections as
@@ -510,5 +597,177 @@ mod tests {
         let (valid, invalid) = revalidate_nodes(&asm, &psnap).await.unwrap();
         assert!(valid.is_empty());
         assert!(invalid.is_empty());
+    }
+
+    /// Build an assembly with two docked adapters (`::4000::a`/`::4000::b`) whose
+    /// nodes are in the topology. `with_link` controls whether a route exists.
+    /// The default (empty) policy denies everything (NoMatch), so with a route
+    /// present the eval still denies — either way the sweep sees a deny.
+    async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
+        let asm = new_assembly_for_tests(None).await;
+        let node_a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052:3000::1", "na", "10.0.0.1:1"),
+                false,
+            )
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052:3000::2", "nb", "10.0.0.2:2"),
+                false,
+            )
+            .await
+            .unwrap();
+        asm.topo_mgr.add_node(node_a).unwrap();
+        asm.topo_mgr.add_node(node_b).unwrap();
+        if with_link {
+            asm.topo_mgr
+                .add_link(node_a, node_b, LinkId("l".into()), vec![], 1)
+                .unwrap();
+        }
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &make_adapter_actor_defexp("fd5a:5052:4000::a", "src"),
+                &node_a,
+            )
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &make_adapter_actor_defexp("fd5a:5052:4000::b", "dst"),
+                &node_b,
+            )
+            .await
+            .unwrap();
+        (Arc::new(asm), node_a)
+    }
+
+    /// Create a single-node visa held (PendingInstall) by `req` for the given
+    /// five-tuple, seeded at `vinst`. Returns its id.
+    async fn create_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: u64) -> u64 {
+        let pdesc =
+            PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
+        let hit = Hit::new_no_signal(0, Direction::Forward);
+        let route = Route::new_direct((*req).into());
+        let vwmd = asm
+            .visa_mgr
+            .create_visa(asm, req, &pdesc, &hit, &route, "", 0, vinst)
+            .await
+            .unwrap();
+        vwmd.visa.issuer_id
+    }
+
+    /// A denied visa is marked PendingRevoke on its holder node (target policy
+    /// still live). Uses the no-route assembly so eval falls out as a deny.
+    #[tokio::test]
+    async fn test_sweep_denied_visa_marked_pending_revoke() {
+        let (asm, node_a) = build_sweep_asm(false).await;
+        let id = create_sweep_visa(&asm, &node_a, 0).await;
+
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        assert!(
+            psnap.vinst() > 0,
+            "target must exceed the visa's checked_vinst"
+        );
+        revalidate_visas_against_policy(&asm, &psnap).await;
+
+        let revoke_ids = asm
+            .visa_mgr
+            .get_pending_revoke_visa_ids_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(revoke_ids, vec![id]);
+    }
+
+    /// A visa already checked at/after target_vinst is skipped before re-eval:
+    /// even on the deny (no-route) assembly it is NOT marked PendingRevoke.
+    #[tokio::test]
+    async fn test_sweep_skips_already_checked() {
+        let (asm, node_a) = build_sweep_asm(false).await;
+        let target = asm.policy_mgr.get_current_snapshot().vinst();
+        // checked_vinst == target, so the guard skips before recheck.
+        let id = create_sweep_visa(&asm, &node_a, target).await;
+
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        revalidate_visas_against_policy(&asm, &psnap).await;
+
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap()
+                .is_empty(),
+            "already-checked visa must not be re-evaluated/revoked"
+        );
+        let pending = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(pending, vec![id]);
+    }
+
+    /// An unresolvable actor leaves the visa untouched (skipped, not revoked).
+    #[tokio::test]
+    async fn test_sweep_unresolved_actor_leaves_visa_untouched() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        // Five-tuple addrs (::4000::a/b) have no actors in the DB → unresolved.
+        let id = create_sweep_visa(&asm, &node, 0).await;
+
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        revalidate_visas_against_policy(&asm, &psnap).await;
+
+        // Still held as PendingInstall (untouched); nothing marked for revoke.
+        let pending = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(&node)
+            .await
+            .unwrap();
+        assert_eq!(pending, vec![id]);
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A deny whose target vinst is no longer the live policy generation is
+    /// skipped (a newer sweep is coming): no revoke is marked.
+    #[tokio::test]
+    async fn test_sweep_denied_but_stale_target_skips() {
+        let (asm, node_a) = build_sweep_asm(false).await;
+        let id = create_sweep_visa(&asm, &node_a, 0).await;
+
+        // Snapshot the current (stale) generation, then bump the live policy so
+        // get_current_snapshot().vinst() moves past the snapshot's vinst.
+        let stale_psnap = asm.policy_mgr.get_current_snapshot();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy("2024-01-02T00:00:00Z", 2, Some("m")))
+            .await
+            .unwrap();
+        assert!(asm.policy_mgr.get_current_snapshot().vinst() > stale_psnap.vinst());
+
+        revalidate_visas_against_policy(&asm, &stale_psnap).await;
+
+        // No revoke marked; the visa stays PendingInstall.
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let pending = asm
+            .visa_mgr
+            .get_pending_visa_ids_for_node(&node_a)
+            .await
+            .unwrap();
+        assert_eq!(pending, vec![id]);
     }
 }

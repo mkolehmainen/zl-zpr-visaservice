@@ -707,45 +707,24 @@ async fn get_related_visas(
     }
     debug!(target: ADMIN, "GET /admin/actors/{}/visas", cn);
 
-    // TODO: Waiting on another PR which reworks how the visa_mgr stores visas, once that is in
-    // place we will add appropriate index for this query. Currently this needs to look at
-    // every visa.
-
     let (actor_addr, visa_mgr) = match resolve_actor_addr(&state, &cn, false).await {
         Ok(pair) => pair,
         Err(code) => return (code, Json(Vec::<ListEntry>::new())),
     };
 
-    let mut related_visas: Vec<ListEntry> = Vec::new();
-
-    let visa_ids = match visa_mgr.list_all_visa_ids().await {
-        Ok(ids) => ids,
+    match visa_mgr.get_visa_ids_for_actors(&[actor_addr]).await {
+        Ok(ids) => (
+            StatusCode::OK,
+            Json(ids.into_iter().map(|id| ListEntry { id }).collect()),
+        ),
         Err(e) => {
-            error!(target: ADMIN, "list_all_visa_ids failed: {e}");
-            return (
+            error!(target: ADMIN, "get_visa_ids_for_actors failed: {e}");
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(Vec::<ListEntry>::new()),
-            );
-        }
-    };
-    for visa_id in visa_ids {
-        // Only the five-tuple is needed here, so fetch the visa without its metadata.
-        match visa_mgr.get_visa_by_id(visa_id).await {
-            Ok(Some(visa)) => {
-                if let Some(ftup) = visa.five_tuple() {
-                    if ftup.source_addr == actor_addr || ftup.dest_addr == actor_addr {
-                        related_visas.push(ListEntry { id: visa_id });
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(target: ADMIN, "error getting visa with id {}: {}", visa_id, e);
-            }
+            )
         }
     }
-
-    (StatusCode::OK, Json(related_visas))
 }
 
 /// List of visa IDs

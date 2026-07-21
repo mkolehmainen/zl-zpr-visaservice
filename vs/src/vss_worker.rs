@@ -14,7 +14,7 @@ use tokio_util::compat::*;
 use tracing::{debug, error, info, trace, warn};
 
 use zpr::vsapi::v1;
-use zpr::vsapi_types::{ApiResponseError, Link, Param, ServiceDescriptor, Visa, pname};
+use zpr::vsapi_types::{ApiResponseError, Link, Param, ServiceDescriptor, Visa, VisaOp, pname};
 use zpr::write_to::WriteTo;
 
 use crate::assembly::Assembly;
@@ -149,8 +149,8 @@ pub async fn vss_worker_loop(
                                 asm.counters.incr(CounterType::VssErrors);
                             }
                         }
-                        VssCmd::RevokeVisasById(_visa_id, resp_tx) => {
-                            if let Err(e) = resp_tx.send(Err(VssSyncError::Internal("revoke-visas not implemented".to_string()))) {
+                        VssCmd::RevokeVisasById(visa_ids, resp_tx) => {
+                            if let Err(e) = resp_tx.send(vss_do_revoke_visas(&vss_handle, &visa_ids).await) {
                                 error!(target: VSS, "failed to send response for revoke-visas command: {:?}", e);
                                 asm.counters.incr(CounterType::VssErrors);
                             }
@@ -303,8 +303,8 @@ async fn do_housekeeping(
     }
 
     send_pending_visas(asm, node_addr, vss_handle).await;
+    send_pending_revokes(asm, node_addr, vss_handle).await;
 
-    // TODO: Check for pending visa revocations.
     // TODO: Check for pending authentication revocations.
 }
 
@@ -361,6 +361,46 @@ async fn send_pending_visas(
         }
         Err(e) => {
             warn!(target: VSS, "failed to get pending visas for node {}: {}", node_addr, e);
+        }
+    }
+}
+
+/// If there are visas pending revocation for this node, send the revokes over
+/// VSS and tear down the acked ones. Mirrors `send_pending_visas`.
+///
+/// No per-id staleness re-check is needed: allow verdicts cancel queued revokes
+/// under the same store lock that marks them, so a `PendingRevoke` with a newer
+/// allow cannot exist in memory.
+async fn send_pending_revokes(
+    asm: &Assembly,
+    node_addr: &IpAddr,
+    vss_handle: &v1::v_s_s_handle::Client,
+) {
+    let ids = match asm
+        .visa_mgr
+        .get_pending_revoke_visa_ids_for_node(node_addr)
+        .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(target: VSS, "failed to get pending-revoke visas for node {}: {}", node_addr, e);
+            return;
+        }
+    };
+    if ids.is_empty() {
+        return; // Nothing to revoke; skip the RPC.
+    }
+
+    match vss_do_revoke_visas(vss_handle, &ids).await {
+        Ok(processed) => {
+            // Tear down state for the acked ids (same prefix convention as install).
+            for &id in ids.iter().take(processed) {
+                asm.visa_mgr.revoke_acked(*node_addr, id).await;
+            }
+            debug!(target: VSS, "revoked {} of {} pending visas on node {}", processed, ids.len(), node_addr);
+        }
+        Err(e) => {
+            error!(target: VSS, "failed to revoke {} pending visas on node {}: {}", ids.len(), node_addr, e);
         }
     }
 }
@@ -527,21 +567,21 @@ fn check_ok_or_error(r: v1::ok_or_error::Reader<'_>) -> Result<(), VssSyncError>
     }
 }
 
-/// Performt he VSS push_visas call, returns the number of visas positively ack'd by node.
-/// Treats zero visas processed as an error.
-async fn vss_do_push_visas(
+/// Send a batch of visa ops (grants and/or revokes) via the VSS `push_visa_op`
+/// call. Returns the number of ops positively ack'd by the node. Treats zero
+/// ops processed as an error.
+async fn vss_do_visa_ops(
     vss_handle: &v1::v_s_s_handle::Client,
-    visas: &[Visa],
+    ops: &[VisaOp],
 ) -> Result<usize, VssSyncError> {
     let mut req = vss_handle.push_visa_op_request();
     let req_builder = req.get();
-    let mut ops_list_builder = req_builder.init_ops(visas.len() as u32);
+    let mut ops_list_builder = req_builder.init_ops(ops.len() as u32);
 
-    // A VisaOp is either a Grant or a Revoke; these are all GRANTs here.
-    for (i, visa) in visas.iter().enumerate() {
-        let op_builder = ops_list_builder.reborrow().get(i as u32);
-        let mut grant_builder = op_builder.init_grant();
-        visa.write_to(&mut grant_builder);
+    // Each VisaOp writes itself as either a Grant or a RevokeVisaId.
+    for (i, op) in ops.iter().enumerate() {
+        let mut op_builder = ops_list_builder.reborrow().get(i as u32);
+        op.write_to(&mut op_builder);
     }
 
     let push_response_rdr =
@@ -550,22 +590,40 @@ async fn vss_do_push_visas(
     // Response is an Ack struct (TODO: Add this to the vsapi types in zpr-common)
     let ack_response = push_response_rdr.get()?.get_ack()?;
     if ack_response.get_ok() {
-        // At least one visa was processed. In this case we return the number processed and
+        // At least one op was processed. In this case we return the number processed and
         // log the error (if any).
         let processed = ack_response.get_processed() as usize;
-        if processed < visas.len() {
+        if processed < ops.len() {
             let err_rdr = ack_response.get_error()?;
             let err_obj = ApiResponseError::try_from(err_rdr)?;
-            error!(target: VSS, "push-visas partially succeeded: {} of {} processed, error code={:?} msg={}",
-            processed, visas.len(), err_obj.code, err_obj.message);
+            error!(target: VSS, "visa-ops partially succeeded: {} of {} processed, error code={:?} msg={}",
+            processed, ops.len(), err_obj.code, err_obj.message);
         }
         return Ok(processed);
     } else {
-        // No visas were processed.  Return error or zero ?? Not sure.
+        // No ops were processed.  Return error or zero ?? Not sure.
         let err_rdr = ack_response.get_error()?;
         let err_obj = ApiResponseError::try_from(err_rdr)?;
         return Err(err_obj.into());
     }
+}
+
+/// Push visa grants to the node, returning the number positively ack'd.
+async fn vss_do_push_visas(
+    vss_handle: &v1::v_s_s_handle::Client,
+    visas: &[Visa],
+) -> Result<usize, VssSyncError> {
+    let ops: Vec<VisaOp> = visas.iter().cloned().map(VisaOp::Grant).collect();
+    vss_do_visa_ops(vss_handle, &ops).await
+}
+
+/// Revoke visas on the node by ID, returning the number positively ack'd.
+async fn vss_do_revoke_visas(
+    vss_handle: &v1::v_s_s_handle::Client,
+    ids: &[u64],
+) -> Result<usize, VssSyncError> {
+    let ops: Vec<VisaOp> = ids.iter().map(|id| VisaOp::RevokeVisaId(*id)).collect();
+    vss_do_visa_ops(vss_handle, &ops).await
 }
 
 async fn vss_do_set_services(

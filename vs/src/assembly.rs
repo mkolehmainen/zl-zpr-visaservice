@@ -66,7 +66,8 @@ pub mod tests {
 
     use zpr::policy::v1;
 
-    fn make_policy(created: &str, version: u64, metadata: Option<&str>) -> Vec<u8> {
+    // "pub" as this is used in some other tests too.
+    pub fn make_policy(created: &str, version: u64, metadata: Option<&str>) -> Vec<u8> {
         let mut msg = capnp::message::Builder::new_default();
         {
             let mut policy_bldr = msg.init_root::<v1::policy::Builder>();

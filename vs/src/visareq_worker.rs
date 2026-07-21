@@ -50,6 +50,19 @@ pub enum VisaDecision {
     Deny(DenyCode),
 }
 
+/// Outcome of running resolved actors and a packet through policy (docking-node
+/// resolution, routing, and eval). Shared by the request path and the
+/// policy-update visa sweep so both run identical policy logic.
+pub(crate) enum PolicyOutcome {
+    // default_route: None => route came from the hit (NeedsRoute-allow);
+    // Some(best) => the AllowWithoutRoute case.
+    Allow {
+        hits: Vec<Hit>,
+        default_route: Option<Route>,
+    },
+    Deny(DenyCode),
+}
+
 /// The result is either a [Visa], or a regular denial, or there was an unexpected failure
 /// and you get a [ServiceError].
 pub type VisaRequestResult = Result<VisaDecision, ServiceError>;
@@ -224,111 +237,124 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         return Ok(VisaDecision::Deny(DenyCode::DestNotFound));
     };
 
-    // Find the docking nodes for each actor. For AAA actors (unauthenticated adapters
-    // fabricated during anonymous auth), the docking node is looked up from the AAA table
-    // registered on the request side, rather than from the connection table.
-    let node_addr_a = match asm.actor_mgr.get_docking_node_for_actor(&source_actor) {
-        Some(node_addr) => node_addr,
-        None => match asm.actor_mgr.get_docking_node_for_aaa(source_zpr_addr) {
-            Some(node_addr) => node_addr,
-            None => {
-                warn!(target: VREQ,
-                    "visa request from {:?} denied: source actor {:?} is not docked to any node",
-                    job.requesting_node, source_actor
-                );
-                return Ok(VisaDecision::Deny(DenyCode::SourceNotFound));
-            }
-        },
+    // Docking-node resolution, routing, and policy eval all live in the shared
+    // core (used by the Phase 2 sweep too). Actor resolution above stays
+    // per-caller — the request path fabricates AAA and denies on missing.
+    let policy = asm.policy_mgr.get_current();
+    let outcome = evaluate_against_policy(
+        &asm,
+        &source_actor,
+        &dest_actor,
+        source_zpr_addr,
+        dest_zpr_addr,
+        &job.packet_desc,
+        &policy,
+    )
+    .await?;
+
+    match outcome {
+        PolicyOutcome::Allow {
+            hits,
+            default_route,
+        } => visa_from_allow(asm.clone(), job, &hits, &policy, default_route).await,
+        PolicyOutcome::Deny(code) => Ok(VisaDecision::Deny(code)),
+    }
+}
+
+/// Resolve an actor's docking node: the connection-table entry, falling back to
+/// the AAA table for fabricated anonymous actors. `None` means undocked.
+pub(crate) fn resolve_docking_node(
+    asm: &Assembly,
+    actor: &Actor,
+    zpr_addr: &IpAddr,
+) -> Option<IpAddr> {
+    asm.actor_mgr
+        .get_docking_node_for_actor(actor)
+        .or_else(|| asm.actor_mgr.get_docking_node_for_aaa(zpr_addr))
+}
+
+/// Shared policy-evaluation core: resolve both docking nodes, require a route,
+/// then run the actors and packet through the policy (handling `NeedsRoute` route
+/// evaluation). An undocked endpoint or no best route falls out as `Deny`.
+pub(crate) async fn evaluate_against_policy(
+    asm: &Assembly,
+    src: &Actor,
+    dst: &Actor,
+    src_zpr: &IpAddr,
+    dst_zpr: &IpAddr,
+    pkt: &PacketDesc,
+    policy: &Arc<Policy>,
+) -> Result<PolicyOutcome, ServiceError> {
+    // For AAA actors the docking node comes from the AAA table registered on the
+    // request side rather than the connection table.
+    let Some(node_addr_a) = resolve_docking_node(asm, src, src_zpr) else {
+        warn!(target: VREQ, "eval denied: source actor {src:?} is not docked to any node");
+        return Ok(PolicyOutcome::Deny(DenyCode::SourceNotFound));
     };
-    let node_addr_b = match asm.actor_mgr.get_docking_node_for_actor(&dest_actor) {
-        Some(node_addr) => node_addr,
-        None => match asm.actor_mgr.get_docking_node_for_aaa(dest_zpr_addr) {
-            Some(node_addr) => node_addr,
-            None => {
-                warn!(target: VREQ,
-                    "visa request from {:?} denied: dest actor {:?} is not docked to any node",
-                    job.requesting_node, dest_actor
-                );
-                return Ok(VisaDecision::Deny(DenyCode::DestNotFound));
-            }
-        },
+    let Some(node_addr_b) = resolve_docking_node(asm, dst, dst_zpr) else {
+        warn!(target: VREQ, "eval denied: dest actor {dst:?} is not docked to any node");
+        return Ok(PolicyOutcome::Deny(DenyCode::DestNotFound));
     };
 
     // When the evaluator does not care about the route, we use the "best" route.
     // And if there is no route at all then we don't bother evaluating.
     let Some(default_route) = asm.topo_mgr.get_best_route(&node_addr_a, &node_addr_b) else {
-        info!(target: VREQ,
-            "visa request from {:?} denied: no route between {:?} and {:?}",
-            job.requesting_node, node_addr_a, node_addr_b
-        );
-        return Ok(VisaDecision::Deny(DenyCode::NoRoute));
+        info!(target: VREQ, "eval denied: no route between {node_addr_a:?} and {node_addr_b:?}");
+        return Ok(PolicyOutcome::Deny(DenyCode::NoRoute));
     };
 
-    let policy = asm.policy_mgr.get_current();
     let ctx = EvalContext::new(policy.clone());
-    let decision = match ctx.eval_request(&source_actor, &dest_actor, &job.packet_desc) {
-        Ok(decision) => decision,
-        Err(e) => {
-            debug!(target: VREQ,
-                "error evaluating visa request from {:?}: {}",
-                job.requesting_node, e
-            );
-            return Err(e.into());
-        }
-    };
+    let decision = ctx.eval_request(src, dst, pkt)?;
 
     match decision {
         PartialEvalResult::Deny(FinalDeny::NoMatch(message)) => {
-            info!(target: VREQ,
-                "visa request from {:?} denied (no match): {}",
-                job.requesting_node, message
-            );
-            Ok(VisaDecision::Deny(DenyCode::NoMatch))
+            info!(target: VREQ, "eval denied (no match): {message}");
+            Ok(PolicyOutcome::Deny(DenyCode::NoMatch))
         }
-        PartialEvalResult::AllowWithoutRoute(hits) => {
-            visa_from_allow(asm.clone(), job, &hits, &policy, Some(default_route)).await
-        }
+        PartialEvalResult::AllowWithoutRoute(hits) => Ok(PolicyOutcome::Allow {
+            hits,
+            default_route: Some(default_route),
+        }),
         PartialEvalResult::Deny(FinalDeny::Deny(_hits)) => {
-            info!(target: VREQ,
-                "visa request from {:?} denied by policy",
-                job.requesting_node
-            );
-            Ok(VisaDecision::Deny(DenyCode::Denied))
+            info!(target: VREQ, "eval denied by policy");
+            Ok(PolicyOutcome::Deny(DenyCode::Denied))
         }
         PartialEvalResult::NeedsRoute(residual_evaluator) => {
             let hint = residual_evaluator.hint();
-            let routes = asm
-                .topo_mgr
-                .get_routes(source_zpr_addr, dest_zpr_addr, hint);
-
-            match residual_evaluator.eval_routes(&routes, &asm.topo_mgr) {
-                // TODO: Note that when we get a match using routes, the route it returned in the hit.
-                Ok(FinalEvalResult::Allow(hits)) => {
-                    visa_from_allow(asm.clone(), job, &hits, &policy, None).await
+            let routes = asm.topo_mgr.get_routes(src_zpr, dst_zpr, hint);
+            match residual_evaluator.eval_routes(&routes, &asm.topo_mgr)? {
+                // TODO: Note that when we get a match using routes, the route is returned in the hit.
+                FinalEvalResult::Allow(hits) => Ok(PolicyOutcome::Allow {
+                    hits,
+                    default_route: None,
+                }),
+                FinalEvalResult::Deny(_hits) => {
+                    info!(target: VREQ, "eval denied by policy with routes");
+                    Ok(PolicyOutcome::Deny(DenyCode::Denied))
                 }
-                Ok(FinalEvalResult::Deny(_hits)) => {
-                    info!(target: VREQ,
-                        "visa request from {:?} denied by policy with routes",
-                        job.requesting_node
-                    );
-                    Ok(VisaDecision::Deny(DenyCode::Denied))
-                }
-                Ok(FinalEvalResult::NoMatch(message)) => {
-                    info!(target: VREQ,
-                        "visa request from {:?} denied (no match using route): {}",
-                        job.requesting_node, message
-                    );
-                    Ok(VisaDecision::Deny(DenyCode::NoMatch))
-                }
-                Err(e) => {
-                    debug!(target: VREQ,
-                        "error evaluating route for visa request from {:?}: {}",
-                        job.requesting_node, e
-                    );
-                    return Err(e.into());
+                FinalEvalResult::NoMatch(message) => {
+                    info!(target: VREQ, "eval denied (no match using route): {message}");
+                    Ok(PolicyOutcome::Deny(DenyCode::NoMatch))
                 }
             }
         }
+    }
+}
+
+/// Pick the route for an allow decision: the first hit's own route if it has
+/// one, else the supplied default route. Shared by the request path
+/// (`visa_from_allow`) and the sweep recheck so route selection stays identical.
+pub(crate) fn route_for_allow(
+    hits: &[Hit],
+    default_route: Option<Route>,
+) -> Result<Route, ServiceError> {
+    match hits[0].route.as_ref() {
+        Some(route) => Ok(route.clone()),
+        None => default_route.ok_or_else(|| {
+            ServiceError::Internal(
+                "policy allowed visa but no route in hit and no default route".into(),
+            )
+        }),
     }
 }
 
@@ -385,14 +411,7 @@ async fn visa_from_allow(
         .unwrap_or("")
         .to_string();
 
-    let allowed_route: Route = match hits[0].route.as_ref() {
-        Some(route) => route.clone(),
-        None => default_route.ok_or_else(|| {
-            ServiceError::Internal(
-                "policy allowed visa but no route in hit and no default route".into(),
-            )
-        })?,
-    };
+    let allowed_route: Route = route_for_allow(hits, default_route)?;
 
     let visawmd = asm
         .visa_mgr
