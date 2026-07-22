@@ -65,7 +65,12 @@ pub fn load_policy(fpath: &Path, min_version: &Version) -> Result<Policy, Policy
     load_policy_from_container(&encoded_container_bytes, min_version)
 }
 
-/// Returns an error if the `found_version` is not compatible with the `min_version`.
+/// Returns an error if the `found_version` is not compatible with the
+/// `min_version`.
+///
+/// For now (pre version 1.0.0) we require that the major and minor versions
+/// match exactly, and the patch version must be greater than or equal to the
+/// minimum required.
 fn check_version(found_version: &Version, min_version: &Version) -> Result<(), PolicyError> {
     if found_version.0 != min_version.0 {
         return Err(PolicyError::PolicyVersionError(format!(
@@ -73,9 +78,9 @@ fn check_version(found_version: &Version, min_version: &Version) -> Result<(), P
         )));
     }
     // Majors match, so check minor & patch.
-    if found_version.1 < min_version.1 {
+    if found_version.1 != min_version.1 {
         return Err(PolicyError::PolicyVersionError(format!(
-            "policy file minor version {found_version} is less than required minimum {min_version}",
+            "policy file minor version {found_version} does not match required minimum {min_version}",
         )));
     } else if found_version.1 == min_version.1 {
         if found_version.2 < min_version.2 {
@@ -98,8 +103,8 @@ mod test {
         let found_ok = vec![
             Version(5, 6, 7),
             Version(5, 6, 8),
-            Version(5, 7, 0),
-            Version(5, 8, 9),
+            Version(5, 6, 9),
+            Version(5, 6, 1000),
         ];
         for v in found_ok {
             assert!(
@@ -111,6 +116,7 @@ mod test {
         }
 
         let found_nogood = vec![
+            Version(5, 7, 0),
             Version(4, 9, 9),
             Version(6, 0, 0),
             Version(5, 5, 9),

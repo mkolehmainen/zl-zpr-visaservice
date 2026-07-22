@@ -1,7 +1,7 @@
 # minimal config so that we can test parsing the RFC zpl
 
 [nodes.n0]
-provider = [["endpoint.zpr.adapter.cn", "node.zpr.org"]]
+provider = [["device.zpr.adapter.cn", "node.zpr.org"]]
 zpr_address = "fd5a:5052:90de::1"
 
 [trusted_services.default]
@@ -17,6 +17,6 @@ port = 80
 
 [services.webs]
 protocol = "http"
-provider = [[ "endpoint.zpr.adapter.cn", "foo.fee" ]]
+provider = [[ "device.zpr.adapter.cn", "foo.fee" ]]
 
 

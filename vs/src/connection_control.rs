@@ -39,7 +39,7 @@ use crate::error::ServiceError;
 use crate::logging::targets::CC;
 
 // TODO: move to libeval
-const CLASS_ENDPOINT: &str = "endpoint";
+const CLASS_DEVICE: &str = "device";
 const CLASS_USER: &str = "user";
 const CLASS_SERVICE: &str = "service";
 
@@ -544,9 +544,9 @@ fn check_required_claims(claims: &[Claim], required: &[&str]) -> Result<(), Serv
 //   - zpr.addr -> which is interpreted as a request adapter ZPR address.
 //
 // Also cannot have <class>.zpr.* except:
-//   - endpoint.zpr.adapter.cn -> which is the CN of the adapter as told to the node.
+//   - device.zpr.adapter.cn -> which is the CN of the adapter as told to the node.
 //
-// Note classes are endpoint, user, service (as per ZPL and the compiler).
+// Note classes are device, user, service (as per ZPL and the compiler).
 //
 // Finally, the incoming VSAPI "Claims" are converted into libeval "Attributes" and returned.
 fn scrub_adapter_claims(claims: Vec<Claim>) -> Result<Vec<Attribute>, ServiceError> {
@@ -565,15 +565,15 @@ fn scrub_adapter_claims(claims: Vec<Claim>) -> Result<Vec<Attribute>, ServiceErr
 
         let parts: Vec<&str> = claim.key.split('.').collect();
         if parts.len() >= 2 && parts[1] == "zpr" {
-            // Only permissible is endpoint.zpr.adapter.cn
+            // Only permissible is device.zpr.adapter.cn
             if claim.key == key::CN {
-                // Allow endpoint.zpr.adapter.cn
+                // Allow device.zpr.adapter.cn
                 scrubbed_claims.push(Attribute::builder(claim.key).value(claim.value));
                 continue;
             }
 
             // We only check for the defined classes.
-            if parts[0] == CLASS_ENDPOINT || parts[0] == CLASS_USER || parts[0] == CLASS_SERVICE {
+            if parts[0] == CLASS_DEVICE || parts[0] == CLASS_USER || parts[0] == CLASS_SERVICE {
                 warn!(target: CC, "adapter claim key '{}' not allowed", claim.key);
                 continue;
             }
@@ -667,18 +667,18 @@ mod tests {
             claim("zpr.role", "adapter"),
             claim("zpr.services", "svc-a"),
             claim(key::ZPR_ADDR, "fd5a:5052:90de::2"),
-            claim("endpoint.label", "edge"),
+            claim("device.label", "edge"),
         ];
 
         let scrubbed = scrub_adapter_claims(claims).expect("scrub should succeed");
 
-        assert_eq!(keys(&scrubbed), vec![key::ZPR_ADDR, "endpoint.label"]);
+        assert_eq!(keys(&scrubbed), vec![key::ZPR_ADDR, "device.label"]);
     }
 
     #[test]
     fn scrub_adapter_claims_blocks_class_zpr_for_known_classes() {
         let claims = vec![
-            claim("endpoint.zpr.adapter.token", "nope"),
+            claim("device.zpr.adapter.token", "nope"),
             claim("user.zpr.name", "nope"),
             claim("service.zpr.name", "nope"),
             claim(key::CN, "allowed-cn"),

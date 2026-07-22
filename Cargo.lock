@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "admin-api-types"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "colored",
@@ -2103,7 +2103,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libeval"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "capnp",
@@ -4393,7 +4393,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vs"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "admin-api-types",
  "arc-swap",
@@ -4447,7 +4447,7 @@ dependencies = [
 
 [[package]]
 name = "vs-admin"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "admin-api-types",
  "base64",
@@ -5248,8 +5248,8 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zpr"
-version = "0.19.2"
-source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.19.2#2a4c9857ab8772fb4328bf9e9d94c0c99e6e9ad5"
+version = "0.20.0"
+source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.20.0#76b909ebce8d865b99fd6659ffda7b560423f120"
 dependencies = [
  "base64",
  "bytes",
@@ -5270,7 +5270,7 @@ dependencies = [
 
 [[package]]
 name = "zpt"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "capnp",

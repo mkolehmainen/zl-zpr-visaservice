@@ -464,7 +464,7 @@ mod test {
     use zpr::policy_types::{AttrExp, AttrOp, NetAddr, Peering};
     use zpr::write_to::WriteTo;
 
-    const MIN_COMPILER_VERSION: Version = Version(0, 9, 2);
+    const MIN_COMPILER_VERSION: Version = Version(0, 13, 0);
 
     fn read_policy_from_test_file(filename: &str) -> Policy {
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();

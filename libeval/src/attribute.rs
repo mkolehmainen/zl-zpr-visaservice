@@ -21,7 +21,7 @@ pub mod key {
     pub const ACTOR_HASH: &str = "zpr.actor_hash";
 
     /// CN value
-    pub const CN: &str = "endpoint.zpr.adapter.cn";
+    pub const CN: &str = "device.zpr.adapter.cn";
 
     /// "zpr.authority" attribute key
     pub const AUTHORITY: &str = "zpr.authority";
@@ -30,7 +30,7 @@ pub mod key {
     pub const CONFIG_ID: &str = "zpr.config_id";
 
     /// AAA network in CIDR notation
-    pub const AAA_NET: &str = "endpoint.zpr.node.aaa_net";
+    pub const AAA_NET: &str = "device.zpr.node.aaa_net";
 
     /// Substrate address is a SocketAddr.to_string()
     pub const SUBSTRATE_ADDR: &str = "zpr.substrate_addr";

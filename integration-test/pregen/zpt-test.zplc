@@ -1,6 +1,6 @@
 
 [nodes.n0]
-provider = [["endpoint.zpr.adapter.cn", "node.zpr.org"]]
+provider = [["device.zpr.adapter.cn", "node.zpr.org"]]
 zpr_address = "fd5a:5052:90de::1"
 
 
@@ -8,9 +8,9 @@ zpr_address = "fd5a:5052:90de::1"
 api = "validation/2"
 client = "AuthService"
 cert_path = "include/bas-tls.crt"
-returns_attributes = [ "tint -> endpoint.tint", "color -> user.color", "bas_id -> user.bas_id", "hard -> #endpoint.hardened" ]
+returns_attributes = [ "tint -> device.tint", "color -> user.color", "bas_id -> user.bas_id", "hard -> #device.hardened" ]
 identity_attributes = [ "bas_id" ]
-provider = [[ "endpoint.zpr.adapter.cn", "bas.zpr.org" ]]
+provider = [[ "device.zpr.adapter.cn", "bas.zpr.org" ]]
 
 [bootstrap]
 "bas.zpr.org" = "include/rsa-pub-key.pem"

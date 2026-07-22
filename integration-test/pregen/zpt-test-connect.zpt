@@ -1,9 +1,9 @@
 load zpt-test.bin2
 
 # test connect success
-connect --ac endpoint.zpr.adapter.cn:bas.zpr.org
+connect --ac device.zpr.adapter.cn:bas.zpr.org
 
 # test connect fails
-connect --ac endpoint.zpr.adapter.cn:bazz.zpr.org
+connect --ac device.zpr.adapter.cn:bazz.zpr.org
 
 

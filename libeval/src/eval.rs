@@ -1122,11 +1122,7 @@ mod test {
             )
             .unwrap();
         actor
-            .add_attr_from_parts(
-                "endpoint.zpr.adapter.cn",
-                "node.zpr.org",
-                Duration::from_secs(1000),
-            )
+            .add_attr_from_parts(key::CN, "node.zpr.org", Duration::from_secs(1000))
             .unwrap();
         actor
             .add_attr_from_parts(key::ROLE, ROLE_NODE, Duration::from_secs(1000))
