@@ -14,7 +14,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 
-use tracing::debug;
+use tracing::{debug, info};
 
 use libeval::attribute::{Attribute, AttributeSource};
 use libeval::policy::Policy;
@@ -121,6 +121,7 @@ impl TrustedServicesMgr {
     /// fetches fresh. Returns one result per service.
     ///
     /// For api=file trusted services, this re-reads the file.
+    #[allow(dead_code)]
     pub async fn flush_all(&self) -> Vec<Result<(), ServiceError>> {
         let snapshot = self.services.load_full();
 
@@ -132,6 +133,27 @@ impl TrustedServicesMgr {
         });
 
         join_all(futures).await
+    }
+
+    /// Flush one service. Error returned if the operation fails or service is not found.
+    ///
+    /// ### Errors
+    /// - `ServiceError::TrustedServiceNotFound` if the service with the given `source_ident` does not exist.
+    /// - Any error returned by the service's `flush` method.
+    pub async fn flush_one(&self, source_ident: &str) -> Result<(), ServiceError> {
+        let snapshot = self.services.load_full();
+
+        if let Some(svc) = snapshot
+            .iter()
+            .find(|svc| svc.get_source_id() == source_ident)
+        {
+            let svc = svc.clone();
+            return svc.flush().await;
+        }
+
+        Err(ServiceError::TrustedServiceNotFound(
+            source_ident.to_string(),
+        ))
     }
 }
 
@@ -224,7 +246,7 @@ type AttributeValue = String;
 #[derive(Debug, Deserialize, Clone)]
 struct ActorAttributes(BTreeMap<ActorId, BTreeMap<AttributeName, Vec<AttributeValue>>>);
 
-// ponytail: blocking read of a small local JSON file, at most once per `ttl` and always
+// Blocking read of a small local JSON file, at most once per `ttl` and always
 // under the refresh lock. Move to tokio::fs (or spawn_blocking, as actor_mgr.rs does) if
 // the file ever gets big enough to stall the runtime.
 fn load_actor_attributes_from_file(fp: &Path) -> Result<ActorAttributes, ServiceError> {
@@ -257,8 +279,18 @@ impl FileAttributeStore {
                 "trusted service '{id}' ttl {ttl:?} is below the minimum of {MIN_ATTRIBUTE_TTL:?}"
             )));
         }
+
+        let attributes = match load_actor_attributes_from_file(fp) {
+            Ok(attrs) => attrs,
+            Err(e) => {
+                return Err(ServiceError::TrustedServiceInit(format!(
+                    "TS '{id}' failed to read attribute data file {fp:?}: {e}"
+                )));
+            }
+        };
+
         let snapshot = Snapshot {
-            attributes: load_actor_attributes_from_file(fp)?,
+            attributes,
             expires_at: Instant::now() + ttl,
         };
         let store = FileAttributeStore {
@@ -291,6 +323,7 @@ impl FileAttributeStore {
             return Ok(snapshot);
         }
 
+        info!(target: TS, "TS {} re-loading actor attributes", self.id);
         let fresh = Arc::new(Snapshot {
             attributes: load_actor_attributes_from_file(&self.fp)?,
             expires_at: Instant::now() + self.ttl,
@@ -345,6 +378,7 @@ impl TrustedServiceInterface for FileAttributeStore {
     /// Expire the cached data in place so the next lookup re-reads the file. Reuses the
     /// normal staleness path rather than carrying a separate "force reload" flag.
     async fn flush(&self) -> Result<(), ServiceError> {
+        info!(target: TS, "TS {} flushing cached actor attributes", self.id);
         self.snapshot.rcu(|cur| Snapshot {
             attributes: cur.attributes.clone(),
             expires_at: Instant::now(),

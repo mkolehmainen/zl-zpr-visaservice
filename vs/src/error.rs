@@ -72,6 +72,9 @@ pub enum ServiceError {
 
     #[error("trusted service not found: ID={0}")]
     TrustedServiceNotFound(String),
+
+    #[error("trusted service initialization error: {0}")]
+    TrustedServiceInit(String),
 }
 
 #[derive(Debug, Error)]

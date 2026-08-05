@@ -387,8 +387,6 @@ impl ConnectionControl {
             }
         }
 
-        info!(target: CC, "XXX authorize_connection - consulting trusted services");
-
         let ectx = EvalContext::new(current_policy.clone());
 
         // TODO: Need to go in to eval and fix the approve_connection logic w/respect to the ROLE claim.

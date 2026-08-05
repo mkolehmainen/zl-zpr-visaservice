@@ -79,6 +79,9 @@ pub enum SubCmd {
         /// See more information on a specific service
         #[arg(long, short = 'i')]
         id: Option<String>,
+        /// Flush the cached attribute data for a trusted service. If flush is supplied, id must be as well
+        #[arg(long, short = 'f', requires = "id")]
+        flush: bool,
     },
 
     /// Commands related to auth revokes, provide no additional arguments to see list of IDs of all auth revokes

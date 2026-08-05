@@ -78,7 +78,7 @@ fn main() {
             visas,
         }) => exec.do_cmd_actors(cn, revoke, nodes, visas),
 
-        Some(SubCmd::Services { id }) => exec.do_cmd_services(id),
+        Some(SubCmd::Services { id, flush }) => exec.do_cmd_services(id, flush),
         // Some(SubCmd::Install {
         //     compiler_version,
         //     policy,

@@ -39,6 +39,7 @@ use crate::apikey::ApiKey;
 use crate::assembly::Assembly;
 use crate::counters::CounterType;
 use crate::db::Role;
+use crate::error::ServiceError;
 use crate::event_mgr::VsEvent;
 use crate::logging::targets::ADMIN;
 use crate::policy_mgr::DEFAULT_POLICY_ID;
@@ -173,6 +174,10 @@ fn admin_app(state: SharedState) -> Router {
         .route("/admin/nodes/{capture}/visas", get(get_visas_on_node))
         .route("/admin/services", get(get_services))
         .route("/admin/services/{capture}", get(get_service))
+        .route(
+            "/admin/services/{capture}/cache",
+            delete(flush_service_cache),
+        )
         .route("/admin/authrevoke", get(get_revokes))
         .route("/admin/authrevoke/{capture}", get(get_revoke))
         .route("/admin/authrevoke/{capture}", post(add_revoke))
@@ -831,6 +836,31 @@ async fn get_service(
             } else {
                 Err(StatusCode::NOT_FOUND)
             }
+        }
+    }
+}
+
+/// DELETE /admin/services/{id}/cache — drop a trusted service's cached attribute
+/// data so the next lookup fetches fresh.
+async fn flush_service_cache(
+    Extension(perm): Extension<Permission>,
+    State(state): State<SharedState>,
+    EPath(svc_id): EPath<String>,
+) -> StatusCode {
+    if !perm.can_write() {
+        return StatusCode::FORBIDDEN;
+    }
+    debug!(target: ADMIN, "DELETE /admin/services/{}/cache", svc_id);
+
+    // Clone the Arc and drop the read guard before awaiting the flush.
+    let ts_mgr = state.read().await.asm.ts_mgr.clone();
+
+    match ts_mgr.flush_one(&svc_id).await {
+        Ok(()) => StatusCode::OK,
+        Err(ServiceError::TrustedServiceNotFound(_)) => StatusCode::NOT_FOUND,
+        Err(e) => {
+            error!(target: ADMIN, "error flushing trusted service {}: {}", svc_id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
@@ -1984,5 +2014,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    const FLUSH_TS_ID: &str = "ts-file";
+
+    /// Minimal trusted service that only records whether it was flushed.
+    struct FlushCountingService {
+        flushes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services_mgr::TrustedServiceInterface for FlushCountingService {
+        async fn get_attributes_for_actor(
+            &self,
+            _actor_ident: &str,
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            Ok(Vec::new())
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn get_source_id(&self) -> &str {
+            FLUSH_TS_ID
+        }
+    }
+
+    /// Register one flush-counting trusted service on the assembly and return it for
+    /// assertions.
+    fn register_flush_counting_service(asm: &Arc<Assembly>) -> Arc<FlushCountingService> {
+        let svc = Arc::new(FlushCountingService {
+            flushes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        asm.ts_mgr.update_services(vec![svc.clone()]);
+        svc
+    }
+
+    /// DELETE /admin/services/{id}/cache flushes the named trusted service.
+    #[tokio::test]
+    async fn test_flush_service_cache_ok() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let svc = register_flush_counting_service(&asm);
+        let api_key = setup_test_api_rw_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/admin/services/{FLUSH_TS_ID}/cache"))
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// DELETE /admin/services/{id}/cache for an unregistered service returns NOT_FOUND.
+    #[tokio::test]
+    async fn test_flush_service_cache_unknown_not_found() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        register_flush_counting_service(&asm);
+        let api_key = setup_test_api_rw_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/services/does-not-exist/cache")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A read-only key may not flush a trusted service.
+    #[tokio::test]
+    async fn test_flush_service_cache_read_key_forbidden() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let svc = register_flush_counting_service(&asm);
+        let api_key = setup_test_api_r_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/admin/services/{FLUSH_TS_ID}/cache"))
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

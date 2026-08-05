@@ -53,7 +53,6 @@ impl Permission {
         matches!(self, Permission::Read | Permission::ReadWrite)
     }
 
-    #[allow(dead_code)]
     pub fn can_write(&self) -> bool {
         matches!(self, Permission::ReadWrite)
     }

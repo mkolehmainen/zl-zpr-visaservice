@@ -86,9 +86,16 @@ impl Executor {
         Ok(())
     }
 
-    pub fn do_cmd_services(&self, id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn do_cmd_services(
+        &self,
+        id: Option<String>,
+        flush: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match id {
-            Some(id) => self.get_service(&id)?,
+            Some(id) => match flush {
+                true => self.flush_service_cache(&id)?,
+                false => self.get_service(&id)?,
+            },
             None => self.get_services()?,
         }
         Ok(())
@@ -242,6 +249,13 @@ impl Executor {
     fn get_service(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let svc = self.vs_cli.get_service(id)?;
         println!("{svc}");
+        Ok(())
+    }
+
+    /// Flush the cached attribute data held by a trusted service.
+    fn flush_service_cache(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.vs_cli.flush_service_cache(id)?;
+        println!("flushed {id}");
         Ok(())
     }
 

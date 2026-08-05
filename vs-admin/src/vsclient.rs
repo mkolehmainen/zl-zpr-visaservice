@@ -214,6 +214,16 @@ impl VsClient {
         Ok(entry)
     }
 
+    /// `DELETE <api_url>/admin/services/<id>/cache`
+    ///
+    /// Drops the trusted service's cached attribute data so the next lookup fetches fresh.
+    pub fn flush_service_cache(&self, id: &str) -> Result<(), VsaError> {
+        let mut requrl = reqwest::Url::parse(&format!("{}/admin/services", self.api_url))?;
+        requrl.path_segments_mut().unwrap().push(id).push("cache");
+        self.ht_delete(requrl.as_str())?;
+        Ok(())
+    }
+
     /// `GET <api_url>/admin/visas`
     pub fn get_visas(&self) -> Result<Vec<u64>, VsaError> {
         let entry_vec =
