@@ -216,7 +216,8 @@ impl VsClient {
 
     /// `DELETE <api_url>/admin/services/<id>/cache`
     ///
-    /// Drops the trusted service's cached attribute data so the next lookup fetches fresh.
+    /// Reloads the trusted service's attribute data. The visa service then refreshes the
+    /// actors behind live visas and revalidates those visas asynchronously (202 Accepted).
     pub fn flush_service_cache(&self, id: &str) -> Result<(), VsaError> {
         let mut requrl = reqwest::Url::parse(&format!("{}/admin/services", self.api_url))?;
         requrl.path_segments_mut().unwrap().push(id).push("cache");

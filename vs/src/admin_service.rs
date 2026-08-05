@@ -840,8 +840,13 @@ async fn get_service(
     }
 }
 
-/// DELETE /admin/services/{id}/cache — drop a trusted service's cached attribute
-/// data so the next lookup fetches fresh.
+/// DELETE /admin/services/{id}/cache — reload a trusted service's attribute data and
+/// reconcile against it: the actors behind live visas are refreshed and their visas
+/// re-checked, so no visa keeps relying on the old data.
+///
+/// The reload is synchronous (its failure is reported to the caller); the reconciliation
+/// runs on the event worker, so success returns `202 Accepted` and the outcome shows up
+/// in the log rather than the response.
 async fn flush_service_cache(
     Extension(perm): Extension<Permission>,
     State(state): State<SharedState>,
@@ -852,11 +857,23 @@ async fn flush_service_cache(
     }
     debug!(target: ADMIN, "DELETE /admin/services/{}/cache", svc_id);
 
-    // Clone the Arc and drop the read guard before awaiting the flush.
-    let ts_mgr = state.read().await.asm.ts_mgr.clone();
+    // Clone the Arcs and drop the read guard before awaiting the flush.
+    let (ts_mgr, event_mgr) = {
+        let rstate = state.read().await;
+        (rstate.asm.ts_mgr.clone(), rstate.asm.event_mgr.clone())
+    };
 
     match ts_mgr.flush_one(&svc_id).await {
-        Ok(()) => StatusCode::OK,
+        Ok(()) => {
+            // The flush itself is done. If the event cannot be queued we lose only the
+            // sweep of existing visas -- new visa decisions are still protected by the
+            // per-actor revision check.
+            let evt = VsEvent::TrustedServiceChange(svc_id.clone());
+            if let Err(e) = event_mgr.record_event(evt).await {
+                error!(target: ADMIN, "flushed trusted service {} but could not queue revalidation: {}", svc_id, e);
+            }
+            StatusCode::ACCEPTED
+        }
         Err(ServiceError::TrustedServiceNotFound(_)) => StatusCode::NOT_FOUND,
         Err(e) => {
             error!(target: ADMIN, "error flushing trusted service {}: {}", svc_id, e);
@@ -1028,7 +1045,7 @@ mod tests {
     use zpr::vsapi_types::PacketDesc;
 
     use crate::admin_apikeys::{ApiKeyRecord, KeyStatus};
-    use crate::assembly::tests::new_assembly_for_tests;
+    use crate::assembly::tests::{new_assembly_for_tests, new_assembly_with_event_rx};
     use crate::test_helpers::{make_adapter_actor_defexp, make_node_actor_defexp};
 
     /// Insert a readwrite test key into the assembly's key store and return the
@@ -2061,7 +2078,8 @@ mod tests {
     /// DELETE /admin/services/{id}/cache flushes the named trusted service.
     #[tokio::test]
     async fn test_flush_service_cache_ok() {
-        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let (asm, mut event_rx) = new_assembly_with_event_rx(None).await;
+        let asm = Arc::new(asm);
         let svc = register_flush_counting_service(&asm);
         let api_key = setup_test_api_rw_key(&asm);
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
@@ -2077,14 +2095,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The revalidation of existing visas is queued for the event worker.
+        match event_rx.try_recv() {
+            Ok(VsEvent::TrustedServiceChange(id)) => assert_eq!(id, FLUSH_TS_ID),
+            other => panic!("expected TrustedServiceChange event, got {other:?}"),
+        }
     }
 
     /// DELETE /admin/services/{id}/cache for an unregistered service returns NOT_FOUND.
     #[tokio::test]
     async fn test_flush_service_cache_unknown_not_found() {
-        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let (asm, mut event_rx) = new_assembly_with_event_rx(None).await;
+        let asm = Arc::new(asm);
         register_flush_counting_service(&asm);
         let api_key = setup_test_api_rw_key(&asm);
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
@@ -2101,12 +2125,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // Nothing was invalidated, so nothing needs revalidating.
+        assert!(event_rx.try_recv().is_err());
     }
 
     /// A read-only key may not flush a trusted service.
     #[tokio::test]
     async fn test_flush_service_cache_read_key_forbidden() {
-        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let (asm, mut event_rx) = new_assembly_with_event_rx(None).await;
+        let asm = Arc::new(asm);
         let svc = register_flush_counting_service(&asm);
         let api_key = setup_test_api_r_key(&asm);
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
@@ -2124,5 +2151,6 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(event_rx.try_recv().is_err());
     }
 }

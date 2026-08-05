@@ -247,19 +247,13 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
 
     // If necessary, refresh any expired attributes
     // TODO: Can we parallize this?
-    if refresh_expired_attributes(&asm.ts_mgr, &mut source_actor).await {
-        // write to store
-        if let Err(e) = asm.actor_mgr.update_actor(&source_actor).await {
-            error!(target: VREQ, "failed to update source actor after refreshing attributes: {}", e);
-            return Ok(VisaDecision::Deny(DenyCode::NoReason));
-        }
+    if let Err(e) = refresh_and_persist_actor(&asm, &mut source_actor).await {
+        error!(target: VREQ, "failed to update source actor after refreshing attributes: {}", e);
+        return Ok(VisaDecision::Deny(DenyCode::NoReason));
     }
-    if refresh_expired_attributes(&asm.ts_mgr, &mut dest_actor).await {
-        // write to store
-        if let Err(e) = asm.actor_mgr.update_actor(&dest_actor).await {
-            error!(target: VREQ, "failed to update dest actor after refreshing attributes: {}", e);
-            return Ok(VisaDecision::Deny(DenyCode::NoReason));
-        }
+    if let Err(e) = refresh_and_persist_actor(&asm, &mut dest_actor).await {
+        error!(target: VREQ, "failed to update dest actor after refreshing attributes: {}", e);
+        return Ok(VisaDecision::Deny(DenyCode::NoReason));
     }
 
     // Docking-node resolution, routing, and policy eval all live in the shared
@@ -284,6 +278,22 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         } => visa_from_allow(asm.clone(), job, &hits, &policy, default_route).await,
         PolicyOutcome::Deny(code) => Ok(VisaDecision::Deny(code)),
     }
+}
+
+/// Refresh the actor's attributes (see [refresh_expired_attributes]) and persist it to
+/// the store if anything changed. Used by the request path and by the attribute-change
+/// reconciliation in `event_mgr`.
+///
+/// Returns TRUE if the actor was changed and written back.
+pub(crate) async fn refresh_and_persist_actor(
+    asm: &Assembly,
+    actor: &mut Actor,
+) -> Result<bool, ServiceError> {
+    if !refresh_expired_attributes(&asm.ts_mgr, actor).await {
+        return Ok(false);
+    }
+    asm.actor_mgr.update_actor(actor).await?;
+    Ok(true)
 }
 
 /// Refresh the actor's attributes from the trusted service manager where needed: any

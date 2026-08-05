@@ -545,6 +545,13 @@ impl VisaMgr {
         Ok(self.repo.record_deny_verdict(visa_id, vinst).await?)
     }
 
+    /// Mark every node of a visa `PendingRevoke` with no policy-generation gate. Used by
+    /// the attribute-change sweep, where the policy `vinst` has not moved and so the
+    /// verdict recorders would no-op. See [db::VisaRepo::mark_visa_revoked].
+    pub async fn mark_visa_revoked(&self, visa_id: u64) -> Result<bool, ServiceError> {
+        Ok(self.repo.mark_visa_revoked(visa_id).await?)
+    }
+
     /// Remove a visa entirely (Redis + memory). See [db::VisaRepo::remove_visa].
     pub async fn remove_visa(&self, visa_id: u64) -> Result<(), ServiceError> {
         self.repo.remove_visa(visa_id).await?;

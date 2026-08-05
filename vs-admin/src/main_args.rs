@@ -79,7 +79,8 @@ pub enum SubCmd {
         /// See more information on a specific service
         #[arg(long, short = 'i')]
         id: Option<String>,
-        /// Flush the cached attribute data for a trusted service. If flush is supplied, id must be as well
+        /// Refresh a trusted service's attribute data and revalidate active visas against
+        /// it. If flush is supplied, id must be as well
         #[arg(long, short = 'f', requires = "id")]
         flush: bool,
     },

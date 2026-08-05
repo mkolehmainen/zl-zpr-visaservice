@@ -169,7 +169,9 @@ impl ActorRepo {
         Ok(addrs)
     }
 
-    /// Update existing actor data.
+    /// Update existing actor data. The passed actor is authoritative: attributes it no
+    /// longer carries are dropped from the store (an attribute refresh can remove
+    /// attributes, and a stale copy left behind would resurface on the next load).
     pub async fn update_actor(&self, actor: &Actor) -> Result<(), StoreError> {
         let zpraddr = match actor.get_zpr_addr() {
             Some(addr) => addr.clone(),
@@ -214,14 +216,14 @@ impl ActorRepo {
         //
         // Write the attributes. We write out the attributes in JSON.
         // There may be a bunch of attributes so we take the time to set up a pipeline.
-        let ops = actor
-            .attrs_iter()
-            .map(|attr| DbOp::HSet {
-                hash_key: attrs_key.clone(),
-                field: attr.get_key().to_string(),
-                value: serde_json::to_string(attr).unwrap_or_default(),
-            })
-            .collect::<Vec<_>>();
+        // The hash is dropped first so removed attributes do not linger; the pipeline is
+        // atomic, so no reader sees the actor without its attributes.
+        let mut ops = vec![DbOp::Del(attrs_key.clone())];
+        ops.extend(actor.attrs_iter().map(|attr| DbOp::HSet {
+            hash_key: attrs_key.clone(),
+            field: attr.get_key().to_string(),
+            value: serde_json::to_string(attr).unwrap_or_default(),
+        }));
         self.db.atomic_pipeline(&ops).await?;
 
         //
@@ -873,6 +875,31 @@ mod test {
         let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
         let err = repo.get_cn_by_zpr_addr(&addr).await.unwrap_err();
         assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    /// update_actor is authoritative: an attribute dropped from the actor is dropped from
+    /// the store, so a later load does not resurrect it. (An attribute refresh can remove
+    /// attributes -- e.g. a trusted service no longer vends one.)
+    #[tokio::test]
+    async fn test_update_actor_drops_removed_attributes() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let mut actor = make_actor_defexp(&[
+            (key::ROLE, ROLE_NODE),
+            (key::CN, "drop-node"),
+            (key::ZPR_ADDR, "fd5a:5052::10"),
+            ("user.dept", "sales"),
+        ]);
+        repo.add_actor(&actor).await.unwrap();
+
+        actor.remove_attribute("user.dept");
+        repo.update_actor(&actor).await.unwrap();
+
+        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let loaded = repo.get_actor_by_zpr_addr(&addr).await.unwrap();
+        assert!(loaded.attrs_iter().all(|a| a.get_key() != "user.dept"));
+        // The rest of the actor survived the rewrite.
+        assert_eq!(loaded.get_cn(), Some("drop-node"));
     }
 
     #[tokio::test]

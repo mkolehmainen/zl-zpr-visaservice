@@ -61,6 +61,7 @@ pub mod tests {
     use crate::connection_control::ConnectionControl;
     use crate::db::FakeDb;
     use crate::db::{ActorRepo, LinkRepo, NodeRepo, PolicyRepo, VisaRepo};
+    use crate::event_mgr::VsEvent;
     use crate::policy_mgr::PolicyMgr;
     use crate::test_helpers::FakeResolver;
     use crate::test_helpers::make_container_bytes;
@@ -93,9 +94,22 @@ pub mod tests {
         )
     }
 
+    /// Test assembly with no event manager worker running. The event receiver is kept
+    /// alive but never read, so `record_event` succeeds (a dropped receiver would make
+    /// every send fail). Use [new_assembly_with_event_rx] to inspect queued events.
     pub async fn new_assembly_for_tests(
         vreq_tx_chan: Option<mpsc::Sender<VisaRequestJob>>,
     ) -> Assembly {
+        let (asm, event_rx) = new_assembly_with_event_rx(vreq_tx_chan).await;
+        std::mem::forget(event_rx);
+        asm
+    }
+
+    /// As [new_assembly_for_tests], but hands back the event receiver so a test can
+    /// assert which events a handler queued.
+    pub async fn new_assembly_with_event_rx(
+        vreq_tx_chan: Option<mpsc::Sender<VisaRequestJob>>,
+    ) -> (Assembly, mpsc::Receiver<VsEvent>) {
         let vreq_tx = if let Some(tx) = vreq_tx_chan {
             tx
         } else {
@@ -114,13 +128,13 @@ pub mod tests {
 
         let counters: Arc<Counters> = Arc::new(Default::default());
 
-        let (event_tx, _event_rx) = mpsc::channel(100);
+        let (event_tx, event_rx) = mpsc::channel(100);
         // TODO: Start event manager worker?
 
         // Shared with the PolicyMgr below so it can publish policy-declared stores.
         let ts_mgr = Arc::new(TrustedServicesMgr::new());
 
-        Assembly {
+        let asm = Assembly {
             config: VSConfig::default(),
             counters: counters.clone(),
             system_start_time: std::time::Instant::now(),
@@ -144,6 +158,7 @@ pub mod tests {
             admin_api_keys: Arc::new(ReloadableApiKeys::default()),
             topo_mgr: TopologyMgr::new(LinkRepo::new(db_handle)),
             ts_mgr,
-        }
+        };
+        (asm, event_rx)
     }
 }

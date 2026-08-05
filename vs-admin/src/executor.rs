@@ -252,10 +252,11 @@ impl Executor {
         Ok(())
     }
 
-    /// Flush the cached attribute data held by a trusted service.
+    /// Refresh a trusted service's attribute data. The visa service then revalidates
+    /// active visas against the refreshed attributes asynchronously.
     fn flush_service_cache(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.vs_cli.flush_service_cache(id)?;
-        println!("flushed {id}");
+        println!("refreshed {id}; active visas are being revalidated");
         Ok(())
     }
 

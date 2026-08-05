@@ -215,6 +215,28 @@ GET /admin/services/{name}
     service_kind and service_endpoints are sourced from the current policy
     (both "" if the service is not present in it).
 
+DELETE /admin/services/{id}/cache
+---------------------------------
+  Summary
+    Refreshes a trusted service's attribute data and reconciles the system against
+    it. Use after the service's external data (e.g. its attribute file) changed.
+  Request
+    (none)
+  Response
+    202: accepted (reload succeeded, reconciliation queued)
+    403: permission denied (read-only key)
+    404: no such trusted service
+    500: reload failed (e.g. the attribute file is missing or unparseable)
+  Notes
+    The reload is synchronous, so a 202 means the new data is live. The
+    reconciliation that follows is asynchronous: the actors behind live visas are
+    refreshed from the service and their visas re-checked against current policy,
+    with visas no longer allowed queued for revocation. Its outcome is logged, not
+    returned.
+    Actors with no live visa are not touched here -- they refresh on their next
+    visa request.
+    Note that passed {id} must be url path encoded.
+
 GET /admin/visas
 ----------------
   Summary
