@@ -135,6 +135,22 @@ impl Actor {
         Ok(())
     }
 
+    /// Removes the attribute named `key`, clearing any derived field it fed and
+    /// dropping it from the identity keys. Returns the removed attribute, or None
+    /// if the actor did not have one.
+    pub fn remove_attribute(&mut self, key: &str) -> Option<Attribute> {
+        let attr = self.attrs.remove(key)?;
+        match key {
+            key::ZPR_ADDR => self.zpr_addr = None,
+            key::SERVICES => self.provider = false,
+            key::CN => self.cn = None,
+            key::ROLE => self.role = Role::default(),
+            _ => (),
+        }
+        self.identity_keys.retain(|k| k != key);
+        Some(attr)
+    }
+
     pub fn get_attribute(&self, key: &str) -> Option<&Attribute> {
         self.attrs.get(key)
     }

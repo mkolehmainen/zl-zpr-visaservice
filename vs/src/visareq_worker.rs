@@ -43,6 +43,7 @@ use crate::assembly::Assembly;
 use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
+use crate::trusted_services_mgr::TrustedServicesMgr;
 use crate::visa_mgr::VisaWithMetadata;
 use crate::{config, net_mgr};
 
@@ -244,18 +245,16 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         }
     };
 
-    // TODO: make sure libeval ignores expired attributes
-
     // If necessary, refresh any expired attributes
     // TODO: Can we parallize this?
-    if refresh_expired_attributes(&asm, &mut source_actor).await {
+    if refresh_expired_attributes(&asm.ts_mgr, &mut source_actor).await {
         // write to store
         if let Err(e) = asm.actor_mgr.update_actor(&source_actor).await {
             error!(target: VREQ, "failed to update source actor after refreshing attributes: {}", e);
             return Ok(VisaDecision::Deny(DenyCode::NoReason));
         }
     }
-    if refresh_expired_attributes(&asm, &mut dest_actor).await {
+    if refresh_expired_attributes(&asm.ts_mgr, &mut dest_actor).await {
         // write to store
         if let Err(e) = asm.actor_mgr.update_actor(&dest_actor).await {
             error!(target: VREQ, "failed to update dest actor after refreshing attributes: {}", e);
@@ -288,7 +287,14 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
 }
 
 /// Look for expired attributes and refresh them from the trusted service manager if possible.
-async fn refresh_expired_attributes(asm: &Assembly, actor: &mut Actor) -> bool {
+///
+/// A successful lookup is authoritative for that source: anything the service did not vend
+/// stays expired and is dropped from the actor. A failed lookup changes nothing, so a service
+/// outage cannot strip attributes.
+///
+/// Returns TRUE if any attribute was added, replaced, or removed.
+///
+async fn refresh_expired_attributes(ts_mgr: &TrustedServicesMgr, actor: &mut Actor) -> bool {
     let actor_ident = match actor.get_cn() {
         Some(cn) => cn.to_string(),
         None => return false,
@@ -300,32 +306,49 @@ async fn refresh_expired_attributes(asm: &Assembly, actor: &mut Actor) -> bool {
             ts_sources.insert(attr.get_source().to_string());
         }
     }
-    let mut updates = 0;
-    if !ts_sources.is_empty() {
-        for source in &ts_sources {
-            for ts_result in asm
-                .ts_mgr
-                .get_attributes_from_source_for_actor(source, &actor_ident)
-                .await
-            {
-                match ts_result {
-                    Ok(ts_attrs) => {
-                        for attr in ts_attrs {
-                            if let Err(e) = actor.add_attribute(attr) {
-                                warn!(target: VREQ, "failed to add attribute for actor {}: {}", actor_ident, e);
-                            } else {
-                                updates += 1;
-                            }
+
+    let mut changed = false;
+    for source in &ts_sources {
+        for ts_result in ts_mgr
+            .get_attributes_from_source_for_actor(source, &actor_ident)
+            .await
+        {
+            match ts_result {
+                Ok(ts_attrs) => {
+                    for attr in ts_attrs {
+                        if let Err(e) = actor.add_attribute(attr) {
+                            warn!(target: VREQ, "failed to add attribute for actor {}: {}", actor_ident, e);
+                        } else {
+                            changed = true;
                         }
                     }
-                    Err(e) => {
-                        warn!(target: VREQ, "ts service attr lookup failed for actor {}: {}", actor_ident, e);
-                    }
+                    // Whatever the service did not just set for this source is gone: drop
+                    // the leftovers rather than carry a permanently expired copy.
+                    changed |= prune_expired_from_source(actor, source);
+                }
+                Err(e) => {
+                    warn!(target: VREQ, "ts service attr lookup failed for actor {}: {}", actor_ident, e);
                 }
             }
         }
     }
-    updates > 0 // TRUE if we have changed an attribute
+    changed
+}
+
+/// Removes every still-expired attribute on `actor` that came from `source`.
+/// Returns TRUE if anything was removed.
+fn prune_expired_from_source(actor: &mut Actor, source: &str) -> bool {
+    let stale: Vec<String> = actor
+        .attrs_iter()
+        .filter(|a| a.is_expired() && a.get_source() == source)
+        .map(|a| a.get_key().to_string())
+        .collect();
+
+    for key in &stale {
+        debug!(target: VREQ, "dropping expired attribute '{key}' no longer vended by source '{source}'");
+        actor.remove_attribute(key);
+    }
+    !stale.is_empty()
 }
 
 /// Resolve an actor's docking node: the connection-table entry, falling back to
@@ -734,7 +757,7 @@ mod tests {
     use crate::test_helpers::{
         make_actor_with_services_defexp, make_container_bytes, make_node_actor_defexp,
     };
-    use libeval::attribute::ROLE_ADAPTER;
+    use libeval::attribute::{AttributeSource, ROLE_ADAPTER, SOURCE_ZPR};
     use libeval::eval_result::Direction;
     use libeval::policy::Policy;
     use libeval::route::LinkId;
@@ -1196,5 +1219,160 @@ mod tests {
             matches!(result, VisaDecision::Deny(DenyCode::NoMatch)),
             "expected NoMatch (policy eval reached)"
         );
+    }
+
+    /// A trusted service that records the actor idents it was asked about and returns
+    /// one canned, freshly-expiring attribute.
+    struct FakeTrustedService {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    const FAKE_SOURCE: &str = "fake";
+    const FAKE_ATTR_KEY: &str = "user.dept";
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services_mgr::TrustedServiceInterface for FakeTrustedService {
+        async fn get_attributes_for_actor(
+            &self,
+            actor_ident: &str,
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            self.calls.lock().unwrap().push(actor_ident.to_string());
+            Ok(vec![
+                AttributeSource::new(FAKE_SOURCE)
+                    .builder(FAKE_ATTR_KEY)
+                    .expires_in(Duration::from_secs(600))
+                    .value("engineering"),
+            ])
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn get_source_id(&self) -> &str {
+            FAKE_SOURCE
+        }
+    }
+
+    /// A manager holding one FakeTrustedService, plus a handle on the fake for assertions.
+    fn ts_mgr_with_fake() -> (TrustedServicesMgr, Arc<FakeTrustedService>) {
+        let fake = Arc::new(FakeTrustedService {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mgr = TrustedServicesMgr::new();
+        mgr.update_services(vec![fake.clone()]);
+        (mgr, fake)
+    }
+
+    /// An actor with a CN and one already-expired attribute from the given source.
+    fn actor_with_expired_attr(cn: &str, source: &str) -> Actor {
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::CN)
+                    .expires_in(Duration::from_secs(600))
+                    .value(cn),
+            )
+            .unwrap();
+        actor
+            .add_attribute(
+                AttributeSource::new(source)
+                    .builder(FAKE_ATTR_KEY)
+                    .expires(SystemTime::now() - Duration::from_secs(1))
+                    .value("engineering"),
+            )
+            .unwrap();
+        actor
+    }
+
+    /// An expired attribute whose source is a registered trusted service is refreshed
+    /// from that service, and only that service is queried.
+    #[tokio::test]
+    async fn test_refresh_expired_attributes_refreshes_from_source() {
+        let (mgr, fake) = ts_mgr_with_fake();
+        let mut actor = actor_with_expired_attr("someone.zpr.org", FAKE_SOURCE);
+        assert!(actor.get_attribute(FAKE_ATTR_KEY).unwrap().is_expired());
+
+        assert!(refresh_expired_attributes(&mgr, &mut actor).await);
+        assert!(!actor.get_attribute(FAKE_ATTR_KEY).unwrap().is_expired());
+        assert_eq!(*fake.calls.lock().unwrap(), vec!["someone.zpr.org"]);
+    }
+
+    /// The hot path: no expired attributes means no trusted-service round trip at all.
+    #[tokio::test]
+    async fn test_refresh_expired_attributes_skips_when_nothing_expired() {
+        let (mgr, fake) = ts_mgr_with_fake();
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::CN)
+                    .expires_in(Duration::from_secs(600))
+                    .value("someone.zpr.org"),
+            )
+            .unwrap();
+
+        assert!(!refresh_expired_attributes(&mgr, &mut actor).await);
+        assert!(fake.calls.lock().unwrap().is_empty());
+    }
+
+    /// A trusted service that knows nothing about any actor: every lookup succeeds and
+    /// returns no attributes.
+    struct EmptyTrustedService;
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services_mgr::TrustedServiceInterface for EmptyTrustedService {
+        async fn get_attributes_for_actor(
+            &self,
+            _actor_ident: &str,
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            Ok(Vec::new())
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn get_source_id(&self) -> &str {
+            FAKE_SOURCE
+        }
+    }
+
+    /// A successful lookup is authoritative: an expired attribute the service no longer
+    /// vends is dropped from the actor rather than kept in its expired state.
+    #[tokio::test]
+    async fn test_refresh_expired_attributes_prunes_unvended() {
+        let mgr = TrustedServicesMgr::new();
+        mgr.update_services(vec![Arc::new(EmptyTrustedService)]);
+        let mut actor = actor_with_expired_attr("someone.zpr.org", FAKE_SOURCE);
+
+        assert!(refresh_expired_attributes(&mgr, &mut actor).await);
+        assert!(actor.get_attribute(FAKE_ATTR_KEY).is_none());
+        // The unexpired CN from another source is untouched.
+        assert!(actor.get_attribute(key::CN).is_some());
+    }
+
+    /// An unroutable source (no registered service) and an actor with no CN must both
+    /// fall through quietly rather than panic.
+    #[tokio::test]
+    async fn test_refresh_expired_attributes_handles_unrefreshable() {
+        let (mgr, fake) = ts_mgr_with_fake();
+
+        // SOURCE_ZPR is internal -- no trusted service vends it.
+        let mut internal = actor_with_expired_attr("someone.zpr.org", SOURCE_ZPR);
+        assert!(!refresh_expired_attributes(&mgr, &mut internal).await);
+        assert!(fake.calls.lock().unwrap().is_empty());
+
+        // No CN means no ident to look up.
+        let mut no_cn = Actor::new();
+        no_cn
+            .add_attribute(
+                AttributeSource::new(FAKE_SOURCE)
+                    .builder(FAKE_ATTR_KEY)
+                    .expires(SystemTime::now() - Duration::from_secs(1))
+                    .value("engineering"),
+            )
+            .unwrap();
+        assert!(!refresh_expired_attributes(&mgr, &mut no_cn).await);
+        assert!(fake.calls.lock().unwrap().is_empty());
     }
 }

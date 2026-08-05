@@ -128,6 +128,14 @@ impl JPolicy {
 
             for attr in attrs {
                 if attr.get_key() == jp_exp.key {
+                    // An expired attribute is indeterminate -- it cannot satisfy any
+                    // expression, so this policy cannot grant the join. Returning false
+                    // rather than leaving `found` unset matters: the !found branch below
+                    // lets an empty-value EXCLUDES succeed, which would make expiry grant
+                    // access.
+                    if attr.is_expired() {
+                        return false;
+                    }
                     // We assume the key appears only once in the incoming list.
                     found = true;
 
@@ -181,6 +189,7 @@ impl JPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime};
 
     fn attr(key: &str, values: Vec<&str>) -> Attribute {
         Attribute::builder(key).values(values)
@@ -514,5 +523,52 @@ mod tests {
         let attrs = vec![attr("k1", vec!["a"])];
 
         assert!(policy.matches(&attrs));
+    }
+
+    /// Build an already-expired attribute.
+    fn expired_attr(key: &str, values: Vec<&str>) -> Attribute {
+        Attribute::builder(key)
+            .expires(SystemTime::now() - Duration::from_secs(1))
+            .values(values)
+    }
+
+    /// Build a single-expression join policy.
+    fn jpolicy(op: AttrOp, value: Vec<&str>) -> JPolicy {
+        JPolicy {
+            matches: vec![AttrExp {
+                key: "k1".to_string(),
+                op,
+                value: value.into_iter().map(str::to_string).collect(),
+            }],
+            flags: EnumSet::new(),
+            services: None,
+        }
+    }
+
+    // An expired claim cannot satisfy an EQ expression it would otherwise match.
+    #[test]
+    fn test_jpolicy_expired_attr_fails_eq() {
+        let policy = jpolicy(AttrOp::Eq, vec!["a", "b"]);
+        assert!(policy.matches(&[attr("k1", vec!["a", "b"])]));
+        assert!(!policy.matches(&[expired_attr("k1", vec!["a", "b"])]));
+    }
+
+    // The no-flip case: an expired claim that would *pass* EXCLUDES must not, or
+    // expiry would grant the join.
+    #[test]
+    fn test_jpolicy_expired_attr_fails_excludes() {
+        let policy = jpolicy(AttrOp::Excludes, vec!["b"]);
+        assert!(policy.matches(&[attr("k1", vec!["a"])]));
+        assert!(!policy.matches(&[expired_attr("k1", vec!["a"])]));
+    }
+
+    // EXCLUDES with an empty value means "must not have this key". An expired
+    // attribute is present-but-indeterminate, so it must fail rather than count
+    // as absent.
+    #[test]
+    fn test_jpolicy_expired_attr_fails_excludes_empty_value() {
+        let policy = jpolicy(AttrOp::Excludes, vec![""]);
+        assert!(policy.matches(&[attr("k2", vec!["a"])]));
+        assert!(!policy.matches(&[expired_attr("k1", vec!["a"])]));
     }
 }

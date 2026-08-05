@@ -417,7 +417,7 @@ impl EvalContext {
                     }
                     debug!(target: EVAL, "policy #{i} matches FWD scope");
                     // This policy matches only if all conditions match.
-                    if self.match_policy_conditions(src_actor, dst_actor, &com_policy) {
+                    if self.match_policy_conditions(src_actor, dst_actor, &com_policy, allows) {
                         Some(Direction::Forward)
                     } else {
                         None
@@ -442,7 +442,7 @@ impl EvalContext {
                     }
                     debug!(target: EVAL, "policy #{i} matches REV scope");
                     // This policy matches only if all conditions match.
-                    if self.match_policy_conditions(dst_actor, src_actor, &com_policy) {
+                    if self.match_policy_conditions(dst_actor, src_actor, &com_policy, allows) {
                         Some(Direction::Reverse)
                     } else {
                         None
@@ -474,11 +474,14 @@ impl EvalContext {
         client_actor: &Actor,
         server_actor: &Actor,
         com_policy: &policy_capnp::c_policy::Reader,
+        for_allow: bool,
     ) -> bool {
-        // All conditions must match for the policy to match.
+        // All conditions must match for the policy to match. Expired attributes must
+        // not help satisfy an allow policy; denies are matched against all attributes,
+        // expired or not, so they stay fail-closed.
         if com_policy.has_client_conds() {
             for cond in com_policy.get_client_conds().unwrap() {
-                if !self.match_condition_to_actor(&cond, client_actor) {
+                if !self.match_condition_to_actor(&cond, client_actor, for_allow) {
                     debug!(target: EVAL, "-- client condition not met: {:?}", cond);
                     return false;
                 }
@@ -486,7 +489,7 @@ impl EvalContext {
         }
         if com_policy.has_service_conds() {
             for cond in com_policy.get_service_conds().unwrap() {
-                if !self.match_condition_to_actor(&cond, server_actor) {
+                if !self.match_condition_to_actor(&cond, server_actor, for_allow) {
                     debug!(target: EVAL, "-- service condition not met: {:?}", cond);
                     return false;
                 }
@@ -495,11 +498,13 @@ impl EvalContext {
         true
     }
 
-    /// Returns TRUE if the policy condition is satisfied by the actor.
+    /// Returns TRUE if the policy condition is satisfied by the actor. `for_allow`
+    /// marks this as part of the allow pass, where expired attributes cannot match.
     fn match_condition_to_actor(
         &self,
         cond: &policy_capnp::attr_expr::Reader,
         actor: &Actor,
+        for_allow: bool,
     ) -> bool {
         let value = if !cond.has_value() {
             None
@@ -521,6 +526,15 @@ impl EvalContext {
             }
         };
         let key = cond.get_key().unwrap().to_str().unwrap();
+
+        // An expired attribute is indeterminate: we can neither confirm nor rule out
+        // its value, so it can never satisfy an allow condition. Note this is not the
+        // same as treating it as absent -- absent would make NE and EXCLUDES *pass*,
+        // which would let expiry grant access. A key that was never set is unaffected.
+        if for_allow && actor.get_attribute(key).is_some_and(|a| a.is_expired()) {
+            debug!(target: EVAL, "-- condition key '{}' is expired, cannot match allow", key);
+            return false;
+        }
 
         match cond.get_op().unwrap() {
             policy_capnp::AttrOp::Eq => {
@@ -677,7 +691,7 @@ mod test {
     use crate::attribute::key;
     use bytes::{Buf, Bytes};
     use std::net::IpAddr;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use std::{path::Path, sync::Once};
     use tracing::Level;
     use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
@@ -1148,6 +1162,121 @@ mod test {
 
         // "not-allowed" is not among join policy 4's permitted services.
         let actor = node_actor_with_services(&["zpr/n0/vss", "not-allowed"]);
+        assert!(!ctx.approve_connected(&actor).unwrap());
+    }
+
+    /// Build an attribute that is already expired.
+    fn expired(key: &str, value: &str) -> Attribute {
+        Attribute::builder(key)
+            .expires(SystemTime::now() - Duration::from_secs(1))
+            .value(value)
+    }
+
+    /// A user whose tag has expired cannot satisfy the allow policy that keys on it.
+    #[test]
+    fn test_expired_attr_cannot_match_allow() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let mut user = Actor::new();
+        user.add_attribute(expired("user.zpr.tag", "user.red"))
+            .unwrap();
+
+        let mut service = Actor::new();
+        service
+            .add_attr_from_parts(key::SERVICES, "database", Duration::from_secs(60))
+            .unwrap();
+        service
+            .add_attr_from_parts("service.content", "red", Duration::from_secs(60))
+            .unwrap();
+        let packet =
+            PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80).unwrap();
+
+        let decision = ctx.eval_request(&user, &service, &packet).unwrap();
+        match decision {
+            PartialEvalResult::Deny(FinalDeny::NoMatch(_)) => {}
+            _ => panic!("expected NoMatch deny, not {:?}", decision),
+        }
+    }
+
+    /// Expiry must never *grant* access: the deny pass ignores expiry, so an expired
+    /// green tag still hits the deny policy rather than falling through to NoMatch.
+    #[test]
+    fn test_expired_attr_does_not_flip_deny() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let mut green_user = Actor::new();
+        green_user
+            .add_attribute(expired("user.zpr.tag", "user.green"))
+            .unwrap();
+
+        let mut service = Actor::new();
+        service
+            .add_attr_from_parts(key::SERVICES, "database", Duration::from_secs(60))
+            .unwrap();
+        service
+            .add_attr_from_parts("service.content", "red", Duration::from_secs(60))
+            .unwrap();
+        let packet =
+            PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80).unwrap();
+
+        let decision = ctx.eval_request(&green_user, &service, &packet).unwrap();
+        match decision {
+            PartialEvalResult::Deny(FinalDeny::Deny(hits)) => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].match_idx, 0);
+            }
+            _ => panic!("expected deny decision, not {:?}", decision),
+        }
+    }
+
+    /// A key the actor never sets at all behaves exactly as before: the new guard is
+    /// keyed on present-but-expired, not on absence.
+    #[test]
+    fn test_absent_attr_unaffected_by_expiry_guard() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        // No user.zpr.tag at all -- neither the deny nor the allow policy can match.
+        let user = Actor::new();
+
+        let mut service = Actor::new();
+        service
+            .add_attr_from_parts(key::SERVICES, "database", Duration::from_secs(60))
+            .unwrap();
+        service
+            .add_attr_from_parts("service.content", "red", Duration::from_secs(60))
+            .unwrap();
+        let packet =
+            PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80).unwrap();
+
+        let decision = ctx.eval_request(&user, &service, &packet).unwrap();
+        match decision {
+            PartialEvalResult::Deny(FinalDeny::NoMatch(_)) => {}
+            _ => panic!("expected NoMatch deny, not {:?}", decision),
+        }
+    }
+
+    /// A connected node whose join-policy key (CN) has expired matches no join policy
+    /// and must be disconnected rather than silently re-approved. Role is a cached
+    /// snapshot and NEVER_EXPIRES, so `is_node()` still reports true.
+    #[test]
+    fn test_approve_connected_expired_join_key_rejects_node() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let mut actor = node_actor_with_services(&["zpr/n0/vss"]);
+        // Overwrite the CN join policy 4 keys on with an expired copy.
+        actor
+            .add_attribute(expired(key::CN, "node.zpr.org"))
+            .unwrap();
+        assert!(actor.is_node());
+
         assert!(!ctx.approve_connected(&actor).unwrap());
     }
 }
