@@ -32,7 +32,7 @@ pub struct Assembly {
     pub event_mgr: EventMgr,
     pub admin_api_keys: Arc<ReloadableApiKeys>,
     pub topo_mgr: TopologyMgr,
-    pub ts_mgr: TrustedServicesMgr,
+    pub ts_mgr: Arc<TrustedServicesMgr>,
 }
 
 impl Assembly {
@@ -53,6 +53,8 @@ impl Assembly {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    use std::path::PathBuf;
 
     use crate::actor_mgr::ActorMgr;
     use crate::config;
@@ -115,6 +117,9 @@ pub mod tests {
         let (event_tx, _event_rx) = mpsc::channel(100);
         // TODO: Start event manager worker?
 
+        // Shared with the PolicyMgr below so it can publish policy-declared stores.
+        let ts_mgr = Arc::new(TrustedServicesMgr::new());
+
         Assembly {
             config: VSConfig::default(),
             counters: counters.clone(),
@@ -124,6 +129,8 @@ pub mod tests {
                 policy_container_bytes,
                 policy_repo,
                 Arc::new(FakeResolver::ip_only()),
+                ts_mgr.clone(),
+                PathBuf::from("."),
             )
             .await
             .expect("failed to initialize PolicyMgr"),
@@ -136,7 +143,7 @@ pub mod tests {
             event_mgr: EventMgr::new(event_tx),
             admin_api_keys: Arc::new(ReloadableApiKeys::default()),
             topo_mgr: TopologyMgr::new(LinkRepo::new(db_handle)),
-            ts_mgr: TrustedServicesMgr::new(),
+            ts_mgr,
         }
     }
 }

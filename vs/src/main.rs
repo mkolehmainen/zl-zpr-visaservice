@@ -233,6 +233,15 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // The policy manager builds the trusted service stores as part of every policy
+    // transaction, so it needs the manager and the attribute file directory up front.
+    let ts_mgr = Arc::new(TrustedServicesMgr::new());
+    let file_ts_dir = cfg
+        .core
+        .file_ts_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+
     // Initialize the policy manager either from provided policy-container or from database.
     let policy_mgr = {
         let policy_mgr_res = match initial_policy_bytes {
@@ -241,6 +250,8 @@ async fn main() -> std::process::ExitCode {
                     p,
                     db::PolicyRepo::new(db_handle.clone()),
                     Arc::new(SystemResolver),
+                    ts_mgr.clone(),
+                    file_ts_dir,
                 )
                 .await
             }
@@ -248,6 +259,8 @@ async fn main() -> std::process::ExitCode {
                 PolicyMgr::new_from_state(
                     db::PolicyRepo::new(db_handle.clone()),
                     Arc::new(SystemResolver),
+                    ts_mgr.clone(),
+                    file_ts_dir,
                 )
                 .await
             }
@@ -314,7 +327,7 @@ async fn main() -> std::process::ExitCode {
         event_mgr: EventMgr::new(event_tx),
         admin_api_keys: Arc::new(admin_api_keys),
         topo_mgr: TopologyMgr::new(db::LinkRepo::new(db_handle)),
-        ts_mgr: TrustedServicesMgr::new(),
+        ts_mgr,
     });
 
     // Rebuild the in-memory router topology from persisted state. This runs after

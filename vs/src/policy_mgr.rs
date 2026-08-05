@@ -15,6 +15,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -28,6 +29,9 @@ use crate::db;
 use crate::error::{ResolverError, ServiceError, StoreError, TopologyError};
 use crate::loaded_policy::LoadedPolicy;
 use crate::logging::targets::MAIN;
+use crate::trusted_services_mgr::{
+    TrustedServiceInterface, TrustedServicesMgr, build_services_from_policy,
+};
 
 /// Abstracts DNS hostname resolution so it can be swapped out in tests.
 #[async_trait]
@@ -47,6 +51,9 @@ struct PolicyState {
     policy: Arc<Policy>,
     container: PolicyContainerBytes,
     links_by_node: HashMap<IpAddr, Vec<Link>>,
+    /// Attribute stores for the trusted services this policy declares. Republished to
+    /// `ts_mgr` on every successful swap so the stores can never outlive their policy.
+    trusted_services: Vec<Arc<dyn TrustedServiceInterface>>,
 }
 
 pub struct PolicyMgr {
@@ -55,6 +62,9 @@ pub struct PolicyMgr {
     /// Serializes concurrent policy updates; reads remain lock-free via ArcSwap.
     update_lock: tokio::sync::Mutex<()>,
     resolver: PolicyResolver,
+    ts_mgr: Arc<TrustedServicesMgr>,
+    /// Directory holding the `<service-id>.json` files for `api=file` trusted services.
+    file_ts_dir: PathBuf,
 }
 
 /// A consistent, owned snapshot of policy, source container, and resolved topology,
@@ -134,6 +144,8 @@ impl PolicyMgr {
         container_bytes: Vec<u8>,
         repo: db::PolicyRepo,
         resolver: Arc<dyn DnsResolver>,
+        ts_mgr: Arc<TrustedServicesMgr>,
+        file_ts_dir: PathBuf,
     ) -> Result<Self, ServiceError> {
         debug!(target: MAIN, "initializing policy manager");
 
@@ -162,11 +174,11 @@ impl PolicyMgr {
         // Resolve topology before persisting so a policy that cannot initialize is never
         // stored as the current policy. build_state borrows `loaded`, leaving it
         // available for the post-resolution persist below.
-        let state = Self::build_state(&resolver, &loaded).await?;
+        let state = Self::build_state(&resolver, &loaded, &file_ts_dir).await?;
         repo.set_current_policy(&loaded, false).await?;
 
         debug!(target: MAIN, "policy manager initialized successfully");
-        Ok(Self::from_state(state, repo, resolver))
+        Ok(Self::from_state(state, repo, resolver, ts_mgr, file_ts_dir))
     }
 
     /// Create a new policy manager, initializing it with the current policy in
@@ -180,6 +192,8 @@ impl PolicyMgr {
     pub async fn new_from_state(
         repo: db::PolicyRepo,
         resolver: Arc<dyn DnsResolver>,
+        ts_mgr: Arc<TrustedServicesMgr>,
+        file_ts_dir: PathBuf,
     ) -> Result<Self, ServiceError> {
         debug!(target: MAIN, "initializing policy manager from state");
         let mut loaded = repo
@@ -194,10 +208,12 @@ impl PolicyMgr {
                 policy.get_created().unwrap_or("unknown").to_string());
         }
         let resolver = PolicyResolver::new(resolver);
-        let state = Self::build_state(&resolver, &loaded).await?;
+        // A trusted service the policy declares but that cannot be configured (e.g. its
+        // attribute file is missing) fails startup; the error names the service and file.
+        let state = Self::build_state(&resolver, &loaded, &file_ts_dir).await?;
 
         debug!(target: MAIN, "policy manager initialized successfully");
-        Ok(Self::from_state(state, repo, resolver))
+        Ok(Self::from_state(state, repo, resolver, ts_mgr, file_ts_dir))
     }
 
     /// This is the placeholder "update policy" function. It only replaces the current policy
@@ -224,24 +240,43 @@ impl PolicyMgr {
     async fn build_state(
         resolver: &PolicyResolver,
         loaded: &LoadedPolicy,
-    ) -> Result<PolicyState, ResolverError> {
+        file_ts_dir: &Path,
+    ) -> Result<PolicyState, ServiceError> {
         let policy = loaded.policy();
         let links_by_node = resolver.resolve_topology(&policy).await?;
+        let trusted_services = build_services_from_policy(&policy, file_ts_dir)?;
         Ok(PolicyState {
             policy,
             container: loaded.container().clone(),
             links_by_node,
+            trusted_services,
         })
     }
 
     /// Assemble a PolicyMgr from already-built state and constructor-owned parts.
-    fn from_state(state: PolicyState, repo: db::PolicyRepo, resolver: PolicyResolver) -> Self {
+    fn from_state(
+        state: PolicyState,
+        repo: db::PolicyRepo,
+        resolver: PolicyResolver,
+        ts_mgr: Arc<TrustedServicesMgr>,
+        file_ts_dir: PathBuf,
+    ) -> Self {
+        ts_mgr.update_services(state.trusted_services.clone());
         PolicyMgr {
             state: ArcSwap::from_pointee(state),
             repo,
             update_lock: tokio::sync::Mutex::new(()),
             resolver,
+            ts_mgr,
+            file_ts_dir,
         }
+    }
+
+    /// Swap in `state` and republish its trusted service stores, so the manager's stores
+    /// always come from the policy that is currently live.
+    fn publish(&self, state: PolicyState) {
+        self.ts_mgr.update_services(state.trusted_services.clone());
+        self.state.store(Arc::new(state));
     }
 
     /// Update the current policy in state database and memory.  The new policy
@@ -269,10 +304,10 @@ impl PolicyMgr {
         // Resolve topology before swapping in the new state so a failed update leaves
         // the current policy, container, and topology untouched. The new policy,
         // container, and links swap in together as one PolicyState.
-        let state = Self::build_state(&self.resolver, &loaded).await?;
+        let state = Self::build_state(&self.resolver, &loaded, &self.file_ts_dir).await?;
         self.repo.set_current_policy(&loaded, false).await?;
 
-        self.state.store(Arc::new(state));
+        self.publish(state);
         Ok(vinst)
     }
 
@@ -392,7 +427,7 @@ async fn resolve_netaddr(
 mod tests {
     use super::*;
 
-    use crate::test_helpers::make_container_bytes;
+    use crate::test_helpers::{make_container_bytes, make_trusted_service_policy};
     use std::sync::Arc;
     use zpr::policy::v1 as policy_capnp;
     use zpr::policy_types::{AttrExp, NetAddr, Peering};
@@ -437,9 +472,69 @@ mod tests {
     async fn make_policy_mgr(container_bytes: Vec<u8>) -> PolicyMgr {
         let db = Arc::new(FakeDb::new());
         let repo = PolicyRepo::new(db);
-        PolicyMgr::new_with_initial_policy(container_bytes, repo, Arc::new(FakeResolver::ip_only()))
-            .await
-            .unwrap()
+        PolicyMgr::new_with_initial_policy(
+            container_bytes,
+            repo,
+            Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A PolicyMgr over a FakeDb that publishes its trusted service stores into `ts_mgr`
+    /// and looks for attribute files in `dir`.
+    async fn make_policy_mgr_with_ts(
+        container_bytes: Vec<u8>,
+        ts_mgr: Arc<TrustedServicesMgr>,
+        dir: &Path,
+    ) -> PolicyMgr {
+        PolicyMgr::new_with_initial_policy(
+            container_bytes,
+            PolicyRepo::new(Arc::new(FakeDb::new())),
+            Arc::new(FakeResolver::ip_only()),
+            ts_mgr,
+            dir.to_path_buf(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A successful update publishes the policy's trusted service stores, and a later
+    /// update whose attribute file is missing fails without disturbing the live state.
+    #[tokio::test]
+    async fn test_update_publishes_stores_and_preserves_state_on_failure() {
+        let dir = std::env::temp_dir().join("vs-pm-ts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attrfile.json"),
+            r#"{"alice": {"color": ["red"]}}"#,
+        )
+        .unwrap();
+
+        let ts_mgr = Arc::new(TrustedServicesMgr::new());
+        let good = make_trusted_service_policy("attrfile", "file", Some(3600), &[]);
+        let mgr = make_policy_mgr_with_ts(good, ts_mgr.clone(), &dir).await;
+
+        // The declared store is live: looking it up by source id no longer reports it missing.
+        let results = ts_mgr
+            .get_attributes_from_source_for_actor("attrfile", "alice")
+            .await;
+        assert!(results[0].is_ok());
+
+        // An update declaring a service with no attribute file fails...
+        let bad = make_trusted_service_policy("nosuchfile", "file", Some(3600), &[]);
+        assert!(mgr.update_policy_from_container_bytes(bad).await.is_err());
+
+        // ...leaving the current policy and its published stores untouched.
+        assert_eq!(mgr.get_current().vinst(), 1);
+        let results = ts_mgr
+            .get_attributes_from_source_for_actor("attrfile", "alice")
+            .await;
+        assert!(results[0].is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Build a Peering between two ZPR addresses. describe_link(node_a, node_b) will find it.
@@ -477,6 +572,8 @@ mod tests {
             policy_with_peerings(&[peering]),
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
         )
         .await;
 
@@ -692,6 +789,8 @@ mod tests {
             policy_no_topology(),
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
         )
         .await
         .unwrap();
@@ -701,10 +800,14 @@ mod tests {
             .await
             .unwrap();
 
-        let restored =
-            PolicyMgr::new_from_state(PolicyRepo::new(db), Arc::new(FakeResolver::ip_only()))
-                .await
-                .unwrap();
+        let restored = PolicyMgr::new_from_state(
+            PolicyRepo::new(db),
+            Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
+        )
+        .await
+        .unwrap();
         assert_eq!(restored.get_current().vinst(), 2);
     }
 
@@ -719,6 +822,8 @@ mod tests {
             container.clone(),
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
         )
         .await
         .unwrap();
@@ -729,6 +834,8 @@ mod tests {
             container,
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
         )
         .await
         .unwrap();
@@ -740,6 +847,8 @@ mod tests {
             policy_with_peerings(&[peering]),
             PolicyRepo::new(db),
             Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
         )
         .await
         .unwrap();
@@ -757,6 +866,8 @@ mod tests {
             policy_no_topology(),
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
         )
         .await
         .unwrap();
@@ -764,8 +875,13 @@ mod tests {
         db.del("policy:current").await.unwrap();
         db.hset("policy:current", "phash", &phash).await.unwrap();
 
-        let res =
-            PolicyMgr::new_from_state(PolicyRepo::new(db), Arc::new(FakeResolver::ip_only())).await;
+        let res = PolicyMgr::new_from_state(
+            PolicyRepo::new(db),
+            Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
+        )
+        .await;
         assert!(res.is_err());
     }
 

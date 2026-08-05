@@ -17,11 +17,15 @@ use std::fs;
 use tracing::debug;
 
 use libeval::attribute::{Attribute, AttributeSource};
+use libeval::policy::Policy;
 
-use zpr::policy_types::AttrMapping;
+use zpr::policy_types::{AttrMapping, ServiceType};
 
 use crate::error::ServiceError;
 use crate::logging::targets::TS;
+
+/// The api name in `ServiceType::Trusted(<api>)` served by [`FileAttributeStore`].
+const TS_API_FILE: &str = "file";
 
 /// Shortest TTL we are willing to stamp on an emitted attribute. When a store's cached
 /// data has less than this left, it refreshes early rather than hand a consumer something
@@ -115,6 +119,8 @@ impl TrustedServicesMgr {
 
     /// Ask every trusted service to drop its cached attribute data, so the next lookup
     /// fetches fresh. Returns one result per service.
+    ///
+    /// For api=file trusted services, this re-reads the file.
     pub async fn flush_all(&self) -> Vec<Result<(), ServiceError>> {
         let snapshot = self.services.load_full();
 
@@ -127,6 +133,59 @@ impl TrustedServicesMgr {
 
         join_all(futures).await
     }
+}
+
+/// Build the trusted service stores (only works for local file at the moment)
+/// declared by `policy`.
+///
+/// One store per `ServiceType::Trusted` service; for the `file` api the
+/// attribute data is `<file_ts_dir>/<service-id>.json`. Any service that cannot
+/// be built is an error, so a caller can run this before committing a policy
+/// and reject the whole policy on failure.
+///
+pub fn build_services_from_policy(
+    policy: &Policy,
+    file_ts_dir: &Path,
+) -> Result<Vec<Arc<dyn TrustedServiceInterface>>, ServiceError> {
+    let mut stores: Vec<Arc<dyn TrustedServiceInterface>> = Vec::new();
+
+    for svc in policy.list_services() {
+        let ServiceType::Trusted(api) = &svc.kind else {
+            continue;
+        };
+        if api != TS_API_FILE {
+            return Err(ServiceError::Param(format!(
+                "trusted service '{}': unsupported api '{api}'",
+                svc.id
+            )));
+        }
+        // The id becomes a filename, so it must not be able to escape `file_ts_dir`.
+        if svc.id.contains('/') || svc.id.contains("..") {
+            return Err(ServiceError::Param(format!(
+                "trusted service '{}': id is not a plain filename",
+                svc.id
+            )));
+        }
+        let Some(ts) = policy.trusted_service_by_id(&svc.id) else {
+            return Err(ServiceError::Param(format!(
+                "trusted service '{}': no trusted service record in policy",
+                svc.id
+            )));
+        };
+
+        // Covers the missing/unparseable file and the below-floor ttl (including an unset
+        // expiration_seconds of 0).
+        stores.push(Arc::new(FileAttributeStore::new(
+            svc.id.clone(),
+            AttributeMapper {
+                mappings: ts.returns_attrs.clone(),
+            },
+            Duration::from_secs(ts.expiration_seconds as u64),
+            &file_ts_dir.join(format!("{}.json", svc.id)),
+        )?));
+    }
+
+    Ok(stores)
 }
 
 /// File based attributes encoded in JSON.
@@ -346,7 +405,10 @@ impl AttributeMapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zpr::policy_types::parse_attribute_mapping;
+    use zpr::policy_types::{PolicyContainerBytes, parse_attribute_mapping};
+
+    use crate::loaded_policy::LoadedPolicy;
+    use crate::test_helpers::make_trusted_service_policy;
 
     /// A mapper covering all three RHS spec forms: single, multi, and tag.
     fn test_mapper() -> AttributeMapper {
@@ -446,6 +508,73 @@ mod tests {
         assert!(snapshot.remaining() >= MIN_ATTRIBUTE_TTL);
 
         fs::remove_file(&fp).unwrap();
+    }
+
+    /// Decode a container built by `make_trusted_service_policy` into a `Policy`.
+    fn policy_from_container(container_bytes: Vec<u8>) -> Arc<Policy> {
+        let loaded = LoadedPolicy::from_container(
+            PolicyContainerBytes::from(container_bytes),
+            &crate::config::POLICY_MIN_VERSION,
+        )
+        .unwrap();
+        loaded.policy()
+    }
+
+    /// A well-formed `api=file` trusted service yields a working store: it is named after
+    /// the service and serves the mapped attributes out of `<id>.json`.
+    #[tokio::test]
+    async fn test_build_services_from_policy_happy_path() {
+        let dir = std::env::temp_dir().join("vs-bsfp-ok");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("attrfile.json"),
+            r#"{"alice": {"color": ["red"]}}"#,
+        )
+        .unwrap();
+
+        let policy = policy_from_container(make_trusted_service_policy(
+            "attrfile",
+            "file",
+            Some(3600),
+            &["color -> user.color"],
+        ));
+        let stores = build_services_from_policy(&policy, &dir).unwrap();
+
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].get_source_id(), "attrfile");
+        let attrs = stores[0].get_attributes_for_actor("alice").await.unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].get_key(), "user.color");
+        assert!(attrs[0].value_has("red"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every way a declared trusted service can fail to configure must be an error, so the
+    /// policy carrying it is rejected rather than silently losing the service.
+    #[test]
+    fn test_build_services_from_policy_rejects_bad_declarations() {
+        // Empty dir: no `<id>.json` exists for any of these.
+        let dir = std::env::temp_dir().join("vs-bsfp-bad");
+        fs::create_dir_all(&dir).unwrap();
+
+        let cases = [
+            // (id, api, expiration_seconds) — the failure each one exercises.
+            ("attrfile", "file", Some(3600)), // attribute file is missing
+            ("attrfile", "ldap", Some(3600)), // unsupported api
+            ("attrfile", "file", None),       // no TrustedService record in policy
+            ("attrfile", "file", Some(1)),    // ttl below MIN_ATTRIBUTE_TTL
+            ("../escape", "file", Some(3600)), // path traversal in the id
+        ];
+        for (id, api, secs) in cases {
+            let policy = policy_from_container(make_trusted_service_policy(id, api, secs, &[]));
+            assert!(
+                build_services_from_policy(&policy, &dir).is_err(),
+                "expected failure for id={id} api={api} secs={secs:?}"
+            );
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `flush_all` must reach every registered service.

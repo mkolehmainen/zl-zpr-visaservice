@@ -131,6 +131,9 @@ pub struct CoreSection {
 
     /// Path to the API keys file.
     pub api_keys: Option<PathBuf>,
+
+    /// Directory holding the `<service-id>.json` attribute files for `api=file` trusted services.
+    pub file_ts_dir: Option<PathBuf>,
 }
 
 impl Default for VSConfig {
@@ -151,6 +154,7 @@ impl Default for CoreSection {
             vk_uri: Some(VALKEY_URI.to_string()),
             identity: Some(String::new()),
             api_keys: Some(PathBuf::from(DEFAULT_API_KEYS_FILE)),
+            file_ts_dir: Some(PathBuf::from(".")),
         }
     }
 }

@@ -10,7 +10,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::SystemTime;
 use zpr::policy::v1 as capnp_policy;
+use zpr::policy_types::{
+    JoinPolicy, PFlags, Service, ServiceType, TrustedService, parse_attribute_mapping,
+};
 use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Visa};
+use zpr::write_to::WriteTo;
 
 use crate::error::ResolverError;
 use crate::policy_mgr::DnsResolver;
@@ -160,6 +164,60 @@ pub fn make_visa(visa_id: u64, expires_in: Duration) -> Visa {
 /// care about its contents.
 pub fn make_pdesc() -> PacketDesc {
     PacketDesc::new_tcp("fd5a:5052::10", "fd5a:5052::20", 1234, 443).unwrap()
+}
+
+/// Build a policy container declaring one trusted service: a join policy providing a
+/// `ServiceType::Trusted(api)` service named `id`, plus (when `expiration_seconds` is
+/// `Some`) the matching `TrustedService` record carrying `mappings`.
+///
+/// Pass `None` for `expiration_seconds` to get the "service declared but no record"
+/// case. Each entry of `mappings` is a `"<service key> -> <attr spec>"` string.
+pub fn make_trusted_service_policy(
+    id: &str,
+    api: &str,
+    expiration_seconds: Option<u32>,
+    mappings: &[&str],
+) -> Vec<u8> {
+    let service = Service {
+        id: id.to_string(),
+        endpoints: Vec::new(),
+        kind: ServiceType::Trusted(api.to_string()),
+    };
+    let jp = JoinPolicy {
+        conditions: Vec::new(),
+        flags: PFlags::default(),
+        provides: Some(vec![service]),
+    };
+
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
+        policy_bldr.set_created("2024-01-01T00:00:00Z");
+        policy_bldr.set_version(1);
+        policy_bldr.set_metadata("");
+        jp.write_to(&mut policy_bldr.reborrow().init_join_policies(1).get(0));
+
+        if let Some(secs) = expiration_seconds {
+            let ts = TrustedService {
+                service_id: id.to_string(),
+                expiration_seconds: secs,
+                returns_attrs: mappings
+                    .iter()
+                    .map(|m| parse_attribute_mapping(m).unwrap())
+                    .collect(),
+                identity_attrs: Vec::new(),
+            };
+            ts.write_to(&mut policy_bldr.reborrow().init_trusted_services(1).get(0));
+        }
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+    make_container_bytes(
+        crate::config::POLICY_MIN_COMPILER_MAJOR,
+        crate::config::POLICY_MIN_COMPILER_MINOR,
+        crate::config::POLICY_MIN_COMPILER_PATCH,
+        &bytes,
+    )
 }
 
 /// Build the Cap'n Proto encoded bytes of a `PolicyContainer` with the given

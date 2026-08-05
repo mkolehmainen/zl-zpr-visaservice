@@ -11,7 +11,9 @@ use crate::attribute::{Attribute, key};
 use crate::joinpolicy::JPolicy;
 
 use zpr::policy::v1 as policy_capnp;
-use zpr::policy_types::{AttrExp, NetAddr, Peering, PolicyTypeError, Service, ServiceType};
+use zpr::policy_types::{
+    AttrExp, NetAddr, Peering, PolicyTypeError, Service, ServiceType, TrustedService,
+};
 
 /// The default and the minimum.
 pub const DEFAULT_LINK_COST: u32 = 1;
@@ -57,6 +59,9 @@ pub struct Policy {
     bootstrap_keys: HashMap<String, PKey<Public>>,
     join_policies: Vec<JPolicy>,
     services: HashMap<String, Service>,
+    /// Trusted service records, keyed by `service_id`. Pairs with the `services` entry
+    /// whose `kind` is [`ServiceType::Trusted`].
+    trusted_services: HashMap<String, TrustedService>,
     cpol_sources: Vec<String>,
     serialized: Bytes,
     peer_table: Option<HashMap<IpAddr, Vec<Peer>>>, // zpr_addr -> peers
@@ -109,6 +114,7 @@ impl Policy {
         let bootstrap_keys = load_bootstrap_keys(&policy)?;
         let join_policies = load_join_policies(&policy)?;
         let services = load_services(&policy)?;
+        let trusted_services = load_trusted_services(&policy)?;
         let cpol_sources = load_cpol_sources(&policy)?;
         let peerings = load_peerings(&policy)?;
         let peer_table = if let Some(ref peerings) = peerings {
@@ -131,6 +137,7 @@ impl Policy {
             bootstrap_keys,
             join_policies,
             services,
+            trusted_services,
             cpol_sources,
             serialized,
             peer_table,
@@ -234,6 +241,11 @@ impl Policy {
 
     pub fn service_by_id(&self, id: &str) -> Option<&Service> {
         self.services.get(id)
+    }
+
+    /// The trusted service record declared for `id`, if this policy has one.
+    pub fn trusted_service_by_id(&self, id: &str) -> Option<&TrustedService> {
+        self.trusted_services.get(id)
     }
 
     /// Get the ZPL source for the communication policy by policy index.
@@ -437,6 +449,26 @@ fn load_services(
     Ok(services)
 }
 
+// Load (cache) the trusted service records found in the binary policy object. Each pairs
+// with a service whose kind is ServiceType::Trusted; see [Policy::trusted_service_by_id].
+fn load_trusted_services(
+    policy: &policy_capnp::policy::Reader,
+) -> Result<HashMap<String, TrustedService>, PolicyError> {
+    let mut trusted_services = HashMap::new();
+    if policy.has_trusted_services() {
+        for ts_rdr in policy.get_trusted_services()?.iter() {
+            let ts = TrustedService::try_from(ts_rdr).map_err(PolicyTypeError::from)?;
+            if let Some(previous) = trusted_services.insert(ts.service_id.clone(), ts) {
+                return Err(PolicyError::InvalidFormat(format!(
+                    "duplicate trusted service id in policy: {}",
+                    previous.service_id
+                )));
+            }
+        }
+    }
+    Ok(trusted_services)
+}
+
 fn load_peerings(
     policy: &policy_capnp::policy::Reader,
 ) -> Result<Option<Vec<Peering>>, PolicyError> {
@@ -461,7 +493,7 @@ mod test {
 
     use bytes::Bytes;
     use zpr::policy::v1 as policy_capnp;
-    use zpr::policy_types::{AttrExp, AttrOp, NetAddr, Peering};
+    use zpr::policy_types::{AttrExp, AttrOp, NetAddr, Peering, parse_attribute_mapping};
     use zpr::write_to::WriteTo;
 
     const MIN_COMPILER_VERSION: Version = Version(0, 13, 0);
@@ -541,6 +573,59 @@ mod test {
         let policy = Policy::new_empty();
 
         assert!(policy.get_cpol_source(0).is_none());
+    }
+
+    /// Build policy bytes carrying the given trusted service records (ids may repeat, so
+    /// the duplicate-id path can be exercised).
+    fn policy_bytes_with_trusted_services(records: &[TrustedService]) -> Bytes {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
+            let mut list = policy
+                .reborrow()
+                .init_trusted_services(records.len() as u32);
+            for (i, ts) in records.iter().enumerate() {
+                ts.write_to(&mut list.reborrow().get(i as u32));
+            }
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+        Bytes::from(bytes)
+    }
+
+    /// A trusted service record and its attribute mappings survive the capnp round trip
+    /// and are reachable by id.
+    #[test]
+    fn test_trusted_service_by_id_round_trip() {
+        let ts = TrustedService {
+            service_id: "attrfile".to_string(),
+            expiration_seconds: 3600,
+            returns_attrs: vec![parse_attribute_mapping("color -> user.color").unwrap()],
+            identity_attrs: vec![],
+        };
+        let policy =
+            Policy::new_from_policy_bytes(policy_bytes_with_trusted_services(&[ts])).unwrap();
+
+        let found = policy.trusted_service_by_id("attrfile").unwrap();
+        assert_eq!(found.expiration_seconds, 3600);
+        assert_eq!(found.returns_attrs[0].service_attr_key, "color");
+        assert_eq!(found.returns_attrs[0].attr.zpl_key(), "user.color");
+        assert!(policy.trusted_service_by_id("nope").is_none());
+    }
+
+    /// Two trusted service records sharing an id are ambiguous, so the whole policy is
+    /// rejected rather than silently keeping one of them.
+    #[test]
+    fn test_duplicate_trusted_service_id_errors() {
+        let ts = TrustedService {
+            service_id: "attrfile".to_string(),
+            expiration_seconds: 3600,
+            returns_attrs: vec![],
+            identity_attrs: vec![],
+        };
+        let result =
+            Policy::new_from_policy_bytes(policy_bytes_with_trusted_services(&[ts.clone(), ts]));
+        assert!(matches!(result, Err(PolicyError::InvalidFormat(_))));
     }
 
     fn ip(s: &str) -> IpAddr {

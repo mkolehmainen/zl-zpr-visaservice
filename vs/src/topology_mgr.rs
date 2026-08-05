@@ -577,7 +577,10 @@ impl TopologyQueryApi for TopologyMgr {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
     use std::sync::Arc;
+
+    use crate::trusted_services_mgr::TrustedServicesMgr;
 
     use zpr::policy::v1 as policy_capnp;
     use zpr::policy_types::{AttrExp, AttrOp, NetAddr, Peering};
@@ -649,6 +652,8 @@ mod tests {
             ),
             repo,
             Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
         )
         .await
         .unwrap()
