@@ -27,7 +27,7 @@ pub const EVENT_QUEUE_DEPTH: usize = 1024;
 
 // We only load policy files built by this version or later.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 13;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 14;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 0;
 
 /// Minimum policy compiler version this build will load.
@@ -52,7 +52,7 @@ pub const INITIAL_VISA_ID: u64 = 1000;
 pub const VALKEY_URI: &str = "redis://127.0.0.1:6379";
 
 /// Every THIS often we re-acquire the DB lock.
-pub const VALKEY_LOCK_REFRESH_SECS: Duration = Duration::from_secs(60);
+pub const VALKEY_LOCK_REFRESH_SECS: Duration = Duration::from_secs(30);
 
 /// We set the DB lock to expire after THIS long.
 pub const VALKEY_LOCK_TIMEOUT: Duration = Duration::from_secs(90);

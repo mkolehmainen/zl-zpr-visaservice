@@ -3,9 +3,13 @@ use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 
+/// Internally sourced attributes
+pub const SOURCE_ZPR: &str = "zpr";
+
 pub const ROLE_NODE: &str = "node";
 pub const ROLE_ADAPTER: &str = "adapter";
-const NEVER_EXPIRES: Duration = Duration::from_secs(60 * 60 * 60 * 24 * 365 * 100); // 100 years
+
+pub const NEVER_EXPIRES: Duration = Duration::from_secs(60 * 60 * 60 * 24 * 365 * 100); // 100 years
 
 pub mod key {
 
@@ -57,6 +61,7 @@ pub struct Attribute {
     key: String,
     value: Vec<String>,
     expires_at: SystemTime,
+    source: String,
 }
 
 /// TBD. Placeholder for that which is used to match link attributes based on policy.
@@ -66,19 +71,44 @@ pub struct Attribute {
 #[derive(Debug, Clone, Serialize, Hash, Eq, PartialEq)]
 pub struct AttrMatch {} // TODO
 
+/// A named attribute source. Use this to get a builder for a source.
+pub struct AttributeSource(String);
+
+impl AttributeSource {
+    pub fn new<S: Into<String>>(source: S) -> Self {
+        AttributeSource(source.into())
+    }
+
+    pub fn builder<S: Into<String>>(&self, key: S) -> AttributeBuilder {
+        AttributeBuilder::new_from_source(key.into(), self.0.clone())
+    }
+}
+
 pub struct AttributeBuilder {
     key: String,
     expires_at: SystemTime,
+    source: String,
 }
 
 /// Helper for building attributes.  Allows for addin an expiration time before setting value/values.
 impl AttributeBuilder {
-    /// Create a builder with the given attribute key and a default expiration
+    /// Create a builder for an internal/zpr attribute with given key and a default expiration
     /// in the far future.
     fn new(key: String) -> Self {
         AttributeBuilder {
             key,
             expires_at: SystemTime::now() + NEVER_EXPIRES,
+            source: SOURCE_ZPR.into(),
+        }
+    }
+
+    /// Create a builder for an attribute from the given `source` and with the
+    /// given attribute `key` and a default expiration in the far future.
+    fn new_from_source(key: String, source: String) -> Self {
+        AttributeBuilder {
+            key,
+            expires_at: SystemTime::now() + NEVER_EXPIRES,
+            source,
         }
     }
 
@@ -99,7 +129,12 @@ impl AttributeBuilder {
     where
         S: AsRef<str>,
     {
-        Attribute::new(self.key, std::iter::once(value), self.expires_at)
+        Attribute::new(
+            self.key,
+            std::iter::once(value),
+            self.expires_at,
+            self.source,
+        )
     }
 
     /// Finishes the build and returns an attribute with the given set of values.
@@ -108,7 +143,7 @@ impl AttributeBuilder {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        Attribute::new(self.key, values, self.expires_at)
+        Attribute::new(self.key, values, self.expires_at, self.source)
     }
 }
 
@@ -124,16 +159,17 @@ impl Attribute {
             .collect()
     }
 
-    /// Create a handy attribute builder initialized with the given key.
-    /// By default the attribute will expire in the far future unless you
-    /// set an expiration using the builder.  To finish the build use
-    /// [AttributeBuilder::value] or [AttributeBuilder::values] depending
-    /// on whether you want to create a single or multi-valued attribute.
+    /// Create a handy attribute builder for internal/zpr attributes initialized
+    /// with the given key. By default the attribute will expire in the far
+    /// future unless you set an expiration using the builder.  To finish the
+    /// build use [AttributeBuilder::value] or [AttributeBuilder::values]
+    /// depending on whether you want to create a single or multi-valued
+    /// attribute.
     pub fn builder<S: Into<String>>(key: S) -> AttributeBuilder {
         AttributeBuilder::new(key.into())
     }
 
-    pub fn new<I, S>(key: String, values: I, expires_at: SystemTime) -> Self
+    pub fn new<I, S>(key: String, values: I, expires_at: SystemTime, source: String) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -142,6 +178,7 @@ impl Attribute {
             key,
             value: Self::collect_values(values),
             expires_at,
+            source,
         }
     }
 
@@ -151,6 +188,10 @@ impl Attribute {
 
     pub fn get_value(&self) -> &[String] {
         &self.value
+    }
+
+    pub fn get_source(&self) -> &str {
+        &self.source
     }
 
     /// If this is a single valued attribute, return a reference to the single value.

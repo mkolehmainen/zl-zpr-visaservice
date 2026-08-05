@@ -342,6 +342,11 @@ impl VisaMgr {
         policy_version: u64,
         vinst: u64,
     ) -> Result<VisaWithMetadata, ServiceError> {
+        // TODO: The visa expiration needs to be computed as watever is soonest:
+        //   - expiration of authentication of source actor
+        //   - expiration of authentication of destination actor
+        //   - expiration of any single attribute used to produce the visa (ie, a matching attribute)
+        //   - the system default maximum visa lifetime
         let expiration_time = std::time::SystemTime::now()
             .checked_add(config::DEFAULT_VISA_EXPIRATION)
             .ok_or_else(|| {

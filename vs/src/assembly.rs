@@ -12,6 +12,7 @@ use crate::event_mgr::EventMgr;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::PolicyMgr;
 use crate::topology_mgr::TopologyMgr;
+use crate::trusted_services_mgr::TrustedServicesMgr;
 use crate::visa_mgr::VisaMgr;
 use crate::vss_mgr::VssMgr;
 
@@ -31,6 +32,7 @@ pub struct Assembly {
     pub event_mgr: EventMgr,
     pub admin_api_keys: Arc<ReloadableApiKeys>,
     pub topo_mgr: TopologyMgr,
+    pub ts_mgr: TrustedServicesMgr,
 }
 
 impl Assembly {
@@ -134,6 +136,7 @@ pub mod tests {
             event_mgr: EventMgr::new(event_tx),
             admin_api_keys: Arc::new(ReloadableApiKeys::default()),
             topo_mgr: TopologyMgr::new(LinkRepo::new(db_handle)),
+            ts_mgr: TrustedServicesMgr::new(),
         }
     }
 }

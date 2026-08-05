@@ -35,6 +35,7 @@ mod policy_mgr;
 mod router;
 mod signal_worker;
 mod topology_mgr;
+mod trusted_services_mgr;
 mod visa_mgr;
 mod visareq_worker;
 mod vsapi_worker;
@@ -61,6 +62,7 @@ use crate::logging::targets::MAIN;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::{PolicyMgr, SystemResolver};
 use crate::topology_mgr::TopologyMgr;
+use crate::trusted_services_mgr::TrustedServicesMgr;
 use crate::visa_mgr::VisaMgr;
 use crate::vss_mgr::VssMgr;
 
@@ -312,6 +314,7 @@ async fn main() -> std::process::ExitCode {
         event_mgr: EventMgr::new(event_tx),
         admin_api_keys: Arc::new(admin_api_keys),
         topo_mgr: TopologyMgr::new(db::LinkRepo::new(db_handle)),
+        ts_mgr: TrustedServicesMgr::new(),
     });
 
     // Rebuild the in-memory router topology from persisted state. This runs after

@@ -66,6 +66,12 @@ pub enum ServiceError {
 
     #[error("resolver error: {0}")]
     Resolver(#[from] ResolverError),
+
+    #[error("serialization/deserialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("trusted service not found: ID={0}")]
+    TrustedServiceNotFound(String),
 }
 
 #[derive(Debug, Error)]

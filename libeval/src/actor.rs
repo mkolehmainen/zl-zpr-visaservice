@@ -1,6 +1,8 @@
 use serde::Serialize;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use thiserror::Error;
 
 use crate::attribute::key;
@@ -25,20 +27,35 @@ pub enum Role {
 /// From the perspective of the evaluator, and actor is just a bunch of
 /// attributes and provided services.  The provided services is stored
 /// under the [Key::SERVICES] attribute key.
-#[derive(Debug, Default, Clone, Serialize, Hash)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct Actor {
-    // Attributes associated with this actor.
-    attrs: Vec<Attribute>,
+    // Attributes associated with this actor, keyed by attribute key.
+    attrs: HashMap<String, Attribute>,
 
     // Once authenticated, an actor will have one or more identity attributes.
     // The names are kept here in order.
     identity_keys: Vec<String>,
 
-    // These are all pulled from the attributes vec if/when set.
+    // These are all pulled from the attributes map if/when set.
     cn: Option<String>,
     role: Role,
     provider: bool,
     zpr_addr: Option<IpAddr>,
+}
+
+/// Hand written because [HashMap] is not [Hash]. Attributes are hashed in key
+/// order so the result does not depend on insertion or map iteration order.
+impl Hash for Actor {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut attrs: Vec<&Attribute> = self.attrs.values().collect();
+        attrs.sort_by_key(|a| a.get_key());
+        attrs.hash(state);
+        self.identity_keys.hash(state);
+        self.cn.hash(state);
+        self.role.hash(state);
+        self.provider.hash(state);
+        self.zpr_addr.hash(state);
+    }
 }
 
 impl Actor {
@@ -47,7 +64,7 @@ impl Actor {
     }
 
     pub fn attrs_iter(&self) -> impl Iterator<Item = &Attribute> {
-        self.attrs.iter()
+        self.attrs.values()
     }
 
     pub fn identity_keys_iter(&self) -> impl Iterator<Item = &String> {
@@ -74,20 +91,22 @@ impl Actor {
     }
 
     /// Adds or replaces the attribute with name `key`.  Assumes a single value attribute.
+    /// Only used in tests.
+    #[cfg(test)]
     pub fn add_attr_from_parts(
         &mut self,
         key: &str,
         value: &str,
-        expires_in: Duration,
+        expires_in: std::time::Duration,
     ) -> Result<(), AttributeError> {
         self.add_attribute(Attribute::builder(key).expires_in(expires_in).value(value))
     }
 
     /// Adds or replaces the attribute on the actor.
     pub fn add_attribute(&mut self, attr: Attribute) -> Result<(), AttributeError> {
-        let key = attr.get_key();
+        let key = attr.get_key().to_string();
         let value = attr.get_value();
-        match key {
+        match key.as_str() {
             key::ZPR_ADDR => {
                 if let Ok(ip) = value[0].parse::<IpAddr>() {
                     self.zpr_addr = Some(ip);
@@ -112,12 +131,12 @@ impl Actor {
             },
             _ => (),
         }
-        self.attrs.push(attr);
+        self.attrs.insert(key, attr);
         Ok(())
     }
 
     pub fn get_attribute(&self, key: &str) -> Option<&Attribute> {
-        self.attrs.iter().find(|a| a.get_key() == key)
+        self.attrs.get(key)
     }
 
     /// If there are identity attributes, the values are copied and returned here
@@ -138,16 +157,29 @@ impl Actor {
 
     /// TODO: Figure out all the details of how we hold authentication data.
     ///
-    /// For now this looks at the identity keys and if any are found, return the
-    /// soonest expiration.
+    /// Returns the minimum expiration time from:
+    /// - [key::AUTHORITY] attribute, if present.
+    /// - any `identity` attributes, if present.
+    /// - ELSE: None.
     ///
     /// If there are no identity keys we assume there is no authentication and return None.
     pub fn get_authentication_expiration(&self) -> Option<SystemTime> {
-        self.identity_keys
+        let authority_expiration = self
+            .get_attribute(key::AUTHORITY)
+            .map(|attr| attr.get_expires());
+        let identity_expiration = self
+            .identity_keys
             .iter()
             .filter_map(|key| self.get_attribute(key))
             .map(|attr| attr.get_expires())
-            .min()
+            .min();
+
+        match (authority_expiration, identity_expiration) {
+            (Some(a), Some(i)) => Some(a.min(i)),
+            (Some(a), None) => Some(a),
+            (None, Some(i)) => Some(i),
+            (None, None) => None,
+        }
     }
 
     pub fn is_provider(&self) -> bool {
@@ -168,40 +200,35 @@ impl Actor {
 
     pub fn provides(&self, service_id: &str) -> bool {
         self.attrs
-            .iter()
-            .any(|a| a.get_key() == key::SERVICES && a.value_has(service_id))
+            .get(key::SERVICES)
+            .is_some_and(|a| a.value_has(service_id))
     }
 
     pub fn services_iter(&self) -> impl Iterator<Item = &str> {
         self.attrs
-            .iter()
-            .find(|a| a.get_key() == key::SERVICES)
+            .get(key::SERVICES)
             .into_iter()
             .flat_map(|attr| attr.get_value().iter().map(|s| s.as_str()))
     }
 
-    pub fn has_attribute_named(&self, key: &str) -> bool {
-        self.attrs.iter().any(|a| a.get_key() == key)
+    pub(crate) fn has_attribute_named(&self, key: &str) -> bool {
+        self.attrs.contains_key(key)
     }
 
-    pub fn has_attribute_value(&self, key: &str, value: &str) -> bool {
+    pub(crate) fn has_attribute_value(&self, key: &str, value: &str) -> bool {
         self.attrs
-            .iter()
-            .any(|a| a.get_key() == key && a.get_value_len() == 1 && a.get_value()[0] == value)
+            .get(key)
+            .is_some_and(|a| a.is_single_value(value))
     }
 
     /// TRUE if all attribute values are present.
-    pub fn has_attribute_values(&self, key: &str, values: &[String]) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.get_key() == key && a.value_has_all(values))
+    pub(crate) fn has_attribute_values(&self, key: &str, values: &[String]) -> bool {
+        self.attrs.get(key).is_some_and(|a| a.value_has_all(values))
     }
 
     /// TRUE if any attribute value from `values` is present.
-    pub fn has_any_attribute_values(&self, key: &str, values: &[String]) -> bool {
-        self.attrs
-            .iter()
-            .any(|a| a.get_key() == key && a.value_has_any(values))
+    pub(crate) fn has_any_attribute_values(&self, key: &str, values: &[String]) -> bool {
+        self.attrs.get(key).is_some_and(|a| a.value_has_any(values))
     }
 }
 
@@ -397,7 +424,7 @@ mod tests {
         // Should have the new value
         assert_eq!(actor.role, Role::Node);
         assert!(actor.is_node());
-        assert_eq!(actor.attrs.len(), 2); // Both attributes are kept in the list
+        assert_eq!(actor.attrs.len(), 1); // Same key, so the second replaces the first
     }
 
     #[test]

@@ -247,11 +247,7 @@ impl ZMachine {
         };
 
         if let Some(ctx) = state.get_ctx() {
-            match ctx.approve_connection(
-                libeval_authd_claims,
-                libeval_unauthed_claims,
-                Duration::from_secs(3600),
-            ) {
+            match ctx.approve_connection(libeval_authd_claims, libeval_unauthed_claims) {
                 Ok(actor) => {
                     outfmt.write_connection_approved(&actor);
                 }

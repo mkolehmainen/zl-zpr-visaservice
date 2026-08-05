@@ -160,7 +160,7 @@ impl ConnectionControl {
         // We are the authority since we are checking RSA locally.
         authd_claims.push(
             Attribute::builder(key::AUTHORITY)
-                .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
+                .expires_in(config::DEFAULT_AUTH_EXPIRATION)
                 .value(&self.authority),
         );
 
@@ -206,11 +206,7 @@ impl ConnectionControl {
             AuthBlob::SS(ssb) => match ssb.alg {
                 ChallengeAlg::RsaSha256Pkcs1v15 => {
                     // We are the authority since we are checking RSA locally.
-                    authd_claims.push(
-                        Attribute::builder(key::AUTHORITY)
-                            .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
-                            .value(&self.authority),
-                    );
+                    authd_claims.push(Attribute::builder(key::AUTHORITY).value(&self.authority));
 
                     self.authenticate_zpr_entity_rsa(
                         asm,
@@ -248,9 +244,13 @@ impl ConnectionControl {
         let policy = asm.policy_mgr.get_current();
 
         // Ok checks out -- now run through policy.
-        let vs_actor = self
+        let mut vs_actor = self
             .authorize_connection(asm, &policy, &config::VS_CN, Vec::new(), authd_claims, 0)
             .await?;
+
+        // The `authorized_connection` call will add the default expiration on the authority key. We
+        // want to make vs not expire.
+        vs_actor.add_attribute(Attribute::builder(key::AUTHORITY).value(&self.authority))?;
 
         Ok(vs_actor)
     }
@@ -335,10 +335,16 @@ impl ConnectionControl {
     /// Use policy to authorize the connection request. Works for adapters and nodes.
     /// If successful you get an authorized Actor back.
     ///
+    /// Is able to use the api=file Trusted service to fetch additional attributes.
+    /// Eventually will query trusted services for additional actor attributes.
+    ///
     /// Does not alter our actor databases.
     /// May take an IP address.
     ///
     /// Caller should set ROLE in unauthd_claims before calling.
+    ///
+    /// This always adds the `key::AUTHORITY` key as an identity attribute with the default
+    /// auth expiration on it.
     async fn authorize_connection(
         &self,
         asm: Arc<Assembly>,
@@ -362,22 +368,47 @@ impl ConnectionControl {
         // There may in the future be additional network I/O in the next step
         // for example if VS needs to talk to attribute service.
 
+        // This function is POST authentication - so we already have some notion of an ID for this actor.
+
+        // TODO: Need to figure out what we are using for an ID. For now using CN (which comes from our RSA auth).
+        // TODO: But why don't we set CN as the identity attribute on the actor? Why mess with the JWT?
+        // TODO: We will need some formal way to pass an IDENTITY value to this function.
+
+        for ts_results in asm.ts_mgr.get_attributes_for_actor(endpoint_cn).await {
+            match ts_results {
+                Ok(ts_attrs) => {
+                    for attr in ts_attrs {
+                        authd_claims.push(attr);
+                    }
+                }
+                Err(e) => {
+                    error!(target: CC, "ts service attr lookup failed for actor {}: {}", endpoint_cn, e);
+                }
+            }
+        }
+
+        info!(target: CC, "XXX authorize_connection - consulting trusted services");
+
         let ectx = EvalContext::new(current_policy.clone());
 
         // TODO: Need to go in to eval and fix the approve_connection logic w/respect to the ROLE claim.
         // We won't know a priori if this is a node or adapter. Though sometimes we do know it's a node.
         // Anyway, best to let VS sort it out and do not do it in libeval.
-        let mut authd_actor = match ectx.approve_connection(
-            Some(&authd_claims),
-            Some(&unauthd_claims),
-            config::DEFAULT_AUTH_EXPIRATION,
-        ) {
-            Ok(actor) => actor,
-            Err(e) => {
-                info!(target: CC, "connection not approved for cn {}: {}", endpoint_cn, e);
-                return Err(e.into());
-            }
-        };
+        let mut authd_actor =
+            match ectx.approve_connection(Some(&authd_claims), Some(&unauthd_claims)) {
+                Ok(actor) => actor,
+                Err(e) => {
+                    info!(target: CC, "connection not approved for cn {}: {}", endpoint_cn, e);
+                    return Err(e.into());
+                }
+            };
+
+        authd_actor.add_attribute(
+            Attribute::builder(key::AUTHORITY)
+                .expires_in(config::DEFAULT_AUTH_EXPIRATION)
+                .value(&self.authority),
+        )?;
+        authd_actor.add_identity_key(usize::MAX, key::AUTHORITY)?;
 
         let actor_role = if authd_actor.is_node() {
             Role::Node
@@ -390,11 +421,8 @@ impl ConnectionControl {
         } else {
             match asm.net_mgr.get_next_zpr_addr(&actor_role) {
                 Ok(addr) => {
-                    authd_actor.add_attribute(
-                        Attribute::builder(key::ZPR_ADDR)
-                            .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
-                            .value(addr.to_string()),
-                    )?;
+                    authd_actor
+                        .add_attribute(Attribute::builder(key::ZPR_ADDR).value(addr.to_string()))?;
                     info!(target: CC, "authorized adapter/{actor_role:?} cn {} assigned ZPR addr {}", endpoint_cn, addr);
                 }
                 Err(e) => {

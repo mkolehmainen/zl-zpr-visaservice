@@ -149,6 +149,13 @@ impl ActorMgr {
         Ok(())
     }
 
+    // TODO: This probably updates too much ... all we really need is to update the attributes.
+    // Only call path is after running an attribute refresh in the visa request path.
+    pub async fn update_actor(&self, actor: &Actor) -> Result<(), ServiceError> {
+        self.actor_db.update_actor(actor).await?;
+        Ok(())
+    }
+
     /// Use [ActorMgr::remove_actor_by_zpr_addr] to remove actor records which apply to both nodes and adapters.
     /// Use this function here in addition to remove node state.
     ///

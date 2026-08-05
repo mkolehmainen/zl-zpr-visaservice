@@ -1052,13 +1052,18 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
 
         let addr_attr = actor.get_attribute(key::ZPR_ADDR).unwrap();
         {
-            let expires_utc: DateTime<Utc> = addr_attr.get_expires().into();
+            let expires_val = if let Some(exp) = actor.get_authentication_expiration() {
+                let dt: DateTime<Utc> = exp.into();
+                dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            } else {
+                "never".to_string()
+            };
             info!(
                 target: API,
                 "successfully authorized {} {:?} with address {actor_addr} (expires {})",
                 if actor.is_node() { "node" } else { "adapter" },
                 actor.get_cn(),
-                expires_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                expires_val
             );
         }
         let zpr_con = Connection::new(actor_addr, addr_attr.get_expires());

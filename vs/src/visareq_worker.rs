@@ -19,6 +19,7 @@
 //! Once we have a path, the visa is queued up for install on all the impacted nodes and
 //! returned to the caller.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -35,7 +36,7 @@ use libeval::route::Route;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use zpr::vsapi_types::{DenyCode, PacketDesc, Visa};
 
 use crate::assembly::Assembly;
@@ -215,27 +216,52 @@ async fn process_visa_request_job(asm: Arc<Assembly>, job: VisaRequestJob) {
 /// Run visa request.
 async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaRequestResult {
     let (source_actor, dest_actor) = get_actors(&asm, job).await?;
-    let (source_actor, dest_actor) =
+    let (mut source_actor, mut dest_actor) =
         match resolve_actors_or_deny(&asm, job, source_actor, dest_actor).await {
             Ok(actors) => actors,
             Err(decision) => return Ok(decision),
         };
 
     // Both actors must have addresses. Extract them here or return a fail.
-    let Some(source_zpr_addr) = source_actor.get_zpr_addr() else {
-        debug!(target: VREQ,
-            "visa request from {:?} denied: source actor {:?} has no ZPR address",
-            job.requesting_node, source_actor
-        );
-        return Ok(VisaDecision::Deny(DenyCode::SourceNotFound));
+    let source_zpr_addr = match source_actor.get_zpr_addr() {
+        Some(addr) => *addr,
+        None => {
+            debug!(target: VREQ,
+                "visa request from {:?} denied: source actor {:?} has no ZPR address",
+                job.requesting_node, source_actor
+            );
+            return Ok(VisaDecision::Deny(DenyCode::SourceNotFound));
+        }
     };
-    let Some(dest_zpr_addr) = dest_actor.get_zpr_addr() else {
-        debug!(target: VREQ,
-            "visa request from {:?} denied: dest actor {:?} has no ZPR address",
-            job.requesting_node, dest_actor
-        );
-        return Ok(VisaDecision::Deny(DenyCode::DestNotFound));
+    let dest_zpr_addr = match dest_actor.get_zpr_addr() {
+        Some(addr) => *addr,
+        None => {
+            debug!(target: VREQ,
+                "visa request from {:?} denied: dest actor {:?} has no ZPR address",
+                job.requesting_node, dest_actor
+            );
+            return Ok(VisaDecision::Deny(DenyCode::DestNotFound));
+        }
     };
+
+    // TODO: make sure libeval ignores expired attributes
+
+    // If necessary, refresh any expired attributes
+    // TODO: Can we parallize this?
+    if refresh_expired_attributes(&asm, &mut source_actor).await {
+        // write to store
+        if let Err(e) = asm.actor_mgr.update_actor(&source_actor).await {
+            error!(target: VREQ, "failed to update source actor after refreshing attributes: {}", e);
+            return Ok(VisaDecision::Deny(DenyCode::NoReason));
+        }
+    }
+    if refresh_expired_attributes(&asm, &mut dest_actor).await {
+        // write to store
+        if let Err(e) = asm.actor_mgr.update_actor(&dest_actor).await {
+            error!(target: VREQ, "failed to update dest actor after refreshing attributes: {}", e);
+            return Ok(VisaDecision::Deny(DenyCode::NoReason));
+        }
+    }
 
     // Docking-node resolution, routing, and policy eval all live in the shared
     // core (used by the Phase 2 sweep too). Actor resolution above stays
@@ -245,8 +271,8 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         &asm,
         &source_actor,
         &dest_actor,
-        source_zpr_addr,
-        dest_zpr_addr,
+        &source_zpr_addr,
+        &dest_zpr_addr,
         &job.packet_desc,
         &policy,
     )
@@ -259,6 +285,47 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         } => visa_from_allow(asm.clone(), job, &hits, &policy, default_route).await,
         PolicyOutcome::Deny(code) => Ok(VisaDecision::Deny(code)),
     }
+}
+
+/// Look for expired attributes and refresh them from the trusted service manager if possible.
+async fn refresh_expired_attributes(asm: &Assembly, actor: &mut Actor) -> bool {
+    let actor_ident = match actor.get_cn() {
+        Some(cn) => cn.to_string(),
+        None => return false,
+    };
+
+    let mut ts_sources = HashSet::new();
+    for attr in actor.attrs_iter() {
+        if attr.is_expired() {
+            ts_sources.insert(attr.get_source().to_string());
+        }
+    }
+    let mut updates = 0;
+    if !ts_sources.is_empty() {
+        for source in &ts_sources {
+            for ts_result in asm
+                .ts_mgr
+                .get_attributes_from_source_for_actor(source, &actor_ident)
+                .await
+            {
+                match ts_result {
+                    Ok(ts_attrs) => {
+                        for attr in ts_attrs {
+                            if let Err(e) = actor.add_attribute(attr) {
+                                warn!(target: VREQ, "failed to add attribute for actor {}: {}", actor_ident, e);
+                            } else {
+                                updates += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(target: VREQ, "ts service attr lookup failed for actor {}: {}", actor_ident, e);
+                    }
+                }
+            }
+        }
+    }
+    updates > 0 // TRUE if we have changed an attribute
 }
 
 /// Resolve an actor's docking node: the connection-table entry, falling back to
@@ -285,6 +352,20 @@ pub(crate) async fn evaluate_against_policy(
     pkt: &PacketDesc,
     policy: &Arc<Policy>,
 ) -> Result<PolicyOutcome, ServiceError> {
+    // If auth is expired it's a no.
+    if let Some(exp) = src.get_authentication_expiration() {
+        if exp < SystemTime::now() {
+            info!(target: VREQ, "eval denied: source actor authentication expired: {src:?}");
+            return Ok(PolicyOutcome::Deny(DenyCode::SourceAuthError));
+        }
+    }
+    if let Some(exp) = dst.get_authentication_expiration() {
+        if exp < SystemTime::now() {
+            info!(target: VREQ, "eval denied: dest actor authentication expired: {dst:?}");
+            return Ok(PolicyOutcome::Deny(DenyCode::DestAuthError));
+        }
+    }
+
     // For AAA actors the docking node comes from the AAA table registered on the
     // request side rather than the connection table.
     let Some(node_addr_a) = resolve_docking_node(asm, src, src_zpr) else {
@@ -361,21 +442,11 @@ pub(crate) fn route_for_allow(
 /// Fabricate an AAA actor for an anonymous endpoint at the given address.
 fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
     let mut anon_actor = Actor::new();
-    let _ = anon_actor.add_attribute(
-        Attribute::builder(key::ZPR_ADDR)
-            .expires(expiration)
-            .value(anon_addr.to_string()),
-    );
-    let _ = anon_actor.add_attribute(
-        Attribute::builder(key::AUTHORITY)
-            .expires(expiration)
-            .value("vs_hack_anon_to_auth"),
-    );
-    let _ = anon_actor.add_attribute(
-        Attribute::builder(key::ROLE)
-            .expires(expiration)
-            .value(ROLE_ADAPTER),
-    );
+    let _ =
+        anon_actor.add_attribute(Attribute::builder(key::ZPR_ADDR).value(anon_addr.to_string()));
+    let _ =
+        anon_actor.add_attribute(Attribute::builder(key::AUTHORITY).value("vs_hack_anon_to_auth"));
+    let _ = anon_actor.add_attribute(Attribute::builder(key::ROLE).value(ROLE_ADAPTER));
     let _ = anon_actor.add_attribute(
         Attribute::builder(key::CN)
             .expires(expiration)

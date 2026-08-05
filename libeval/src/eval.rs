@@ -1,5 +1,5 @@
 use crate::actor::Actor;
-use crate::attribute::{Attribute, ROLE_ADAPTER, ROLE_NODE, key};
+use crate::attribute::{Attribute, NEVER_EXPIRES, ROLE_ADAPTER, ROLE_NODE, key};
 use crate::error::EvalError;
 use crate::eval_result::{Direction, FinalDeny, Hit, PartialEvalResult, Signal};
 use crate::joinpolicy::JFlag;
@@ -14,7 +14,6 @@ use enumset::EnumSet;
 use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 use tracing::{debug, warn};
 
 use zpr::policy::v1 as policy_capnp;
@@ -203,7 +202,6 @@ impl EvalContext {
         &self,
         authenticated_claims: Option<&[Attribute]>,
         unauthenticated_claims: Option<&[Attribute]>,
-        expiration: Duration,
     ) -> Result<Actor, EvalError> {
         if authenticated_claims.is_none() {
             return Err(EvalError::AttributeMissing(
@@ -279,29 +277,27 @@ impl EvalContext {
 
         let role_attr = if flags.contains(JFlag::IsNode) {
             Attribute::builder(key::ROLE)
-                .expires_in(expiration)
+                .expires_in(NEVER_EXPIRES)
                 .value(ROLE_NODE)
         } else {
             Attribute::builder(key::ROLE)
-                .expires_in(expiration)
+                .expires_in(NEVER_EXPIRES)
                 .value(ROLE_ADAPTER)
         };
         actor.add_attribute(role_attr).unwrap();
 
         if !services.is_empty() {
             debug!(target: EVAL, "actor provides services: {:?}", services);
-            let svc_attr = Attribute::new(
-                key::SERVICES.into(),
-                &services.iter().cloned().collect::<Vec<String>>(),
-                SystemTime::now() + expiration,
-            );
+            let svc_attr = Attribute::builder(key::SERVICES)
+                .expires_in(NEVER_EXPIRES)
+                .values(services);
             actor.add_attribute(svc_attr).unwrap();
         }
 
         actor
             .add_attribute(
                 Attribute::builder(key::VINST)
-                    .expires_in(expiration)
+                    .expires_in(NEVER_EXPIRES)
                     .value(self.policy.get_vinst().to_string()),
             )
             .unwrap();
@@ -1009,7 +1005,6 @@ mod test {
             .approve_connection(
                 Some(authenticated_claims.as_slice()),
                 Some(unauthenticated_claims.as_slice()),
-                Duration::from_secs(1000),
             )
             .unwrap();
 
@@ -1037,7 +1032,6 @@ mod test {
         match ctx.approve_connection(
             Some(authenticated_claims.as_slice()),
             Some(unauthenticated_claims.as_slice()),
-            Duration::from_secs(1000),
         ) {
             Err(e) => panic!("expected connection approval to succeed, got {:?}", e),
             Ok(actor) => {
@@ -1064,7 +1058,6 @@ mod test {
             .approve_connection(
                 Some(authenticated_claims.as_slice()),
                 Some(unauthenticated_claims.as_slice()),
-                Duration::from_secs(1000),
             )
             .unwrap();
         assert!(actor.is_node());
@@ -1081,11 +1074,7 @@ mod test {
 
         let authenticated_claims = vec![Attribute::builder(key::CN).value("nobody.zpr.org")];
         let actor = ctx
-            .approve_connection(
-                Some(authenticated_claims.as_slice()),
-                None,
-                Duration::from_secs(1000),
-            )
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
             .unwrap();
         assert!(!actor.is_node());
 

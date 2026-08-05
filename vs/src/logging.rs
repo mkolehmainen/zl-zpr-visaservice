@@ -16,6 +16,7 @@ pub mod targets {
     pub const VSS: &str = "vss";
     pub const VREQ: &str = "vreq";
     pub const TOPO: &str = "topo";
+    pub const TS: &str = "ts";
 }
 
 pub enum Verbosity {
