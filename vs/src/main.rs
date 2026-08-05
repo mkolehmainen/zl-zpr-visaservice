@@ -35,7 +35,7 @@ mod policy_mgr;
 mod router;
 mod signal_worker;
 mod topology_mgr;
-mod trusted_services_mgr;
+mod trusted_services;
 mod visa_mgr;
 mod visareq_worker;
 mod vsapi_worker;
@@ -62,7 +62,7 @@ use crate::logging::targets::MAIN;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::{PolicyMgr, SystemResolver};
 use crate::topology_mgr::TopologyMgr;
-use crate::trusted_services_mgr::TrustedServicesMgr;
+use crate::trusted_services::TrustedServicesMgr;
 use crate::visa_mgr::VisaMgr;
 use crate::vss_mgr::VssMgr;
 

@@ -2041,7 +2041,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::trusted_services_mgr::TrustedServiceInterface for FlushCountingService {
+    impl crate::trusted_services::TrustedServiceInterface for FlushCountingService {
         async fn get_attributes_for_actor(
             &self,
             _actor_ident: &str,

@@ -580,7 +580,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use crate::trusted_services_mgr::TrustedServicesMgr;
+    use crate::trusted_services::TrustedServicesMgr;
 
     use zpr::policy::v1 as policy_capnp;
     use zpr::policy_types::{AttrExp, AttrOp, NetAddr, Peering};

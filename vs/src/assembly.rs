@@ -12,7 +12,7 @@ use crate::event_mgr::EventMgr;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::PolicyMgr;
 use crate::topology_mgr::TopologyMgr;
-use crate::trusted_services_mgr::TrustedServicesMgr;
+use crate::trusted_services::TrustedServicesMgr;
 use crate::visa_mgr::VisaMgr;
 use crate::vss_mgr::VssMgr;
 

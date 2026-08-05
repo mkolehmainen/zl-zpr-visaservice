@@ -893,7 +893,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::trusted_services_mgr::TrustedServiceInterface for MutableTrustedService {
+    impl crate::trusted_services::TrustedServiceInterface for MutableTrustedService {
         async fn get_attributes_for_actor(
             &self,
             _actor_ident: &str,
@@ -1081,7 +1081,7 @@ mod tests {
         // The external data changed and the service was reloaded.
         *svc.attrs.lock().unwrap() = vec![(TS_KEY.to_string(), "engineering".to_string())];
         {
-            use crate::trusted_services_mgr::TrustedServiceInterface;
+            use crate::trusted_services::TrustedServiceInterface;
             svc.flush().await.unwrap();
         }
 

@@ -29,7 +29,7 @@ use crate::db;
 use crate::error::{ResolverError, ServiceError, StoreError, TopologyError};
 use crate::loaded_policy::LoadedPolicy;
 use crate::logging::targets::MAIN;
-use crate::trusted_services_mgr::{
+use crate::trusted_services::{
     TrustedServiceInterface, TrustedServicesMgr, build_services_from_policy,
 };
 

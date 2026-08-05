@@ -43,7 +43,7 @@ use crate::assembly::Assembly;
 use crate::counters::CounterType;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
-use crate::trusted_services_mgr::{REVISION_NEVER, TrustedServicesMgr};
+use crate::trusted_services::{REVISION_NEVER, TrustedServicesMgr};
 use crate::visa_mgr::VisaWithMetadata;
 use crate::{config, net_mgr};
 
@@ -1283,7 +1283,7 @@ mod tests {
     const FAKE_ATTR_KEY: &str = "user.dept";
 
     #[async_trait::async_trait]
-    impl crate::trusted_services_mgr::TrustedServiceInterface for FakeTrustedService {
+    impl crate::trusted_services::TrustedServiceInterface for FakeTrustedService {
         async fn get_attributes_for_actor(
             &self,
             actor_ident: &str,
@@ -1384,7 +1384,7 @@ mod tests {
     struct EmptyTrustedService;
 
     #[async_trait::async_trait]
-    impl crate::trusted_services_mgr::TrustedServiceInterface for EmptyTrustedService {
+    impl crate::trusted_services::TrustedServiceInterface for EmptyTrustedService {
         async fn get_attributes_for_actor(
             &self,
             _actor_ident: &str,
@@ -1462,7 +1462,7 @@ mod tests {
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
 
         // A flush bumps the revision: stale again.
-        use crate::trusted_services_mgr::TrustedServiceInterface;
+        use crate::trusted_services::TrustedServiceInterface;
         fake.flush().await.unwrap();
         assert!(refresh_expired_attributes(&mgr, &mut actor).await);
         assert_eq!(fake.calls.lock().unwrap().len(), 2);
@@ -1492,7 +1492,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::trusted_services_mgr::TrustedServiceInterface for FailingTrustedService {
+    impl crate::trusted_services::TrustedServiceInterface for FailingTrustedService {
         async fn get_attributes_for_actor(
             &self,
             _actor_ident: &str,
