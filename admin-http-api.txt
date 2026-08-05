@@ -1,4 +1,4 @@
-Admin HTTP API  - Current as of 7/12/2026
+Admin HTTP API  - Current as of 7/29/2026
 -----------------------------------------
 
 This document describes the admin HTTPS API implemented by the server and
@@ -22,6 +22,7 @@ Content Type
 API KEY
 -------
   Every request requires passing the api key in the `X-API-Key` header.
+  A missing, malformed, or unknown key gets a 401 (not listed per endpoint).
   Keys carry a permission (read or read/write). Read endpoints require read;
   write endpoints (POST/DELETE) require read/write, else 403.
 
@@ -95,9 +96,15 @@ Common Types
 |                 |   "PROTO_<n>". Both fields are "" if the service is not  |
 |                 |   found in the current policy.                           |
 |                 |                                                          |
-| NetworkDetails  | { "network": NodeConnections[] }                         |
+| NetworkDetails  | { "network": NodeConnection[] }                          |
 |                 |                                                          |
-| NodeConnections | { "node": string, "connections": string[] }              |
+| NodeConnection  | { "node_a_addr": string, "node_b_addr": string,          |
+|                 |   "ctype": "UP" | "DOWN" | "INVALID",                     |
+|                 |   "node_b_substrate": string, "link_id": string,         |
+|                 |   "link_attrs": ApiAttribute[], "link_cost": number }    |
+|                 |   addrs are ZPR (IPv6) addresses; node_b_substrate is a  |
+|                 |   stringified NetAddr ("host:port"). link_id, link_attrs |
+|                 |   and link_cost come from the policy's link description. |
 |                 |                                                          |
 | Revokes         | { "id": string, "revoked": number[] }                    |
 |                 |                                                          |
@@ -281,7 +288,8 @@ DELETE /admin/visas/{id}
 GET /admin/network
 ------------------
   Summary
-    Returns all nodes and, for each, the CNs of its connected peers.
+    Returns the links the current policy declares between nodes, each marked
+    with whether it is actually up.
   Request
     (none)
   Response
@@ -289,7 +297,10 @@ GET /admin/network
     403: permission denied
     500: server error
   Notes
-    A peer whose CN cannot be resolved appears as "cn_missing:<addr>".
+    A peering is declared from both ends, so a policy peering between two
+    nodes yields two entries (one per endpoint's view of the link).
+    ctype is UP if a connected node reports the link, DOWN if the policy
+    declares it but no node reports it, and INVALID otherwise.
 
 GET /admin/stats
 ----------------

@@ -1,5 +1,5 @@
 //! HTTPS admin service implementation.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -49,8 +49,8 @@ use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 
 use admin_api_types::{
     ActorDescriptor, ApiAttribute, ApiKeyFormat, ApiKeySet, AuthRevokeDescriptor, CnEntry,
-    ListEntry, NamedListEntry, NetworkDetails, NodeConnections, NodeRecordBrief, Revokes,
-    ServiceDescriptor, Stats, VisaDescriptor,
+    ConnectionType, ListEntry, NamedListEntry, NetworkDetails, NodeConnection, NodeRecordBrief,
+    Revokes, ServiceDescriptor, Stats, VisaDescriptor,
 };
 
 // Must use tokio RwLock here becuase we need state to be Send.
@@ -947,6 +947,59 @@ async fn get_network(
     info!(target: ADMIN, "GET /admin/network");
     let rstate = state.read().await;
 
+    // Start with the desired topology setup, then we will mark which ones are up.
+
+    // Only track link(a,b) once (ie, do not also store link(b,a)).
+    let mut pairs = HashSet::new();
+
+    let mut topo = Vec::new();
+    let psnap = rstate.asm.policy_mgr.get_current_snapshot();
+
+    for node_addr in psnap.policy().all_peered_nodes() {
+        if let Some(peers) = psnap.policy().get_peers_for_node(node_addr) {
+            for peer in peers {
+                let pair_id = if node_addr < &peer.remote_zpr_addr {
+                    (node_addr.clone(), peer.remote_zpr_addr.clone())
+                } else {
+                    (peer.remote_zpr_addr.clone(), node_addr.clone())
+                };
+
+                if pairs.contains(&pair_id) {
+                    continue;
+                }
+                pairs.insert(pair_id);
+
+                // Each peer has a link_id, remote_zpr_addr, and a remote_substrate NetAddr.
+                // Ok so a desired link is node_addr to peer
+
+                let mut bldr =
+                    NodeConnection::builder(node_addr.clone(), peer.remote_zpr_addr.clone())
+                        .link_id(peer.link_id.clone())
+                        .node_b_substrate(format!(
+                            "{}:{}",
+                            peer.remote_substrate.host, peer.remote_substrate.port
+                        ));
+
+                if let Ok(link_desc) = psnap
+                    .policy()
+                    .describe_link(node_addr, &peer.remote_zpr_addr)
+                {
+                    let api_attrs = link_desc
+                        .attrs
+                        .iter()
+                        .map(to_api_attribute)
+                        .collect::<Vec<ApiAttribute>>();
+
+                    bldr = bldr.link_attrs(api_attrs).link_cost(link_desc.cost);
+                }
+                topo.push(bldr.build());
+            }
+        }
+    }
+
+    // Now we have constructed the ideal topology, lets see what we've actually got
+    // starting with our connected nodes.
+
     let node_addrs = match rstate.asm.actor_mgr.list_node_addrs().await {
         Ok(addrs) => addrs,
         Err(e) => {
@@ -955,32 +1008,34 @@ async fn get_network(
         }
     };
 
-    let mut network: Vec<NodeConnections> = Vec::new();
+    // Everything in topo so far is policy-declared, so only those entries can go UP.
+    // Links appended past this point were reported by a node but never declared.
+    let declared = topo.len();
 
     for node_addr in node_addrs {
-        let node = match rstate.asm.actor_mgr.get_cn_by_zpr_addr(&node_addr).await {
-            Ok(cn) => cn,
-            Err(e) => {
-                error!(target: ADMIN, "error {} getting CN for node with addr {}", e, node_addr);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        };
-
-        let mut connections: Vec<String> = Vec::new();
         for peer_addr in rstate.asm.topo_mgr.get_peers(&node_addr) {
-            match rstate.asm.actor_mgr.get_cn_by_zpr_addr(&peer_addr).await {
-                Ok(cn) => connections.push(cn),
-                Err(e) => {
-                    warn!(target: ADMIN, "error {} getting CN for peer with addr {}", e, peer_addr);
-                    connections.push(format!("cn_missing:{}", peer_addr))
+            // Ok we have node_addr <-> peer_addr, so update the node connection to UP
+            // Or if it does not exist, insert it as INVALID.
+            let mut matched = false;
+            for (i, nc) in topo.iter_mut().enumerate() {
+                if nc.is_link_between(&node_addr, &peer_addr) {
+                    if i < declared {
+                        nc.set_status(ConnectionType::UP);
+                    }
+                    matched = true;
                 }
             }
+            if !matched {
+                topo.push(
+                    NodeConnection::builder(node_addr.clone(), peer_addr.clone())
+                        .invalid()
+                        .build(),
+                );
+            }
         }
-
-        network.push(NodeConnections { node, connections });
     }
 
-    Ok(Json(NetworkDetails { network }))
+    Ok(Json(NetworkDetails { network: topo }))
 }
 
 async fn get_stats(
@@ -1047,7 +1102,10 @@ mod tests {
 
     use crate::admin_apikeys::{ApiKeyRecord, KeyStatus};
     use crate::assembly::tests::{new_assembly_for_tests, new_assembly_with_event_rx};
-    use crate::test_helpers::{make_adapter_actor_defexp, make_node_actor_defexp};
+    use crate::test_helpers::{
+        make_adapter_actor_defexp, make_node_actor_defexp, make_peering, policy_with_peerings,
+    };
+    use zpr::policy_types::AttrExp;
 
     /// Insert a readwrite test key into the assembly's key store and return the
     /// key string to use in the X-API-Key header.
@@ -1776,46 +1834,18 @@ mod tests {
     }
 
     #[tokio::test]
+    /// The test policy declares no topology, so there are no links to report.
     async fn test_get_network_empty() {
-        // No nodes
         let asm = Arc::new(new_assembly_for_tests(None).await);
-        let api_key = setup_test_api_r_key(&asm);
-        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
-        let app = admin_app(shared_state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/admin/network")
-                    .header("X-API-Key", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let details: NetworkDetails = serde_json::from_slice(&body).unwrap();
+        let details = fetch_network(&asm).await;
         assert!(details.network.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_get_network_one_node_no_peers() {
-        // One node with no links
-        let asm = Arc::new(new_assembly_for_tests(None).await);
-        let api_key = setup_test_api_r_key(&asm);
-
-        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
-        let actor = make_node_actor_defexp("fd5a:5052::10", "node-a", "[fd5a:5052::100]:1234");
-        asm.actor_mgr.add_node(&actor, false).await.unwrap();
-        asm.topo_mgr.add_node(addr).unwrap();
-
+    /// GET /admin/network and deserialize the response body.
+    async fn fetch_network(asm: &Arc<Assembly>) -> NetworkDetails {
+        let api_key = setup_test_api_r_key(asm);
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
-        let app = admin_app(shared_state);
-
-        let response = app
+        let response = admin_app(shared_state)
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -1827,27 +1857,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let details: NetworkDetails = serde_json::from_slice(&body).unwrap();
-        assert_eq!(details.network.len(), 1);
-        assert_eq!(details.network[0].node, "node-a");
-        assert!(details.network[0].connections.is_empty());
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Install a policy peering `a` and `b` over `link-ab`, with a link cost attribute.
+    async fn install_ab_peering(asm: &Arc<Assembly>, a: IpAddr, b: IpAddr) {
+        let attrs = vec![AttrExp {
+            key: libeval::attribute::key::LINK_COST.to_string(),
+            op: zpr::policy_types::AttrOp::Eq,
+            value: vec!["7".to_string()],
+        }];
+        asm.policy_mgr
+            .update_policy_from_container_bytes(policy_with_peerings(&[make_peering(
+                a, b, "link-ab", attrs,
+            )]))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn test_get_network_two_nodes_linked() {
-        // Two nodes linked to each other
+    /// A link the policy declares but that no connected node reports is DOWN, and it
+    /// carries the link detail (id, substrate, cost, attrs) taken from policy.
+    async fn test_get_network_declared_link_down() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let addr_a: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let addr_b: IpAddr = "fd5a:5052::11".parse().unwrap();
+        install_ab_peering(&asm, addr_a, addr_b).await;
+
+        let details = fetch_network(&asm).await;
+
+        assert_eq!(details.network.len(), 1);
+        for nc in &details.network {
+            assert!(nc.is_link_between(&addr_a, &addr_b));
+            assert!(matches!(nc.ctype, ConnectionType::DOWN));
+            assert_eq!(nc.link_id, "link-ab");
+            assert_eq!(nc.link_cost, 7);
+            assert_eq!(nc.node_b_substrate, format!("{}:0", nc.node_b_addr));
+            assert_eq!(nc.link_attrs.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    /// A declared link that the connected nodes also report is UP.
+    async fn test_get_network_declared_link_up() {
         use libeval::route::LinkId;
 
         let asm = Arc::new(new_assembly_for_tests(None).await);
-        let api_key = setup_test_api_r_key(&asm);
-
         let addr_a: IpAddr = "fd5a:5052::10".parse().unwrap();
         let addr_b: IpAddr = "fd5a:5052::11".parse().unwrap();
+        install_ab_peering(&asm, addr_a, addr_b).await;
+
         let actor_a = make_node_actor_defexp("fd5a:5052::10", "node-a", "[fd5a:5052::100]:1234");
         let actor_b = make_node_actor_defexp("fd5a:5052::11", "node-b", "[fd5a:5052::101]:1234");
-
         asm.actor_mgr.add_node(&actor_a, false).await.unwrap();
         asm.actor_mgr.add_node(&actor_b, false).await.unwrap();
         asm.topo_mgr.add_node(addr_a).unwrap();
@@ -1856,32 +1918,43 @@ mod tests {
             .add_link(addr_a, addr_b, LinkId("link-ab".into()), vec![], 1)
             .unwrap();
 
-        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
-        let app = admin_app(shared_state);
+        let details = fetch_network(&asm).await;
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/admin/network")
-                    .header("X-API-Key", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+        assert_eq!(details.network.len(), 1);
+        for nc in &details.network {
+            assert!(nc.is_link_between(&addr_a, &addr_b));
+            assert!(matches!(nc.ctype, ConnectionType::UP));
+        }
+    }
+
+    #[tokio::test]
+    /// A link the nodes report but that the policy does not declare is INVALID.
+    async fn test_get_network_undeclared_link_invalid() {
+        use libeval::route::LinkId;
+
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let addr_a: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let addr_b: IpAddr = "fd5a:5052::11".parse().unwrap();
+
+        // Note: no policy peering installed, so this link is undeclared.
+        let actor_a = make_node_actor_defexp("fd5a:5052::10", "node-a", "[fd5a:5052::100]:1234");
+        let actor_b = make_node_actor_defexp("fd5a:5052::11", "node-b", "[fd5a:5052::101]:1234");
+        asm.actor_mgr.add_node(&actor_a, false).await.unwrap();
+        asm.actor_mgr.add_node(&actor_b, false).await.unwrap();
+        asm.topo_mgr.add_node(addr_a).unwrap();
+        asm.topo_mgr.add_node(addr_b).unwrap();
+        asm.topo_mgr
+            .add_link(addr_a, addr_b, LinkId("link-ab".into()), vec![], 1)
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
 
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let details: NetworkDetails = serde_json::from_slice(&body).unwrap();
-        assert_eq!(details.network.len(), 2);
+        let details = fetch_network(&asm).await;
 
-        let mut network = details.network;
-        network.sort_by(|a, b| a.node.cmp(&b.node));
-        assert_eq!(network[0].node, "node-a");
-        assert_eq!(network[0].connections, vec!["node-b".to_string()]);
-        assert_eq!(network[1].node, "node-b");
-        assert_eq!(network[1].connections, vec!["node-a".to_string()]);
+        assert_eq!(details.network.len(), 1);
+        assert!(
+            matches!(details.network[0].ctype, ConnectionType::INVALID),
+            "got {:?}",
+            details.network[0].ctype
+        );
     }
 
     /// Build a Scope with the given protocol, single port, and port range.

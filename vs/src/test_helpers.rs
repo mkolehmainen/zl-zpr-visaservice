@@ -15,7 +15,8 @@ use libeval::route::{LinkId, Route};
 
 use zpr::policy::v1 as capnp_policy;
 use zpr::policy_types::{
-    JoinPolicy, PFlags, Service, ServiceType, TrustedService, parse_attribute_mapping,
+    AttrExp, JoinPolicy, NetAddr, PFlags, Peering, Service, ServiceType, TrustedService,
+    parse_attribute_mapping,
 };
 use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Visa};
 use zpr::write_to::WriteTo;
@@ -214,6 +215,44 @@ pub fn make_trusted_service_policy(
                 identity_attrs: Vec::new(),
             };
             ts.write_to(&mut policy_bldr.reborrow().init_trusted_services(1).get(0));
+        }
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+    make_container_bytes(
+        crate::config::POLICY_MIN_COMPILER_MAJOR,
+        crate::config::POLICY_MIN_COMPILER_MINOR,
+        crate::config::POLICY_MIN_COMPILER_PATCH,
+        &bytes,
+    )
+}
+
+/// Build a `Peering` between two ZPR addresses, each reachable at its own address as
+/// substrate so a `FakeResolver::ip_only()` resolves it. `describe_link(node_a, node_b)`
+/// on the resulting policy finds this link.
+pub fn make_peering(node_a: IpAddr, node_b: IpAddr, link_id: &str, attrs: Vec<AttrExp>) -> Peering {
+    Peering {
+        link_id: link_id.to_string(),
+        node_a,
+        substrate_a: NetAddr::new_for_ip_or_host(&node_a.to_string(), 0),
+        node_b,
+        substrate_b: NetAddr::new_for_ip_or_host(&node_b.to_string(), 0),
+        attributes: attrs,
+    }
+}
+
+/// Build the container bytes of a policy whose topology is the given peerings
+/// (an empty slice gives a valid policy with no topology).
+pub fn policy_with_peerings(peerings: &[Peering]) -> Vec<u8> {
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut policy = msg.init_root::<capnp_policy::policy::Builder>();
+        policy.reborrow().set_created("1970-01-01T00:00:00Z");
+        if !peerings.is_empty() {
+            let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
+            for (i, p) in peerings.iter().enumerate() {
+                p.write_to(&mut topo.reborrow().get(i as u32));
+            }
         }
     }
     let mut bytes = Vec::new();

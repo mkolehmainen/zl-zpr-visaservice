@@ -7,6 +7,7 @@ use serde_with::{TimestampSeconds, serde_as};
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::time::SystemTime;
 
 /// List entry is a list with a numeric ID.
@@ -618,13 +619,112 @@ impl fmt::Display for CnEntry {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NetworkDetails {
-    pub network: Vec<NodeConnections>,
+    pub network: Vec<NodeConnection>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct NodeConnections {
-    pub node: String,
-    pub connections: Vec<String>,
+pub enum ConnectionType {
+    /// Link is in policy and is UP.
+    UP,
+    /// Link is in policy but is DOWN.
+    DOWN,
+    /// Link is not in policy and is UP.
+    INVALID,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NodeConnection {
+    pub node_a_addr: IpAddr,
+    pub node_b_addr: IpAddr,
+    pub ctype: ConnectionType,
+    pub node_b_substrate: String, // stringified NetAddr
+    pub link_id: String,
+    pub link_attrs: Vec<ApiAttribute>,
+    pub link_cost: u32,
+}
+
+impl NodeConnection {
+    /// Create builder for a link, initiallty set 'DOWN'.
+    pub fn builder(a: IpAddr, b: IpAddr) -> NodeConnectionBuilder {
+        NodeConnectionBuilder::new_down(a, b)
+    }
+
+    /// True if this connection joins `a` and `b`, in either direction.
+    pub fn is_link_between(&self, a: &IpAddr, b: &IpAddr) -> bool {
+        (&self.node_a_addr == a && &self.node_b_addr == b)
+            || (&self.node_a_addr == b && &self.node_b_addr == a)
+    }
+
+    pub fn set_status(&mut self, status: ConnectionType) {
+        self.ctype = status;
+    }
+}
+
+pub struct NodeConnectionBuilder {
+    node_a_addr: IpAddr,
+    node_b_addr: IpAddr,
+    ctype: ConnectionType,
+    node_b_substrate: String,
+    link_id: String,
+    link_attrs: Vec<ApiAttribute>,
+    link_cost: u32,
+}
+
+impl NodeConnectionBuilder {
+    /// Creates a builder which by default returns a `DOWN` connection.
+    fn new_down(a: IpAddr, b: IpAddr) -> Self {
+        NodeConnectionBuilder {
+            node_a_addr: a,
+            node_b_addr: b,
+            ctype: ConnectionType::DOWN,
+            node_b_substrate: String::new(),
+            link_id: String::new(),
+            link_attrs: Vec::new(),
+            link_cost: 0,
+        }
+    }
+
+    pub fn link_id(mut self, link_id: String) -> Self {
+        self.link_id = link_id;
+        self
+    }
+
+    pub fn node_b_substrate(mut self, node_b_substrate: String) -> Self {
+        self.node_b_substrate = node_b_substrate;
+        self
+    }
+
+    pub fn link_cost(mut self, link_cost: u32) -> Self {
+        self.link_cost = link_cost;
+        self
+    }
+
+    pub fn link_attrs(mut self, attrs: Vec<ApiAttribute>) -> Self {
+        self.link_attrs = attrs;
+        self
+    }
+
+    pub fn up(mut self) -> Self {
+        self.ctype = ConnectionType::UP;
+        self
+    }
+
+    pub fn invalid(mut self) -> Self {
+        self.ctype = ConnectionType::INVALID;
+        self
+    }
+
+    pub fn build(self) -> NodeConnection {
+        NodeConnection {
+            node_a_addr: self.node_a_addr,
+            node_b_addr: self.node_b_addr,
+            ctype: self.ctype,
+            node_b_substrate: self.node_b_substrate,
+            link_id: self.link_id,
+            link_attrs: self.link_attrs,
+            link_cost: self.link_cost,
+        }
+    }
 }
 
 impl fmt::Display for NetworkDetails {
@@ -632,14 +732,18 @@ impl fmt::Display for NetworkDetails {
         if self.network.is_empty() {
             writeln!(f, "No network")?;
         }
-        for node in &self.network {
+        for nc in &self.network {
             writeln!(
                 f,
-                "{} {}  {} {:?}",
-                "actor:".dimmed(),
-                node.node.yellow(),
-                "connected to:".dimmed(),
-                node.connections
+                "{}  {} <-> {}  {}",
+                "link:".dimmed(),
+                nc.node_a_addr.to_string().yellow(),
+                nc.node_b_addr.to_string().yellow(),
+                match nc.ctype {
+                    ConnectionType::UP => "up".green(),
+                    ConnectionType::DOWN => "down".red(),
+                    ConnectionType::INVALID => "invalid".yellow(),
+                }
             )?;
         }
         Ok(())

@@ -448,11 +448,9 @@ async fn resolve_netaddr(
 mod tests {
     use super::*;
 
-    use crate::test_helpers::{make_container_bytes, make_trusted_service_policy};
+    use crate::test_helpers::{make_peering, make_trusted_service_policy, policy_with_peerings};
     use std::sync::Arc;
-    use zpr::policy::v1 as policy_capnp;
-    use zpr::policy_types::{AttrExp, NetAddr, Peering};
-    use zpr::write_to::WriteTo;
+    use zpr::policy_types::{NetAddr, Peering};
 
     use crate::db::{DbConnection, FakeDb, PolicyRepo};
     use crate::test_helpers::FakeResolver;
@@ -464,29 +462,6 @@ mod tests {
     /// Build a minimal valid Policy with no topology.
     fn policy_no_topology() -> Vec<u8> {
         policy_with_peerings(&[])
-    }
-
-    /// Build a Policy containing the given peerings by encoding a capnp message in memory.
-    fn policy_with_peerings(peerings: &[Peering]) -> Vec<u8> {
-        let mut msg = capnp::message::Builder::new_default();
-        {
-            let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
-            policy.reborrow().set_created("1970-01-01T00:00:00Z");
-            if !peerings.is_empty() {
-                let mut topo = policy.reborrow().init_topology(peerings.len() as u32);
-                for (i, p) in peerings.iter().enumerate() {
-                    p.write_to(&mut topo.reborrow().get(i as u32));
-                }
-            }
-        }
-        let mut bytes = Vec::new();
-        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
-        make_container_bytes(
-            config::POLICY_MIN_COMPILER_MAJOR,
-            config::POLICY_MIN_COMPILER_MINOR,
-            config::POLICY_MIN_COMPILER_PATCH,
-            &bytes,
-        )
     }
 
     /// Create a PolicyMgr backed by a FakeDb with the given policy loaded.
@@ -595,18 +570,6 @@ mod tests {
         assert_eq!(ts_mgr.stale_sources_for_actor("alice").len(), 1);
 
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// Build a Peering between two ZPR addresses. describe_link(node_a, node_b) will find it.
-    fn make_peering(node_a: IpAddr, node_b: IpAddr, link_id: &str, attrs: Vec<AttrExp>) -> Peering {
-        Peering {
-            link_id: link_id.to_string(),
-            node_a,
-            substrate_a: NetAddr::new_for_ip_or_host(&node_a.to_string(), 0),
-            node_b,
-            substrate_b: NetAddr::new_for_ip_or_host(&node_b.to_string(), 0),
-            attributes: attrs,
-        }
     }
 
     /// Build a Peering whose node_b substrate is an unresolvable hostname, so that
