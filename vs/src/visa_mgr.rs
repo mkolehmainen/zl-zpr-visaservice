@@ -12,10 +12,8 @@ use crate::error::{ServiceError, StoreError};
 use crate::logging::targets::VISA;
 use crate::packet::make_fivetuple_tcp;
 use crate::policy_mgr::PolicySnapshot;
-use crate::visareq_worker::{
-    PolicyOutcome, VisaDecision, evaluate_against_policy, request_visa_wait_response,
-    route_for_allow,
-};
+use crate::visa_policy::{PolicyOutcome, evaluate_against_policy, route_for_allow};
+use crate::visareq_worker::{VisaDecision, request_visa_wait_response};
 
 use libeval::eval_result::{Direction, Hit};
 use libeval::route::{NodeId, Route};

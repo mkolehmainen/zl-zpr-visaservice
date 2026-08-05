@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use libeval::attribute::{ROLE_ADAPTER, key};
 
+mod actor_attributes;
 mod actor_mgr;
 mod admin_apikeys;
 mod admin_service;
@@ -37,6 +38,8 @@ mod signal_worker;
 mod topology_mgr;
 mod trusted_services;
 mod visa_mgr;
+mod visa_policy;
+mod visa_reconciler;
 mod visareq_worker;
 mod vsapi_worker;
 mod vss;

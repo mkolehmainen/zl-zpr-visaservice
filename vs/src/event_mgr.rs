@@ -16,12 +16,12 @@ use zpr::vsapi_types::ServiceDescriptor;
 
 use libeval::eval::EvalContext;
 
+use crate::actor_attributes::refresh_actors;
 use crate::assembly::Assembly;
 use crate::error::ServiceError;
 use crate::logging::targets::EVENT;
 use crate::policy_mgr::PolicySnapshot;
-use crate::visa_mgr::VisaRecheck;
-use crate::visareq_worker::refresh_and_persist_actor;
+use crate::visa_reconciler::{SweepReason, revalidate_visas};
 
 #[derive(Debug)]
 pub enum VsEvent {
@@ -40,22 +40,11 @@ pub enum VsEvent {
     PolicyUpdated(u64),
 
     /// The attribute data behind a trusted service changed (an admin refreshed it).
-    /// Pass the source id. Handler refreshes the actors behind live visas and
-    /// re-checks those visas against the refreshed attributes.
-    TrustedServiceChange(String),
-}
-
-/// Why a visa sweep is running. The two reasons need different handling because
-/// an attribute change does not move the policy generation, so the
-/// `checked_vinst` gates that make the policy sweep idempotent (ie, do not do
-/// anything if the `vinst` has not changed) would make an attribute sweep a
-/// complete no-op.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SweepReason {
-    /// A new policy was installed.
-    PolicyUpdate,
-    /// A trusted service's attribute data changed.
-    AttributeChange,
+    /// Handler reconciles *all* stale or TTL-expired trusted attributes on the actors
+    /// behind live visas, then re-checks those visas. Deliberately not scoped to the
+    /// source that changed: `stale_sources_for_actor` already narrows the fetch to
+    /// sources whose revision actually moved, so a source id would buy nothing.
+    TrustedServiceChange,
 }
 
 #[derive(Clone)]
@@ -102,8 +91,8 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
                     error!(target: EVENT, "failed to handle policy updated event: {}", e);
                 }
             }
-            VsEvent::TrustedServiceChange(source_id) => {
-                handle_trusted_service_change(&asm, &source_id).await;
+            VsEvent::TrustedServiceChange => {
+                handle_trusted_service_change(&asm).await;
             }
         }
     }
@@ -316,7 +305,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
 /// Note this only reconciles actors that hold a live visa. Everyone else is
 /// handled lazily on their next visa request by the revision check in
 /// `refresh_expired_attributes`.
-async fn handle_trusted_service_change(asm: &Arc<Assembly>, source_id: &str) {
+async fn handle_trusted_service_change(asm: &Arc<Assembly>) {
     // One snapshot for the whole pass, same as the policy handler.
     let psnap = asm.policy_mgr.get_current_snapshot();
 
@@ -324,7 +313,7 @@ async fn handle_trusted_service_change(asm: &Arc<Assembly>, source_id: &str) {
         refresh_actors(asm, live_visa_actor_addrs(asm).await).await;
     info!(
         target: EVENT,
-        "trusted service '{source_id}' changed: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
+        "trusted service changed: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
     );
 
     revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
@@ -339,41 +328,6 @@ async fn live_visa_actor_addrs(asm: &Arc<Assembly>) -> HashSet<IpAddr> {
         zpr_addrs.insert(md.five_tuple.dest_addr);
     }
     zpr_addrs
-}
-
-/// Refresh (and persist) the attributes of each actor in `zpr_addrs`. Only sources that
-/// are TTL-expired or revision-stale are actually fetched.
-///
-/// A failure is logged and skipped rather than aborting the pass: that actor's recorded
-/// revision stays mismatched, so its next visa request refreshes it again. This includes
-/// an unreachable trusted service (`AttributesIndeterminate`).
-///
-/// Returns `(refreshed, unresolved, failed)` counts for logging.
-///
-/// TODO: Sequential, and unbounded in the size of the set. Fine while the only trusted
-/// service is the in-memory file store; revisit once services are network calls and
-/// actor/visa counts are large.
-async fn refresh_actors(asm: &Arc<Assembly>, zpr_addrs: HashSet<IpAddr>) -> (u32, u32, u32) {
-    let (mut refreshed, mut unresolved, mut failed) = (0u32, 0u32, 0u32);
-    // Sequential for now, join_all it if sweeps ever get slow.
-    for zpr_addr in zpr_addrs {
-        match asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await {
-            Ok(Some(mut actor)) => match refresh_and_persist_actor(asm, &mut actor).await {
-                Ok(true) => refreshed += 1,
-                Ok(false) => {}
-                Err(e) => {
-                    warn!(target: EVENT, "attribute reconcile: failed to refresh actor {zpr_addr}: {e}");
-                    failed += 1;
-                }
-            },
-            Ok(None) => unresolved += 1,
-            Err(e) => {
-                warn!(target: EVENT, "attribute reconcile: failed to load actor {zpr_addr}: {e}");
-                failed += 1;
-            }
-        }
-    }
-    (refreshed, unresolved, failed)
 }
 
 /// When we get a new policy, some nodes may no longer be valid. This checks each of
@@ -435,131 +389,20 @@ async fn node_still_valid(asm: &Arc<Assembly>, ectx: &EvalContext, naddr: &IpAdd
     }
 }
 
-/// Sweep every live visa and re-evaluate it against the given policy snapshot.
-/// Denied visas (and visas whose route moved) are marked `PendingRevoke` on all
-/// their nodes so VSS housekeeping revokes them.
-///
-/// Visas whose actors can't be resolved are skipped (not revoked). A verdict is
-/// only applied while `target_vinst` is still the live policy generation —
-/// otherwise a newer policy sweep is coming and it will decide when it runs.
-///
-/// [SweepReason::PolicyUpdate] skips any visa already checked at/after
-/// `target_vinst`, bumps `checked_vinst` on allow (canceling any older queued
-/// revoke), and denies through the vinst-gated verdict recorder.
-///
-/// [SweepReason::AttributeChange] cannot use those gates: the policy generation has
-/// not moved, so every visa looks "current". It checks every visa, revokes through
-/// the ungated [VisaMgr::mark_visa_revoked], and does nothing at all on allow —
-/// a revoke queued by an earlier attribute sweep stays queued, and the node simply
-/// re-requests to get a fresh decision.
-async fn revalidate_visas(asm: &Arc<Assembly>, psnap: &PolicySnapshot, reason: SweepReason) {
-    let target_vinst = psnap.vinst();
-    let snapshot = asm.visa_mgr.list_visa_metadata().await;
-
-    // Some numbers for logging purposes.
-    let total = snapshot.len();
-    let mut allowed = 0u32;
-    let mut revoked = 0u32;
-    let mut skipped_stale = 0u32;
-    let mut skipped_unresolved = 0u32;
-    let mut skipped_current = 0u32;
-
-    for (visa_id, metadata) in snapshot {
-        // Only a policy sweep can skip on generation: an attribute change leaves the
-        // generation alone, so this would skip everything.
-        if reason == SweepReason::PolicyUpdate && metadata.checked_vinst >= target_vinst {
-            skipped_current += 1;
-            continue;
-        }
-        match asm
-            .visa_mgr
-            .recheck_visa_allowed(asm, &metadata, psnap)
-            .await
-        {
-            Ok(VisaRecheck::SkipUnresolvedActor) => {
-                skipped_unresolved += 1;
-                debug!(target: EVENT, "visa sweep: visa {visa_id} actor unresolved, skipping");
-            }
-            Ok(VisaRecheck::AllowSameRoute) => {
-                // An attribute sweep records nothing on allow: it must not bump
-                // checked_vinst (that would make a later policy sweep skip the visa)
-                // and it deliberately leaves any queued revoke in place.
-                if reason == SweepReason::AttributeChange {
-                    allowed += 1;
-                    continue;
-                }
-                // Allowed. Only apply while target_vinst is still the live policy;
-                // otherwise an older sweep could cancel a newer revoke verdict.
-                if asm.policy_mgr.get_current_snapshot().vinst() != target_vinst {
-                    skipped_stale += 1;
-                    continue;
-                }
-                match asm
-                    .visa_mgr
-                    .record_allow_verdict(visa_id, target_vinst)
-                    .await
-                {
-                    Ok(_) => allowed += 1,
-                    Err(e) => {
-                        warn!(target: EVENT, "visa sweep: failed to record allow for visa {visa_id}: {e}")
-                    }
-                }
-            }
-            Ok(VisaRecheck::Revoke) => {
-                // Denied, or allowed but rerouted. Only apply while target_vinst
-                // is still the live policy; otherwise a newer sweep is coming and
-                // will make the decision.
-                if asm.policy_mgr.get_current_snapshot().vinst() != target_vinst {
-                    skipped_stale += 1;
-                    continue;
-                }
-                // The verdict recorder is vinst-gated, so an attribute sweep has to
-                // revoke through the ungated path.
-                let res = match reason {
-                    SweepReason::PolicyUpdate => {
-                        asm.visa_mgr
-                            .record_deny_verdict(visa_id, target_vinst)
-                            .await
-                    }
-                    SweepReason::AttributeChange => asm.visa_mgr.mark_visa_revoked(visa_id).await,
-                };
-                match res {
-                    Ok(_) => revoked += 1,
-                    Err(e) => {
-                        warn!(target: EVENT, "visa sweep: failed to record deny for visa {visa_id}: {e}")
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(target: EVENT, "visa sweep: error re-checking visa {visa_id}: {e}");
-            }
-        }
-    }
-
-    // Note that this sweep just manipulates the desired state of the visas. The
-    // actual revocations happen asynchronously in VSS housekeeping.
-    info!(
-        target: EVENT,
-        "visa sweep reason={reason:?} vinst={target_vinst}: total={total} allowed={allowed} revoked={revoked} skipped_stale={skipped_stale} skipped_unresolved={skipped_unresolved} skipped_current={skipped_current}"
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::assembly::tests::{make_policy, new_assembly_for_tests};
+    use crate::assembly::tests::new_assembly_for_tests;
     use crate::config;
     use crate::test_helpers::{
-        make_adapter_actor_defexp, make_container_bytes, make_node_actor_defexp,
+        TS_KEY, build_sweep_asm, create_sweep_visa, make_container_bytes, make_node_actor_defexp,
+        register_ts, seed_source_attr, stored_attr,
     };
-    use libeval::attribute::{Attribute, AttributeSource, key};
-    use libeval::eval_result::{Direction, Hit};
-    use libeval::route::{LinkId, Route};
+    use libeval::attribute::{Attribute, key};
     use std::time::Duration;
     use zpr::policy::v1 as capnp_policy;
     use zpr::policy_types::{JoinPolicy, PFlags, Scope, Service, ServiceType};
-    use zpr::vsapi_types::PacketDesc;
     use zpr::write_to::WriteTo;
 
     /// Build a policy container whose single join policy marks connections as
@@ -736,366 +579,6 @@ mod tests {
         assert!(invalid.is_empty());
     }
 
-    /// Build an assembly with two docked adapters (`::4000::a`/`::4000::b`) whose
-    /// nodes are in the topology. `with_link` controls whether a route exists.
-    /// The default (empty) policy denies everything (NoMatch), so with a route
-    /// present the eval still denies — either way the sweep sees a deny.
-    async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
-        let asm = new_assembly_for_tests(None).await;
-        let node_a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
-        let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
-        asm.actor_mgr
-            .add_node(
-                &make_node_actor_defexp("fd5a:5052:3000::1", "na", "10.0.0.1:1"),
-                false,
-            )
-            .await
-            .unwrap();
-        asm.actor_mgr
-            .add_node(
-                &make_node_actor_defexp("fd5a:5052:3000::2", "nb", "10.0.0.2:2"),
-                false,
-            )
-            .await
-            .unwrap();
-        asm.topo_mgr.add_node(node_a).unwrap();
-        asm.topo_mgr.add_node(node_b).unwrap();
-        if with_link {
-            asm.topo_mgr
-                .add_link(node_a, node_b, LinkId("l".into()), vec![], 1)
-                .unwrap();
-        }
-        asm.actor_mgr
-            .add_adapter_via_node(
-                &make_adapter_actor_defexp("fd5a:5052:4000::a", "src"),
-                &node_a,
-            )
-            .await
-            .unwrap();
-        asm.actor_mgr
-            .add_adapter_via_node(
-                &make_adapter_actor_defexp("fd5a:5052:4000::b", "dst"),
-                &node_b,
-            )
-            .await
-            .unwrap();
-        (Arc::new(asm), node_a)
-    }
-
-    /// Create a single-node visa held (PendingInstall) by `req` for the given
-    /// five-tuple, seeded at `vinst`. Returns its id.
-    async fn create_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: u64) -> u64 {
-        let pdesc =
-            PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
-        let hit = Hit::new_no_signal(0, Direction::Forward);
-        let route = Route::new_direct((*req).into());
-        let vwmd = asm
-            .visa_mgr
-            .create_visa(asm, req, &pdesc, &hit, &route, "", 0, vinst)
-            .await
-            .unwrap();
-        vwmd.visa.issuer_id
-    }
-
-    /// A denied visa is marked PendingRevoke on its holder node (target policy
-    /// still live). Uses the no-route assembly so eval falls out as a deny.
-    #[tokio::test]
-    async fn test_sweep_denied_visa_marked_pending_revoke() {
-        let (asm, node_a) = build_sweep_asm(false).await;
-        let id = create_sweep_visa(&asm, &node_a, 0).await;
-
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        assert!(
-            psnap.vinst() > 0,
-            "target must exceed the visa's checked_vinst"
-        );
-        revalidate_visas(&asm, &psnap, SweepReason::PolicyUpdate).await;
-
-        let revoke_ids = asm
-            .visa_mgr
-            .get_pending_revoke_visa_ids_for_node(&node_a)
-            .await
-            .unwrap();
-        assert_eq!(revoke_ids, vec![id]);
-    }
-
-    /// A visa already checked at/after target_vinst is skipped before re-eval:
-    /// even on the deny (no-route) assembly it is NOT marked PendingRevoke.
-    #[tokio::test]
-    async fn test_sweep_skips_already_checked() {
-        let (asm, node_a) = build_sweep_asm(false).await;
-        let target = asm.policy_mgr.get_current_snapshot().vinst();
-        // checked_vinst == target, so the guard skips before recheck.
-        let id = create_sweep_visa(&asm, &node_a, target).await;
-
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        revalidate_visas(&asm, &psnap, SweepReason::PolicyUpdate).await;
-
-        assert!(
-            asm.visa_mgr
-                .get_pending_revoke_visa_ids_for_node(&node_a)
-                .await
-                .unwrap()
-                .is_empty(),
-            "already-checked visa must not be re-evaluated/revoked"
-        );
-        let pending = asm
-            .visa_mgr
-            .get_pending_visa_ids_for_node(&node_a)
-            .await
-            .unwrap();
-        assert_eq!(pending, vec![id]);
-    }
-
-    /// An unresolvable actor leaves the visa untouched (skipped, not revoked).
-    #[tokio::test]
-    async fn test_sweep_unresolved_actor_leaves_visa_untouched() {
-        let asm = Arc::new(new_assembly_for_tests(None).await);
-        let node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
-        // Five-tuple addrs (::4000::a/b) have no actors in the DB → unresolved.
-        let id = create_sweep_visa(&asm, &node, 0).await;
-
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        revalidate_visas(&asm, &psnap, SweepReason::PolicyUpdate).await;
-
-        // Still held as PendingInstall (untouched); nothing marked for revoke.
-        let pending = asm
-            .visa_mgr
-            .get_pending_visa_ids_for_node(&node)
-            .await
-            .unwrap();
-        assert_eq!(pending, vec![id]);
-        assert!(
-            asm.visa_mgr
-                .get_pending_revoke_visa_ids_for_node(&node)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// A deny whose target vinst is no longer the live policy generation is
-    /// skipped (a newer sweep is coming): no revoke is marked.
-    #[tokio::test]
-    async fn test_sweep_denied_but_stale_target_skips() {
-        let (asm, node_a) = build_sweep_asm(false).await;
-        let id = create_sweep_visa(&asm, &node_a, 0).await;
-
-        // Snapshot the current (stale) generation, then bump the live policy so
-        // get_current_snapshot().vinst() moves past the snapshot's vinst.
-        let stale_psnap = asm.policy_mgr.get_current_snapshot();
-        asm.policy_mgr
-            .update_policy_from_container_bytes(make_policy("2024-01-02T00:00:00Z", 2, Some("m")))
-            .await
-            .unwrap();
-        assert!(asm.policy_mgr.get_current_snapshot().vinst() > stale_psnap.vinst());
-
-        revalidate_visas(&asm, &stale_psnap, SweepReason::PolicyUpdate).await;
-
-        // No revoke marked; the visa stays PendingInstall.
-        assert!(
-            asm.visa_mgr
-                .get_pending_revoke_visa_ids_for_node(&node_a)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let pending = asm
-            .visa_mgr
-            .get_pending_visa_ids_for_node(&node_a)
-            .await
-            .unwrap();
-        assert_eq!(pending, vec![id]);
-    }
-
-    // ---- attribute-change sweep ----
-
-    const TS_SOURCE: &str = "hr";
-    const TS_KEY: &str = "user.dept";
-
-    /// A trusted service whose vended attributes, revision, and failure mode are all
-    /// settable, so a test can simulate "the external data changed" and "the service is
-    /// down".
-    struct MutableTrustedService {
-        /// (key, value) pairs to vend; empty means the actor has no attributes here.
-        attrs: std::sync::Mutex<Vec<(String, String)>>,
-        fail: std::sync::atomic::AtomicBool,
-        revision: std::sync::atomic::AtomicU64,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::trusted_services::TrustedServiceInterface for MutableTrustedService {
-        async fn get_attributes_for_actor(
-            &self,
-            _actor_ident: &str,
-        ) -> Result<Vec<Attribute>, ServiceError> {
-            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(ServiceError::TrustedServiceInit("down".into()));
-            }
-            Ok(self
-                .attrs
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| {
-                    AttributeSource::new(TS_SOURCE)
-                        .builder(k)
-                        .expires_in(Duration::from_secs(600))
-                        .value(v)
-                })
-                .collect())
-        }
-
-        async fn flush(&self) -> Result<(), ServiceError> {
-            self.revision
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn current_revision(&self) -> u64 {
-            self.revision.load(std::sync::atomic::Ordering::SeqCst)
-        }
-
-        fn get_source_id(&self) -> &str {
-            TS_SOURCE
-        }
-    }
-
-    /// Register one [MutableTrustedService] vending `attrs` on the assembly, and return
-    /// it so the test can change its data or knock it over.
-    fn register_ts(asm: &Arc<Assembly>, attrs: &[(&str, &str)]) -> Arc<MutableTrustedService> {
-        let svc = Arc::new(MutableTrustedService {
-            attrs: std::sync::Mutex::new(
-                attrs
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            ),
-            fail: std::sync::atomic::AtomicBool::new(false),
-            revision: std::sync::atomic::AtomicU64::new(1),
-        });
-        asm.ts_mgr.update_services(vec![svc.clone()]);
-        svc
-    }
-
-    /// Give the stored actor at `zpr_addr` an attribute from [TS_SOURCE], standing in for
-    /// data the actor picked up from that source under the previous snapshot.
-    async fn seed_source_attr(asm: &Arc<Assembly>, zpr_addr: &str, ts_key: &str, value: &str) {
-        let addr: IpAddr = zpr_addr.parse().unwrap();
-        let mut actor = asm
-            .actor_mgr
-            .get_actor_by_zpr_addr(&addr)
-            .await
-            .unwrap()
-            .unwrap();
-        actor
-            .add_attribute(
-                AttributeSource::new(TS_SOURCE)
-                    .builder(ts_key)
-                    .expires_in(Duration::from_secs(600))
-                    .value(value),
-            )
-            .unwrap();
-        asm.actor_mgr.update_actor(&actor).await.unwrap();
-    }
-
-    /// The stored actor's attribute values for `key`, if any.
-    async fn stored_attr(asm: &Arc<Assembly>, zpr_addr: &str, attr_key: &str) -> Option<String> {
-        let addr: IpAddr = zpr_addr.parse().unwrap();
-        let actor = asm
-            .actor_mgr
-            .get_actor_by_zpr_addr(&addr)
-            .await
-            .unwrap()
-            .unwrap();
-        actor
-            .attrs_iter()
-            .find(|a| a.get_key() == attr_key)
-            .map(|a| a.get_value_as_string())
-    }
-
-    /// The core case: an attribute sweep re-checks (and revokes) a visa whose
-    /// `checked_vinst` already equals the live generation -- exactly what the policy
-    /// sweep skips, at both the sweep and the store layer.
-    #[tokio::test]
-    async fn test_attr_sweep_revokes_visa_at_current_vinst() {
-        let (asm, node_a) = build_sweep_asm(false).await;
-        let target = asm.policy_mgr.get_current_snapshot().vinst();
-        let id = create_sweep_visa(&asm, &node_a, target).await;
-
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        revalidate_visas(&asm, &psnap, SweepReason::AttributeChange).await;
-
-        let revoke_ids = asm
-            .visa_mgr
-            .get_pending_revoke_visa_ids_for_node(&node_a)
-            .await
-            .unwrap();
-        assert_eq!(revoke_ids, vec![id]);
-
-        // The attribute sweep must not touch the policy generation it was checked at.
-        let md = asm.visa_mgr.list_visa_metadata().await;
-        assert_eq!(md.len(), 1);
-        assert_eq!(md[0].1.checked_vinst, target);
-    }
-
-    /// An attribute sweep holding a snapshot older than the live policy applies nothing:
-    /// a policy sweep is already coming and will decide.
-    #[tokio::test]
-    async fn test_attr_sweep_stale_target_skips() {
-        let (asm, node_a) = build_sweep_asm(false).await;
-        let id = create_sweep_visa(&asm, &node_a, 0).await;
-
-        let stale_psnap = asm.policy_mgr.get_current_snapshot();
-        asm.policy_mgr
-            .update_policy_from_container_bytes(make_policy("2024-01-02T00:00:00Z", 2, Some("m")))
-            .await
-            .unwrap();
-
-        revalidate_visas(&asm, &stale_psnap, SweepReason::AttributeChange).await;
-
-        assert!(
-            asm.visa_mgr
-                .get_pending_revoke_visa_ids_for_node(&node_a)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            asm.visa_mgr
-                .get_pending_visa_ids_for_node(&node_a)
-                .await
-                .unwrap(),
-            vec![id]
-        );
-    }
-
-    /// An unresolvable actor is skipped by the attribute sweep too, never revoked.
-    #[tokio::test]
-    async fn test_attr_sweep_unresolved_actor_leaves_visa_untouched() {
-        let asm = Arc::new(new_assembly_for_tests(None).await);
-        let node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
-        let id = create_sweep_visa(&asm, &node, 0).await;
-
-        let psnap = asm.policy_mgr.get_current_snapshot();
-        revalidate_visas(&asm, &psnap, SweepReason::AttributeChange).await;
-
-        assert_eq!(
-            asm.visa_mgr
-                .get_pending_visa_ids_for_node(&node)
-                .await
-                .unwrap(),
-            vec![id]
-        );
-        assert!(
-            asm.visa_mgr
-                .get_pending_revoke_visa_ids_for_node(&node)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
     /// Phase A: handling the event refreshes the stored actors behind live visas from the
     /// changed service -- replacing a changed value and dropping an attribute the service
     /// no longer vends.
@@ -1115,7 +598,7 @@ mod tests {
             svc.flush().await.unwrap();
         }
 
-        handle_trusted_service_change(&asm, TS_SOURCE).await;
+        handle_trusted_service_change(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -1140,7 +623,7 @@ mod tests {
         seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
 
         svc.fail.store(true, std::sync::atomic::Ordering::SeqCst);
-        handle_trusted_service_change(&asm, TS_SOURCE).await;
+        handle_trusted_service_change(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
@@ -1210,7 +693,7 @@ mod tests {
         seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
 
         // No visa created, so no actor is in scope for the refresh.
-        handle_trusted_service_change(&asm, TS_SOURCE).await;
+        handle_trusted_service_change(&asm).await;
 
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,

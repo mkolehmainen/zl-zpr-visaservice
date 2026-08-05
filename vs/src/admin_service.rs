@@ -867,9 +867,10 @@ async fn flush_service_cache(
         Ok(()) => {
             // The flush itself is done. If the event cannot be queued we lose only the
             // sweep of existing visas -- new visa decisions are still protected by the
-            // per-actor revision check.
-            let evt = VsEvent::TrustedServiceChange(svc_id.clone());
-            if let Err(e) = event_mgr.record_event(evt).await {
+            // per-actor revision check. The event carries no source id (the reconcile
+            // is unscoped), so name the source here where it is known.
+            info!(target: ADMIN, "flushed trusted service {}, queueing revalidation", svc_id);
+            if let Err(e) = event_mgr.record_event(VsEvent::TrustedServiceChange).await {
                 error!(target: ADMIN, "flushed trusted service {} but could not queue revalidation: {}", svc_id, e);
             }
             StatusCode::ACCEPTED
@@ -2099,7 +2100,7 @@ mod tests {
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
         // The revalidation of existing visas is queued for the event worker.
         match event_rx.try_recv() {
-            Ok(VsEvent::TrustedServiceChange(id)) => assert_eq!(id, FLUSH_TS_ID),
+            Ok(VsEvent::TrustedServiceChange) => {}
             other => panic!("expected TrustedServiceChange event, got {other:?}"),
         }
     }

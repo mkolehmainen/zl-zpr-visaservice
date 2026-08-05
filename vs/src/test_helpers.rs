@@ -3,12 +3,16 @@
 #![cfg(test)]
 
 use async_trait::async_trait;
-use libeval::actor::Actor;
-use libeval::attribute::{Attribute, ROLE_ADAPTER, ROLE_NODE, key};
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::time::Duration;
-use std::time::SystemTime;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use libeval::actor::Actor;
+use libeval::attribute::{Attribute, AttributeSource, ROLE_ADAPTER, ROLE_NODE, key};
+use libeval::eval_result::{Direction, Hit};
+use libeval::route::{LinkId, Route};
+
 use zpr::policy::v1 as capnp_policy;
 use zpr::policy_types::{
     JoinPolicy, PFlags, Service, ServiceType, TrustedService, parse_attribute_mapping,
@@ -16,7 +20,9 @@ use zpr::policy_types::{
 use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Visa};
 use zpr::write_to::WriteTo;
 
-use crate::error::ResolverError;
+use crate::assembly::Assembly;
+use crate::assembly::tests::new_assembly_for_tests;
+use crate::error::{ResolverError, ServiceError};
 use crate::policy_mgr::DnsResolver;
 
 const DEFAULT_EXPIRES: Duration = Duration::from_secs(3600);
@@ -235,4 +241,174 @@ pub fn make_container_bytes(maj: u32, min: u32, patch: u32, policy: &[u8]) -> Ve
     let mut buf = Vec::new();
     capnp::serialize::write_message(&mut buf, &msg).unwrap();
     buf
+}
+
+// ---- visa-sweep fixtures ----
+// Shared by `visa_reconciler` (the sweep itself) and `event_mgr` (the handlers that
+// drive it), so they live here rather than in either module's test block.
+
+/// Build an assembly with two docked adapters (`::4000::a`/`::4000::b`) whose
+/// nodes are in the topology. `with_link` controls whether a route exists.
+/// The default (empty) policy denies everything (NoMatch), so with a route
+/// present the eval still denies — either way the sweep sees a deny.
+pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
+    let asm = new_assembly_for_tests(None).await;
+    let node_a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+    let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+    asm.actor_mgr
+        .add_node(
+            &make_node_actor_defexp("fd5a:5052:3000::1", "na", "10.0.0.1:1"),
+            false,
+        )
+        .await
+        .unwrap();
+    asm.actor_mgr
+        .add_node(
+            &make_node_actor_defexp("fd5a:5052:3000::2", "nb", "10.0.0.2:2"),
+            false,
+        )
+        .await
+        .unwrap();
+    asm.topo_mgr.add_node(node_a).unwrap();
+    asm.topo_mgr.add_node(node_b).unwrap();
+    if with_link {
+        asm.topo_mgr
+            .add_link(node_a, node_b, LinkId("l".into()), vec![], 1)
+            .unwrap();
+    }
+    asm.actor_mgr
+        .add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052:4000::a", "src"),
+            &node_a,
+        )
+        .await
+        .unwrap();
+    asm.actor_mgr
+        .add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052:4000::b", "dst"),
+            &node_b,
+        )
+        .await
+        .unwrap();
+    (Arc::new(asm), node_a)
+}
+
+/// Create a single-node visa held (PendingInstall) by `req` for the given
+/// five-tuple, seeded at `vinst`. Returns its id.
+pub async fn create_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: u64) -> u64 {
+    let pdesc = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
+    let hit = Hit::new_no_signal(0, Direction::Forward);
+    let route = Route::new_direct((*req).into());
+    let vwmd = asm
+        .visa_mgr
+        .create_visa(asm, req, &pdesc, &hit, &route, "", 0, vinst)
+        .await
+        .unwrap();
+    vwmd.visa.issuer_id
+}
+
+// ---- attribute-change sweep ----
+
+pub const TS_SOURCE: &str = "hr";
+pub const TS_KEY: &str = "user.dept";
+
+/// A trusted service whose vended attributes, revision, and failure mode are all
+/// settable, so a test can simulate "the external data changed" and "the service is
+/// down".
+pub struct MutableTrustedService {
+    /// (key, value) pairs to vend; empty means the actor has no attributes here.
+    pub attrs: std::sync::Mutex<Vec<(String, String)>>,
+    pub fail: std::sync::atomic::AtomicBool,
+    pub revision: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl crate::trusted_services::TrustedServiceInterface for MutableTrustedService {
+    async fn get_attributes_for_actor(
+        &self,
+        _actor_ident: &str,
+    ) -> Result<Vec<Attribute>, ServiceError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ServiceError::TrustedServiceInit("down".into()));
+        }
+        Ok(self
+            .attrs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| {
+                AttributeSource::new(TS_SOURCE)
+                    .builder(k)
+                    .expires_in(Duration::from_secs(600))
+                    .value(v)
+            })
+            .collect())
+    }
+
+    async fn flush(&self) -> Result<(), ServiceError> {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn current_revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn get_source_id(&self) -> &str {
+        TS_SOURCE
+    }
+}
+
+/// Register one [MutableTrustedService] vending `attrs` on the assembly, and return
+/// it so the test can change its data or knock it over.
+pub fn register_ts(asm: &Arc<Assembly>, attrs: &[(&str, &str)]) -> Arc<MutableTrustedService> {
+    let svc = Arc::new(MutableTrustedService {
+        attrs: std::sync::Mutex::new(
+            attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ),
+        fail: std::sync::atomic::AtomicBool::new(false),
+        revision: std::sync::atomic::AtomicU64::new(1),
+    });
+    asm.ts_mgr.update_services(vec![svc.clone()]);
+    svc
+}
+
+/// Give the stored actor at `zpr_addr` an attribute from [TS_SOURCE], standing in for
+/// data the actor picked up from that source under the previous snapshot.
+pub async fn seed_source_attr(asm: &Arc<Assembly>, zpr_addr: &str, ts_key: &str, value: &str) {
+    let addr: IpAddr = zpr_addr.parse().unwrap();
+    let mut actor = asm
+        .actor_mgr
+        .get_actor_by_zpr_addr(&addr)
+        .await
+        .unwrap()
+        .unwrap();
+    actor
+        .add_attribute(
+            AttributeSource::new(TS_SOURCE)
+                .builder(ts_key)
+                .expires_in(Duration::from_secs(600))
+                .value(value),
+        )
+        .unwrap();
+    asm.actor_mgr.update_actor(&actor).await.unwrap();
+}
+
+/// The stored actor's attribute values for `key`, if any.
+pub async fn stored_attr(asm: &Arc<Assembly>, zpr_addr: &str, attr_key: &str) -> Option<String> {
+    let addr: IpAddr = zpr_addr.parse().unwrap();
+    let actor = asm
+        .actor_mgr
+        .get_actor_by_zpr_addr(&addr)
+        .await
+        .unwrap()
+        .unwrap();
+    actor
+        .attrs_iter()
+        .find(|a| a.get_key() == attr_key)
+        .map(|a| a.get_value_as_string())
 }
