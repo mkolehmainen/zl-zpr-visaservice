@@ -374,6 +374,11 @@ impl ConnectionControl {
         // TODO: But why don't we set CN as the identity attribute on the actor? Why mess with the JWT?
         // TODO: We will need some formal way to pass an IDENTITY value to this function.
 
+        // A lookup failure is indeterminate, not "the actor has no such attribute", and
+        // the two are indistinguishable once evaluation starts: a join policy can be
+        // satisfied by a missing key. Refuse the connection rather than authorize
+        // against a partial claim set. Note this means a trusted-service outage blocks
+        // new connections.
         for ts_results in asm.ts_mgr.get_attributes_for_actor(endpoint_cn).await {
             match ts_results {
                 Ok(ts_attrs) => {
@@ -383,6 +388,9 @@ impl ConnectionControl {
                 }
                 Err(e) => {
                     error!(target: CC, "ts service attr lookup failed for actor {}: {}", endpoint_cn, e);
+                    return Err(ServiceError::AttributesIndeterminate(format!(
+                        "trusted service lookup failed for {endpoint_cn}: {e}"
+                    )));
                 }
             }
         }
@@ -779,6 +787,55 @@ mod tests {
 
         pio::load_policy_from_container(&container_bytes, &config::POLICY_MIN_VERSION)
             .expect("should load policy from container bytes");
+    }
+
+    /// A trusted service whose lookups always fail, standing in for an unreadable
+    /// attribute file or an unreachable service.
+    struct FailingTrustedService;
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services::TrustedServiceInterface for FailingTrustedService {
+        async fn get_attributes_for_actor(
+            &self,
+            _actor_ident: &str,
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            Err(ServiceError::Internal("service is down".to_string()))
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn current_revision(&self) -> u64 {
+            1
+        }
+
+        fn get_source_id(&self) -> &str {
+            "failing"
+        }
+    }
+
+    /// A trusted-service lookup failure must reject the connection rather than
+    /// authorize against a partial claim set -- a join policy can be satisfied by a
+    /// missing key, so falling through would let an outage approve an actor.
+    #[tokio::test]
+    async fn authorize_connection_rejects_on_trusted_service_failure() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+
+        // Baseline: with no trusted services configured this same call succeeds, so the
+        // rejection below is caused by the failure and not by the surrounding setup.
+        cc.authenticate_visa_service(asm.clone(), Vec::new())
+            .await
+            .expect("should authorize with no trusted services");
+
+        asm.ts_mgr
+            .update_services(vec![Arc::new(FailingTrustedService)]);
+        let result = cc.authenticate_visa_service(asm, Vec::new()).await;
+        assert!(matches!(
+            result,
+            Err(ServiceError::AttributesIndeterminate(_))
+        ));
     }
 
     #[tokio::test]

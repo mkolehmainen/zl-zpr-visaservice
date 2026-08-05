@@ -71,9 +71,9 @@ impl FileAttributeStore {
         ttl: Duration,
         fp: &Path,
     ) -> Result<Self, ServiceError> {
-        if ttl < MIN_ATTRIBUTE_TTL {
+        if ttl <= MIN_ATTRIBUTE_TTL {
             return Err(ServiceError::Param(format!(
-                "trusted service '{id}' ttl {ttl:?} is below the minimum of {MIN_ATTRIBUTE_TTL:?}"
+                "trusted service '{id}' ttl {ttl:?} must exceed minimum of {MIN_ATTRIBUTE_TTL:?}"
             )));
         }
 
@@ -198,9 +198,19 @@ mod tests {
             &fp,
         );
         assert!(matches!(result, Err(ServiceError::Param(_))));
+
+        let result =
+            FileAttributeStore::new("test".to_string(), test_mapper(), MIN_ATTRIBUTE_TTL, &fp);
+        assert!(matches!(result, Err(ServiceError::Param(_))));
+
         assert!(
-            FileAttributeStore::new("test".to_string(), test_mapper(), MIN_ATTRIBUTE_TTL, &fp)
-                .is_ok()
+            FileAttributeStore::new(
+                "test".to_string(),
+                test_mapper(),
+                MIN_ATTRIBUTE_TTL + Duration::from_secs(1),
+                &fp
+            )
+            .is_ok()
         );
         fs::remove_file(&fp).unwrap();
     }

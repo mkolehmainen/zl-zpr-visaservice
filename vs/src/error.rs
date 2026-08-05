@@ -75,6 +75,9 @@ pub enum ServiceError {
 
     #[error("trusted service initialization error: {0}")]
     TrustedServiceInit(String),
+
+    #[error("trusted service attributes indeterminate: {0}")]
+    AttributesIndeterminate(String),
 }
 
 #[derive(Debug, Error)]

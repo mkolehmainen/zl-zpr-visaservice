@@ -540,14 +540,15 @@ impl EvalContext {
             policy_capnp::AttrOp::Eq => {
                 match value {
                     None => {
-                        // Hmm... KEY, EQ, NONE ?? Is this valid?
-                        if actor.has_attribute_named(key) {
-                            return false;
-                        }
+                        // TODO: This is not valid and should be rejected at policy install.
+                        warn!(target: EVAL, "INVALID ZPL: condition key '{}' has EQ op but no value", key);
+                        return !for_allow;
                     }
                     Some(PAttrValue::Set(_)) => {
-                        // EQ with a set is not supported for now.
-                        return false;
+                        // EQ with a set is not supported for now, so this condition is
+                        // indeterminate: it cannot satisfy an allow, and a deny keyed on
+                        // it must still fire rather than silently disappear.
+                        return !for_allow;
                     }
                     Some(PAttrValue::Atom(s)) => {
                         if !actor.has_attribute_value(key, s.as_str()) {
@@ -559,14 +560,15 @@ impl EvalContext {
             policy_capnp::AttrOp::Ne => {
                 match value {
                     None => {
-                        // Hmm... KEY, NE, NONE ?? Is this valid?
-                        if !actor.has_attribute_named(key) {
-                            return false;
-                        }
+                        // TODO: This is not valid and should be rejected at policy install.
+                        warn!(target: EVAL, "INVALID ZPL: condition key '{}' has NE op but no value", key);
+                        return !for_allow;
                     }
                     Some(PAttrValue::Set(_)) => {
-                        // NE with a set is not supported for now.
-                        return false;
+                        // NE with a set is not supported for now, so this condition is
+                        // indeterminate: it cannot satisfy an allow, and a deny keyed on
+                        // it must still fire rather than silently disappear.
+                        return !for_allow;
                     }
                     Some(PAttrValue::Atom(s)) => {
                         if actor.has_attribute_value(key, s.as_str()) {
@@ -594,7 +596,14 @@ impl EvalContext {
             }
             policy_capnp::AttrOp::Excludes => {
                 // Any values in here must not be present in the actor.
-                if actor.has_any_attribute_values(key, value.as_ref().unwrap().as_slice()) {
+                // TODO: The compiler does not produce EXCLUDES or NE, so maybe we should remove them.
+                let Some(ref values) = value else {
+                    // Valueless EXCLUDES is indeterminate rather than a panic: it cannot
+                    // satisfy an allow, and a deny keyed on it must still fire.
+                    warn!(target: EVAL, "INVALID ZPL: condition key '{}' has EXCLUDES op but no value", key);
+                    return !for_allow;
+                };
+                if actor.has_any_attribute_values(key, values.as_slice()) {
                     return false;
                 }
             }
@@ -1278,5 +1287,57 @@ mod test {
         assert!(actor.is_node());
 
         assert!(!ctx.approve_connected(&actor).unwrap());
+    }
+
+    /// Build a standalone `AttrExpr` message so a single condition can be evaluated
+    /// without compiling a whole policy.
+    fn cond_message(
+        key: &str,
+        op: policy_capnp::AttrOp,
+        values: &[&str],
+    ) -> capnp::message::Builder<capnp::message::HeapAllocator> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut expr = msg.init_root::<policy_capnp::attr_expr::Builder>();
+            expr.set_key(key);
+            expr.set_op(op);
+            let mut vlist = expr.init_value(values.len() as u32);
+            for (i, v) in values.iter().enumerate() {
+                vlist.set(i as u32, *v);
+            }
+        }
+        msg
+    }
+
+    /// Conditions libeval cannot evaluate -- valueless EQ/NE/EXCLUDES, and set-valued
+    /// EQ/NE -- are indeterminate: they must never satisfy an allow, and must never let
+    /// a deny silently stop matching. Valueless EXCLUDES also used to panic here.
+    #[test]
+    fn test_indeterminate_conditions_fail_safe() {
+        setup();
+        let ctx = EvalContext::new(Arc::new(load_policy("basic.bin2")));
+        let actor = Actor::new();
+
+        let cases: [(policy_capnp::AttrOp, &[&str]); 5] = [
+            (policy_capnp::AttrOp::Eq, &[]),
+            (policy_capnp::AttrOp::Ne, &[]),
+            (policy_capnp::AttrOp::Excludes, &[]),
+            (policy_capnp::AttrOp::Eq, &["a", "b"]),
+            (policy_capnp::AttrOp::Ne, &["a", "b"]),
+        ];
+        for (op, values) in cases {
+            let msg = cond_message("user.zpr.tag", op, values);
+            let cond = msg
+                .get_root_as_reader::<policy_capnp::attr_expr::Reader>()
+                .unwrap();
+            assert!(
+                !ctx.match_condition_to_actor(&cond, &actor, true),
+                "{op:?} with {values:?} must not satisfy an allow"
+            );
+            assert!(
+                ctx.match_condition_to_actor(&cond, &actor, false),
+                "{op:?} with {values:?} must keep a deny matching"
+            );
+        }
     }
 }

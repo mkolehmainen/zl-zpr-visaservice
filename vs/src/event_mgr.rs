@@ -222,9 +222,32 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         );
     }
 
-    // The new policy may invalidate some existing nodes. An error here will bail on the
-    // update handling.
-    let (connected_node_addrs, invalid_node_addrs) = revalidate_nodes(asm, &psnap).await?;
+    // Reconcile attributes before anything reads them. Both consumers below --
+    // node revalidation and the visa sweep -- evaluate actors exactly as stored, so
+    // a stale actor is judged on the previous store's data. Nothing between here and
+    // the sweep mutates attributes, so this one pass covers both.
+    //
+    // Only actors that are actually stale cost a fetch: `PolicyMgr::build_state`
+    // carries unchanged trusted-service stores (and their revisions) across a policy
+    // install, so this is a no-op unless the policy changed a trusted-service
+    // declaration.
+    //
+    // TODO: when a declaration does change, this refetches every source for every
+    // actor in the set, sequentially -- an N x M synchronous fan-out on the event
+    // handler's critical path once services are network-backed and actor/visa counts
+    // are large.
+    let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
+    let mut refresh_set = live_visa_actor_addrs(asm).await;
+    refresh_set.extend(connected_node_addrs.iter().copied());
+    let (refreshed, unresolved, failed) = refresh_actors(asm, refresh_set).await;
+    info!(
+        target: EVENT,
+        "policy updated vinst={vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
+    );
+
+    // The new policy may invalidate some existing nodes.
+    let (valid_node_addrs, invalid_node_addrs) =
+        revalidate_nodes(asm, &psnap, connected_node_addrs).await;
 
     // Disconnect the nodes that are no longer approved by the new policy.
     for naddr in &invalid_node_addrs {
@@ -248,11 +271,11 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // have been (or will soon be) updated via other code paths.  The purpose of
     // updating the topology when presented with a new policy is to verify that
     // existing links are still allowed, and send out peer messages.
-    if !connected_node_addrs.is_empty() {
-        info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology ({} nodes)", connected_node_addrs.len());
+    if !valid_node_addrs.is_empty() {
+        info!(target: EVENT, "policy updated vinst={vinst}: revalidating topology ({} nodes)", valid_node_addrs.len());
         let report = asm
             .topo_mgr
-            .revalidate_against_policy(&psnap, &connected_node_addrs)
+            .revalidate_against_policy(&psnap, &valid_node_addrs)
             .await?;
         info!(
             target: EVENT,
@@ -264,7 +287,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         );
 
         // Queue up setTopology messages in parallel.
-        let futs = connected_node_addrs.iter().filter_map(|naddr| {
+        let futs = valid_node_addrs.iter().filter_map(|naddr| {
             let links = psnap.links_for_node(naddr);
             asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
                 if let Err(e) = vss_handle.set_topology(links).await {
@@ -296,13 +319,15 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
 /// Phase order matters: the sweep re-reads actors from the store, so their attributes
 /// have to be reconciled and written back first.
 ///
-/// Note this only reconciles actors that hold a live visa. Everyone else is handled
-/// lazily on their next visa request by the revision check in `refresh_expired_attributes`.
+/// Note this only reconciles actors that hold a live visa -- the visa sweep is the only
+/// consumer here. Everyone else is handled lazily on their next visa request by the
+/// revision check in `refresh_expired_attributes`.
 async fn handle_trusted_service_change(asm: &Arc<Assembly>, source_id: &str) {
     // One snapshot for the whole pass, same as the policy handler.
     let psnap = asm.policy_mgr.get_current_snapshot();
 
-    let (refreshed, unresolved, failed) = refresh_actors_for_live_visas(asm).await;
+    let (refreshed, unresolved, failed) =
+        refresh_actors(asm, live_visa_actor_addrs(asm).await).await;
     info!(
         target: EVENT,
         "trusted service '{source_id}' changed: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
@@ -311,21 +336,33 @@ async fn handle_trusted_service_change(asm: &Arc<Assembly>, source_id: &str) {
     revalidate_visas(asm, &psnap, SweepReason::AttributeChange).await;
 }
 
-/// Refresh (and persist) the attributes of every distinct actor referenced by a live
-/// visa. Only sources that are TTL-expired or revision-stale are actually fetched, so
-/// an actor already current costs nothing.
-///
-/// A failure is logged and skipped rather than aborting the pass: that actor's recorded
-/// revision stays mismatched, so its next visa request refreshes it again.
-///
-/// Returns `(refreshed, unresolved, failed)` counts for logging.
-async fn refresh_actors_for_live_visas(asm: &Arc<Assembly>) -> (u32, u32, u32) {
+/// The distinct actor addresses referenced by a live visa (both ends of every visa's
+/// five-tuple). The reconcile set for a sweep that only re-checks visas.
+async fn live_visa_actor_addrs(asm: &Arc<Assembly>) -> HashSet<IpAddr> {
     let mut zpr_addrs: HashSet<IpAddr> = HashSet::new();
     for (_, md) in asm.visa_mgr.list_visa_metadata().await {
         zpr_addrs.insert(md.five_tuple.source_addr);
         zpr_addrs.insert(md.five_tuple.dest_addr);
     }
+    zpr_addrs
+}
 
+/// Refresh (and persist) the attributes of each actor in `zpr_addrs`. Only sources that
+/// are TTL-expired or revision-stale are actually fetched, so an actor already current
+/// costs nothing.
+///
+/// A failure is logged and skipped rather than aborting the pass: that actor's recorded
+/// revision stays mismatched, so its next visa request refreshes it again. This includes
+/// an unreachable trusted service (`AttributesIndeterminate`) -- the actor has already
+/// been stripped and persisted, and the deny that comes with it belongs to the request
+/// path, not to a background reconcile.
+///
+/// Returns `(refreshed, unresolved, failed)` counts for logging.
+///
+/// TODO: sequential, and unbounded in the size of the set. Fine while the only trusted
+/// service is the in-memory file store; revisit once services are network calls and
+/// actor/visa counts are large.
+async fn refresh_actors(asm: &Arc<Assembly>, zpr_addrs: HashSet<IpAddr>) -> (u32, u32, u32) {
     let (mut refreshed, mut unresolved, mut failed) = (0u32, 0u32, 0u32);
     // Sequential for now, join_all it if sweeps ever get slow.
     for zpr_addr in zpr_addrs {
@@ -348,22 +385,21 @@ async fn refresh_actors_for_live_visas(asm: &Arc<Assembly>) -> (u32, u32, u32) {
     (refreshed, unresolved, failed)
 }
 
-/// When we get a new policy, some nodes may no longer be valid. This checks each
-/// connected node against the policy and partitions them into `(valid, invalid)`
+/// When we get a new policy, some nodes may no longer be valid. This checks each of
+/// `connected_node_addrs` against the policy and partitions them into `(valid, invalid)`
 /// addresses. It has no side effects -- disconnecting the invalid nodes is left to
 /// the caller.
 ///
+/// The caller supplies the address list because it also needs it to reconcile those
+/// nodes' attributes first; the evaluation below reads the actors as stored.
+///
 /// Note that the best way to revalidate a node is to prompt it to
 /// re-authenticate. (TODO).
-///
-/// ### Errors
-/// - The only error you get from this will be an error from `list_node_addrs`.
 async fn revalidate_nodes(
     asm: &Arc<Assembly>,
     psnap: &PolicySnapshot,
-) -> Result<(Vec<IpAddr>, Vec<IpAddr>), ServiceError> {
-    let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
-
+    connected_node_addrs: Vec<IpAddr>,
+) -> (Vec<IpAddr>, Vec<IpAddr>) {
     // Check existing nodes against policy.
     let ectx = EvalContext::new(psnap.policy_arc());
 
@@ -383,7 +419,7 @@ async fn revalidate_nodes(
     let valid = valid.into_iter().map(|(naddr, _)| naddr).collect();
     let invalid = invalid.into_iter().map(|(naddr, _)| naddr).collect();
 
-    Ok((valid, invalid))
+    (valid, invalid)
 }
 
 /// Pure predicate helper for [revalidate_nodes].
@@ -615,7 +651,8 @@ mod tests {
             .unwrap();
 
         let psnap = asm.policy_mgr.get_current_snapshot();
-        let (valid, invalid) = revalidate_nodes(&asm, &psnap).await.unwrap();
+        let node_addrs = asm.actor_mgr.list_node_addrs().await.unwrap();
+        let (valid, invalid) = revalidate_nodes(&asm, &psnap, node_addrs).await;
 
         assert_eq!(sorted(valid), sorted(vec![a, b]));
         assert!(invalid.is_empty());
@@ -646,7 +683,8 @@ mod tests {
             .unwrap();
 
         let psnap = asm.policy_mgr.get_current_snapshot();
-        let (valid, invalid) = revalidate_nodes(&asm, &psnap).await.unwrap();
+        let node_addrs = asm.actor_mgr.list_node_addrs().await.unwrap();
+        let (valid, invalid) = revalidate_nodes(&asm, &psnap, node_addrs).await;
 
         assert!(valid.is_empty());
         assert_eq!(sorted(invalid), sorted(vec![a, b]));
@@ -689,7 +727,8 @@ mod tests {
         asm.actor_mgr.add_node(&bad_actor, false).await.unwrap();
 
         let psnap = asm.policy_mgr.get_current_snapshot();
-        let (valid, invalid) = revalidate_nodes(&asm, &psnap).await.unwrap();
+        let node_addrs = asm.actor_mgr.list_node_addrs().await.unwrap();
+        let (valid, invalid) = revalidate_nodes(&asm, &psnap, node_addrs).await;
 
         assert_eq!(valid, vec![good]);
         assert_eq!(invalid, vec![bad]);
@@ -700,7 +739,8 @@ mod tests {
     async fn test_revalidate_nodes_empty() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let psnap = asm.policy_mgr.get_current_snapshot();
-        let (valid, invalid) = revalidate_nodes(&asm, &psnap).await.unwrap();
+        let node_addrs = asm.actor_mgr.list_node_addrs().await.unwrap();
+        let (valid, invalid) = revalidate_nodes(&asm, &psnap, node_addrs).await;
         assert!(valid.is_empty());
         assert!(invalid.is_empty());
     }
@@ -947,9 +987,8 @@ mod tests {
         svc
     }
 
-    /// Give the stored actor at `zpr_addr` an attribute from [TS_SOURCE], so the source
-    /// counts as relevant to that actor (a source the actor holds nothing from and has no
-    /// revision record for is not refreshed).
+    /// Give the stored actor at `zpr_addr` an attribute from [TS_SOURCE], standing in for
+    /// data the actor picked up from that source under the previous snapshot.
     async fn seed_source_attr(asm: &Arc<Assembly>, zpr_addr: &str, ts_key: &str, value: &str) {
         let addr: IpAddr = zpr_addr.parse().unwrap();
         let mut actor = asm
@@ -1116,6 +1155,58 @@ mod tests {
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
             None,
             "unreachable service must not leave stale attributes in place"
+        );
+    }
+
+    /// A policy update reconciles the actors behind live visas before it sweeps them.
+    /// The actor here is revision-stale against the registered store (it has no recorded
+    /// revision for it); the sweep re-reads actors from the store, and would otherwise
+    /// judge them on the attributes seeded below.
+    #[tokio::test]
+    async fn test_policy_update_refreshes_stored_actors_before_sweep() {
+        let (asm, node_a) = build_sweep_asm(false).await;
+        // A policy the connected nodes still satisfy, so revalidation keeps them (and
+        // their docked adapters) rather than disconnecting everything out from under us.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        create_sweep_visa(&asm, &node_a, 0).await;
+        register_ts(&asm, &[(TS_KEY, "engineering")]);
+        // What the actor holds from the previous store's data.
+        seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
+
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert_eq!(
+            stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
+            Some("engineering".to_string()),
+            "policy update must reconcile attributes before the visa sweep reads actors"
+        );
+    }
+
+    /// A connected node is reconciled even though it holds no visa: `revalidate_nodes`
+    /// judges it on its stored attributes, so those have to be current first. The
+    /// live-visa refresh alone did not cover this (item 1 in ts-followups.md).
+    #[tokio::test]
+    async fn test_policy_update_refreshes_connected_nodes_without_visas() {
+        let (asm, _node_a) = build_sweep_asm(false).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(None))
+            .await
+            .unwrap();
+        register_ts(&asm, &[(TS_KEY, "engineering")]);
+        // No visa anywhere, so the node is in scope only via the node-address list.
+        seed_source_attr(&asm, "fd5a:5052:3000::1", TS_KEY, "sales").await;
+
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert_eq!(
+            stored_attr(&asm, "fd5a:5052:3000::1", TS_KEY).await,
+            Some("engineering".to_string()),
+            "policy update must reconcile connected nodes before revalidating them"
         );
     }
 

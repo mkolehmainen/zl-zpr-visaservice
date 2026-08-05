@@ -30,7 +30,8 @@ use crate::error::{ResolverError, ServiceError, StoreError, TopologyError};
 use crate::loaded_policy::LoadedPolicy;
 use crate::logging::targets::MAIN;
 use crate::trusted_services::{
-    TrustedServiceInterface, TrustedServicesMgr, build_services_from_policy,
+    TrustedServiceDefinition, TrustedServiceInterface, TrustedServicesMgr, build_services,
+    trusted_service_definitions,
 };
 
 /// Abstracts DNS hostname resolution so it can be swapped out in tests.
@@ -54,6 +55,9 @@ struct PolicyState {
     /// Attribute stores for the trusted services this policy declares. Republished to
     /// `ts_mgr` on every successful swap so the stores can never outlive their policy.
     trusted_services: Vec<Arc<dyn TrustedServiceInterface>>,
+    /// The declarations `trusted_services` was built from. Carried alongside the stores so
+    /// the next policy can be compared against them and reuse the stores when unchanged.
+    ts_definitions: Vec<TrustedServiceDefinition>,
 }
 
 pub struct PolicyMgr {
@@ -174,7 +178,7 @@ impl PolicyMgr {
         // Resolve topology before persisting so a policy that cannot initialize is never
         // stored as the current policy. build_state borrows `loaded`, leaving it
         // available for the post-resolution persist below.
-        let state = Self::build_state(&resolver, &loaded, &file_ts_dir).await?;
+        let state = Self::build_state(&resolver, &loaded, &file_ts_dir, None).await?;
         repo.set_current_policy(&loaded, false).await?;
 
         debug!(target: MAIN, "policy manager initialized successfully");
@@ -210,7 +214,7 @@ impl PolicyMgr {
         let resolver = PolicyResolver::new(resolver);
         // A trusted service the policy declares but that cannot be configured (e.g. its
         // attribute file is missing) fails startup; the error names the service and file.
-        let state = Self::build_state(&resolver, &loaded, &file_ts_dir).await?;
+        let state = Self::build_state(&resolver, &loaded, &file_ts_dir, None).await?;
 
         debug!(target: MAIN, "policy manager initialized successfully");
         Ok(Self::from_state(state, repo, resolver, ts_mgr, file_ts_dir))
@@ -237,19 +241,32 @@ impl PolicyMgr {
     /// leaking partial policy state. Borrows `loaded` (cloning only the `Arc<Policy>`
     /// and the `Bytes`-backed container — both refcount bumps) so the caller can still
     /// persist it after resolution succeeds.
+    ///
+    /// `previous` is the currently live state, when there is one, and is used only to
+    /// carry unchanged trusted-service stores forward.
     async fn build_state(
         resolver: &PolicyResolver,
         loaded: &LoadedPolicy,
         file_ts_dir: &Path,
+        previous: Option<&PolicyState>,
     ) -> Result<PolicyState, ServiceError> {
         let policy = loaded.policy();
         let links_by_node = resolver.resolve_topology(&policy).await?;
-        let trusted_services = build_services_from_policy(&policy, file_ts_dir)?;
+        let ts_definitions = trusted_service_definitions(&policy)?;
+        let trusted_services = match previous {
+            // Identical declarations mean the live stores are still correct.
+            // Reusing them keeps their revisions, otherwise a policy install
+            // makes every actor revision-stale against every source. Cached
+            // attribute data now only moves on a TTL reload or an admin flush.
+            Some(prev) if prev.ts_definitions == ts_definitions => prev.trusted_services.clone(),
+            _ => build_services(&ts_definitions, file_ts_dir)?,
+        };
         Ok(PolicyState {
             policy,
             container: loaded.container().clone(),
             links_by_node,
             trusted_services,
+            ts_definitions,
         })
     }
 
@@ -303,8 +320,12 @@ impl PolicyMgr {
 
         // Resolve topology before swapping in the new state so a failed update leaves
         // the current policy, container, and topology untouched. The new policy,
-        // container, and links swap in together as one PolicyState.
-        let state = Self::build_state(&self.resolver, &loaded, &self.file_ts_dir).await?;
+        // container, and links swap in together as one PolicyState. The live state is
+        // passed in so trusted-service stores whose declaration did not change are
+        // carried over rather than rebuilt with a fresh revision.
+        let previous = self.state.load_full();
+        let state =
+            Self::build_state(&self.resolver, &loaded, &self.file_ts_dir, Some(&previous)).await?;
         self.repo.set_current_policy(&loaded, false).await?;
 
         self.publish(state);
@@ -533,6 +554,45 @@ mod tests {
             .get_attributes_from_source_for_actor("attrfile", "alice")
             .await;
         assert!(results[0].is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Installing a policy whose trusted-service declarations are unchanged keeps the live
+    /// stores, so actors stay caught up. A changed declaration rebuilds the store and makes
+    /// them stale again.
+    #[tokio::test]
+    async fn test_policy_update_preserves_revisions_when_ts_config_unchanged() {
+        let dir = std::env::temp_dir().join("vs-pm-ts-rev");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attrfile.json"),
+            r#"{"alice": {"color": ["red"]}}"#,
+        )
+        .unwrap();
+
+        let ts_mgr = Arc::new(TrustedServicesMgr::new());
+        let policy = make_trusted_service_policy("attrfile", "file", Some(3600), &[]);
+        let mgr = make_policy_mgr_with_ts(policy.clone(), ts_mgr.clone(), &dir).await;
+
+        // Catch "alice" up with the store's current revision.
+        let stale = ts_mgr.stale_sources_for_actor("alice");
+        assert_eq!(stale.len(), 1);
+        ts_mgr.record_revision("alice", &stale[0].0, stale[0].1);
+        assert!(ts_mgr.stale_sources_for_actor("alice").is_empty());
+
+        // Same trusted-service declarations: the store (and its revision) is carried over.
+        mgr.update_policy_from_container_bytes(policy)
+            .await
+            .unwrap();
+        assert!(ts_mgr.stale_sources_for_actor("alice").is_empty());
+
+        // A changed declaration rebuilds the store, so the actor is stale again.
+        let changed = make_trusted_service_policy("attrfile", "file", Some(7200), &[]);
+        mgr.update_policy_from_container_bytes(changed)
+            .await
+            .unwrap();
+        assert_eq!(ts_mgr.stale_sources_for_actor("alice").len(), 1);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

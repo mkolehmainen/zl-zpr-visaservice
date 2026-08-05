@@ -15,7 +15,7 @@ mod manager;
 #[cfg(test)]
 mod test_support;
 
-pub use factory::build_services_from_policy;
+pub use factory::{TrustedServiceDefinition, build_services, trusted_service_definitions};
 pub use manager::TrustedServicesMgr;
 
 /// A revision no snapshot will ever carry (the counter starts at 1). Recording it for

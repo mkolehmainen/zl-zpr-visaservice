@@ -3,7 +3,7 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::future::join_all;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use libeval::attribute::Attribute;
@@ -28,12 +28,12 @@ impl TrustedServicesMgr {
         }
     }
 
-    /// Return relevant sources whose current revision differs from the actor's record.
-    pub fn stale_sources_for_actor(
-        &self,
-        actor_ident: &str,
-        attr_sources: &HashSet<String>,
-    ) -> Vec<(String, u64)> {
+    /// Return sources whose current revision differs from the actor's record. A source
+    /// with no record at all is stale: the actor has never been refreshed from it (or
+    /// the last attempt failed), so it must be consulted even when the actor holds no
+    /// attribute from it -- otherwise a source that vended nothing on the first lookup
+    /// would be skipped forever, including after a flush adds attributes for the actor.
+    pub fn stale_sources_for_actor(&self, actor_ident: &str) -> Vec<(String, u64)> {
         let services = self.services.load_full();
         let recorded = self.actor_revisions.get(actor_ident);
         services
@@ -43,9 +43,6 @@ impl TrustedServicesMgr {
                 let recorded_revision = recorded
                     .as_ref()
                     .and_then(|revisions| revisions.value().get(source_id).copied());
-                if recorded_revision.is_none() && !attr_sources.contains(source_id) {
-                    return None;
-                }
                 let current_revision = service.current_revision();
                 (recorded_revision != Some(current_revision))
                     .then(|| (source_id.to_string(), current_revision))
@@ -176,26 +173,18 @@ mod tests {
         );
         manager.update_services(vec![store.clone()]);
 
-        assert!(
-            manager
-                .stale_sources_for_actor("alice", &HashSet::new())
-                .is_empty()
-        );
-
-        let sources = HashSet::from(["test".to_string()]);
-        let stale = manager.stale_sources_for_actor("alice", &sources);
+        // A configured source the actor has no record for is stale, even though the
+        // actor holds no attribute from it -- otherwise a source that vended nothing on
+        // the first lookup would never be consulted again.
+        let stale = manager.stale_sources_for_actor("alice");
         assert_eq!(stale, vec![("test".to_string(), store.current_revision())]);
 
         manager.record_revision("alice", "test", stale[0].1);
-        assert!(
-            manager
-                .stale_sources_for_actor("alice", &sources)
-                .is_empty()
-        );
+        assert!(manager.stale_sources_for_actor("alice").is_empty());
 
         store.flush().await.unwrap();
         assert_eq!(
-            manager.stale_sources_for_actor("alice", &HashSet::new()),
+            manager.stale_sources_for_actor("alice"),
             vec![("test".to_string(), store.current_revision())]
         );
 
