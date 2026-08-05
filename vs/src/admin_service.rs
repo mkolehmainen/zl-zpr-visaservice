@@ -2038,6 +2038,11 @@ mod tests {
             Ok(())
         }
 
+        // Holds no snapshot; its flush count doubles as the revision.
+        fn current_revision(&self) -> u64 {
+            self.flushes.load(std::sync::atomic::Ordering::SeqCst) as u64
+        }
+
         fn get_source_id(&self) -> &str {
             FLUSH_TS_ID
         }

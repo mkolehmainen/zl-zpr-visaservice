@@ -5,13 +5,15 @@
 use async_trait::async_trait;
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use futures::future::join_all;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 
 use tracing::{debug, info};
@@ -32,6 +34,23 @@ const TS_API_FILE: &str = "file";
 /// that expires almost immediately.
 const MIN_ATTRIBUTE_TTL: Duration = Duration::from_secs(60);
 
+/// Process-wide source of snapshot revisions: every snapshot ever built in this
+/// process gets a distinct value, across all services. Not durable.
+/// The per-actor revision records are in-memory too, so both reset together on
+/// restart and "missing record = stale" forces a safe refresh.
+static REVISION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// A revision no snapshot will ever carry (the counter starts at 1). Recording it for
+/// an actor keeps a source relevant-and-stale, forcing a retry on the next request —
+/// used when a revision-triggered refresh fails and the source's attributes were
+/// stripped fail-closed.
+pub const REVISION_NEVER: u64 = 0;
+
+/// Hand out the next snapshot revision.
+fn next_revision() -> u64 {
+    REVISION_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Interface for trusted services that can provide attributes for actors.
 #[async_trait]
 pub trait TrustedServiceInterface: Send + Sync {
@@ -48,6 +67,11 @@ pub trait TrustedServiceInterface: Send + Sync {
     /// flushes. Implementors holding no cache should return `Ok(())`.
     async fn flush(&self) -> Result<(), ServiceError>;
 
+    /// Revision of the data the service currently serves; bumps whenever the data may
+    /// have changed (flush or reload). Implementors without snapshots (e.g. test fakes)
+    /// return a counter of their own flushes.
+    fn current_revision(&self) -> u64;
+
     fn get_source_id(&self) -> &str;
 }
 
@@ -59,6 +83,17 @@ pub trait TrustedServiceInterface: Send + Sync {
 /// the underlying set of services.
 pub struct TrustedServicesMgr {
     services: ArcSwap<Vec<Arc<dyn TrustedServiceInterface>>>,
+
+    /// Per actor (keyed by CN): the revision of each source the actor's
+    /// attributes were last refreshed from. Memory-only; a missing entry reads
+    /// as "stale", which seems safe (forces a refresh on the actor's next visa
+    /// request).
+    ///
+    // TODO: for now entries are never evicted — bounded by distinct CNs seen since process
+    // start. I think we are going to rework attributes soon. I'm not sure it makes sense to
+    // keep then "on" the actors. I think we want to manage attribute data as its own thing
+    // especially as we want to support multiple credentials for attribute sources.
+    actor_revisions: DashMap<String, HashMap<String, u64>>,
 }
 
 impl TrustedServicesMgr {
@@ -66,7 +101,49 @@ impl TrustedServicesMgr {
     pub fn new() -> Self {
         TrustedServicesMgr {
             services: ArcSwap::new(Arc::new(Vec::new())),
+            actor_revisions: DashMap::new(),
         }
+    }
+
+    /// Get the sources needing a revision-triggered refresh for `actor_ident`: every
+    /// registered service that appears in `attr_sources` (the sources of the actor's
+    /// attributes) or in the actor's revision record, whose current revision differs
+    /// from the recorded one. A missing record counts as stale.
+    ///
+    /// Returns `(source id, current revision at check time)` pairs; pass the revision
+    /// back to [`Self::record_revision`] after a successful refresh so a flush racing
+    /// the fetch re-triggers rather than being missed.
+    pub fn stale_sources_for_actor(
+        &self,
+        actor_ident: &str,
+        attr_sources: &HashSet<String>,
+    ) -> Vec<(String, u64)> {
+        let services = self.services.load_full();
+        let recorded = self.actor_revisions.get(actor_ident);
+        services
+            .iter()
+            .filter_map(|svc| {
+                let sid = svc.get_source_id();
+                let rec = recorded.as_ref().and_then(|r| r.value().get(sid).copied());
+                // A service the actor holds no attributes from and has no record for is
+                // not relevant to this actor.
+                if rec.is_none() && !attr_sources.contains(sid) {
+                    return None;
+                }
+                let cur = svc.current_revision();
+                (rec != Some(cur)).then(|| (sid.to_string(), cur))
+            })
+            .collect()
+    }
+
+    /// Record that `actor_ident`'s attributes from `source` are current as of
+    /// `revision`. Call after a successful refresh (including one that returned zero
+    /// attributes), or with [`REVISION_NEVER`] to pin the source stale for a retry.
+    pub fn record_revision(&self, actor_ident: &str, source: &str, revision: u64) {
+        self.actor_revisions
+            .entry(actor_ident.to_string())
+            .or_default()
+            .insert(source.to_string(), revision);
     }
 
     /// Atomically replaces the whole service list.
@@ -223,12 +300,13 @@ pub struct FileAttributeStore {
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
-/// Attribute data and the instant it goes stale, swapped as a unit so the two can
-/// never drift apart.
+/// Attribute data, the instant it goes stale, and its revision, swapped as a unit so
+/// they can never drift apart.
 #[derive(Debug)]
 struct Snapshot {
     attributes: ActorAttributes,
     expires_at: Instant,
+    revision: u64,
 }
 
 impl Snapshot {
@@ -292,6 +370,7 @@ impl FileAttributeStore {
         let snapshot = Snapshot {
             attributes,
             expires_at: Instant::now() + ttl,
+            revision: next_revision(),
         };
         let store = FileAttributeStore {
             id,
@@ -327,6 +406,7 @@ impl FileAttributeStore {
         let fresh = Arc::new(Snapshot {
             attributes: load_actor_attributes_from_file(&self.fp)?,
             expires_at: Instant::now() + self.ttl,
+            revision: next_revision(),
         });
         self.snapshot.store(fresh.clone());
         Ok(fresh)
@@ -375,15 +455,23 @@ impl TrustedServiceInterface for FileAttributeStore {
         Ok(result)
     }
 
-    /// Expire the cached data in place so the next lookup re-reads the file. Reuses the
-    /// normal staleness path rather than carrying a separate "force reload" flag.
+    /// Re-read the attribute file and swap in a fresh snapshot (with a fresh
+    /// revision). On failure the current snapshot and revision are left untouched and
+    /// the error is returned — a bad file must not advance the revision.
     async fn flush(&self) -> Result<(), ServiceError> {
         info!(target: TS, "TS {} flushing cached actor attributes", self.id);
-        self.snapshot.rcu(|cur| Snapshot {
-            attributes: cur.attributes.clone(),
-            expires_at: Instant::now(),
-        });
+        let _guard = self.refresh_lock.lock().await;
+        let attributes = load_actor_attributes_from_file(&self.fp)?;
+        self.snapshot.store(Arc::new(Snapshot {
+            attributes,
+            expires_at: Instant::now() + self.ttl,
+            revision: next_revision(),
+        }));
         Ok(())
+    }
+
+    fn current_revision(&self) -> u64 {
+        self.snapshot.load().revision
     }
 }
 
@@ -627,14 +715,88 @@ mod tests {
         );
         mgr.update_services(vec![store.clone()]);
 
-        assert!(store.snapshot.load().remaining() >= MIN_ATTRIBUTE_TTL);
+        let rev_before = store.current_revision();
 
         let results = mgr.flush_all().await;
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
 
-        // Flushed means expired: the cached data is now below the floor.
-        assert!(store.snapshot.load().remaining() < MIN_ATTRIBUTE_TTL);
+        // Eager flush: a fresh, fully-valid snapshot with a new revision was swapped in.
+        assert!(store.current_revision() > rev_before);
+        assert!(store.snapshot.load().remaining() >= MIN_ATTRIBUTE_TTL);
+
+        fs::remove_file(&fp).unwrap();
+    }
+
+    /// A failed flush (unparseable file) must leave the current snapshot and revision
+    /// untouched; a subsequent successful flush moves both forward.
+    #[tokio::test]
+    async fn test_flush_failure_keeps_snapshot_and_revision() {
+        let fp = write_fixture("vs-fas-flush-fail.json", r#"{"alice": {"color": ["red"]}}"#);
+        let store = FileAttributeStore::new(
+            "test".to_string(),
+            test_mapper(),
+            Duration::from_secs(3600),
+            &fp,
+        )
+        .unwrap();
+        let rev = store.current_revision();
+
+        // Corrupt the file: flush must fail and change nothing.
+        fs::write(&fp, "not json").unwrap();
+        assert!(store.flush().await.is_err());
+        assert_eq!(store.current_revision(), rev);
+        assert!(store.snapshot.load().attributes.0.contains_key("alice"));
+
+        // Fix the file: flush succeeds, data and revision move forward.
+        fs::write(&fp, r#"{"bob": {"color": ["blue"]}}"#).unwrap();
+        store.flush().await.unwrap();
+        assert!(store.current_revision() > rev);
+        assert!(store.snapshot.load().attributes.0.contains_key("bob"));
+
+        fs::remove_file(&fp).unwrap();
+    }
+
+    /// Revision staleness bookkeeping: an irrelevant source is skipped, a missing
+    /// record reads as stale, recording the revision clears it, and a flush makes the
+    /// actor stale again even when only the record marks the source relevant.
+    #[tokio::test]
+    async fn test_stale_sources_for_actor_tracks_revisions() {
+        let fp = write_fixture("vs-fas-stale.json", r#"{"alice": {"color": ["red"]}}"#);
+        let mgr = TrustedServicesMgr::new();
+        let store = Arc::new(
+            FileAttributeStore::new(
+                "test".to_string(),
+                test_mapper(),
+                Duration::from_secs(3600),
+                &fp,
+            )
+            .unwrap(),
+        );
+        mgr.update_services(vec![store.clone()]);
+
+        // No attributes from the source and no record: not relevant, not stale.
+        assert!(
+            mgr.stale_sources_for_actor("alice", &HashSet::new())
+                .is_empty()
+        );
+
+        // Attributes from the source but no record: stale.
+        let sources = HashSet::from(["test".to_string()]);
+        let stale = mgr.stale_sources_for_actor("alice", &sources);
+        assert_eq!(stale, vec![("test".to_string(), store.current_revision())]);
+
+        // Recording the fetched revision clears the staleness.
+        mgr.record_revision("alice", "test", stale[0].1);
+        assert!(mgr.stale_sources_for_actor("alice", &sources).is_empty());
+
+        // A flush bumps the revision: stale again, and the record alone is enough to
+        // keep the source relevant (no attr_sources needed).
+        store.flush().await.unwrap();
+        assert_eq!(
+            mgr.stale_sources_for_actor("alice", &HashSet::new()),
+            vec![("test".to_string(), store.current_revision())]
+        );
 
         fs::remove_file(&fp).unwrap();
     }
