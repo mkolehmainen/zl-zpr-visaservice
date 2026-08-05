@@ -45,9 +45,10 @@ pub enum VsEvent {
     TrustedServiceChange(String),
 }
 
-/// Why a visa sweep is running. The two reasons need different handling because an
-/// attribute change does not move the policy generation, so the `checked_vinst`
-/// gates that make the policy sweep idempotent would make an attribute sweep a
+/// Why a visa sweep is running. The two reasons need different handling because
+/// an attribute change does not move the policy generation, so the
+/// `checked_vinst` gates that make the policy sweep idempotent (ie, do not do
+/// anything if the `vinst` has not changed) would make an attribute sweep a
 /// complete no-op.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SweepReason {
@@ -187,9 +188,6 @@ async fn set_services_all_nodes(
 
 async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), ServiceError> {
     /*
-    https://github.com/org-zpr/zpr-visaservice/issues/219
-
-
     When we get here we have already updated policy.
 
     - TODO: request re-auth all nodes.
@@ -201,10 +199,6 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
        - We can do a basic check to see that all the services we have do exist in policy.
           - But that won't detect if a service has altered its provider.
           - TO BE SAFE: expire auth from all services - force re-auth of all existing services (after removing non-existing ones)
-
-    - all connected adapters.  Are they still allowed?
-       - Well we could expire all the auth, but that seems drastic.
-       - Instead we will have already killed visas. Probably ok to let them be connected but unable to do anything.
      */
 
     // Grab one consistent policy snapshot and use it for the entire synchronize-to-policy
@@ -229,13 +223,12 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     //
     // Only actors that are actually stale cost a fetch: `PolicyMgr::build_state`
     // carries unchanged trusted-service stores (and their revisions) across a policy
-    // install, so this is a no-op unless the policy changed a trusted-service
-    // declaration.
+    // install, so this is a no-op unless the policy changed a trusted-service.
     //
-    // TODO: when a declaration does change, this refetches every source for every
+    // TODO: When a declaration does change, this refetches every source for every
     // actor in the set, sequentially -- an N x M synchronous fan-out on the event
-    // handler's critical path once services are network-backed and actor/visa counts
-    // are large.
+    // handler's critical path. Once services are network-backed and actor/visa counts
+    // are large this is going to be an issue.
     let connected_node_addrs = asm.actor_mgr.list_node_addrs().await?;
     let mut refresh_set = live_visa_actor_addrs(asm).await;
     refresh_set.extend(connected_node_addrs.iter().copied());
@@ -312,16 +305,17 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     Ok(())
 }
 
-/// A trusted service's attribute data changed (an admin refreshed it). The new data may
-/// invalidate visas that were issued under the old data, so reconcile in two phases:
-/// refresh and persist the actors behind live visas, then re-check those visas.
+/// A trusted service's attribute data changed (eg, an admin refreshed it). The
+/// new data may invalidate visas that were issued under the old data, so
+/// reconcile in two phases: refresh and persist the actors behind live visas,
+/// then re-check those visas.
 ///
-/// Phase order matters: the sweep re-reads actors from the store, so their attributes
-/// have to be reconciled and written back first.
+/// Phase order matters: the sweep re-reads actors from the store, so their
+/// attributes have to be reconciled and written back first.
 ///
-/// Note this only reconciles actors that hold a live visa -- the visa sweep is the only
-/// consumer here. Everyone else is handled lazily on their next visa request by the
-/// revision check in `refresh_expired_attributes`.
+/// Note this only reconciles actors that hold a live visa. Everyone else is
+/// handled lazily on their next visa request by the revision check in
+/// `refresh_expired_attributes`.
 async fn handle_trusted_service_change(asm: &Arc<Assembly>, source_id: &str) {
     // One snapshot for the whole pass, same as the policy handler.
     let psnap = asm.policy_mgr.get_current_snapshot();
@@ -348,18 +342,15 @@ async fn live_visa_actor_addrs(asm: &Arc<Assembly>) -> HashSet<IpAddr> {
 }
 
 /// Refresh (and persist) the attributes of each actor in `zpr_addrs`. Only sources that
-/// are TTL-expired or revision-stale are actually fetched, so an actor already current
-/// costs nothing.
+/// are TTL-expired or revision-stale are actually fetched.
 ///
 /// A failure is logged and skipped rather than aborting the pass: that actor's recorded
 /// revision stays mismatched, so its next visa request refreshes it again. This includes
-/// an unreachable trusted service (`AttributesIndeterminate`) -- the actor has already
-/// been stripped and persisted, and the deny that comes with it belongs to the request
-/// path, not to a background reconcile.
+/// an unreachable trusted service (`AttributesIndeterminate`).
 ///
 /// Returns `(refreshed, unresolved, failed)` counts for logging.
 ///
-/// TODO: sequential, and unbounded in the size of the set. Fine while the only trusted
+/// TODO: Sequential, and unbounded in the size of the set. Fine while the only trusted
 /// service is the in-memory file store; revisit once services are network calls and
 /// actor/visa counts are large.
 async fn refresh_actors(asm: &Arc<Assembly>, zpr_addrs: HashSet<IpAddr>) -> (u32, u32, u32) {
@@ -450,7 +441,7 @@ async fn node_still_valid(asm: &Arc<Assembly>, ectx: &EvalContext, naddr: &IpAdd
 ///
 /// Visas whose actors can't be resolved are skipped (not revoked). A verdict is
 /// only applied while `target_vinst` is still the live policy generation —
-/// otherwise a newer policy sweep is coming and will decide.
+/// otherwise a newer policy sweep is coming and it will decide when it runs.
 ///
 /// [SweepReason::PolicyUpdate] skips any visa already checked at/after
 /// `target_vinst`, bumps `checked_vinst` on allow (canceling any older queued

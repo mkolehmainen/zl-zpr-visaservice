@@ -246,7 +246,6 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
     };
 
     // If necessary, refresh any expired attributes
-    // TODO: Can we parallize this?
     if let Err(e) = refresh_and_persist_actor(&asm, &mut source_actor).await {
         error!(target: VREQ, "failed to update source actor after refreshing attributes: {}", e);
         return Ok(VisaDecision::Deny(DenyCode::NoReason));
@@ -294,9 +293,10 @@ struct RefreshOutcome {
 }
 
 impl RefreshOutcome {
-    /// Record the pending source revisions against `actor_ident`. Deliberately not done
-    /// during the refresh itself: a revision must never say "current" for an actor whose
-    /// refreshed attributes did not reach the database, or the next request would trust
+    /// Direct [TrustedServicesMgr] to Record the pending source revisions
+    /// against `actor_ident`. Deliberately not done during the refresh itself:
+    /// a revision must never say "current" for an actor whose refreshed
+    /// attributes did not reach the database, or the next request would trust
     /// the stale copy it loads.
     fn commit_revisions(&self, ts_mgr: &TrustedServicesMgr, actor_ident: &str) {
         for (source, revision) in &self.revisions {
@@ -344,25 +344,31 @@ pub(crate) async fn refresh_and_persist_actor(
     Ok(outcome.changed)
 }
 
-/// Refresh the actor's attributes from the trusted service manager where needed: any
-/// source with an expired attribute (TTL path), plus any source whose snapshot revision
-/// differs from the actor's recorded one (revision path, e.g. after an admin flush).
+/// Refresh the actor's attributes from the trusted service manager where
+/// needed: any source with an expired attribute (TTL path), plus any source
+/// whose snapshot revision differs from the actor's recorded one (revision
+/// path, e.g. after an admin flush).
 ///
-/// A successful lookup is authoritative for that source: anything the service did not
-/// vend is dropped — still-expired leftovers on the TTL path, *everything* not just
-/// returned on the revision path (the old snapshot's data is invalid by definition).
+/// A successful lookup is authoritative for that source, but the two paths drop
+/// different things: the revision path drops every key the service did not just
+/// return (the old snapshot is invalid), while the TTL path only drops leftovers
+/// that are *still* expired after the refresh -- an unexpired attribute the
+/// service omitted survives on its own TTL until the next revision bump.
 ///
-/// A failed TTL lookup changes nothing, so a service outage cannot strip attributes.
-/// The leftovers stay expired, and libeval already refuses to satisfy an allow condition
-/// from an expired attribute, so that path is fail-closed without any help from here.
+/// A failed TTL lookup changes nothing, so a service outage cannot strip
+/// attributes. The leftovers stay expired, and libeval already refuses to
+/// satisfy an allow condition from an expired attribute, so that path is
+/// fail-closed in this failure case.
 ///
-/// A failed lookup for a revision-stale source is different: there is no expired copy to
-/// fall back on, so the source's attributes are stripped and the source is reported as
-/// *indeterminate*. The caller must deny rather than evaluate the remaining claims --
-/// absence is not "known to have no such attribute". REVISION_NEVER is queued so the
-/// source stays stale and the next request retries.
+/// A failed lookup for a revision-stale source (ie, source reports a new
+/// revision) is different: there is no expired copy to fall back on, so the
+/// source's attributes are stripped and the source is reported as
+/// *indeterminate*. The caller must deny rather than evaluate the remaining
+/// claims -- absence is not "known to have no such attribute". REVISION_NEVER
+/// is queued so the source stays stale and the next request retries.
 ///
-/// Nothing is recorded with the trusted-service manager here; see [RefreshOutcome].
+/// Nothing is recorded with the trusted-service manager here; see
+/// [RefreshOutcome].
 async fn refresh_expired_attributes(
     ts_mgr: &TrustedServicesMgr,
     actor: &mut Actor,
@@ -414,9 +420,10 @@ async fn refresh_expired_attributes(
                             prune_from_source(actor, source, |a| !returned.contains(a.get_key()));
                         outcome.revisions.push((source.clone(), rev));
                     } else {
-                        // TTL refresh: whatever the service did not just set for this
-                        // source is gone; drop the leftovers rather than carry a
-                        // permanently expired copy.
+                        // TTL refresh: drop the leftovers that are still expired
+                        // rather than carry a permanently expired copy. Unexpired
+                        // attributes the service omitted are left alone -- only a
+                        // revision bump invalidates the whole snapshot.
                         outcome.changed |= prune_from_source(actor, source, |a| a.is_expired());
                     }
                 }

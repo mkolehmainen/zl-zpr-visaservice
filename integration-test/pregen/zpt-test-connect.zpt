@@ -3,7 +3,6 @@ load zpt-test.bin2
 # test connect success
 connect --ac device.zpr.adapter.cn:bas.zpr.org
 
-# test connect fails
+# test connect succeeds as an adapter without a matching join policy
 connect --ac device.zpr.adapter.cn:bazz.zpr.org
-
 
