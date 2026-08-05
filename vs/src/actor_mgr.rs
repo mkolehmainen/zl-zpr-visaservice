@@ -150,7 +150,8 @@ impl ActorMgr {
     }
 
     // TODO: This probably updates too much ... all we really need is to update the attributes.
-    // Only call path is after running an attribute refresh in the visa request path.
+    // Only called from refresh_and_persist_actor, after an attribute refresh: from the
+    // visa request path and from the attribute reconcile sweep in event_mgr.
     pub async fn update_actor(&self, actor: &Actor) -> Result<(), ServiceError> {
         self.actor_db.update_actor(actor).await?;
         Ok(())

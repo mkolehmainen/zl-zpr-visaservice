@@ -36,10 +36,7 @@ pub struct Actor {
     // The names are kept here in order.
     identity_keys: Vec<String>,
 
-    // These are all pulled from the attributes map if/when set.
-    cn: Option<String>,
-    role: Role,
-    provider: bool,
+    // Cache zpr_addr since we parse it.
     zpr_addr: Option<IpAddr>,
 }
 
@@ -51,9 +48,6 @@ impl Hash for Actor {
         attrs.sort_by_key(|a| a.get_key());
         attrs.hash(state);
         self.identity_keys.hash(state);
-        self.cn.hash(state);
-        self.role.hash(state);
-        self.provider.hash(state);
         self.zpr_addr.hash(state);
     }
 }
@@ -117,35 +111,28 @@ impl Actor {
                     )));
                 }
             }
-            key::SERVICES => self.provider = !value.is_empty() && !value[0].is_empty(),
-            key::CN => self.cn = Some(value[0].to_string()),
-            key::ROLE => match value[0].as_str() {
-                ROLE_ADAPTER => self.role = Role::Adapter,
-                ROLE_NODE => self.role = Role::Node,
-                _ => {
+            // Validated on the way in so the getters can trust what is in the map.
+            key::ROLE => {
+                if value[0] != ROLE_ADAPTER && value[0] != ROLE_NODE {
                     return Err(AttributeError::AttributeError(format!(
                         "role must be 'node' or 'adapter', not: '{}'",
                         value[0]
                     )));
                 }
-            },
+            }
             _ => (),
         }
         self.attrs.insert(key, attr);
         Ok(())
     }
 
-    /// Removes the attribute named `key`, clearing any derived field it fed and
-    /// dropping it from the identity keys. Returns the removed attribute, or None
-    /// if the actor did not have one.
+    /// Removes the attribute named `key`, clearing the cached ZPR address if that is
+    /// what went away, and dropping it from the identity keys. Returns the removed
+    /// attribute, or None if the actor did not have one.
     pub fn remove_attribute(&mut self, key: &str) -> Option<Attribute> {
         let attr = self.attrs.remove(key)?;
-        match key {
-            key::ZPR_ADDR => self.zpr_addr = None,
-            key::SERVICES => self.provider = false,
-            key::CN => self.cn = None,
-            key::ROLE => self.role = Role::default(),
-            _ => (),
+        if key == key::ZPR_ADDR {
+            self.zpr_addr = None;
         }
         self.identity_keys.retain(|k| k != key);
         Some(attr)
@@ -153,6 +140,11 @@ impl Actor {
 
     pub fn get_attribute(&self, key: &str) -> Option<&Attribute> {
         self.attrs.get(key)
+    }
+
+    /// First value of the attribute named `key`, if the actor has one.
+    fn single(&self, key: &str) -> Option<&str> {
+        self.attrs.get(key)?.get_value().first().map(|s| s.as_str())
     }
 
     /// If there are identity attributes, the values are copied and returned here
@@ -199,15 +191,24 @@ impl Actor {
     }
 
     pub fn is_provider(&self) -> bool {
-        self.provider
+        self.single(key::SERVICES).is_some_and(|s| !s.is_empty())
     }
 
     pub fn is_node(&self) -> bool {
-        matches!(self.role, Role::Node)
+        self.single(key::ROLE) == Some(ROLE_NODE)
+    }
+
+    /// Role as recorded in the [key::ROLE] attribute. Unknown if there is none.
+    pub fn get_role(&self) -> Role {
+        match self.single(key::ROLE) {
+            Some(ROLE_NODE) => Role::Node,
+            Some(ROLE_ADAPTER) => Role::Adapter,
+            _ => Role::Unknown,
+        }
     }
 
     pub fn get_cn(&self) -> Option<&str> {
-        self.cn.as_deref()
+        self.single(key::CN)
     }
 
     pub fn get_zpr_addr(&self) -> Option<&IpAddr> {
@@ -366,7 +367,7 @@ mod tests {
         let result = actor.add_attribute(attr);
 
         assert!(result.is_ok());
-        assert_eq!(actor.role, Role::Adapter);
+        assert_eq!(actor.get_role(), Role::Adapter);
         assert!(!actor.is_node());
         assert_eq!(actor.attrs.len(), 1);
     }
@@ -380,7 +381,7 @@ mod tests {
         let result = actor.add_attribute(attr);
 
         assert!(result.is_ok());
-        assert_eq!(actor.role, Role::Node);
+        assert_eq!(actor.get_role(), Role::Node);
         assert!(actor.is_node());
         assert_eq!(actor.attrs.len(), 1);
     }
@@ -395,7 +396,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("role must be"));
-        assert_eq!(actor.role, Role::Unknown); // Should remain unchanged
+        assert_eq!(actor.get_role(), Role::Unknown); // Should remain unchanged
         assert_eq!(actor.attrs.len(), 0); // Attribute should not be added on error
     }
 
@@ -413,7 +414,7 @@ mod tests {
         assert_eq!(actor.get_zpr_addr(), None);
         assert!(!actor.is_provider());
         assert_eq!(actor.get_cn(), None);
-        assert_eq!(actor.role, Role::Unknown);
+        assert_eq!(actor.get_role(), Role::Unknown);
         // But the attribute should be added to the list
         assert_eq!(actor.attrs.len(), 1);
         assert!(actor.has_attribute_named("custom.attribute"));
@@ -429,7 +430,7 @@ mod tests {
             .expires_in(Duration::from_secs(3600))
             .value(ROLE_ADAPTER);
         assert!(actor.add_attribute(initial_attr).is_ok());
-        assert_eq!(actor.role, Role::Adapter);
+        assert_eq!(actor.get_role(), Role::Adapter);
 
         // Overwrite with new value
         let new_attr = Attribute::builder(key::ROLE)
@@ -438,7 +439,7 @@ mod tests {
         assert!(actor.add_attribute(new_attr).is_ok());
 
         // Should have the new value
-        assert_eq!(actor.role, Role::Node);
+        assert_eq!(actor.get_role(), Role::Node);
         assert!(actor.is_node());
         assert_eq!(actor.attrs.len(), 1); // Same key, so the second replaces the first
     }
