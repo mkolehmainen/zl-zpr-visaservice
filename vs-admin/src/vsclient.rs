@@ -7,8 +7,8 @@ use reqwest::tls::Certificate;
 use zpr::policy_types::PolicyBundle;
 
 use admin_api_types::{
-    ActorDescriptor, AuthRevokeDescriptor, CnEntry, ListEntry, NamedListEntry, NetworkDetails,
-    Revokes, ServiceDescriptor, Stats, VisaDescriptor, reason_for,
+    ActorDescriptor, AuthRevokeDescriptor, CnEntry, DenyRecord, ListEntry, NamedListEntry,
+    NetworkDetails, Revokes, ServiceDescriptor, Stats, VisaDescriptor, reason_for,
 };
 
 use crate::error::VsaError;
@@ -357,11 +357,74 @@ impl VsClient {
         Ok(entry_vec)
     }
 
+    /// `GET <api_url>/admin/visas/denies[?since=<EPOCH_MS>][&limit=<COUNT>]`
+    ///
+    /// Returns the recent-denies window, newest request first.
+    pub fn get_denies(
+        &self,
+        since: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<DenyRecord>, VsaError> {
+        let requrl = denies_url(&self.api_url, since, limit)?;
+        let entry_vec = self.request_get_list_entries::<DenyRecord>(requrl.as_str())?;
+        Ok(entry_vec)
+    }
+
     /// `GET <api_url>/admin/stats`
     pub fn get_stats(&self) -> Result<Stats, VsaError> {
         let req = format!("{}/admin/stats", self.api_url);
         let resp = self.ht_get(&req)?;
         let entry: Stats = resp.json()?;
         Ok(entry)
+    }
+}
+
+/// Builds the `/admin/visas/denies` URL, omitting each query parameter that is
+/// `None` so the service applies its own default.
+fn denies_url(
+    api_url: &str,
+    since: Option<u64>,
+    limit: Option<usize>,
+) -> Result<reqwest::Url, VsaError> {
+    let mut requrl = reqwest::Url::parse(&format!("{api_url}/admin/visas/denies"))?;
+    if since.is_none() && limit.is_none() {
+        // query_pairs_mut() would leave a bare trailing "?" with nothing to append.
+        return Ok(requrl);
+    }
+    {
+        let mut qp = requrl.query_pairs_mut();
+        if let Some(since) = since {
+            qp.append_pair("since", &since.to_string());
+        }
+        if let Some(limit) = limit {
+            qp.append_pair("limit", &limit.to_string());
+        }
+    }
+    Ok(requrl)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `since`/`limit` are passed through verbatim, and omitted entirely when None.
+    #[test]
+    fn denies_url_includes_only_supplied_query_params() {
+        let base = "https://[fd5a:5052::1]:8182";
+        let url = |since, limit| denies_url(base, since, limit).unwrap().to_string();
+
+        assert_eq!(url(None, None), format!("{base}/admin/visas/denies"));
+        assert_eq!(
+            url(Some(1_700_000_000_000), None),
+            format!("{base}/admin/visas/denies?since=1700000000000")
+        );
+        assert_eq!(
+            url(None, Some(25)),
+            format!("{base}/admin/visas/denies?limit=25")
+        );
+        assert_eq!(
+            url(Some(5), Some(25)),
+            format!("{base}/admin/visas/denies?since=5&limit=25")
+        );
     }
 }

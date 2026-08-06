@@ -95,6 +95,9 @@ pub const DEFAULT_VISA_REQ_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Max number of visas the node can request at a time
 pub const MAX_NUM_VISA_REQUEST: usize = 20;
 
+/// Size of the in-memory recent-denies window kept by the deny log.
+pub const DENY_LOG_SIZE: usize = 500;
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields, default)]
 pub struct VSConfig {

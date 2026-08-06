@@ -46,7 +46,13 @@ impl Executor {
         id: Option<u64>,
         revoke: bool,
         on_node: Option<String>,
+        denies: bool,
+        last: Option<u64>,
+        limit: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if denies {
+            return self.get_denies(last, limit);
+        }
         match (id, on_node) {
             (Some(id), _) => match revoke {
                 true => self.revoke_visa(id)?,
@@ -188,6 +194,20 @@ impl Executor {
         Ok(())
     }
 
+    /// Prints the recent-denies window, newest first. `last` is a lookback
+    /// duration in milliseconds; without it every recorded deny is requested.
+    fn get_denies(
+        &self,
+        last: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let since = last.map(|d| since_from_last(epoch_ms_now(), d));
+        for record in self.vs_cli.get_denies(since, limit)? {
+            println!("{record}");
+        }
+        Ok(())
+    }
+
     fn revoke_visa(&self, id: u64) -> Result<(), Box<dyn std::error::Error>> {
         let revoke = self.vs_cli.revoke_visa(id)?;
         println!("{revoke}");
@@ -302,5 +322,35 @@ impl Executor {
 
         println!("{network}");
         Ok(())
+    }
+}
+
+/// Current epoch time in milliseconds, clamped rather than panicking on a
+/// pre-epoch or absurdly future clock.
+fn epoch_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Turns a `--last` lookback duration into the `since` value for the HTTP API.
+/// A lookback reaching before the Unix epoch saturates to 0, ie "everything".
+fn since_from_last(now_ms: u64, duration_ms: u64) -> u64 {
+    now_ms.saturating_sub(duration_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `--last` window subtracts from now, and one reaching past the epoch clamps to 0.
+    #[test]
+    fn since_from_last_subtracts_and_saturates() {
+        let now_ms = 1_700_000_000_000u64;
+        // "3m" arrives here as 180_000 ms from parse_timespec.
+        assert_eq!(since_from_last(now_ms, 180_000), 1_699_999_820_000);
+        assert_eq!(since_from_last(1_000, 5_000), 0);
+        assert_eq!(since_from_last(now_ms, 0), now_ms);
     }
 }

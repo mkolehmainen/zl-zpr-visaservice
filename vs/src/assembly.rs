@@ -8,6 +8,7 @@ use crate::config::VSConfig;
 use crate::connection_control::ConnectionControl;
 use crate::counters::Counters;
 use crate::db::DbConnection;
+use crate::deny_log::DenyLog;
 use crate::event_mgr::EventMgr;
 use crate::net_mgr::NetMgr;
 use crate::policy_mgr::PolicyMgr;
@@ -33,6 +34,7 @@ pub struct Assembly {
     pub admin_api_keys: Arc<ReloadableApiKeys>,
     pub topo_mgr: TopologyMgr,
     pub ts_mgr: Arc<TrustedServicesMgr>,
+    pub deny_log: DenyLog,
 }
 
 impl Assembly {
@@ -158,6 +160,7 @@ pub mod tests {
             admin_api_keys: Arc::new(ReloadableApiKeys::default()),
             topo_mgr: TopologyMgr::new(LinkRepo::new(db_handle)),
             ts_mgr,
+            deny_log: Default::default(),
         };
         (asm, event_rx)
     }

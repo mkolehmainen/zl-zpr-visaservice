@@ -755,6 +755,58 @@ pub struct Stats {
     pub stats: HashMap<String, String>,
 }
 
+/// One collapsed deny from the visa service's recent-denies window.
+/// `last_deny_ms` is epoch **milliseconds** (not seconds like other endpoints).
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DenyRecord {
+    pub source_addr: IpAddr,
+    pub dest_addr: IpAddr,
+    pub protocol: u8,
+    pub dest_port: u16,
+    pub count: u64,
+    pub last_deny_ms: u64,
+    pub deny_code: String,
+}
+
+// IANA IP protocol numbers, local so admin-api-types need not depend on `zpr`.
+const IP_PROTO_ICMP: u8 = 1;
+const IP_PROTO_TCP: u8 = 6;
+const IP_PROTO_UDP: u8 = 17;
+const IP_PROTO_IPV6_ICMP: u8 = 58;
+
+impl fmt::Display for DenyRecord {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let proto = match self.protocol {
+            IP_PROTO_TCP => "TCP".to_string(),
+            IP_PROTO_UDP => "UDP".to_string(),
+            IP_PROTO_ICMP => "ICMP".to_string(),
+            IP_PROTO_IPV6_ICMP => "IPV6_ICMP".to_string(),
+            other => other.to_string(),
+        };
+        let when = DateTime::from_timestamp_millis(self.last_deny_ms as i64)
+            .map(|dt: DateTime<Utc>| dt.to_rfc3339_opts(SecondsFormat::Millis, true))
+            .unwrap_or_else(|| format!("{}ms", self.last_deny_ms));
+
+        write!(
+            f,
+            "{} {} {} {} {} {} {} {} {} {} {} {}",
+            "src:".dimmed(),
+            self.source_addr.to_string().yellow(),
+            "dst:".dimmed(),
+            self.dest_addr.to_string().yellow(),
+            "proto:".dimmed(),
+            proto,
+            "dport:".dimmed(),
+            self.dest_port,
+            "code:".dimmed(),
+            self.deny_code.red(),
+            "count:".dimmed(),
+            self.count,
+        )?;
+        write!(f, "  {} {}", "last:".dimmed(), when)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

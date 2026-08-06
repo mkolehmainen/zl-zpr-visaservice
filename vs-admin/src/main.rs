@@ -69,7 +69,10 @@ fn main() {
             id,
             revoke,
             on_node,
-        }) => exec.do_cmd_visas(id, revoke, on_node),
+            denies,
+            last,
+            limit,
+        }) => exec.do_cmd_visas(id, revoke, on_node, denies, last, limit),
 
         Some(SubCmd::Actors {
             cn,

@@ -93,6 +93,8 @@ pub async fn request_visa_wait_response(
     timeout: Duration,
 ) -> Result<VisaDecision, ServiceError> {
     let deadline = tokio::time::Instant::now() + timeout;
+    // Copied out before the job takes ownership of pkt_data; needed for the deny log below.
+    let five_tuple = pkt_data.five_tuple;
     let (job, response_rx) = VisaRequestJob::new(requesting_node.clone(), pkt_data);
 
     asm.counters.incr(CounterType::VisaRequests);
@@ -132,10 +134,11 @@ pub async fn request_visa_wait_response(
 
                 vr_result
             }
-            Ok(VisaDecision::Deny(_)) => {
+            Ok(VisaDecision::Deny(ref code)) => {
                 asm.counters.incr(CounterType::VisaRequestsDenied);
                 asm.counters
                     .incr_node(CounterType::VisaRequestsDenied, requesting_node);
+                asm.deny_log.record(&five_tuple, code);
                 vr_result
             }
             Err(_) => {
@@ -639,6 +642,16 @@ mod tests {
                 .unwrap();
 
         assert!(matches!(result, VisaDecision::Deny(DenyCode::NoMatch)));
+
+        // The deny funnel must have logged this exact 5-tuple in the deny log.
+        let denies = asm.deny_log.recent(None, None);
+        assert_eq!(denies.len(), 1);
+        assert_eq!(denies[0].source_addr, src_zpr);
+        assert_eq!(denies[0].dest_addr, dst_zpr);
+        assert_eq!(denies[0].protocol, zpr::vsapi_types::vsapi_ip_number::TCP);
+        assert_eq!(denies[0].dest_port, 80);
+        assert_eq!(denies[0].deny_code, "NoMatch");
+        assert_eq!(denies[0].count, 1);
 
         arena.abort();
     }

@@ -53,6 +53,15 @@ pub enum SubCmd {
         /// List the visas currently installed on the node with the given CN
         #[arg(long, short = 'n', value_name = "CN", conflicts_with_all = ["id", "revoke"])]
         on_node: Option<String>,
+        /// Show the recent visa denies, most recent first
+        #[arg(long, conflicts_with_all = ["id", "revoke", "on_node"])]
+        denies: bool,
+        /// Only show denies from within the last <TIMESPEC>, eg "45s", "3m", "2h"
+        #[arg(long, value_name = "TIMESPEC", requires = "denies", value_parser = parse_timespec)]
+        last: Option<u64>,
+        /// Limit output to the most recent <COUNT> denies
+        #[arg(long, value_name = "COUNT", requires = "denies")]
+        limit: Option<usize>,
     },
 
     /// Commands related to actors, provide no additional arguments to see list of CNs of all actors
@@ -112,4 +121,100 @@ pub enum SubCmd {
     /// Enter GUI mode
     #[command()]
     Gui,
+}
+
+/// Parses a `<N><unit>` duration into milliseconds, where the unit is exactly
+/// one of the lowercase `h`, `m`, `s`. Used as the clap value parser for
+/// `visas --denies --last`.
+fn parse_timespec(spec: &str) -> Result<u64, String> {
+    let bad = || format!("invalid time spec '{spec}', expected <N>h, <N>m, or <N>s (eg \"3m\")");
+
+    // split_at_checked, not split_at: a trailing multi-byte char (eg "3µ") would
+    // otherwise land the index inside a char and panic instead of erroring.
+    let Some((digits, unit)) = spec.split_at_checked(spec.len().saturating_sub(1)) else {
+        return Err(bad());
+    };
+    let secs_per_unit: u64 = match unit {
+        "h" => 3600,
+        "m" => 60,
+        "s" => 1,
+        _ => return Err(bad()),
+    };
+    // Rejects signs, whitespace and any other non-digit; also rejects an empty number.
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    n.checked_mul(secs_per_unit)
+        .and_then(|secs| secs.checked_mul(1000))
+        .ok_or_else(|| format!("time spec '{spec}' is too large"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Accepts each supported unit and converts it to milliseconds.
+    #[test]
+    fn parse_timespec_accepts_all_units() {
+        assert_eq!(parse_timespec("45s").unwrap(), 45_000);
+        assert_eq!(parse_timespec("3m").unwrap(), 180_000);
+        assert_eq!(parse_timespec("2h").unwrap(), 7_200_000);
+        assert_eq!(parse_timespec("0s").unwrap(), 0);
+    }
+
+    /// Rejects everything outside the exact `<N><unit>` form, plus overflow.
+    #[test]
+    fn parse_timespec_rejects_malformed_specs() {
+        for bad in [
+            "", "m", "3", "-3m", "+3m", " 3m", "3m ", "3 m", "3M", "3H", "3S", "3ms", "3d", "3.5m",
+            "three m", // Multi-byte trailing chars must error, not panic on a char-boundary split.
+            "3µ", "3秒", "3🕐",
+        ] {
+            assert!(parse_timespec(bad).is_err(), "should reject {bad:?}");
+        }
+        assert!(parse_timespec(&format!("{}h", u64::MAX)).is_err());
+        // Fits u64 seconds but overflows once converted to milliseconds.
+        assert!(parse_timespec(&format!("{}s", u64::MAX / 999)).is_err());
+    }
+
+    /// Parses a `vs-admin visas ...` command line with the required global args.
+    fn try_parse_visas(extra: &[&str]) -> Result<Cmd, clap::Error> {
+        let mut argv = vec![
+            "vs-admin",
+            "--svc-url",
+            "https://[::1]:8182",
+            "--ca-cert",
+            "ca.pem",
+            "--api-key",
+            "k",
+            "visas",
+        ];
+        argv.extend_from_slice(extra);
+        Cmd::try_parse_from(argv)
+    }
+
+    /// `--last` and `--limit` are only meaningful alongside `--denies`.
+    #[test]
+    fn last_and_limit_require_denies() {
+        assert!(try_parse_visas(&["--last", "3m"]).is_err());
+        assert!(try_parse_visas(&["--limit", "5"]).is_err());
+        assert!(try_parse_visas(&["--denies", "--last", "3m", "--limit", "5"]).is_ok());
+    }
+
+    /// `--denies` cannot be combined with the single-visa or per-node options.
+    #[test]
+    fn denies_conflicts_with_other_visa_options() {
+        assert!(try_parse_visas(&["--denies", "--id", "7"]).is_err());
+        assert!(try_parse_visas(&["--denies", "--id", "7", "--revoke"]).is_err());
+        assert!(try_parse_visas(&["--denies", "--on-node", "node-1"]).is_err());
+    }
+
+    /// The clap definition itself is well formed (catches bad `requires`/`conflicts_with` names).
+    #[test]
+    fn command_definition_is_valid() {
+        Cmd::command().debug_assert();
+    }
 }

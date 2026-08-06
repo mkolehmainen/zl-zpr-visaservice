@@ -26,6 +26,7 @@ mod connection_control;
 mod counters;
 mod db;
 mod db_worker;
+mod deny_log;
 mod error;
 mod event_mgr;
 mod loaded_policy;
@@ -331,6 +332,7 @@ async fn main() -> std::process::ExitCode {
         admin_api_keys: Arc::new(admin_api_keys),
         topo_mgr: TopologyMgr::new(db::LinkRepo::new(db_handle)),
         ts_mgr,
+        deny_log: Default::default(),
     });
 
     // Rebuild the in-memory router topology from persisted state. This runs after

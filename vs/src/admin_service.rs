@@ -48,9 +48,9 @@ use crate::visa_mgr::VisaMgr;
 use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 
 use admin_api_types::{
-    ActorDescriptor, ApiAttribute, ApiKeyFormat, ApiKeySet, AuthRevokeDescriptor, CnEntry,
-    ConnectionType, ListEntry, NamedListEntry, NetworkDetails, NodeConnection, NodeRecordBrief,
-    Revokes, ServiceDescriptor, Stats, VisaDescriptor,
+    ActorDescriptor, ApiAttribute, ApiKeyFormat, ApiKeySet, CnEntry, ConnectionType, DenyRecord,
+    ListEntry, NamedListEntry, NetworkDetails, NodeConnection, NodeRecordBrief, Revokes,
+    ServiceDescriptor, Stats, VisaDescriptor,
 };
 
 // Must use tokio RwLock here becuase we need state to be Send.
@@ -64,6 +64,13 @@ struct AdminState {
 #[derive(Deserialize, Debug)]
 struct RoleFilter {
     role: Option<ActorRole>,
+}
+
+/// Query args for `GET /admin/visas/denies`. `since` is epoch milliseconds.
+#[derive(Deserialize, Debug)]
+struct DenyFilter {
+    since: Option<u64>,
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -165,6 +172,7 @@ fn admin_app(state: SharedState) -> Router {
         .route("/admin/policies/curr", get(get_curr_policy))
         .route("/admin/policies", post(install_policy))
         .route("/admin/visas", get(get_visas).with_state(state.clone()))
+        .route("/admin/visas/denies", get(get_denies))
         .route("/admin/visas/{capture}", get(get_visa))
         .route("/admin/visas/{capture}", delete(revoke_visa))
         .route("/admin/actors", get(get_actors).with_state(state.clone()))
@@ -226,13 +234,6 @@ async fn serve(tls_acceptor: TlsAcceptor, listen: SocketAddr, state: SharedState
             }
         });
     }
-}
-
-fn two_elem_list() -> impl IntoResponse {
-    let le0 = ListEntry { id: 0 };
-    let le1 = ListEntry { id: 1 };
-
-    (StatusCode::OK, Json(vec![le0, le1])).into_response()
 }
 
 /// TODO: Placeholder - Only returns ID(0) which is for the current policy.
@@ -365,6 +366,38 @@ async fn get_visas(
             return (StatusCode::OK, Json(le_list));
         }
     }
+}
+
+/// Returns the recent-denies window, newest request first, optionally filtered
+/// by `since` (epoch milliseconds, inclusive) and capped by `limit`.
+async fn get_denies(
+    Extension(perm): Extension<Permission>,
+    State(state): State<SharedState>,
+    Query(q): Query<DenyFilter>,
+) -> (StatusCode, Json<Vec<DenyRecord>>) {
+    if !perm.can_read() {
+        return (StatusCode::FORBIDDEN, Json(Vec::<DenyRecord>::new()));
+    }
+    debug!(target: ADMIN, "GET /admin/visas/denies since={:?} limit={:?}", q.since, q.limit);
+    let rstate = state.read().await;
+
+    let records = rstate
+        .asm
+        .deny_log
+        .recent(q.since, q.limit)
+        .into_iter()
+        .map(|e| DenyRecord {
+            source_addr: e.source_addr,
+            dest_addr: e.dest_addr,
+            protocol: e.protocol,
+            dest_port: e.dest_port,
+            count: e.count,
+            last_deny_ms: e.last_deny_ms,
+            deny_code: e.deny_code,
+        })
+        .collect();
+
+    (StatusCode::OK, Json(records))
 }
 
 async fn get_visa(
@@ -905,36 +938,28 @@ fn service_endpoints_to_string(endpoints: &[Scope]) -> String {
 }
 
 async fn get_revokes() -> impl IntoResponse {
-    debug!(target: ADMIN, "GET /admin/authrevoke");
-    two_elem_list()
+    debug!(target: ADMIN, "GET /admin/authrevoke - NOT IMPLEMENTED");
+    (StatusCode::OK, Json(Vec::<ListEntry>::new())).into_response()
 }
 
 async fn get_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
-    debug!(target: ADMIN, "GET /admin/authrevoke/{}", id);
-    let ard: AuthRevokeDescriptor = AuthRevokeDescriptor {
-        ty: "t".to_string(),
-        cn: "c".to_string(),
-    };
-
-    (StatusCode::OK, Json(ard)).into_response()
+    debug!(target: ADMIN, "GET /admin/authrevoke/{} - NOT IMPLEMENTED", id);
+    (StatusCode::NOT_FOUND, Json(()).into_response())
 }
 
 async fn clear_revokes() -> impl IntoResponse {
-    debug!(target: ADMIN, "POST /admin/authrevoke/clear");
-    two_elem_list()
+    debug!(target: ADMIN, "POST /admin/authrevoke/clear - NOT IMPLEMENTED");
+    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
 }
 
 async fn remove_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
-    debug!(target: ADMIN, "DELETE /admin/authrevoke/{}", id);
-    let le = ListEntry { id: 0 };
-    (StatusCode::OK, Json(le)).into_response()
+    debug!(target: ADMIN, "DELETE /admin/authrevoke/{} - NOT IMPLEMENTED", id);
+    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
 }
 
 async fn add_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
-    debug!(target: ADMIN, "POST /admin/authrevoke/{}", id);
-
-    let le = ListEntry { id: 0 };
-    (StatusCode::OK, Json(le)).into_response()
+    debug!(target: ADMIN, "POST /admin/authrevoke/{} - NOT IMPLEMENTED", id);
+    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
 }
 
 async fn get_network(
@@ -1098,7 +1123,7 @@ mod tests {
     use libeval::route::Route;
     use std::net::IpAddr;
     use tower::ServiceExt;
-    use zpr::vsapi_types::PacketDesc;
+    use zpr::vsapi_types::{DenyCode, PacketDesc};
 
     use crate::admin_apikeys::{ApiKeyRecord, KeyStatus};
     use crate::assembly::tests::{new_assembly_for_tests, new_assembly_with_event_rx};
@@ -1429,6 +1454,130 @@ mod tests {
         let visas: Vec<ListEntry> = serde_json::from_slice(&body).unwrap();
         assert_eq!(visas.len(), 1);
         assert_eq!(visas[0].id, created_id);
+    }
+
+    /// Drives `GET /admin/visas/denies` with the given query string and returns
+    /// the status plus the decoded body.
+    async fn fetch_denies(
+        asm: &Arc<Assembly>,
+        api_key: &str,
+        query: &str,
+    ) -> (StatusCode, Vec<DenyRecord>) {
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/admin/visas/denies{query}"))
+                    .header("X-API-Key", api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        // A non-OK response has no DenyRecord list body.
+        let records = if status == StatusCode::OK {
+            serde_json::from_slice(&body).unwrap()
+        } else {
+            Vec::new()
+        };
+        (status, records)
+    }
+
+    /// Records three denies at known times so the ordering and query-filter
+    /// assertions below are deterministic.
+    fn seed_denies(asm: &Arc<Assembly>) {
+        for (i, dport) in [80u16, 443, 8080].into_iter().enumerate() {
+            let ft = PacketDesc::new_tcp(
+                "fd5a:5052:3000::1",
+                "fd5a:5052:3000::2",
+                12345,
+                dport.into(),
+            )
+            .unwrap()
+            .five_tuple;
+            asm.deny_log
+                .record_at_ms(&ft, &DenyCode::NoMatch, 1_000 + i as u64 * 1_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_denies_empty() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let (status, denies) = fetch_denies(&asm, &api_key, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(denies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_denies_newest_first() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        seed_denies(&asm);
+
+        let (status, denies) = fetch_denies(&asm, &api_key, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            denies.iter().map(|d| d.dest_port).collect::<Vec<_>>(),
+            vec![8080, 443, 80]
+        );
+
+        let newest = &denies[0];
+        assert_eq!(
+            newest.source_addr,
+            "fd5a:5052:3000::1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            newest.dest_addr,
+            "fd5a:5052:3000::2".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(newest.protocol, ip_proto::TCP);
+        assert_eq!(newest.count, 1);
+        assert_eq!(newest.last_deny_ms, 3_000);
+        assert_eq!(newest.deny_code, "NoMatch");
+    }
+
+    #[tokio::test]
+    async fn test_get_denies_since_and_limit() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        seed_denies(&asm);
+
+        // `since` is inclusive, so the entry recorded exactly at 2000 is returned.
+        let (status, denies) = fetch_denies(&asm, &api_key, "?since=2000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            denies.iter().map(|d| d.last_deny_ms).collect::<Vec<_>>(),
+            vec![3_000, 2_000]
+        );
+
+        let (_, denies) = fetch_denies(&asm, &api_key, "?limit=1").await;
+        assert_eq!(denies.len(), 1);
+        assert_eq!(denies[0].last_deny_ms, 3_000);
+
+        let (_, denies) = fetch_denies(&asm, &api_key, "?since=1000&limit=2").await;
+        assert_eq!(
+            denies.iter().map(|d| d.last_deny_ms).collect::<Vec<_>>(),
+            vec![3_000, 2_000]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_denies_rejects_malformed_query() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        for query in ["?since=-1", "?since=abc", "?limit=-5", "?limit=1.5"] {
+            let (status, _) = fetch_denies(&asm, &api_key, query).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "expected 400 for query {query}"
+            );
+        }
     }
 
     #[tokio::test]
