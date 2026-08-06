@@ -1,0 +1,11 @@
+[dataplane]
+base_url = "https://[fd5a:5052::1]:8182" # VS Server URL
+timeout = "30s"                     # Default Timeout
+
+# Relative to this file
+[files]
+ca = "../zpr-visaservice/vs/admin-tls-cert.pem" # CA Certificate of VS Server
+key = "../zpr-visaservice/mk2.key"   # API Key
+
+[ui]
+show_static = false

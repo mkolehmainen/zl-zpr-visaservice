@@ -1,0 +1,8 @@
+server.crt
+server.key
+bin/*
+./key.txt
+
+*.zpl
+*.zplc
+*.zpt
