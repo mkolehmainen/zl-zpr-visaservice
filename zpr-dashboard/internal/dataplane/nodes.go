@@ -1,12 +1,13 @@
 package dataplane
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
+	"slices"
 )
 
 type ActorDescriptor struct {
@@ -60,16 +61,6 @@ type NodeRecordBrief struct {
 	Visas             []int64 `json:"visas"`          // installed on the node
 	VisasEnqueued     []int64 `json:"visas_enqueued"` // queued for install
 	PendingRevocation int     `json:"pending_revocation"`
-}
-
-const missingCNPrefix = "cn_missing:"
-
-func PeerName(peer string) (name string, resolved bool) {
-	if addr, ok := strings.CutPrefix(peer, missingCNPrefix); ok {
-		return addr, false
-	}
-
-	return peer, true
 }
 
 type VisaIDEntry struct {
@@ -133,6 +124,12 @@ func (c *Client) GetActor(ctx context.Context, cn string) (ActorDescriptor, erro
 		return ActorDescriptor{}, fmt.Errorf("Decode actor: %w", err)
 	}
 
+	// Stable order so rows don't reshuffle between polls. Every
+	// ActorDescriptor comes from here, so views can assume sorted attributes.
+	slices.SortFunc(actor.Attrs, func(a, b Attribute) int {
+		return cmp.Compare(a.Key, b.Key)
+	})
+
 	return actor, nil
 }
 
@@ -177,6 +174,7 @@ func (c *Client) FetchActorVisas(ctx context.Context, cn string) ([]VisaDescript
 		}
 		visas = append(visas, visa)
 	}
+	sortVisas(visas)
 
 	return visas, nil
 }

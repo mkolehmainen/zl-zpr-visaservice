@@ -44,7 +44,7 @@ func ServicesPage(
 
 	grid = append(grid, lipgloss.JoinHorizontal(
 		lipgloss.Left,
-		components.ServiceVisas(colWidth, visasHeight, services, selectedIndex, visas, visasFetchErr),
+		components.ServiceVisas(colWidth, visasHeight, services, selectedIndex, visas, actors, visasFetchErr),
 		components.ServiceEndpoints(colWidth, visasHeight, services, selectedIndex, fetchErr),
 	))
 

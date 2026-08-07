@@ -1,11 +1,13 @@
 package dataplane
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 )
 
@@ -16,6 +18,11 @@ type ServiceDescriptor struct {
 	DockZprAddress string `json:"dock_zpr_addr"`
 	Kind           string `json:"service_kind"`
 	Endpoints      string `json:"service_endpoints"`
+}
+
+// Hosts reports whether addr is one of the addresses this service answers on.
+func (s ServiceDescriptor) Hosts(addr string) bool {
+	return addr != "" && (addr == s.ZprAddress || addr == s.DockZprAddress)
 }
 
 type Endpoint struct {
@@ -110,6 +117,11 @@ func (c *Client) FetchServices(ctx context.Context) ([]ServiceDescriptor, error)
 		}
 		services = append(services, svc)
 	}
+
+	// Stable order so rows don't reshuffle between polls.
+	slices.SortFunc(services, func(a, b ServiceDescriptor) int {
+		return cmp.Compare(a.ServiceName, b.ServiceName)
+	})
 
 	return services, nil
 }

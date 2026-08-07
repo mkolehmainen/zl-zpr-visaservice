@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"neboagency.com/zpr-dashborad/internal/dataplane"
 	"neboagency.com/zpr-dashborad/internal/styles"
@@ -12,7 +13,7 @@ import (
 
 func NetworkTopology(
 	width, height int,
-	network []dataplane.NodeConnections,
+	network []dataplane.NodeConnection,
 	actors []dataplane.ActorDescriptor,
 	online bool,
 	uptime time.Duration,
@@ -26,31 +27,45 @@ func NetworkTopology(
 	}
 
 	if len(network) == 0 {
-		return detailPanel(width, height, title, subtitle, panelNote("No nodes connected"))
+		return detailPanel(width, height, title, subtitle, panelNote("No links declared"))
 	}
 
 	budget := height - panelChrome
 	size := width - 5
 
-	nodeSize := int(float32(size) * 0.26)
-	sourceSize := int(float32(size) * 0.27)
-	destSize := int(float32(size) * 0.27)
-	adapterSize := size - nodeSize - sourceSize - destSize
+	nodeSize := int(float32(size) * 0.30)
+	peerSize := int(float32(size) * 0.30)
+	substrateSize := int(float32(size) * 0.27)
+	statusSize := size - nodeSize - peerSize - substrateSize
 
-	widths := []int{nodeSize, sourceSize, destSize, adapterSize}
+	// The stale-data warning below takes a line away from the table.
+	extra := 0
+	if fetchErr != nil {
+		extra = 1
+	}
 
-	t := panelTable(size, []string{"Node", "Source Nodes", "Destination Nodes", "Adapters"}, widths)
+	// Rows with a known CN are two lines high, so fit them by rendered height.
+	cells := make([][2]string, len(network))
+	heights := make([]int, len(network))
+	for i, link := range network {
+		cells[i] = [2]string{
+			topologyNodeCell(link.NodeA, actors, nodeSize),
+			topologyNodeCell(link.NodeB, actors, peerSize),
+		}
+		heights[i] = max(cellLines(cells[i][0]), cellLines(cells[i][1]))
+	}
 
-	fits, hidden := tableRowsThatFit(len(network), budget, 0)
+	fits, hidden := tableRowsThatFitHeights(heights, budget, extra)
 
-	for _, node := range network[:fits] {
-		sources, destinations := nodeLinks(node, network)
+	t := panelTable(size, []string{"Node", "Link To", "Substrate", "Status"},
+		[]int{nodeSize, peerSize, substrateSize, statusSize})
 
+	for i, link := range network[:fits] {
 		t.Row(
-			ansi.Truncate(orDash(node.Node), nodeSize, "..."),
-			ansi.Truncate(peerList(sources), sourceSize, "..."),
-			ansi.Truncate(peerList(destinations), destSize, "..."),
-			ansi.Truncate(adapterList(node.Node, actors), adapterSize, "..."),
+			cells[i][0],
+			cells[i][1],
+			ansi.Truncate(orDash(link.Substrate), substrateSize, "..."),
+			linkStatus(link.CType),
 		)
 	}
 
@@ -61,60 +76,41 @@ func NetworkTopology(
 		body += "\n" + styles.SubtitleStyle.Render(fmt.Sprintf("+%d more", hidden))
 	}
 
+	if fetchErr != nil {
+		body += "\n" + lipgloss.NewStyle().Foreground(styles.ColorRed).Render("last refresh failed: "+fetchErr.Error())
+	}
+
 	return detailPanel(width, height, title, subtitle, body)
 }
 
-func nodeLinks(node dataplane.NodeConnections, network []dataplane.NodeConnections) (sources, destinations []string) {
-	for _, link := range node.Connections {
-		peer, _ := dataplane.PeerName(link)
-
-		if linksBack(network, peer, node.Node) {
-			sources = append(sources, peer)
-			continue
-		}
-
-		destinations = append(destinations, peer)
+// topologyNodeCell shows a node address and, when known, its actor CN below it.
+func topologyNodeCell(addr string, actors []dataplane.ActorDescriptor, width int) string {
+	cell := ansi.Truncate(orDash(addr), width, "...")
+	actor, ok := actorByAddr(actors, addr)
+	if !ok || actor.CName == "" {
+		return cell
 	}
 
-	return sources, destinations
+	cn := ansi.Truncate(actor.CName, width, "...")
+	return cell + "\n" + styles.SubtitleStyle.Render(cn)
 }
 
-func linksBack(network []dataplane.NodeConnections, peer, cn string) bool {
-	for _, node := range network {
-		if node.Node != peer {
-			continue
-		}
-
-		for _, link := range node.Connections {
-			if name, _ := dataplane.PeerName(link); name == cn {
-				return true
-			}
-		}
-	}
-
-	return false
+// cellLines counts the terminal lines a rendered table cell occupies.
+func cellLines(cell string) int {
+	return strings.Count(cell, "\n") + 1
 }
 
-func peerList(peers []string) string {
-	if len(peers) == 0 {
-		return "—"
+// linkStatus renders a ctype with the colour the CLI uses: up green,
+// down red, undeclared-but-live yellow.
+func linkStatus(ctype string) string {
+	colour := styles.ColorYellow // INVALID, and anything unrecognised
+	switch ctype {
+	case "UP":
+		colour = styles.ColorGreen
+	case "DOWN":
+		colour = styles.ColorRed
 	}
-
-	return strings.Join(peers, ", ")
-}
-
-func adapterList(cn string, actors []dataplane.ActorDescriptor) string {
-	actor, ok := actorByCN(actors, cn)
-	if !ok || actor.NodeDetails == nil || len(actor.NodeDetails.Adapters) == 0 {
-		return "—"
-	}
-
-	adapters := actor.NodeDetails.Adapters
-	if len(adapters) > 2 {
-		return fmt.Sprintf("%s, +%d", strings.Join(adapters[:2], ", "), len(adapters)-2)
-	}
-
-	return strings.Join(adapters, ", ")
+	return lipgloss.NewStyle().Foreground(colour).Render(orDash(ctype))
 }
 
 func topologyStatus(online bool, uptime time.Duration) string {

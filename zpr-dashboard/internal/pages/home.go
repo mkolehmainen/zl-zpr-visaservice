@@ -33,10 +33,11 @@ func HomePage(
 	uptime time.Duration,
 	services []dataplane.ServiceDescriptor,
 	actors []dataplane.ActorDescriptor,
-	network []dataplane.NodeConnections,
-	revokedHistory []int,
+	network []dataplane.NodeConnection,
+	denies []dataplane.DenyRecord,
 	alerts []components.Alert,
-	fetchErr error,
+	networkErr error,
+	denyFetchErr error,
 	showStatic bool,
 ) string {
 	containers := []container{
@@ -92,7 +93,7 @@ func HomePage(
 
 	topology := lipgloss.JoinHorizontal(
 		lipgloss.Left,
-		components.NetworkTopology(colWidth, topologyHeight, network, actors, online, uptime, fetchErr),
+		components.NetworkTopology(colWidth, topologyHeight, network, actors, online, uptime, networkErr),
 		components.AlertPanel(vp.Width()-colWidth, topologyHeight, alerts),
 	)
 
@@ -107,7 +108,7 @@ func HomePage(
 			height = lastHeight
 		}
 
-		trend := components.VisaDenialRateChart(trendWidth, height, revokedHistory, fetchErr)
+		trend := components.DenyList(trendWidth, height, denies, actors, denyFetchErr)
 		if showStatic {
 			trend = lipgloss.JoinHorizontal(
 				lipgloss.Left,

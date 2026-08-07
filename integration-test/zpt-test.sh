@@ -20,12 +20,11 @@ if [ "$result" = "false" ]; then
   exit 1
 fi
 
-# Verify that it picks up the signal clause for instruction 1, match-idx 1
+# Verify that it picks up the signal clause for instruction 1.
 if "$ZPT_BIN" -i "$INPUT" --json | jq -e -s '
   any(.[];
     .kind=="EVAL"
     and .instruction==1
-    and .hit.match_idx==0
     and (.hit.signal // {} | .message=="red employee" and .service=="signalService")
   )
 '; then

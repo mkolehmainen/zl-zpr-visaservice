@@ -2,50 +2,54 @@ package components
 
 import (
 	"fmt"
+	"time"
 
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/table"
 	"github.com/charmbracelet/x/ansi"
 	"neboagency.com/zpr-dashborad/internal/styles"
+	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
 
+// agoSeconds is how far back this sample action happened, so the rendered
+// stamp is in the viewer's timezone instead of a hard-coded clock string.
 type UserAction struct {
-	source    string
-	action    string
-	attention bool
-	time      string
+	source     string
+	action     string
+	attention  bool
+	agoSeconds int
 }
 
 var actions = [5]UserAction{
 	{
-		source:    "deploy-agent",
-		action:    "Firewall rule #991 updated",
-		attention: false,
-		time:      "16:00:23",
+		source:     "deploy-agent",
+		action:     "Firewall rule #991 updated",
+		attention:  false,
+		agoSeconds: 146,
 	},
 	{
-		source:    "root@zpr.net",
-		action:    "Certificate Rotation: Rotated certificate for kms.zpr.com",
-		attention: false,
-		time:      "16:00:27",
+		source:     "root@zpr.net",
+		action:     "Certificate Rotation: Rotated certificate for kms.zpr.com",
+		attention:  false,
+		agoSeconds: 142,
 	},
 	{
-		source:    "ops-bot-8",
-		action:    "Permission Updated: Granted access to vault.svc.org to zpr service",
-		attention: true,
-		time:      "16:01:38",
+		source:     "ops-bot-8",
+		action:     "Permission Updated: Granted access to vault.svc.org to zpr service",
+		attention:  true,
+		agoSeconds: 71,
 	},
 	{
-		source:    "manager-bot-2",
-		action:    "Actor Disconneced: Actor #23 disconnected",
-		attention: true,
-		time:      "16:02:12",
+		source:     "manager-bot-2",
+		action:     "Actor Disconneced: Actor #23 disconnected",
+		attention:  true,
+		agoSeconds: 37,
 	},
 	{
-		source:    "manager-bot-1",
-		action:    "Actor Disconneced: Actor #24 disconnected",
-		attention: true,
-		time:      "16:02:49",
+		source:     "manager-bot-1",
+		action:     "Actor Disconneced: Actor #24 disconnected",
+		attention:  true,
+		agoSeconds: 0,
 	},
 }
 
@@ -66,6 +70,9 @@ var actions = [5]UserAction{
 //	    risk low|medium|high
 //	    outcome string
 func UserActionsPanel(width, height int) string {
+	// Captured once so every row in a single render shares one reference point.
+	now := time.Now()
+
 	content := placeholderTitle("User Action Overview") + "\n"
 	content += styles.SubtitleStyle.Render("User actions across the network") + "\n"
 
@@ -133,7 +140,7 @@ func UserActionsPanel(width, height int) string {
 			ansi.Truncate(m.source, sourceSize, "..."),
 			ansi.Truncate(m.action, actionSize, "..."),
 			ansi.Truncate(attention, attentionSize, "..."),
-			ansi.Truncate(m.time, timeSize, "..."),
+			ansi.Truncate(now.Add(-time.Duration(m.agoSeconds)*time.Second).Format(timefmt.LayoutTimeOfDay), timeSize, "..."),
 		)
 	}
 

@@ -21,9 +21,10 @@ type state struct {
 		revokeOpen  bool
 		revokeVisas bool
 
-		actors   []dataplane.ActorDescriptor
-		network  []dataplane.NodeConnections
-		fetchErr error
+		actors          []dataplane.ActorDescriptor
+		fetchErr        error
+		network         []dataplane.NodeConnection
+		networkFetchErr error
 
 		visas            []dataplane.VisaDescriptor
 		visasFetchErr    error
@@ -70,6 +71,11 @@ type state struct {
 	revocation struct {
 		revocations []dataplane.AuthRevokeDescriptor
 		fetchErr    error
+	}
+
+	deny struct {
+		records  []dataplane.DenyRecord
+		fetchErr error
 	}
 
 	dismissedAlerts map[string]bool

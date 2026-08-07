@@ -53,7 +53,9 @@ func createDotCanvas(width, height int) *DotCanvas {
 // Set a single pixel on the canvas
 func (c *DotCanvas) setPixel(px, py int, col color.Color) {
 	cx, cy := px/2, py/4
-	if cx < 0 || cy < 0 || cx >= c.width || cy >= c.height {
+	// px/py are checked directly: Go truncates toward zero, so -1/4 == 0 and a
+	// cy-only check would let dotBit[..][-1] through.
+	if px < 0 || py < 0 || cx >= c.width || cy >= c.height {
 		return
 	}
 	c.cells[cy][cx] |= dotBit[px%2][py%4]
@@ -145,7 +147,8 @@ func DotChart(width int, height int, color color.Color, data []int) string {
 		if v > MAX_VALUE {
 			v = MAX_VALUE
 		}
-		return canvasH*4 - 1 - v*(canvasH*20-1)/MAX_VALUE
+		// The canvas is canvasH cells tall, 4 braille pixels per cell.
+		return canvasH*4 - 1 - v*(canvasH*4-1)/MAX_VALUE
 	}
 
 	// Create and reset the braile canvas

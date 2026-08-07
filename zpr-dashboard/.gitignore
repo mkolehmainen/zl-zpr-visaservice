@@ -6,3 +6,5 @@ bin/*
 *.zpl
 *.zplc
 *.zpt
+
+config.toml

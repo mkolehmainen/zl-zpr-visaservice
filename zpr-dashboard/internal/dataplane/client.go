@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"neboagency.com/zpr-dashborad/internal/config"
@@ -72,11 +73,18 @@ func New(cfg Config) (*Client, error) {
 	timeout := cmp.Or(cfg.Timeout, 30*time.Second)
 
 	return &Client{
-		baseURL: cfg.BaseURL,
+		// Paths are concatenated onto this, so a configured trailing slash
+		// would produce "//admin/..." and 404 against the admin routes.
+		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 		apiKey:  cfg.APIKey,
 		http: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
+				// A literal Transport defaults this to 0, meaning idle
+				// connections are kept open forever. http.DefaultTransport
+				// uses 90s; match it.
+				IdleConnTimeout: 90 * time.Second,
+
 				TLSClientConfig: &tls.Config{
 					MinVersion: tls.VersionTLS12,
 					RootCAs:    pool,
@@ -99,6 +107,13 @@ func New(cfg Config) (*Client, error) {
 		},
 	}, nil
 }
+
+// Shared returns the process-wide Client, building it on first use. Callers on a
+// refresh tick must use this rather than NewDefault: every Client owns its own
+// http.Transport with its own connection pool, so constructing one per tick
+// strands the previous pool's connections open and eventually exhausts the
+// admin service's file descriptors.
+var Shared = sync.OnceValues(NewDefault)
 
 // NewDefault builds a Client for the local admin API from the environment,
 // falling back to the constants above. config.Load exports those variables from

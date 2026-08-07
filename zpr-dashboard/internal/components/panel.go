@@ -34,6 +34,27 @@ func tableRowsThatFit(total, budget, extra int) (shown, hidden int) {
 	return rows, total - rows
 }
 
+// tableRowsThatFitHeights is tableRowsThatFit for tables whose rows are not
+// all one line high. heights[i] is the rendered line count of row i.
+func tableRowsThatFitHeights(heights []int, budget, extra int) (shown, hidden int) {
+	lines := budget - 3 - extra
+
+	used := 0
+	for i, h := range heights {
+		if used+h > lines {
+			// The note needs a line of its own
+			for i > 0 && used+1 > lines {
+				i--
+				used -= heights[i]
+			}
+			return i, len(heights) - i
+		}
+		used += h
+	}
+
+	return len(heights), 0
+}
+
 // A panel that overflows pushes its neighbour out of line.
 func clampLines(body string, rows, width int) string {
 	if rows <= 0 {

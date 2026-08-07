@@ -101,7 +101,7 @@ func visaDetailRow(
 
 	return lipgloss.JoinHorizontal(
 		lipgloss.Left,
-		components.VisaAuthScope(colWidth, visaDetailHeight, selected),
+		components.VisaAuthScope(colWidth, visaDetailHeight, selected, actors),
 		components.VisaAuthorizedBy(restWidth, visaDetailHeight, selected, actors),
 	)
 }

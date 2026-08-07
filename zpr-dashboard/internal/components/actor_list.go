@@ -33,13 +33,13 @@ func ActorList(
 		return styles.ContainerStyle.Height(height).Width(width).Render(content + clampLines(panelNote("No actors connected"), budget, panelBodyWidth(width)))
 	}
 
-	headers := []string{"Actor", "Address"}
-	shares := []float32{0.6, 0.4}
+	headers := []string{"Actor", "Dock"}
+	shares := []float32{0.5, 0.5}
 
 	showActions = showActions && int(float32(size)*0.25) >= lipgloss.Width(revokeLabel)
 	if showActions {
 		headers = append(headers, "Actions")
-		shares = []float32{0.45, 0.3, 0.25}
+		shares = []float32{0.375, 0.375, 0.25}
 	}
 
 	widths := make([]int, len(shares))
@@ -90,7 +90,7 @@ func ActorList(
 	for i, a := range actors[:fits] {
 		cells := []string{
 			ansi.Truncate(a.CName, widths[0], "..."),
-			ansi.Truncate(a.ZprAddress, widths[1], "..."),
+			ansi.Truncate(orDash(actorDock(actors, a)), widths[1], "..."),
 		}
 
 		if showActions {

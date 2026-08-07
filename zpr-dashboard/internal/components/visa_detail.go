@@ -10,13 +10,14 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"neboagency.com/zpr-dashborad/internal/dataplane"
 	"neboagency.com/zpr-dashborad/internal/styles"
+	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
 
 func visaField(label, value string) string {
 	return styles.SubtitleStyle.Render(fmt.Sprintf("%-*s", 14, label)) + value
 }
 
-func VisaAuthScope(width, height int, visa *dataplane.VisaDescriptor) string {
+func VisaAuthScope(width, height int, visa *dataplane.VisaDescriptor, actors []dataplane.ActorDescriptor) string {
 	if visa == nil {
 		return detailPanel(width, height, "Authorization Scope", "What the visa grants",
 			panelNote("Select an active visa"))
@@ -26,13 +27,13 @@ func VisaAuthScope(width, height int, visa *dataplane.VisaDescriptor) string {
 	remaining := time.Until(visaExpiry(*visa))
 
 	body := "\n" + strings.Join([]string{
-		visaField("Destination", value.Render(orDash(visa.Dest()))),
-		visaField("Source", value.Render(orDash(visa.Source()))),
+		visaField("Destination", value.Render(endpointLabel(visa.Dest(), actors))),
+		visaField("Source", value.Render(endpointLabel(visa.Source(), actors))),
 		visaField("Port / Proto", value.Render(visaPort(*visa))+
 			styles.SubtitleStyle.Render("  /  ")+value.Render(orDash(visa.Proto))),
 		visaField("Direction", value.Render(orDash(visa.Direction))),
 		"",
-		visaField("Issued", styles.SubtitleStyle.Render(time.Unix(visa.Created, 0).Format("2006-01-02 15:04"))),
+		visaField("Issued", styles.SubtitleStyle.Render(timefmt.DateTime(visa.Created))),
 		visaField("Expires in", lipgloss.NewStyle().Foreground(remainingColor(remaining)).Bold(true).
 			Render(formatRemaining(*visa))),
 	}, "\n")

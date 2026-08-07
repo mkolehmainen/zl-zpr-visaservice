@@ -8,9 +8,10 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"neboagency.com/zpr-dashborad/internal/dataplane"
 	"neboagency.com/zpr-dashborad/internal/styles"
+	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
 
-func ActorVisas(width, height int, visas []dataplane.VisaDescriptor, fetchErr error) string {
+func ActorVisas(width, height int, visas []dataplane.VisaDescriptor, actors []dataplane.ActorDescriptor, fetchErr error) string {
 	content := styles.TitleStyle.Render("Assigned Visas") + "\n"
 	content += styles.SubtitleStyle.Render("Visas granted to this actor") + "\n"
 
@@ -70,11 +71,11 @@ func ActorVisas(width, height int, visas []dataplane.VisaDescriptor, fetchErr er
 		})
 
 	for _, v := range visas {
-		expires := visaExpiry(v).Format("01-02 15:04")
+		expires := timefmt.Expiry(v.Expires)
 
 		t.Row(
 			ansi.Truncate(strconv.FormatInt(v.ID, 10), idSize, "..."),
-			ansi.Truncate(orDash(v.Dest()), destinationSize, "..."),
+			ansi.Truncate(endpointLabel(v.Dest(), actors), destinationSize, "..."),
 			ansi.Truncate(v.Proto, protoSize, "..."),
 			ansi.Truncate(expires, expireSize, "..."),
 		)

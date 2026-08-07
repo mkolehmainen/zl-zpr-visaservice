@@ -210,7 +210,15 @@ async fn serve(tls_acceptor: TlsAcceptor, listen: SocketAddr, state: SharedState
     loop {
         let tower_service = app.clone();
         let tls_acceptor = tls_acceptor.clone();
-        let (cnx, addr) = listener.accept().await.unwrap();
+        let (cnx, addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                // Exponential backoff saved for later.
+                error!(target: ADMIN, "admin accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
             let stream = match tls_acceptor.accept(cnx).await {
                 Ok(stream) => stream,
@@ -969,7 +977,7 @@ async fn get_network(
     if !perm.can_read() {
         return Err(StatusCode::FORBIDDEN);
     }
-    info!(target: ADMIN, "GET /admin/network");
+    debug!(target: ADMIN, "GET /admin/network");
     let rstate = state.read().await;
 
     // Start with the desired topology setup, then we will mark which ones are up.

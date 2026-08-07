@@ -14,6 +14,8 @@ func ActorsPage(
 	fetchErr error,
 	visas []dataplane.VisaDescriptor,
 	visasFetchErr error,
+	activeVisas []dataplane.VisaDescriptor,
+	activeVisasFetchErr error,
 	visaCountHistory []int,
 	services []dataplane.ServiceDescriptor,
 	servicesFetchErr error,
@@ -27,25 +29,20 @@ func ActorsPage(
 
 	roster := components.ActorList(rosterWidth, vp.Height(), actors, selectedIndex, showStatic, fetchErr)
 
-	// Everything on the right is scoped to the actor selected on the left.
-	details := lipgloss.JoinVertical(
+	// Everything on the right is scoped to the actor selected on the left. The
+	// grid is not rectangular, so it is assembled column by column.
+	detail := lipgloss.JoinVertical(
 		lipgloss.Top,
-		lipgloss.JoinHorizontal(
-			lipgloss.Left,
-			components.ActorDetails(colWidth, rowHeight, actors, selectedIndex, fetchErr),
-			components.ActorIdentity(colWidth, rowHeight, actors, selectedIndex, fetchErr),
-		),
-		lipgloss.JoinHorizontal(
-			lipgloss.Left,
-			components.ActorVisas(colWidth, chartHeight, visas, visasFetchErr),
-			components.ActorActivityChart(colWidth, chartHeight, visaCountHistory, visasFetchErr),
-		),
-		lipgloss.JoinHorizontal(
-			lipgloss.Left,
-			components.ActorServicesOffered(colWidth, rowHeight, actors, selectedIndex, services, servicesFetchErr),
-			components.ActorServicesUsed(colWidth, rowHeight, visas, services, servicesFetchErr),
-		),
+		components.ActorDetails(colWidth, 2*rowHeight, actors, selectedIndex, fetchErr),
+		components.ActorVisas(colWidth, chartHeight, visas, actors, visasFetchErr),
 	)
 
-	return lipgloss.JoinHorizontal(lipgloss.Left, roster, details)
+	context := lipgloss.JoinVertical(
+		lipgloss.Top,
+		components.ActorIdentity(colWidth, rowHeight, actors, selectedIndex, fetchErr),
+		components.ActorActivityChart(colWidth, chartHeight, visaCountHistory, visasFetchErr),
+		components.ActorServicesOffered(colWidth, rowHeight, actors, selectedIndex, services, activeVisas, servicesFetchErr, activeVisasFetchErr),
+	)
+
+	return lipgloss.JoinHorizontal(lipgloss.Left, roster, detail, context)
 }

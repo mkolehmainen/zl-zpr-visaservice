@@ -337,10 +337,12 @@ GET /admin/network
     403: permission denied
     500: server error
   Notes
-    A peering is declared from both ends, so a policy peering between two
-    nodes yields two entries (one per endpoint's view of the link).
+    Links are deduplicated by normalized node pair, so each link appears
+    exactly once; node_a_addr is whichever endpoint policy iteration
+    reached first.
     ctype is UP if a connected node reports the link, DOWN if the policy
     declares it but no node reports it, and INVALID otherwise.
+    INVALID entries carry no node_b_substrate, link_id, or link_cost.
 
 GET /admin/stats
 ----------------

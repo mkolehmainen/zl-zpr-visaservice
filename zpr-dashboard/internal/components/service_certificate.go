@@ -9,6 +9,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"neboagency.com/zpr-dashborad/internal/dataplane"
 	"neboagency.com/zpr-dashborad/internal/styles"
+	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
 
 func ServiceCertificate(
@@ -39,15 +40,15 @@ func ServiceCertificate(
 		return detailPanel(width, height, title, subtitle, panelNote("No expiry tracked for this actor"))
 	}
 
-	expires := time.Unix(*owner.AuthExp, 0)
-	days := int(time.Until(expires).Hours() / 24)
+	now := time.Now()
+	days := int(time.Unix(*owner.AuthExp, 0).Sub(now).Hours() / 24)
 
 	stateColor, icon, status := certState(days)
 
 	body := "\n"
 	body += styles.ValueStyle.Foreground(styles.ColorDimmed).Render("Expires  ") +
-		lipgloss.NewStyle().Foreground(styles.ColorFg).Render(expires.Format("2006-01-02")) + "\n\n"
-	body += certBar(width-6, days, stateColor) + "\n"
+		lipgloss.NewStyle().Foreground(styles.ColorFg).Render(timefmt.Expiry(*owner.AuthExp)) + "\n\n"
+	body += certBar(width-6, days, formatCertRemaining(*owner.AuthExp, now, days), stateColor) + "\n"
 	body += lipgloss.NewStyle().Foreground(stateColor).Bold(true).Render(icon + " " + status)
 
 	return detailPanel(width, height, title, subtitle, body)
@@ -66,12 +67,17 @@ func certState(days int) (color.Color, string, string) {
 	}
 }
 
-func certBar(width, days int, barColor color.Color) string {
-	remaining := fmt.Sprintf("%4d days", days)
-	if days > 999 {
-		remaining = fmt.Sprintf("%4d years", days/365)
+// formatCertRemaining labels the bar with the time left on the certificate,
+// using the same rounded-year rule as the Expires row once it is far out.
+func formatCertRemaining(expiresAt int64, now time.Time, days int) string {
+	if years, ok := timefmt.FarFuture(expiresAt, now); ok {
+		return years
 	}
 
+	return fmt.Sprintf("%4d days", days)
+}
+
+func certBar(width, days int, remaining string, barColor color.Color) string {
 	barWidth := width - len(remaining) - 1
 	if barWidth < 6 {
 		barWidth = 6

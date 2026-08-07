@@ -5,13 +5,28 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 	"neboagency.com/zpr-dashborad/internal/dataplane"
+	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
+
+// inboundVisas returns the visas granted towards svc, i.e. those whose
+// destination is an address the service answers on. Input order is preserved.
+func inboundVisas(visas []dataplane.VisaDescriptor, svc dataplane.ServiceDescriptor) []dataplane.VisaDescriptor {
+	var inbound []dataplane.VisaDescriptor
+	for _, visa := range visas {
+		if svc.Hosts(visa.Dest()) {
+			inbound = append(inbound, visa)
+		}
+	}
+
+	return inbound
+}
 
 func ServiceVisas(
 	width, height int,
 	services []dataplane.ServiceDescriptor,
 	selectedIndex int,
 	visas []dataplane.VisaDescriptor,
+	actors []dataplane.ActorDescriptor,
 	fetchErr error,
 ) string {
 	const title, subtitle = "Assigned Visas", "Granted towards this service"
@@ -26,15 +41,7 @@ func ServiceVisas(
 
 	svc := services[selectedIndex]
 
-	var inbound []dataplane.VisaDescriptor
-	for _, visa := range visas {
-		if visa.Dest() == "" {
-			continue
-		}
-		if visa.Dest() == svc.ZprAddress || visa.Dest() == svc.DockZprAddress {
-			inbound = append(inbound, visa)
-		}
-	}
+	inbound := inboundVisas(visas, svc)
 
 	if len(inbound) == 0 {
 		return detailPanel(width, height, title, subtitle, panelNote("No visas towards this service"))
@@ -54,9 +61,9 @@ func ServiceVisas(
 	for _, visa := range inbound {
 		t.Row(
 			ansi.Truncate(strconv.FormatInt(visa.ID, 10), idSize, "..."),
-			ansi.Truncate(orDash(visa.Source()), sourceSize, "..."),
+			ansi.Truncate(endpointLabel(visa.Source(), actors), sourceSize, "..."),
 			ansi.Truncate(visa.Proto, protoSize, "..."),
-			ansi.Truncate(visaExpiry(visa).Format("01-02 15:04"), expireSize, "..."),
+			ansi.Truncate(timefmt.Expiry(visa.Expires), expireSize, "..."),
 		)
 	}
 

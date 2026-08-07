@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"neboagency.com/zpr-dashborad/internal/dataplane"
 	"neboagency.com/zpr-dashborad/internal/styles"
+	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
 
 type VisaView int
@@ -114,6 +115,9 @@ func visaEmptyNote(view VisaView) string {
 func activeVisaTable(width int, visas []dataplane.VisaDescriptor, actors []dataplane.ActorDescriptor, selectedIndex int) string {
 	size := width - 5
 
+	// ponytail: time-only on the Visas tables -- the date does not fit a 10% column.
+	// Widen issuedSize to 0.14 (from cnSize) and switch to timefmt.DateTime if
+	// day-old visas confuse people.
 	issuedSize := int(float32(size) * 0.12)
 	idSize := int(float32(size) * 0.1)
 	cnSize := int(float32(size) * 0.24)
@@ -123,18 +127,18 @@ func activeVisaTable(width int, visas []dataplane.VisaDescriptor, actors []datap
 
 	widths := []int{issuedSize, idSize, cnSize, sourceSize, destSize, expiresSize}
 
-	t := panelTable(size, []string{"Issued", "ID", "CN", "Source", "Destination", "Expires in"}, widths).
+	t := panelTable(size, []string{"Issued", "ID", "Requesting Node", "Source", "Destination", "Expires in"}, widths).
 		StyleFunc(visaRowStyle(widths, selectedIndex, len(visas), 5, func(row int) bool {
 			return expiringSoon(visas[row])
 		}))
 
 	for _, visa := range visas {
 		t.Row(
-			ansi.Truncate(time.Unix(visa.Created, 0).Format("15:04:05"), issuedSize, "..."),
+			ansi.Truncate(timefmt.TimeOfDay(visa.Created), issuedSize, "..."),
 			ansi.Truncate(strconv.FormatInt(visa.ID, 10), idSize, "..."),
 			ansi.Truncate(visaSubject(visa, actors), cnSize, "..."),
-			ansi.Truncate(orDash(visa.Source()), sourceSize, "..."),
-			ansi.Truncate(orDash(visa.Dest()), destSize, "..."),
+			ansi.Truncate(endpointLabel(visa.Source(), actors), sourceSize, "..."),
+			ansi.Truncate(endpointLabel(visa.Dest(), actors), destSize, "..."),
 			ansi.Truncate(formatRemaining(visa), expiresSize, "..."),
 		)
 	}
@@ -156,20 +160,20 @@ func visaRequestTable(width int, visas []dataplane.VisaDescriptor, actors []data
 
 	widths := []int{timeSize, statusSize, idSize, cnSize, portSize, sourceSize, destSize, expiresSize}
 
-	t := panelTable(size, []string{"Time", "Status", "ID", "CN", "Port", "Source", "Destination", "Expires"}, widths).
+	t := panelTable(size, []string{"Time", "Status", "ID", "Requesting Node", "Port", "Source", "Destination", "Expires"}, widths).
 		StyleFunc(visaRowStyle(widths, -1, len(visas), 7, func(row int) bool {
 			return expiringSoon(visas[row])
 		}))
 
 	for _, visa := range visas {
 		t.Row(
-			ansi.Truncate(time.Unix(visa.Created, 0).Format("15:04:05"), timeSize, "..."),
+			ansi.Truncate(timefmt.TimeOfDay(visa.Created), timeSize, "..."),
 			ansi.Truncate("Granted", statusSize, "..."),
 			ansi.Truncate(strconv.FormatInt(visa.ID, 10), idSize, "..."),
 			ansi.Truncate(visaSubject(visa, actors), cnSize, "..."),
 			ansi.Truncate(visaPort(visa), portSize, "..."),
-			ansi.Truncate(orDash(visa.Source()), sourceSize, "..."),
-			ansi.Truncate(orDash(visa.Dest()), destSize, "..."),
+			ansi.Truncate(endpointLabel(visa.Source(), actors), sourceSize, "..."),
+			ansi.Truncate(endpointLabel(visa.Dest(), actors), destSize, "..."),
 			ansi.Truncate(formatRemaining(visa), expiresSize, "..."),
 		)
 	}
@@ -278,9 +282,15 @@ func ExpiringVisas(visas []dataplane.VisaDescriptor) int {
 }
 
 func formatRemaining(visa dataplane.VisaDescriptor) string {
-	remaining := time.Until(visaExpiry(visa))
+	now := time.Now()
+
+	remaining := visaExpiry(visa).Sub(now)
 	if remaining <= 0 {
 		return "expired"
+	}
+
+	if years, ok := timefmt.FarFuture(visa.Expires, now); ok {
+		return years
 	}
 
 	hours := int(remaining.Hours())

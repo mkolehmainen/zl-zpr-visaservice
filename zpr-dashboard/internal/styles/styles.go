@@ -7,6 +7,10 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
+// HeaderTitleWidth is the width of the "ZPR Dashboard HH:MM:SS ZONE" title
+// block. The tab strip is padded to the remaining width, so both must use it.
+const HeaderTitleWidth = 28
+
 var hasDarkBG = lipgloss.HasDarkBackground(os.Stdin, os.Stdout)
 var lightDark = lipgloss.LightDark(hasDarkBG)
 
@@ -84,7 +88,7 @@ var (
 			Bold(true).
 			Foreground(special).
 			BorderForeground(normal).
-			Width(20)
+			Width(HeaderTitleWidth)
 
 	dimStyle = lipgloss.NewStyle().Foreground(ColorBorder).AlignHorizontal(lipgloss.Center)
 )

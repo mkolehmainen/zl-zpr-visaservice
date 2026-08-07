@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"neboagency.com/zpr-dashborad/internal/charts"
 	"neboagency.com/zpr-dashborad/internal/styles"
+	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
 
 var serviceAlerts = []struct {
@@ -65,7 +66,7 @@ func ServiceAlerts(width, height int) string {
 }
 
 func alertLine(width, agoSeconds int, message, tag string, risk RiskLevel) string {
-	stamp := time.Now().Add(-time.Duration(agoSeconds) * time.Second).Format("15:04:05")
+	stamp := time.Now().Add(-time.Duration(agoSeconds) * time.Second).Format(timefmt.LayoutTimeOfDay)
 	dim := styles.ValueStyle.Foreground(styles.ColorDimmed)
 
 	body := ansi.Truncate(message, max(4, width-len(stamp)-len(tag)-6), "...")

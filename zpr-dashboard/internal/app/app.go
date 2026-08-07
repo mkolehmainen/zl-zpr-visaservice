@@ -1,8 +1,10 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"neboagency.com/zpr-dashborad/internal/dataplane"
 	"neboagency.com/zpr-dashborad/internal/pages"
 	"neboagency.com/zpr-dashborad/internal/styles"
+	"neboagency.com/zpr-dashborad/internal/timefmt"
 
 	"charm.land/bubbles/v2/viewport"
 )
@@ -29,6 +32,10 @@ const (
 const dataRefreshInterval = 5 * time.Second
 const visaHistoryLimit = 12
 
+// How many deny records to ask for per refresh. Enough to fill any practical
+// dashboard pane, and well under the service's 500-record window.
+const denyFetchLimit = 100
+
 type visaTickMsg struct{}
 
 type visaSnapshotMsg struct {
@@ -44,7 +51,7 @@ func tickVisaRefresh() tea.Cmd {
 
 func fetchVisaSnapshotCmd() tea.Cmd {
 	return func() tea.Msg {
-		client, err := dataplane.NewDefault()
+		client, err := dataplane.Shared()
 		if err != nil {
 			return visaSnapshotMsg{err: err}
 		}
@@ -69,7 +76,7 @@ func tickServiceRefresh() tea.Cmd {
 
 func fetchServiceSnapshotCmd() tea.Cmd {
 	return func() tea.Msg {
-		client, err := dataplane.NewDefault()
+		client, err := dataplane.Shared()
 		if err != nil {
 			return serviceSnapshotMsg{err: err}
 		}
@@ -95,7 +102,7 @@ func tickPolicyRefresh() tea.Cmd {
 
 func fetchPolicySnapshotCmd() tea.Cmd {
 	return func() tea.Msg {
-		client, err := dataplane.NewDefault()
+		client, err := dataplane.Shared()
 		if err != nil {
 			return policySnapshotMsg{err: err}
 		}
@@ -126,13 +133,40 @@ func tickRevocationRefresh() tea.Cmd {
 
 func fetchRevocationSnapshotCmd() tea.Cmd {
 	return func() tea.Msg {
-		client, err := dataplane.NewDefault()
+		client, err := dataplane.Shared()
 		if err != nil {
 			return revocationSnapshotMsg{err: err}
 		}
 
 		revocations, err := client.FetchRevocations(context.Background())
 		return revocationSnapshotMsg{revocations: revocations, err: err}
+	}
+}
+
+type denyTickMsg struct{}
+
+type denySnapshotMsg struct {
+	records []dataplane.DenyRecord
+	err     error
+}
+
+// tickDenyRefresh schedules the next recent-denies refresh.
+func tickDenyRefresh() tea.Cmd {
+	return tea.Tick(dataRefreshInterval, func(time.Time) tea.Msg {
+		return denyTickMsg{}
+	})
+}
+
+// fetchDenySnapshotCmd fetches the most recent denies, newest request first.
+func fetchDenySnapshotCmd() tea.Cmd {
+	return func() tea.Msg {
+		client, err := dataplane.Shared()
+		if err != nil {
+			return denySnapshotMsg{err: err}
+		}
+
+		records, err := client.GetDenies(context.Background(), denyFetchLimit)
+		return denySnapshotMsg{records: records, err: err}
 	}
 }
 
@@ -149,8 +183,10 @@ func (m Model) isAdminOnline() bool {
 	return m.state.visa.fetchErr == nil &&
 		m.state.service.fetchErr == nil &&
 		m.state.actor.fetchErr == nil &&
+		m.state.actor.networkFetchErr == nil &&
 		m.state.policy.fetchErr == nil &&
-		m.state.revocation.fetchErr == nil
+		m.state.revocation.fetchErr == nil &&
+		m.state.deny.fetchErr == nil
 }
 
 func (m *Model) refreshOnlineSince() {
@@ -178,10 +214,12 @@ func (m Model) liveAlerts() []components.Alert {
 func (m Model) adminErr() error {
 	for _, err := range []error{
 		m.state.actor.fetchErr,
+		m.state.actor.networkFetchErr,
 		m.state.service.fetchErr,
 		m.state.visa.fetchErr,
 		m.state.policy.fetchErr,
 		m.state.revocation.fetchErr,
+		m.state.deny.fetchErr,
 	} {
 		if err != nil {
 			return err
@@ -203,9 +241,10 @@ func (m Model) visaCounts() pages.VisaCounts {
 type actorTickMsg struct{}
 
 type actorSnapshotMsg struct {
-	actors  []dataplane.ActorDescriptor
-	network []dataplane.NodeConnections
-	err     error
+	actors     []dataplane.ActorDescriptor
+	network    []dataplane.NodeConnection
+	actorErr   error
+	networkErr error
 }
 
 type actorVisasMsg struct {
@@ -222,27 +261,24 @@ func tickActorRefresh() tea.Cmd {
 
 func fetchActorsSnapshotCmd() tea.Cmd {
 	return func() tea.Msg {
-		client, err := dataplane.NewDefault()
+		client, err := dataplane.Shared()
 		if err != nil {
-			return actorSnapshotMsg{err: err}
+			return actorSnapshotMsg{actorErr: err, networkErr: err}
 		}
 
-		actors, err := client.FetchActors(context.Background())
+		actors, actorErr := client.FetchActors(context.Background())
 
 		// The topology reads from /admin/network rather than each node's
 		// record, which the service only serves for nodes it authenticated.
-		network, netErr := client.GetNetwork(context.Background())
-		if err == nil {
-			err = netErr
-		}
+		network, networkErr := client.GetNetwork(context.Background())
 
-		return actorSnapshotMsg{actors: actors, network: network, err: err}
+		return actorSnapshotMsg{actors: actors, network: network, actorErr: actorErr, networkErr: networkErr}
 	}
 }
 
 func fetchActorVisasCmd(cn string) tea.Cmd {
 	return func() tea.Msg {
-		client, err := dataplane.NewDefault()
+		client, err := dataplane.Shared()
 		if err != nil {
 			return actorVisasMsg{cn: cn, err: err}
 		}
@@ -288,14 +324,30 @@ func InitialModel() Model {
 	return m
 }
 
+// clockTickMsg drives the header clock. It carries no data; the header reads
+// time.Now() at render.
+type clockTickMsg struct{}
+
+// tickClock re-renders the header once a second so the clock advances.
+func tickClock() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return clockTickMsg{} })
+}
+
+// formatHeaderClock renders a local clock with its timezone abbreviation.
+func formatHeaderClock(now time.Time) string {
+	return now.Format(timefmt.LayoutTimeOfDay + " MST")
+}
+
 // Run all fetch operations in a batch
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
+		tickClock(),
 		fetchVisaSnapshotCmd(), tickVisaRefresh(),
 		fetchServiceSnapshotCmd(), tickServiceRefresh(),
 		fetchActorsSnapshotCmd(), tickActorRefresh(),
 		fetchPolicySnapshotCmd(), tickPolicyRefresh(),
 		fetchRevocationSnapshotCmd(), tickRevocationRefresh(),
+		fetchDenySnapshotCmd(), tickDenyRefresh(),
 	)
 }
 
@@ -303,6 +355,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+	// View() re-runs Header() every update, so the clock advances without
+	// re-laying out the panes.
+	case clockTickMsg:
+		return m, tickClock()
+
 	case tea.KeyMsg:
 		if m.state.policy.rollbackOpen {
 			switch msg.String() {
@@ -477,18 +534,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(fetchActorsSnapshotCmd(), tickActorRefresh())
 
 	case actorSnapshotMsg:
-		m.state.actor.fetchErr = msg.err
+		m.state.actor.fetchErr = msg.actorErr
+		m.state.actor.networkFetchErr = msg.networkErr
 		m.refreshOnlineSince()
 		var visasCmd tea.Cmd
-		if msg.err == nil {
+		// Keep the last good topology when only the network fetch failed,
+		// and vice versa.
+		if msg.actorErr == nil {
+			prevCN, hadPrev := m.selectedActorCN()
 			m.state.actor.actors = msg.actors
-			m.state.actor.network = msg.network
-			if m.state.actor.selectedIndex >= len(m.state.actor.actors) {
-				m.state.actor.selectedIndex = max(0, len(m.state.actor.actors)-1)
+			// Sort here, not in the view: selectedIndex and the revoke target
+			// index into this slice.
+			slices.SortFunc(m.state.actor.actors, func(a, b dataplane.ActorDescriptor) int {
+				return cmp.Compare(a.CName, b.CName)
+			})
+			// The selection follows the CN, not the row number: an actor that
+			// joins and sorts earlier would otherwise shift the details pane
+			// and the revoke target onto a different actor.
+			idx := slices.IndexFunc(m.state.actor.actors, func(a dataplane.ActorDescriptor) bool {
+				return a.CName == prevCN
+			})
+			switch {
+			case hadPrev && idx >= 0:
+				m.state.actor.selectedIndex = idx
+			case hadPrev:
+				// The selected actor is gone; drop its data and close any
+				// revoke dialogue rather than retarget the clamped neighbour.
+				m.state.actor.visas = nil
+				m.state.actor.visaCountHistory = nil
+				m.state.actor.visasFetchErr = nil
+				m.state.actor.revokeOpen = false
+				m.state.actor.revokeVisas = false
+				fallthrough
+			default:
+				if m.state.actor.selectedIndex >= len(m.state.actor.actors) {
+					m.state.actor.selectedIndex = max(0, len(m.state.actor.actors)-1)
+				}
 			}
 			if cn, ok := m.selectedActorCN(); ok {
 				visasCmd = fetchActorVisasCmd(cn)
 			}
+		}
+		if msg.networkErr == nil {
+			m.state.actor.network = msg.network
 		}
 		if m.viewportReady {
 			m.viewport.SetContent(m.Content())
@@ -499,6 +587,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cn, ok := m.selectedActorCN(); ok && cn == msg.cn {
 			m.state.actor.visasFetchErr = msg.err
 			if msg.err == nil {
+				// FetchActorVisas returns them sorted by visa ID descending.
 				m.state.actor.visas = msg.visas
 				m.state.actor.visaCountHistory = appendCapped(m.state.actor.visaCountHistory, len(msg.visas), visaHistoryLimit)
 			}
@@ -540,6 +629,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case denyTickMsg:
+		return m, tea.Batch(fetchDenySnapshotCmd(), tickDenyRefresh())
+
+	case denySnapshotMsg:
+		m.state.deny.fetchErr = msg.err
+		m.refreshOnlineSince()
+		// Keep the last good rows so a transient failure does not blank the table.
+		if msg.err == nil {
+			m.state.deny.records = msg.records
+		}
+		if m.viewportReady {
+			m.viewport.SetContent(m.Content())
+		}
+		return m, nil
+
 	case tea.MouseMsg:
 		return m.handleCursor(msg)
 
@@ -567,7 +671,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) Header() string {
-	title := styles.HeaderStyle.Render("ZPR Dashboard")
+	title := styles.HeaderStyle.Render("ZPR Dashboard " + formatHeaderClock(time.Now()))
 	header := m.renderTabs()
 
 	return lipgloss.JoinVertical(
@@ -603,9 +707,10 @@ func (m Model) Content() string {
 			m.state.service.services,
 			m.state.actor.actors,
 			m.state.actor.network,
-			m.state.visa.revokedHistory,
+			m.state.deny.records,
 			m.liveAlerts(),
-			m.state.service.fetchErr,
+			m.state.actor.networkFetchErr,
+			m.state.deny.fetchErr,
 			m.showStatic,
 		)
 	case tabVisas:
@@ -629,6 +734,8 @@ func (m Model) Content() string {
 			m.state.actor.fetchErr,
 			m.state.actor.visas,
 			m.state.actor.visasFetchErr,
+			m.state.visa.recentVisas,
+			m.state.visa.fetchErr,
 			m.state.actor.visaCountHistory,
 			m.state.service.services,
 			m.state.service.fetchErr,
@@ -801,5 +908,5 @@ func (m Model) renderTabs() string {
 	// Start counting from the right
 	m.state.header.tabStart = m.width - tabsSize
 
-	return styles.TabsWrapper.Width(m.width - 20).Render(lipgloss.JoinHorizontal(lipgloss.Right, tabs...))
+	return styles.TabsWrapper.Width(m.width - styles.HeaderTitleWidth).Render(lipgloss.JoinHorizontal(lipgloss.Right, tabs...))
 }

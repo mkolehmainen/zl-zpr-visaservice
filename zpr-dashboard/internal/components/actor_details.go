@@ -2,12 +2,14 @@ package components
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"charm.land/lipgloss/v2"
 	"neboagency.com/zpr-dashborad/internal/dataplane"
 	"neboagency.com/zpr-dashborad/internal/styles"
+	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
 
 func label(text string) string {
@@ -19,7 +21,7 @@ func formatCreated(seconds int64) string {
 	if seconds == 0 {
 		return "not tracked yet"
 	}
-	return time.Unix(seconds, 0).Format("2006-01-02 15:04:05")
+	return timefmt.DateTime(seconds)
 }
 
 func nodeSyncState(node *dataplane.NodeRecordBrief) string {
@@ -85,23 +87,84 @@ func ActorDetails(width, height int, actors []dataplane.ActorDescriptor, selecte
 	actor := actors[selectedIndex]
 
 	auth := ActorAuthState(actor)
+	now := time.Now().Truncate(time.Second)
 
-	content := "\n"
-	content += fmt.Sprintf("%s %s\n", label("Name"), actor.CName)
-	content += fmt.Sprintf("%s %s\n", label("Address"), orDash(actor.ZprAddress))
-	content += fmt.Sprintf("%s %s\n", label("Created"), formatCreated(actor.Created))
-	content += fmt.Sprintf("%s %s\n", label("Role"), actorRole(actor))
-	content += fmt.Sprintf("%s %s", label("Auth"), lipgloss.NewStyle().Foreground(authStateColor(auth)).Render(authStateName(auth)))
+	// The leading blank spacer counts against the budget, and a failed refresh
+	// needs its own line at the end.
+	lines := []string{""}
+	room := budget - 1
+	if fetchErr != nil {
+		room--
+	}
+
+	fields := []string{
+		fmt.Sprintf("%s %s", label("Name"), actor.CName),
+		fmt.Sprintf("%s %s", label("Address"), orDash(actor.ZprAddress)),
+		fmt.Sprintf("%s %s", label("Created"), formatCreated(actor.Created)),
+		fmt.Sprintf("%s %s", label("Role"), actorRole(actor)),
+		fmt.Sprintf("%s %s", label("Auth"), lipgloss.NewStyle().Foreground(authStateColor(auth)).Render(authStateName(auth))),
+		fmt.Sprintf("%s %s", label("Dock"), orUnknown(actorDock(actors, actor))),
+	}
+
+	if addr := actor.Attr("zpr.substrate_addr"); len(addr) > 0 && addr[0] != "" {
+		fields = append(fields, fmt.Sprintf("%s %s", label("Substrate Address"), addr[0]))
+	}
+
+	if actor.Node {
+		adapters := "unknown"
+		if actor.NodeDetails != nil {
+			adapters = strconv.Itoa(len(actor.NodeDetails.Adapters))
+		}
+		fields = append(fields, fmt.Sprintf("%s %s", label("Connected Adapters"), adapters))
+	}
 
 	if node := actor.NodeDetails; node != nil {
-		content += "\n" + fmt.Sprintf("%s %s\n", label("VSS"), nodeSyncState(node))
-		content += fmt.Sprintf("%s %s\n", label("Requests"), nodeRequestSummary(node))
-		content += fmt.Sprintf("%s %s", label("Visas"), nodeVisaSummary(node))
+		fields = append(fields,
+			fmt.Sprintf("%s %s", label("VSS"), nodeSyncState(node)),
+			fmt.Sprintf("%s %s", label("Requests"), nodeRequestSummary(node)),
+			fmt.Sprintf("%s %s", label("Visas"), nodeVisaSummary(node)),
+		)
+	}
+
+	// Core and node fields outrank arbitrary attributes for the space left.
+	for _, field := range fields {
+		if len(lines) >= room {
+			break
+		}
+		lines = append(lines, field)
+	}
+
+	attrs := displayAttrs(actor)
+	if len(attrs) > 0 {
+		shown := 0
+		// One line goes to the "+N more" footer unless everything fits.
+		if len(lines)+len(attrs) > room {
+			shown = max(0, room-len(lines)-1)
+		} else {
+			shown = len(attrs)
+		}
+
+		for _, attr := range attrs[:shown] {
+			lines = append(lines, formatAttr(attr, now))
+		}
+
+		if hidden := len(attrs) - shown; hidden > 0 && len(lines) < room {
+			lines = append(lines, styles.SubtitleStyle.Render(fmt.Sprintf("+%d more %s", hidden, plural(hidden, "attribute"))))
+		}
 	}
 
 	if fetchErr != nil {
-		content += "\n" + lipgloss.NewStyle().Foreground(styles.ColorRed).Render("last refresh failed: "+fetchErr.Error())
+		lines = append(lines, lipgloss.NewStyle().Foreground(styles.ColorRed).Render("last refresh failed: "+fetchErr.Error()))
 	}
 
-	return render(content)
+	return render(strings.Join(lines, "\n"))
+}
+
+// orUnknown renders a missing value as the literal "unknown".
+func orUnknown(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+
+	return value
 }
