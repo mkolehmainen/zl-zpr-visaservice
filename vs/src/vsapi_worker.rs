@@ -15,7 +15,8 @@ use ::zpr::vsapi::v1 as vsapi;
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
 use zpr::vsapi_types::{
-    ConnectRequest, Connection, PacketDesc, Param, ParamValue, SockAddr, VisaOp, pname,
+    ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, SockAddr,
+    VSConnectRequest, VisaOp, pname,
 };
 use zpr::write_to::WriteTo;
 
@@ -398,18 +399,27 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "connect call from {}", self.remote);
 
-        let vs_connect_request = params.get()?.get_req()?;
+        let vs_connect_request_rdr = params.get()?.get_req()?;
 
-        let req_cn = vs_connect_request.get_cn()?.to_string()?;
-        let req_type = vs_connect_request.get_ctype()?;
-
-        let parsed_params = match params_from_connect_request(&vs_connect_request, 4) {
-            Ok(p) => p,
+        let vs_connect_request = match VSConnectRequest::try_from(vs_connect_request_rdr) {
+            Ok(req) => req,
             Err(e) => {
                 return self.ok_with_connect_error(
                     results,
                     vsapi::ErrorCode::ParamError,
-                    &format!("failed to parse connect params: {}", e),
+                    &format!("failed to parse connect request: {e}"),
+                );
+            }
+        };
+
+        // There must be at least one param (zpr addr)
+        let parsed_params = match vs_connect_request.params {
+            Some(p) => p,
+            None => {
+                return self.ok_with_connect_error(
+                    results,
+                    vsapi::ErrorCode::ParamError,
+                    "connect params missing",
                 );
             }
         };
@@ -425,11 +435,11 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             }
         };
 
-        info!(target: API, "node {} requests zpr addr {} (CONNECT_TYPE={:?})", req_cn, node_zpr_addr, req_type);
+        info!(target: API, "node {} requests zpr addr {} (CONNECT_TYPE={:?})", vs_connect_request.cn, node_zpr_addr, vs_connect_request.ctype);
 
-        match req_type {
-            vsapi::VSConnT::Reset => {}
-            vsapi::VSConnT::Reconnect => {
+        match vs_connect_request.ctype {
+            ConnectType::Reset => {}
+            ConnectType::Reconnect => {
                 // Node thinks it has state which means it may have connected adapters and a bunch of
                 // visas already. If we don't know anything about this node we can deny this.
 
@@ -472,9 +482,9 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         let vs_gate: vsapi::v_s_gate::Client = capnp_rpc::new_client(VSGateImpl::new(
             self.asm.clone(),
             self.remote,
-            req_cn,
+            vs_connect_request.cn,
             node_zpr_addr,
-            req_type == vsapi::VSConnT::Reconnect,
+            vs_connect_request.ctype == ConnectType::Reconnect,
         ));
 
         res_builder.set_ok(vs_gate)?;
@@ -489,9 +499,17 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "open call from {}", self.remote);
 
-        let vs_connect_request = params.get()?.get_req()?;
-        let req_cn = vs_connect_request.get_cn()?.to_string()?;
-        let req_type = vs_connect_request.get_ctype()?;
+        let vs_connect_request_rdr = params.get()?.get_req()?;
+        let vs_connect_request = match VSConnectRequest::try_from(vs_connect_request_rdr) {
+            Ok(req) => req,
+            Err(e) => {
+                return self.ok_with_open_error(
+                    results,
+                    vsapi::ErrorCode::ParamError,
+                    &format!("failed to parse connect request: {e}"),
+                );
+            }
+        };
 
         // TODO: are there any needed params for an Open call?
 
@@ -499,7 +517,7 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         // authorize_conenct.
 
         let node_zpr_addr = self.remote.ip();
-        info!(target: API, "node {} requests open from addr {} (CONNECT_TYPE={:?})", req_cn, node_zpr_addr, req_type);
+        info!(target: API, "node {} requests open from addr {} (CONNECT_TYPE={:?})", vs_connect_request.cn, node_zpr_addr, vs_connect_request.ctype);
 
         let existing_actor = match self
             .asm
@@ -530,8 +548,8 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
         }
 
         // Not yet sure if we support a RESET over this channel...but might make sense.
-        if matches!(req_type, vsapi::VSConnT::Reset) {
-            warn!(target: API, "{req_cn} requests RESET: not yet implemented");
+        if matches!(vs_connect_request.ctype, ConnectType::Reset) {
+            warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
         }
 
         // Skip ahead to the handle:
@@ -1421,23 +1439,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     }
 }
 
-/// Parse no more than `limit` params out of the connect request.
-pub fn params_from_connect_request(
-    vscr: &vsapi::v_s_connect_request::Reader,
-    limit: usize,
-) -> Result<Vec<Param>, ServiceError> {
-    let mut results = Vec::new();
-    let params = vscr.get_params()?;
-    for param_rdr in params.iter() {
-        let param: Param = param_rdr.try_into()?;
-        results.push(param);
-        if results.len() >= limit {
-            break;
-        }
-    }
-    Ok(results)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1461,59 +1462,21 @@ mod tests {
         reader
     }
 
+    /// A param whose declared type disagrees with the value union must fail conversion,
+    /// which connect()/open() report as ParamError rather than an RPC-level failure.
     #[test]
-    fn test_from_connect_request_empty() {
-        let message = build_connect_request(|req| {
-            req.init_params(0);
-        });
-
-        let reader = message.get_root().unwrap();
-        let result = params_from_connect_request(&reader, 10).unwrap();
-
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_from_connect_request_single_string() {
-        let message = build_connect_request(|req| {
+    fn test_connect_request_mistyped_param_fails_conversion() {
+        let message = build_connect_request(|mut req| {
+            req.set_cn("node1");
             let mut params = req.init_params(1);
             let mut param = params.reborrow().get(0);
             param.set_name("test_name");
             param.set_ptype(vsapi::ParamT::String);
-            param.set_value_text("test_value");
+            param.set_value_u64(42);
         });
 
-        let reader = message.get_root().unwrap();
-        let result = params_from_connect_request(&reader, 10).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].name, "test_name");
-        match &result[0].value {
-            ParamValue::StrParam(s) => assert_eq!(s, "test_value"),
-            _ => panic!("Expected String value"),
-        }
-    }
-
-    #[test]
-    fn test_from_connect_request_limit() {
-        let message = build_connect_request(|req| {
-            let mut params = req.init_params(5);
-            for i in 0..5 {
-                let mut param = params.reborrow().get(i);
-                param.set_name(&format!("param{}", i));
-                param.set_ptype(vsapi::ParamT::U64);
-                param.set_value_u64(i as u64);
-            }
-        });
-
-        let reader = message.get_root().unwrap();
-        let result = params_from_connect_request(&reader, 3).unwrap();
-
-        // Should only return 3 params due to limit
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].name, "param0");
-        assert_eq!(result[1].name, "param1");
-        assert_eq!(result[2].name, "param2");
+        let reader: vsapi::v_s_connect_request::Reader = message.get_root().unwrap();
+        assert!(VSConnectRequest::try_from(reader).is_err());
     }
 
     mod authenticate_undo {
