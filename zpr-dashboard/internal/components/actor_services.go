@@ -55,7 +55,7 @@ func ActorServicesOffered(
 		// A failed visa refresh must not read as a current count of zero.
 		count := "ERR"
 		if activeVisasFetchErr == nil {
-			count = strconv.Itoa(len(inboundVisas(activeVisas, svc)))
+			count = strconv.Itoa(len(visasForService(activeVisas, svc)))
 		}
 
 		t.Row(

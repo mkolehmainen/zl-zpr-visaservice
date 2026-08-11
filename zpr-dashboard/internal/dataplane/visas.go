@@ -48,6 +48,36 @@ func (v VisaDescriptor) Port() (int, bool) {
 	return derefInt(v.DestPort)
 }
 
+// ServiceSide returns the address and port at the service end of the visa: the
+// destination for a forward visa, the source for a reverse one. ok is false
+// when the visa carries no five-tuple (proto "N/A").
+func (v VisaDescriptor) ServiceSide() (addr string, port int, ok bool) {
+	addr, portField := v.Dest(), v.DestPort
+	if v.Direction == "reverse" {
+		addr, portField = v.Source(), v.SourcePort
+	}
+	if v.Proto == "ICMP" {
+		// The icmp type is carried in source_port in both directions.
+		portField = v.SourcePort
+	}
+
+	port, hasPort := derefInt(portField)
+	if addr == "" || !hasPort {
+		return "", 0, false
+	}
+
+	return addr, port, true
+}
+
+// Peer returns the address at the far end from the service.
+func (v VisaDescriptor) Peer() string {
+	if v.Direction == "reverse" {
+		return v.Dest()
+	}
+
+	return v.Source()
+}
+
 func (v VisaDescriptor) ICMP() (icmpType, icmpCode int, ok bool) {
 	if v.Proto != "ICMP" {
 		return 0, 0, false

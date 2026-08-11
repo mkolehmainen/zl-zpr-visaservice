@@ -8,17 +8,17 @@ import (
 	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
 
-// inboundVisas returns the visas granted towards svc, i.e. those whose
-// destination is an address the service answers on. Input order is preserved.
-func inboundVisas(visas []dataplane.VisaDescriptor, svc dataplane.ServiceDescriptor) []dataplane.VisaDescriptor {
-	var inbound []dataplane.VisaDescriptor
+// visasForService returns the visas granted for traffic to svc's endpoints,
+// forward and reverse. Input order is preserved.
+func visasForService(visas []dataplane.VisaDescriptor, svc dataplane.ServiceDescriptor) []dataplane.VisaDescriptor {
+	var matched []dataplane.VisaDescriptor
 	for _, visa := range visas {
-		if svc.Hosts(visa.Dest()) {
-			inbound = append(inbound, visa)
+		if svc.Targets(visa) {
+			matched = append(matched, visa)
 		}
 	}
 
-	return inbound
+	return matched
 }
 
 func ServiceVisas(
@@ -41,27 +41,29 @@ func ServiceVisas(
 
 	svc := services[selectedIndex]
 
-	inbound := inboundVisas(visas, svc)
+	matched := visasForService(visas, svc)
 
-	if len(inbound) == 0 {
+	if len(matched) == 0 {
 		return detailPanel(width, height, title, subtitle, panelNote("No visas towards this service"))
 	}
 
 	tableWidth := width - 5
-	idSize := int(float32(tableWidth) * 0.14)
-	sourceSize := int(float32(tableWidth) * 0.38)
-	protoSize := int(float32(tableWidth) * 0.16)
-	expireSize := int(float32(tableWidth) * 0.32)
+	idSize := int(float32(tableWidth) * 0.12)
+	peerSize := int(float32(tableWidth) * 0.32)
+	dirSize := int(float32(tableWidth) * 0.14)
+	protoSize := int(float32(tableWidth) * 0.14)
+	expireSize := tableWidth - idSize - peerSize - dirSize - protoSize
 
 	t := panelTable(tableWidth,
-		[]string{"ID", "Source", "Proto", "Expires"},
-		[]int{idSize, sourceSize, protoSize, expireSize},
+		[]string{"ID", "Peer", "Dir", "Proto", "Expires"},
+		[]int{idSize, peerSize, dirSize, protoSize, expireSize},
 	)
 
-	for _, visa := range inbound {
+	for _, visa := range matched {
 		t.Row(
 			ansi.Truncate(strconv.FormatInt(visa.ID, 10), idSize, "..."),
-			ansi.Truncate(endpointLabel(visa.Source(), actors), sourceSize, "..."),
+			ansi.Truncate(endpointLabel(visa.Peer(), actors), peerSize, "..."),
+			ansi.Truncate(visa.Direction, dirSize, "..."),
 			ansi.Truncate(visa.Proto, protoSize, "..."),
 			ansi.Truncate(timefmt.Expiry(visa.Expires), expireSize, "..."),
 		)

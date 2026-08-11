@@ -284,19 +284,25 @@ func TestActorServicesOfferedEndpoints(t *testing.T) {
 }
 
 // offeredFixture returns the actor, services and visas the Visas-column tests
-// share: service alpha answers on two addresses, quiet on one and gets nothing.
+// share: alpha and beta answer on the same actor address and are told apart by
+// port alone, alpha also answers on a dock address, and quiet gets nothing.
 func offeredFixture() ([]dataplane.ActorDescriptor, []dataplane.ServiceDescriptor, []dataplane.VisaDescriptor) {
 	actors := []dataplane.ActorDescriptor{{CName: "alpha-cn"}}
 	services := []dataplane.ServiceDescriptor{
-		{ServiceName: "alpha", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::30", DockZprAddress: "fd5a:5052:90de::99"},
-		{ServiceName: "quiet", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::31"},
+		{ServiceName: "alpha", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::30", DockZprAddress: "fd5a:5052:90de::99", Endpoints: "TCP/443"},
+		{ServiceName: "beta", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::30", Endpoints: "TCP/9000"},
+		{ServiceName: "quiet", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::31", Endpoints: "TCP/8080"},
 	}
 	visas := []dataplane.VisaDescriptor{
-		{ID: 1, DestAddr: strPtr("fd5a:5052:90de::30")},
-		{ID: 2, DestAddr: strPtr("fd5a:5052:90de::30")},
-		{ID: 3, DestAddr: strPtr("fd5a:5052:90de::99")},
-		{ID: 4, DestAddr: strPtr("fd5a:5052:90de::40")},
-		{ID: 5, SourceAddr: strPtr("fd5a:5052:90de::31"), DestAddr: strPtr("fd5a:5052:90de::40")},
+		// Forward and reverse halves of one flow towards alpha.
+		{ID: 1, Direction: "forward", Proto: "TCP", SourceAddr: strPtr("fd5a:5052:90de::40"), DestAddr: strPtr("fd5a:5052:90de::30"), SourcePort: intPtr(0), DestPort: intPtr(443)},
+		{ID: 2, Direction: "reverse", Proto: "TCP", SourceAddr: strPtr("fd5a:5052:90de::30"), DestAddr: strPtr("fd5a:5052:90de::40"), SourcePort: intPtr(443), DestPort: intPtr(0)},
+		// Towards alpha on its dock address.
+		{ID: 3, Direction: "forward", Proto: "TCP", SourceAddr: strPtr("fd5a:5052:90de::40"), DestAddr: strPtr("fd5a:5052:90de::99"), SourcePort: intPtr(0), DestPort: intPtr(443)},
+		// Nobody's service.
+		{ID: 4, Direction: "forward", Proto: "TCP", SourceAddr: strPtr("fd5a:5052:90de::31"), DestAddr: strPtr("fd5a:5052:90de::40"), SourcePort: intPtr(0), DestPort: intPtr(22)},
+		// Same address as alpha, beta's port.
+		{ID: 5, Direction: "forward", Proto: "TCP", SourceAddr: strPtr("fd5a:5052:90de::40"), DestAddr: strPtr("fd5a:5052:90de::30"), SourcePort: intPtr(0), DestPort: intPtr(9000)},
 	}
 
 	return actors, services, visas
@@ -318,17 +324,23 @@ func rowCell(t *testing.T, out, svc string) string {
 	return ""
 }
 
-// TestActorServicesOfferedVisaCounts checks the Visas column counts visas
-// whose destination is either service address, and ignores everything else.
+// TestActorServicesOfferedVisaCounts checks the Visas column counts the visas
+// granted for each service's endpoints — both directions, and per port rather
+// than per address, so two services on one address differ.
 func TestActorServicesOfferedVisaCounts(t *testing.T) {
 	actors, services, visas := offeredFixture()
 
 	out := ansi.Strip(ActorServicesOffered(80, 20, actors, 0, services, visas, nil, nil))
 
+	// Forward, its reverse half, and the dock-address visa.
 	if got := rowCell(t, out, "alpha"); got != "3" {
 		t.Errorf("alpha count = %q, want 3:\n%s", got, out)
 	}
-	// ::31 only ever appears as a source, and ::40 is nobody's service.
+	// Same address as alpha, so an address-only match would report 3 here too.
+	if got := rowCell(t, out, "beta"); got != "1" {
+		t.Errorf("beta count = %q, want 1:\n%s", got, out)
+	}
+	// ::31 only ever appears as a forward source, and ::40 is nobody's service.
 	if got := rowCell(t, out, "quiet"); got != "0" {
 		t.Errorf("quiet count = %q, want 0:\n%s", got, out)
 	}
@@ -341,7 +353,7 @@ func TestActorServicesOfferedVisaError(t *testing.T) {
 
 	out := ansi.Strip(ActorServicesOffered(80, 20, actors, 0, services, visas, nil, errors.New("stale")))
 
-	for _, svc := range []string{"alpha", "quiet"} {
+	for _, svc := range []string{"alpha", "beta", "quiet"} {
 		if got := rowCell(t, out, svc); got != "ERR" {
 			t.Errorf("%s count = %q, want ERR:\n%s", svc, got, out)
 		}
@@ -354,3 +366,6 @@ func TestActorServicesOfferedVisaError(t *testing.T) {
 
 // strPtr returns a pointer to s, for the optional visa address fields.
 func strPtr(s string) *string { return &s }
+
+// intPtr returns a pointer to n, for the optional visa port fields.
+func intPtr(n int) *int { return &n }
