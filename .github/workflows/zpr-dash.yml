@@ -1,0 +1,27 @@
+name: Go dashboard
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'zpr-dashboard/**'
+  pull_request:
+    paths:
+      - 'zpr-dashboard/**'
+      - '.github/workflows/zpr-dash.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-dash:
+    name: ${{ matrix.target }}
+    strategy:
+      matrix:
+        target: [zpr-dashboard]
+    uses: org-zpr/zpr-dev-tools/.github/workflows/go-build-test.yml@v1.4
+    with:
+      name: ${{ matrix.target }}
+      path: ./${{ matrix.target }}
+    secrets: inherit

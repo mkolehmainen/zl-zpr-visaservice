@@ -35,6 +35,10 @@ install:
 fmt:
 	$(GO) fmt ./...
 
+.PHONY: test
+test:
+	$(GO) test ./...
+
 .PHONY: clean
 clean:
 	rm -rf $(BIN_DIR)

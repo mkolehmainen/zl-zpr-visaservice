@@ -62,6 +62,7 @@ tool_version cc
 tool_version ld
 tool_version make
 tool_version openssl version   # openssl uses 'version' subcommand
+tool_version go version        # go uses 'version' subcommand
 tool_version git
 
 exit 0
