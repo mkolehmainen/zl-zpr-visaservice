@@ -17,8 +17,10 @@ var testActors = []dataplane.ActorDescriptor{
 }
 
 var testNetwork = []dataplane.NodeConnection{
-	{NodeA: "fd5a:5052:90de::1", NodeB: "fd5a:5052:90de::2", CType: "DOWN", Substrate: "129.22.31.2:5000"},
-	{NodeA: "fd5a:5052:90de::1", NodeB: "fd5a:5052:90de::9", CType: "UP", Substrate: "10.8.22.1:5000"},
+	{NodeA: "fd5a:5052:90de::1", NodeB: "fd5a:5052:90de::2", CType: "DOWN",
+		SubstrateA: "129.22.31.2:5000", SubstrateB: "[fd5a:5052:90de::2]:5000"},
+	{NodeA: "fd5a:5052:90de::1", NodeB: "fd5a:5052:90de::9", CType: "UP",
+		SubstrateA: "129.22.31.2:5000", SubstrateB: "10.8.22.1:5000"},
 	{NodeA: "fd5a:5052:90de::8", NodeB: "fd5a:5052:90de::9", CType: "INVALID"},
 }
 
@@ -28,29 +30,67 @@ func renderTopology(t *testing.T, network []dataplane.NodeConnection, fetchErr e
 	return NetworkTopology(160, 30, network, testActors, true, 0, fetchErr)
 }
 
-// TestTopologyShowsCNUnderKnownAddress checks a matching actor's CN appears
-// beneath its address and unknown endpoints stay one line.
-func TestTopologyShowsCNUnderKnownAddress(t *testing.T) {
+// TestTopologyLinkCellsPairEndpoints checks each endpoint of a link gets its own
+// line, that endpoint B is marked with the ↳ indent, that both CNs are looked
+// up, and that an endpoint no actor claims shows a dash.
+func TestTopologyLinkCellsPairEndpoints(t *testing.T) {
 	out := renderTopology(t, testNetwork, nil)
-
 	for _, cn := range []string{"node-nyc", "node-lon"} {
 		if !strings.Contains(out, cn) {
 			t.Errorf("expected CN %q in output", cn)
 		}
 	}
 
-	cell := topologyNodeCell("fd5a:5052:90de::9", testActors, 30)
-	if strings.Contains(cell, "\n") {
-		t.Errorf("unknown endpoint should render one line, got %q", cell)
+	// Endpoints ::1 and ::2 are both known actors.
+	node, actor, substrate := topologyLinkCells(testNetwork[0], testActors, 22, 13, 27)
+	for name, cell := range map[string]string{"node": node, "actor": actor, "substrate": substrate} {
+		if lines := strings.Count(cell, "\n") + 1; lines != topologyRowLines {
+			t.Errorf("%s cell has %d lines, want %d: %q", name, lines, topologyRowLines, cell)
+		}
+	}
+
+	nodeLines := strings.Split(node, "\n")
+	if strings.Contains(nodeLines[0], "↳") {
+		t.Errorf("endpoint A should not carry the peer marker, got %q", nodeLines[0])
+	}
+	if !strings.Contains(nodeLines[1], "↳") {
+		t.Errorf("endpoint B should carry the peer marker, got %q", nodeLines[1])
+	}
+
+	if !strings.Contains(actor, "node-nyc") || !strings.Contains(actor, "node-lon") {
+		t.Errorf("expected both endpoints' CNs in the actor cell, got %q", actor)
+	}
+
+	// ::9 belongs to no actor, so its half of the cell is a dash.
+	_, actor, _ = topologyLinkCells(testNetwork[1], testActors, 22, 13, 27)
+	if !strings.Contains(strings.Split(actor, "\n")[1], "—") {
+		t.Errorf("expected a dash for the unknown endpoint's actor, got %q", actor)
 	}
 }
 
-// TestTopologyEmptySubstrateIsDash checks an INVALID link's blank substrate
-// degrades to a dash rather than an empty cell.
+// TestTopologyEmptySubstrateIsDash checks an INVALID link, which carries neither
+// substrate, degrades to a dash on both of its lines.
 func TestTopologyEmptySubstrateIsDash(t *testing.T) {
 	out := renderTopology(t, testNetwork[2:], nil)
 	if !strings.Contains(out, "—") {
 		t.Error("expected a dash for the missing substrate")
+	}
+
+	_, _, substrate := topologyLinkCells(testNetwork[2], testActors, 22, 13, 27)
+	if got := strings.Count(substrate, "—"); got != 2 {
+		t.Errorf("got %d dashes in the substrate cell, want 2: %q", got, substrate)
+	}
+}
+
+// TestTopologySubstrateFitsBracketedIPv6 checks a bracketed IPv6 substrate
+// survives whole at the half-pane width of a 160-column terminal, the narrowest
+// real case the Substrate column has to hold.
+func TestTopologySubstrateFitsBracketedIPv6(t *testing.T) {
+	const substrate = "[fd5a:5052:90de::2]:5000"
+
+	out := NetworkTopology(80, 30, testNetwork, testActors, true, 0, nil)
+	if !strings.Contains(out, substrate) {
+		t.Errorf("substrate %q was truncated at an 80-column pane:\n%s", substrate, out)
 	}
 }
 

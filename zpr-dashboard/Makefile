@@ -23,6 +23,10 @@ $(BIN): $(shell find . -name '*.go') go.mod go.sum
 run:
 	$(GO) run $(CMD_PATH)
 
+.PHONY: test
+test:
+	$(GO) test ./...
+
 .PHONY: status
 status:
 	$(GO) run $(SIM_PATH) status

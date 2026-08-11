@@ -2,7 +2,6 @@ package components
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"charm.land/lipgloss/v2"
@@ -34,9 +33,9 @@ func NetworkTopology(
 	size := width - 5
 
 	nodeSize := int(float32(size) * 0.30)
-	peerSize := int(float32(size) * 0.30)
-	substrateSize := int(float32(size) * 0.27)
-	statusSize := size - nodeSize - peerSize - substrateSize
+	actorSize := int(float32(size) * 0.18)
+	substrateSize := int(float32(size) * 0.37)
+	statusSize := size - nodeSize - actorSize - substrateSize
 
 	// The stale-data warning below takes a line away from the table.
 	extra := 0
@@ -44,29 +43,20 @@ func NetworkTopology(
 		extra = 1
 	}
 
-	// Rows with a known CN are two lines high, so fit them by rendered height.
-	cells := make([][2]string, len(network))
+	// Every link renders both its endpoints, so every row is two lines high.
 	heights := make([]int, len(network))
-	for i, link := range network {
-		cells[i] = [2]string{
-			topologyNodeCell(link.NodeA, actors, nodeSize),
-			topologyNodeCell(link.NodeB, actors, peerSize),
-		}
-		heights[i] = max(cellLines(cells[i][0]), cellLines(cells[i][1]))
+	for i := range heights {
+		heights[i] = topologyRowLines
 	}
 
 	fits, hidden := tableRowsThatFitHeights(heights, budget, extra)
 
-	t := panelTable(size, []string{"Node", "Link To", "Substrate", "Status"},
-		[]int{nodeSize, peerSize, substrateSize, statusSize})
+	t := panelTable(size, []string{"Node", "Actor", "Substrate", "Status"},
+		[]int{nodeSize, actorSize, substrateSize, statusSize})
 
-	for i, link := range network[:fits] {
-		t.Row(
-			cells[i][0],
-			cells[i][1],
-			ansi.Truncate(orDash(link.Substrate), substrateSize, "..."),
-			linkStatus(link.CType),
-		)
+	for _, link := range network[:fits] {
+		node, actor, substrate := topologyLinkCells(link, actors, nodeSize, actorSize, substrateSize)
+		t.Row(node, actor, substrate, linkStatus(link.CType))
 	}
 
 	body := "\n" + t.Render()
@@ -83,21 +73,34 @@ func NetworkTopology(
 	return detailPanel(width, height, title, subtitle, body)
 }
 
-// topologyNodeCell shows a node address and, when known, its actor CN below it.
-func topologyNodeCell(addr string, actors []dataplane.ActorDescriptor, width int) string {
-	cell := ansi.Truncate(orDash(addr), width, "...")
-	actor, ok := actorByAddr(actors, addr)
-	if !ok || actor.CName == "" {
-		return cell
-	}
+// topologyRowLines is the height of one link's row: a line per endpoint.
+const topologyRowLines = 2
 
-	cn := ansi.Truncate(actor.CName, width, "...")
-	return cell + "\n" + styles.SubtitleStyle.Render(cn)
+// peerMarker indents endpoint B's line beneath endpoint A's.
+const peerMarker = " ↳ "
+
+// topologyLinkCells renders one link as two-line cells: endpoint A on the
+// first line, endpoint B indented beneath it under a ↳ marker.
+func topologyLinkCells(link dataplane.NodeConnection, actors []dataplane.ActorDescriptor,
+	nodeSize, actorSize, substrateSize int) (node, actor, substrate string) {
+	node = ansi.Truncate(orDash(link.NodeA), nodeSize, "...") + "\n" +
+		peerMarker + ansi.Truncate(orDash(link.NodeB), max(1, nodeSize-lipgloss.Width(peerMarker)), "...")
+
+	actor = styles.SubtitleStyle.Render(topologyActorName(link.NodeA, actors, actorSize)) + "\n" +
+		styles.SubtitleStyle.Render(topologyActorName(link.NodeB, actors, actorSize))
+
+	substrate = ansi.Truncate(orDash(link.SubstrateA), substrateSize, "...") + "\n" +
+		ansi.Truncate(orDash(link.SubstrateB), substrateSize, "...")
+
+	return node, actor, substrate
 }
 
-// cellLines counts the terminal lines a rendered table cell occupies.
-func cellLines(cell string) int {
-	return strings.Count(cell, "\n") + 1
+// topologyActorName is the CN of the actor at addr, or a dash when no actor
+// claims that address.
+func topologyActorName(addr string, actors []dataplane.ActorDescriptor, width int) string {
+	// A miss yields the zero descriptor, whose empty CN becomes the dash.
+	actor, _ := actorByAddr(actors, addr)
+	return ansi.Truncate(orDash(actor.CName), width, "...")
 }
 
 // linkStatus renders a ctype with the colour the CLI uses: up green,

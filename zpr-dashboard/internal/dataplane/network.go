@@ -12,10 +12,11 @@ import (
 
 // A single link between two nodes, as reported by GET /admin/network.
 type NodeConnection struct {
-	NodeA     string `json:"node_a_addr"`
-	NodeB     string `json:"node_b_addr"`
-	CType     string `json:"ctype"`            // UP | DOWN | INVALID
-	Substrate string `json:"node_b_substrate"` // "host:port"; empty for INVALID links
+	NodeA      string `json:"node_a_addr"`
+	NodeB      string `json:"node_b_addr"`
+	CType      string `json:"ctype"`            // UP | DOWN | INVALID
+	SubstrateA string `json:"node_a_substrate"` // "host:port"; empty for INVALID links
+	SubstrateB string `json:"node_b_substrate"`
 }
 
 type NetworkDetails struct {

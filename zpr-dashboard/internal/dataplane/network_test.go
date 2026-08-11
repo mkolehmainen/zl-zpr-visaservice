@@ -23,9 +23,9 @@ func testClient(t *testing.T, body string) *Client {
 // including the empty substrate an INVALID link carries.
 func TestGetNetworkDecodes(t *testing.T) {
 	c := testClient(t, `{"network":[
-		{"node_a_addr":"fd5a:5052:90de::1","node_b_addr":"fd5a:5052:90de::2","ctype":"DOWN","node_b_substrate":"129.22.31.2:5000","link_id":"l1","link_cost":3},
-		{"node_a_addr":"fd5a:5052:90de::1","node_b_addr":"fd5a:5052:90de::3","ctype":"UP","node_b_substrate":"10.8.22.1:5000","link_id":"l2","link_cost":1},
-		{"node_a_addr":"fd5a:5052:90de::4","node_b_addr":"fd5a:5052:90de::5","ctype":"INVALID","node_b_substrate":"","link_id":"","link_cost":0}
+		{"node_a_addr":"fd5a:5052:90de::1","node_b_addr":"fd5a:5052:90de::2","ctype":"DOWN","node_a_substrate":"[fd5a:5052:90de::1]:5000","node_b_substrate":"129.22.31.2:5000","link_id":"l1","link_cost":3},
+		{"node_a_addr":"fd5a:5052:90de::1","node_b_addr":"fd5a:5052:90de::3","ctype":"UP","node_a_substrate":"[fd5a:5052:90de::1]:5000","node_b_substrate":"10.8.22.1:5000","link_id":"l2","link_cost":1},
+		{"node_a_addr":"fd5a:5052:90de::4","node_b_addr":"fd5a:5052:90de::5","ctype":"INVALID","node_a_substrate":"","node_b_substrate":"","link_id":"","link_cost":0}
 	]}`)
 
 	got, err := c.GetNetwork(context.Background())
@@ -34,9 +34,11 @@ func TestGetNetworkDecodes(t *testing.T) {
 	}
 
 	want := []NodeConnection{
-		{"fd5a:5052:90de::1", "fd5a:5052:90de::2", "DOWN", "129.22.31.2:5000"},
-		{"fd5a:5052:90de::1", "fd5a:5052:90de::3", "UP", "10.8.22.1:5000"},
-		{"fd5a:5052:90de::4", "fd5a:5052:90de::5", "INVALID", ""},
+		{NodeA: "fd5a:5052:90de::1", NodeB: "fd5a:5052:90de::2", CType: "DOWN",
+			SubstrateA: "[fd5a:5052:90de::1]:5000", SubstrateB: "129.22.31.2:5000"},
+		{NodeA: "fd5a:5052:90de::1", NodeB: "fd5a:5052:90de::3", CType: "UP",
+			SubstrateA: "[fd5a:5052:90de::1]:5000", SubstrateB: "10.8.22.1:5000"},
+		{NodeA: "fd5a:5052:90de::4", NodeB: "fd5a:5052:90de::5", CType: "INVALID"},
 	}
 
 	if len(got) != len(want) {
