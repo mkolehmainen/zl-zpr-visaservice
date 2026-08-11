@@ -730,14 +730,19 @@ mod tests {
         assert!(snap2.links_for_node(&a).is_empty());
     }
 
+    /// Build a `Peer` whose substrate is a plain IP address (no hostname), so
+    /// `peers_to_links` resolves it without any DNS lookup.
     fn ip_peer(link_id: &str, ip: IpAddr, port: u16) -> Peer {
+        let substrate = NetAddr {
+            host: NetworkHost::Ip(ip),
+            port,
+        };
         Peer {
             link_id: link_id.to_string(),
             remote_zpr_addr: "fd5a:5052::1".parse().unwrap(),
-            remote_substrate: NetAddr {
-                host: NetworkHost::Ip(ip),
-                port,
-            },
+            // ponytail: local end is irrelevant to peers_to_links, so reuse the remote one.
+            local_substrate: substrate.clone(),
+            remote_substrate: substrate,
         }
     }
 
@@ -793,6 +798,10 @@ mod tests {
             remote_zpr_addr: "fd5a:5052::2".parse().unwrap(),
             remote_substrate: NetAddr {
                 host: NetworkHost::Hostname("some.unresolvable.host".to_string()),
+                port: 4000,
+            },
+            local_substrate: NetAddr {
+                host: NetworkHost::Ip(ip),
                 port: 4000,
             },
         };
@@ -917,6 +926,10 @@ mod tests {
             remote_zpr_addr: "fd5a:5052::10".parse().unwrap(),
             remote_substrate: NetAddr {
                 host: NetworkHost::Hostname("peer.example.com".to_string()),
+                port: 5000,
+            },
+            local_substrate: NetAddr {
+                host: NetworkHost::Ip("192.0.2.1".parse().unwrap()),
                 port: 5000,
             },
         };

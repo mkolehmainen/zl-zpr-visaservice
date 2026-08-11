@@ -22,7 +22,7 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tower_service::Service;
 
-use zpr::policy_types::{PolicyBundle, Scope};
+use zpr::policy_types::{NetAddr, NetworkHost, PolicyBundle, Scope};
 use zpr::vsapi_types::{DockPepType, KeyFormat, KeySet, Visa};
 
 use libeval::attribute::{Attribute, ROLE_NODE, key};
@@ -970,6 +970,15 @@ async fn add_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
     (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
 }
 
+/// Stringify a substrate address as a parseable `host:port`. IPv6 hosts get bracketed
+/// (`[fd5a:5052::1]:5000`); IPv4 and hostname forms are left plain.
+fn stringify_netaddr(addr: &NetAddr) -> String {
+    match &addr.host {
+        NetworkHost::Ip(ip) => SocketAddr::new(*ip, addr.port).to_string(),
+        NetworkHost::Hostname(h) => format!("{}:{}", h, addr.port),
+    }
+}
+
 async fn get_network(
     Extension(perm): Extension<Permission>,
     State(state): State<SharedState>,
@@ -1008,10 +1017,8 @@ async fn get_network(
                 let mut bldr =
                     NodeConnection::builder(node_addr.clone(), peer.remote_zpr_addr.clone())
                         .link_id(peer.link_id.clone())
-                        .node_b_substrate(format!(
-                            "{}:{}",
-                            peer.remote_substrate.host, peer.remote_substrate.port
-                        ));
+                        .node_a_substrate(stringify_netaddr(&peer.local_substrate))
+                        .node_b_substrate(stringify_netaddr(&peer.remote_substrate));
 
                 if let Ok(link_desc) = psnap
                     .policy()
@@ -2050,7 +2057,10 @@ mod tests {
             assert!(matches!(nc.ctype, ConnectionType::DOWN));
             assert_eq!(nc.link_id, "link-ab");
             assert_eq!(nc.link_cost, 7);
-            assert_eq!(nc.node_b_substrate, format!("{}:0", nc.node_b_addr));
+            // The fixture uses each node's ZPR (IPv6) address as its substrate, so both
+            // ends must come back bracketed and parseable.
+            assert_eq!(nc.node_a_substrate, format!("[{}]:0", nc.node_a_addr));
+            assert_eq!(nc.node_b_substrate, format!("[{}]:0", nc.node_b_addr));
             assert_eq!(nc.link_attrs.len(), 1);
         }
     }

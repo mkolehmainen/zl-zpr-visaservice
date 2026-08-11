@@ -637,6 +637,7 @@ pub struct NodeConnection {
     pub node_a_addr: IpAddr,
     pub node_b_addr: IpAddr,
     pub ctype: ConnectionType,
+    pub node_a_substrate: String, // stringified NetAddr
     pub node_b_substrate: String, // stringified NetAddr
     pub link_id: String,
     pub link_attrs: Vec<ApiAttribute>,
@@ -664,6 +665,7 @@ pub struct NodeConnectionBuilder {
     node_a_addr: IpAddr,
     node_b_addr: IpAddr,
     ctype: ConnectionType,
+    node_a_substrate: String,
     node_b_substrate: String,
     link_id: String,
     link_attrs: Vec<ApiAttribute>,
@@ -677,6 +679,7 @@ impl NodeConnectionBuilder {
             node_a_addr: a,
             node_b_addr: b,
             ctype: ConnectionType::DOWN,
+            node_a_substrate: String::new(),
             node_b_substrate: String::new(),
             link_id: String::new(),
             link_attrs: Vec::new(),
@@ -686,6 +689,12 @@ impl NodeConnectionBuilder {
 
     pub fn link_id(mut self, link_id: String) -> Self {
         self.link_id = link_id;
+        self
+    }
+
+    /// Sets node A's stringified substrate address, ie the local end of the link.
+    pub fn node_a_substrate(mut self, node_a_substrate: String) -> Self {
+        self.node_a_substrate = node_a_substrate;
         self
     }
 
@@ -719,6 +728,7 @@ impl NodeConnectionBuilder {
             node_a_addr: self.node_a_addr,
             node_b_addr: self.node_b_addr,
             ctype: self.ctype,
+            node_a_substrate: self.node_a_substrate,
             node_b_substrate: self.node_b_substrate,
             link_id: self.link_id,
             link_attrs: self.link_attrs,

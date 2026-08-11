@@ -1,4 +1,4 @@
-Admin HTTP API  - Current as of 7/31/2026
+Admin HTTP API  - Current as of 8/10/2026
 -----------------------------------------
 
 This document describes the admin HTTPS API implemented by the server and
@@ -100,11 +100,15 @@ Common Types
 |                 |                                                          |
 | NodeConnection  | { "node_a_addr": string, "node_b_addr": string,          |
 |                 |   "ctype": "UP" | "DOWN" | "INVALID",                     |
+|                 |   "node_a_substrate": string,                            |
 |                 |   "node_b_substrate": string, "link_id": string,         |
 |                 |   "link_attrs": ApiAttribute[], "link_cost": number }    |
-|                 |   addrs are ZPR (IPv6) addresses; node_b_substrate is a  |
-|                 |   stringified NetAddr ("host:port"). link_id, link_attrs |
-|                 |   and link_cost come from the policy's link description. |
+|                 |   addrs are ZPR (IPv6) addresses; node_a_substrate and    |
+|                 |   node_b_substrate are stringified NetAddrs              |
+|                 |   ("host:port"), the substrate address of each end of the |
+|                 |   link. IPv6 hosts are bracketed, for example            |
+|                 |   "[fd5a:5052::1]:5000". link_id, link_attrs and         |
+|                 |   link_cost come from the policy's link description.     |
 |                 |                                                          |
 | Revokes         | { "id": string, "revoked": number[] }                    |
 |                 |                                                          |
@@ -342,7 +346,7 @@ GET /admin/network
     reached first.
     ctype is UP if a connected node reports the link, DOWN if the policy
     declares it but no node reports it, and INVALID otherwise.
-    INVALID entries carry no node_b_substrate, link_id, or link_cost.
+    INVALID entries carry no substrate addresses, link_id, or link_cost.
 
 GET /admin/stats
 ----------------

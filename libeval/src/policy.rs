@@ -83,6 +83,10 @@ pub struct Peer {
 
     /// Substrate (physical/underlay) address used to reach the remote peer.
     pub remote_substrate: NetAddr,
+
+    /// Substrate (physical/underlay) address of *this* node (the node this peer list is
+    /// keyed under) on this link.
+    pub local_substrate: NetAddr,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +319,7 @@ fn load_peer_table(peerings: &[Peering]) -> Option<HashMap<IpAddr, Vec<Peer>>> {
             link_id: p.link_id.clone(),
             remote_zpr_addr: p.node_b,
             remote_substrate: p.substrate_b.clone(),
+            local_substrate: p.substrate_a.clone(),
         };
         table
             .entry(p.node_a)
@@ -326,6 +331,7 @@ fn load_peer_table(peerings: &[Peering]) -> Option<HashMap<IpAddr, Vec<Peer>>> {
             link_id: p.link_id.clone(),
             remote_zpr_addr: p.node_a,
             remote_substrate: p.substrate_a.clone(),
+            local_substrate: p.substrate_b.clone(),
         };
         table
             .entry(p.node_b)
@@ -715,6 +721,10 @@ mod test {
             p.remote_substrate,
             NetAddr::new_for_ip_or_host("10.0.0.2", 5001)
         );
+        assert_eq!(
+            p.local_substrate,
+            NetAddr::new_for_ip_or_host("10.0.0.1", 5000)
+        );
     }
 
     #[test]
@@ -740,6 +750,10 @@ mod test {
         assert_eq!(
             p.remote_substrate,
             NetAddr::new_for_ip_or_host("10.0.0.1", 5000)
+        );
+        assert_eq!(
+            p.local_substrate,
+            NetAddr::new_for_ip_or_host("10.0.0.2", 5001)
         );
     }
 
