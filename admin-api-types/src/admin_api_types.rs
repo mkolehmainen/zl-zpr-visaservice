@@ -1,12 +1,8 @@
-use chrono::{DateTime, SecondsFormat, Utc};
-use colored::{Color, Colorize};
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
 use serde_with::{TimestampSeconds, serde_as};
 
 use std::collections::HashMap;
-use std::fmt;
 use std::net::IpAddr;
 use std::time::SystemTime;
 
@@ -16,22 +12,10 @@ pub struct ListEntry {
     pub id: u64,
 }
 
-impl fmt::Display for ListEntry {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "{} {}", "id".dimmed(), self.id,)
-    }
-}
-
 /// NamedListEntry is a list with a string ID.
 #[derive(Serialize, Deserialize)]
 pub struct NamedListEntry {
     pub id: String,
-}
-
-impl fmt::Display for NamedListEntry {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "{} {}", "id".dimmed(), self.id)
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -39,15 +23,6 @@ impl fmt::Display for NamedListEntry {
 pub enum VisaMatchDirection {
     Forward,
     Reverse,
-}
-
-impl fmt::Display for VisaMatchDirection {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            VisaMatchDirection::Forward => write!(f, "forward"),
-            VisaMatchDirection::Reverse => write!(f, "reverse"),
-        }
-    }
 }
 
 #[serde_as]
@@ -90,63 +65,6 @@ impl PartialOrd for VisaDescriptor {
     }
 }
 
-impl fmt::Display for VisaDescriptor {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let now = Utc::now();
-        let dt_exp: DateTime<Utc> = self.expires.into();
-        let dt_created: DateTime<Utc> = self.created.into();
-
-        let remain = dt_exp.signed_duration_since(now);
-
-        write!(f, "{} {}  ", "id:".dimmed(), self.id)?;
-        write!(
-            f,
-            "{} {}  ",
-            "requesting node:".dimmed(),
-            self.requesting_node.yellow()
-        )?;
-        write!(f, "{} {}  ", "policy id:".dimmed(), self.policy_id)?;
-        write!(
-            f,
-            "{} [{}] {}  ",
-            "zpl:".dimmed(),
-            self.direction,
-            self.zpl.yellow()
-        )?;
-        write!(
-            f,
-            "{}:{} {} {}:{}  ",
-            self.source_addr.as_ref().unwrap_or(&"-".into()).yellow(),
-            self.source_port.unwrap_or(0),
-            "->".bold().green(),
-            self.dest_addr.as_ref().unwrap_or(&"-".into()).yellow(),
-            self.dest_port.unwrap_or(0),
-        )?;
-        write!(f, "{} {}  ", "proto:".dimmed(), self.proto)?;
-        write!(
-            f,
-            "{} {}  ",
-            "created:".dimmed(),
-            dt_created.to_rfc3339_opts(SecondsFormat::Secs, true).cyan()
-        )?;
-        write!(
-            f,
-            "{} {} ({}:{:02}:{:02} remain)  ",
-            "exp:".dimmed(),
-            dt_exp.to_rfc3339_opts(SecondsFormat::Secs, true).cyan(),
-            remain.num_hours(),
-            remain.num_minutes() % 60,
-            remain.num_seconds() % 60,
-        )?;
-        if !self.signals.is_empty() {
-            write!(f, "{} [{}]  ", "signals:".dimmed(), self.signals.join(", "))?;
-        }
-        write!(f, "{} {}\n", "session_key:".dimmed(), self.session_key,)?;
-
-        Ok(())
-    }
-}
-
 /// Intentionally match the zpr::vsapi_types KeySet and KeyFormat, but
 /// reproduced here to prevent coupling of the API types from the internal types
 /// Note these keys are encrypted.
@@ -162,46 +80,16 @@ pub struct ApiKeySet {
     pub egress_key: Vec<u8>,
 }
 
-// Due to encryption, didn't want to leak too much information in the display,
-// so only have the length of the keys
-impl fmt::Display for ApiKeySet {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}  ", "format:".dimmed(), self.format)?;
-        write!(
-            f,
-            "{} {}B  ",
-            "ingress_key:".dimmed(),
-            self.ingress_key.len()
-        )?;
-        write!(f, "{} {}B\n", "egress_key:".dimmed(), self.egress_key.len())
-    }
-}
-
 #[derive(Default, Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum ApiKeyFormat {
     #[default]
     ZprKF01,
 }
 
-impl fmt::Display for ApiKeyFormat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ApiKeyFormat::ZprKF01 => write!(f, "ZprKF01"),
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct Revokes {
     pub id: String,
     pub revoked: Vec<u64>,
-}
-
-impl fmt::Display for Revokes {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} {}  ", "id:".dimmed(), self.id)?;
-        write!(f, "{} {:?}\n", "revoked:".dimmed(), self.revoked)
-    }
 }
 
 #[serde_as]
@@ -238,48 +126,8 @@ impl PartialOrd for ActorDescriptor {
     }
 }
 
-impl fmt::Display for ActorDescriptor {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let ts: DateTime<Utc> = self.ctime.into();
-        let auth_exp = match self.auth_exp {
-            Some(ae) => Some(DateTime::<Utc>::from(ae)),
-            None => None,
-        };
-        write!(
-            f,
-            "{} ({} {}) @ {}  ",
-            self.cn,
-            "created:".dimmed(),
-            ts.to_rfc3339_opts(SecondsFormat::Secs, true).cyan(),
-            self.zpr_addr.yellow()
-        )?;
-        write!(f, "{} {}  ", "identity:".dimmed(), self.ident)?;
-
-        write!(f, " {} {}  ", "is node:".dimmed(), self.node)?;
-        write!(f, " {} {:?}  ", "attributes:".dimmed(), self.attrs)?;
-        write!(
-            f,
-            "{} {}  ",
-            "auth exp:".dimmed(),
-            match auth_exp {
-                Some(ae) => ae.to_rfc3339_opts(SecondsFormat::Secs, true).cyan(),
-                None => "No auth".to_string().red(),
-            }
-        )?;
-        write!(
-            f,
-            "{}\n",
-            match &self.node_details {
-                Some(nd) => format!("[{} {}]", "node details:".green(), nd,),
-                None => "".normal().to_string(),
-            },
-        )
-    }
-}
-
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct ApiAttribute {
     pub key: String,
     pub value: Vec<String>,
@@ -312,66 +160,6 @@ impl Ord for ServiceDescriptor {
 impl PartialOrd for ServiceDescriptor {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-impl fmt::Display for ServiceDescriptor {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} {}  ", "name:".dimmed(), self.service_name)?;
-        write!(f, "{} {}  ", "cn:".dimmed(), self.actor_cn)?;
-        write!(f, "{} {}  ", "zpr_addr:".dimmed(), self.zpr_addr)?;
-        write!(f, "{} {}\n", "dock_zpr_addr:".dimmed(), self.dock_zpr_addr)?;
-        write!(f, "{} {}\n", "kind:".dimmed(), self.service_kind)?;
-        write!(f, "{} {}\n", "endpoints:".dimmed(), self.service_endpoints)
-    }
-}
-
-#[serde_as]
-#[derive(Debug, Serialize, Deserialize, Eq)]
-#[allow(dead_code)]
-pub struct HostRecordBrief {
-    #[serde_as(as = "TimestampSeconds<i64>")]
-    pub ctime: SystemTime,
-    pub cn: String,
-    pub zpr_addr: String,
-    pub ident: String,
-    pub node: bool,
-}
-
-impl PartialEq for HostRecordBrief {
-    fn eq(&self, other: &Self) -> bool {
-        self.cn == other.cn
-    }
-}
-
-impl Ord for HostRecordBrief {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.cn.cmp(&other.cn)
-    }
-}
-
-impl PartialOrd for HostRecordBrief {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl fmt::Display for HostRecordBrief {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let ts: DateTime<Utc> = self.ctime.into();
-        writeln!(
-            f,
-            "{} ({} {}) @ {} {}",
-            self.cn,
-            "created:".dimmed(),
-            ts.to_rfc3339_opts(SecondsFormat::Secs, true).cyan(),
-            self.zpr_addr.yellow(),
-            if self.node {
-                "[node]".green()
-            } else {
-                "".normal()
-            },
-        )
     }
 }
 
@@ -410,211 +198,16 @@ pub struct NodeRecordBrief {
     pub vss_port: Option<u16>,
 }
 
-impl fmt::Display for NodeRecordBrief {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let last_contact = match self.last_contact {
-            Some(lc) => Some(DateTime::<Utc>::from(lc)),
-            None => None,
-        };
-        let last_vreq = match self.last_vreq {
-            Some(lr) => Some(DateTime::<Utc>::from(lr)),
-            None => None,
-        };
-        write!(
-            f,
-            "{} {}  ",
-            "pending installs:".dimmed(),
-            self.pending_install
-        )?;
-        write!(
-            f,
-            "{} {}  ",
-            "SYNC:".dimmed(),
-            if self.in_sync {
-                "YES".green()
-            } else {
-                "NO".red()
-            }
-        )?;
-        write!(
-            f,
-            "{} {}  ",
-            "last_contact:".dimmed(),
-            match last_contact {
-                Some(lc) => lc.to_rfc3339_opts(SecondsFormat::Secs, true).cyan(),
-                None => "never".to_string().red(),
-            }
-        )?;
-        // [vreqs: VAL (vreqs_appr: VAL | vreqs_den: VAL ) (vinstalled: [VAL, VAL, VAL] | venqueued: [VAL, VAL])]'
-        write!(f, "[{} {} ", "vreqs:".dimmed(), self.visa_requests)?;
-        write!(
-            f,
-            "({} {} | {} {}) ",
-            "vreqs_appr:".dimmed(),
-            self.approved_vreqs,
-            "vreqs_den:".dimmed(),
-            self.denied_vreqs
-        )?;
-        write!(
-            f,
-            "({}{:?} | {} {:?})]  ",
-            "vinstalled:".dimmed(),
-            self.visas,
-            "venqueued:".dimmed(),
-            self.visas_enqueued
-        )?;
-
-        write!(
-            f,
-            "{} {}  ",
-            "last_request:".dimmed(),
-            match last_vreq {
-                Some(lr) => lr.to_rfc3339_opts(SecondsFormat::Secs, true).cyan(),
-                None => "never".to_string().red(),
-            }
-        )?;
-        // [creqs: VAL (adapters: [VAL, VAL, VAL] | nodes: [VAL, VAL])]
-        write!(f, "[{} {} ", "creqs:".dimmed(), self.connect_requests)?;
-        write!(
-            f,
-            "({} {:?} | {} {:?})]  ",
-            "adapters:".dimmed(),
-            self.adapters,
-            "nodes:".dimmed(),
-            self.links
-        )?;
-
-        write!(
-            f,
-            "{} {}  ",
-            "pending revocations:".dimmed(),
-            self.pending_revocation
-        )?;
-        write!(
-            f,
-            "{} {}\n",
-            "vss_port:".dimmed(),
-            match self.vss_port {
-                Some(port) => port.to_string(),
-                None => "no vss".to_string(),
-            }
-        )
-    }
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Eq)]
-#[allow(dead_code)]
-pub struct ServiceRecord {
-    #[serde_as(as = "TimestampSeconds<i64>")]
-    pub ctime: SystemTime,
-    pub cn: String,
-    pub zpr_addr: String,
-    pub ident: String,
-    pub node: bool,
-    pub services: Vec<String>,
-}
-
-impl fmt::Display for ServiceRecord {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for svc in &self.services {
-            writeln!(
-                f,
-                "{:<36}  {}  @ {} {}\n",
-                svc,
-                self.cn.cyan(),
-                self.zpr_addr.yellow(),
-                if self.node {
-                    "[node]".green()
-                } else {
-                    "".normal()
-                },
-            )?;
-        }
-        Ok(())
-    }
-}
-
-impl PartialEq for ServiceRecord {
-    fn eq(&self, other: &Self) -> bool {
-        self.cn == other.cn
-    }
-}
-
-impl Ord for ServiceRecord {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.cn.cmp(&other.cn)
-    }
-}
-
-impl PartialOrd for ServiceRecord {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct AuthRevokeDescriptor {
     pub ty: String,
     pub cn: String,
 }
 
-impl fmt::Display for AuthRevokeDescriptor {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} {}  ", "type:".dimmed(), self.ty)?;
-        write!(f, "{} {}\n", "cn:".dimmed(), self.cn)
-    }
-}
-
-// Not exactly an api type, but the version generated by the compiler has some parts
-// to it separated by colons.  This splits them up and makes it possible to pretty
-// print.
-#[allow(dead_code)]
-pub struct PolicyVersion {
-    parts: Vec<String>,
-}
-
-#[allow(dead_code)]
-impl PolicyVersion {
-    pub fn new(version: &str) -> Self {
-        PolicyVersion {
-            parts: version.split(':').map(|s| s.to_string()).collect(),
-        }
-    }
-}
-
-impl fmt::Display for PolicyVersion {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let colors = [Color::Cyan, Color::Green, Color::Blue, Color::BrightBlue];
-        for (i, part) in self.parts.iter().enumerate() {
-            if i > 0 {
-                write!(f, "{}", ":".bold())?;
-            }
-            write!(f, "{}", part.color(colors[i % 4]))?;
-        }
-        writeln!(f, "")?;
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-pub fn reason_for(sc: StatusCode) -> String {
-    match sc.canonical_reason() {
-        Some(reason) => reason.to_string(),
-        None => "unknown".to_string(),
-    }
-}
-
 /// Simple struct with a "cn" field.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CnEntry {
     pub cn: String,
-}
-
-impl fmt::Display for CnEntry {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "{} {}", "cn".dimmed(), self.cn)
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -737,29 +330,6 @@ impl NodeConnectionBuilder {
     }
 }
 
-impl fmt::Display for NetworkDetails {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if self.network.is_empty() {
-            writeln!(f, "No network")?;
-        }
-        for nc in &self.network {
-            writeln!(
-                f,
-                "{}  {} <-> {}  {}",
-                "link:".dimmed(),
-                nc.node_a_addr.to_string().yellow(),
-                nc.node_b_addr.to_string().yellow(),
-                match nc.ctype {
-                    ConnectionType::UP => "up".green(),
-                    ConnectionType::DOWN => "down".red(),
-                    ConnectionType::INVALID => "invalid".yellow(),
-                }
-            )?;
-        }
-        Ok(())
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Stats {
     pub stats: HashMap<String, String>,
@@ -776,45 +346,6 @@ pub struct DenyRecord {
     pub count: u64,
     pub last_deny_ms: u64,
     pub deny_code: String,
-}
-
-// IANA IP protocol numbers, local so admin-api-types need not depend on `zpr`.
-const IP_PROTO_ICMP: u8 = 1;
-const IP_PROTO_TCP: u8 = 6;
-const IP_PROTO_UDP: u8 = 17;
-const IP_PROTO_IPV6_ICMP: u8 = 58;
-
-impl fmt::Display for DenyRecord {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let proto = match self.protocol {
-            IP_PROTO_TCP => "TCP".to_string(),
-            IP_PROTO_UDP => "UDP".to_string(),
-            IP_PROTO_ICMP => "ICMP".to_string(),
-            IP_PROTO_IPV6_ICMP => "IPV6_ICMP".to_string(),
-            other => other.to_string(),
-        };
-        let when = DateTime::from_timestamp_millis(self.last_deny_ms as i64)
-            .map(|dt: DateTime<Utc>| dt.to_rfc3339_opts(SecondsFormat::Millis, true))
-            .unwrap_or_else(|| format!("{}ms", self.last_deny_ms));
-
-        write!(
-            f,
-            "{} {} {} {} {} {} {} {} {} {} {} {}",
-            "src:".dimmed(),
-            self.source_addr.to_string().yellow(),
-            "dst:".dimmed(),
-            self.dest_addr.to_string().yellow(),
-            "proto:".dimmed(),
-            proto,
-            "dport:".dimmed(),
-            self.dest_port,
-            "code:".dimmed(),
-            self.deny_code.red(),
-            "count:".dimmed(),
-            self.count,
-        )?;
-        write!(f, "  {} {}", "last:".dimmed(), when)
-    }
 }
 
 #[cfg(test)]

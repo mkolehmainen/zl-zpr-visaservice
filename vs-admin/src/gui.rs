@@ -205,8 +205,8 @@ impl Gui {
         {
             let actor_cns = self.vs_cli.get_actors(RoleFilter::All)?;
             self.actors.clear();
-            for cn in &actor_cns {
-                match self.vs_cli.get_actor(cn) {
+            for entry in &actor_cns {
+                match self.vs_cli.get_actor(&entry.cn) {
                     Ok(a) => {
                         self.actors.push(a);
                     }
@@ -221,8 +221,8 @@ impl Gui {
         {
             let service_ids = self.vs_cli.get_services()?;
             self.services.clear();
-            for sid in &service_ids {
-                match self.vs_cli.get_service(sid) {
+            for entry in &service_ids {
+                match self.vs_cli.get_service(&entry.id) {
                     Ok(s) => {
                         self.services.push(s);
                     }
@@ -236,8 +236,8 @@ impl Gui {
         {
             let visa_ids = self.vs_cli.get_visas()?;
             self.visas.clear();
-            for vid in &visa_ids {
-                match self.vs_cli.get_visa(*vid) {
+            for entry in &visa_ids {
+                match self.vs_cli.get_visa(entry.id) {
                     Ok(v) => {
                         self.visas.push(v);
                     }

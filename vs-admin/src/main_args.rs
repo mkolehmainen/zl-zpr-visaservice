@@ -1,5 +1,14 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// How `vs-admin` renders JSON responses on stdout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+pub enum OutputFormat {
+    /// Indented, human-readable JSON.
+    Pretty,
+    /// Single-line JSON.
+    Compact,
+}
 
 #[derive(Parser)]
 #[command(version, about = "Visa Service Admin Tool", long_about = None)]
@@ -22,6 +31,10 @@ pub struct Cmd {
     /// Path to a file containing the API key for the visa service admin API.
     #[arg(long, value_name = "PATH", conflicts_with = "api_key")]
     pub api_key_file: Option<PathBuf>,
+
+    /// Output format for JSON responses.
+    #[arg(long, value_enum, default_value = "pretty", value_name = "FMT")]
+    pub format: OutputFormat,
 }
 
 #[derive(Subcommand)]
@@ -210,6 +223,32 @@ mod tests {
         assert!(try_parse_visas(&["--denies", "--id", "7"]).is_err());
         assert!(try_parse_visas(&["--denies", "--id", "7", "--revoke"]).is_err());
         assert!(try_parse_visas(&["--denies", "--on-node", "node-1"]).is_err());
+    }
+
+    /// Output defaults to pretty, accepts both format names, and no longer takes `--pretty`.
+    #[test]
+    fn format_defaults_to_pretty() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "vs-admin",
+                "--svc-url",
+                "https://[::1]:8182",
+                "--ca-cert",
+                "ca.pem",
+                "--api-key",
+                "k",
+            ];
+            argv.extend_from_slice(extra);
+            argv.push("stats");
+            Cmd::try_parse_from(argv)
+        };
+        assert_eq!(parse(&[]).unwrap().format, OutputFormat::Pretty);
+        assert_eq!(
+            parse(&["--format", "compact"]).unwrap().format,
+            OutputFormat::Compact
+        );
+        assert!(parse(&["--pretty"]).is_err());
+        assert!(parse(&["--format", "bogus"]).is_err());
     }
 
     /// The clap definition itself is well formed (catches bad `requires`/`conflicts_with` names).

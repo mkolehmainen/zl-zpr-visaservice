@@ -60,7 +60,12 @@ fn main() {
         std::process::exit(1);
     });
 
-    let exec = Executor::new(args.svc_url.clone(), ca_cert.clone(), api_key.clone());
+    let exec = Executor::new(
+        args.svc_url.clone(),
+        ca_cert.clone(),
+        api_key.clone(),
+        args.format,
+    );
 
     match args.command {
         Some(SubCmd::Policies { id, path, curr }) => exec.do_cmd_policies(id, path, curr),

@@ -1,6 +1,6 @@
 //! Pure time/string summary helpers for the Details views and header.
 
-use admin_api_types::{ApiKeySet, VisaDescriptor};
+use admin_api_types::{ApiKeySet, VisaDescriptor, VisaMatchDirection};
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::time::SystemTime;
 use thousands::Separable;
@@ -51,6 +51,14 @@ pub(super) fn flow_str(v: &VisaDescriptor) -> String {
     let dport = v.dest_port.unwrap_or(0);
     let proto = v.proto.to_uppercase();
     format!("[{src}]:{sport}  --{proto}-->  [{dst}]:{dport}")
+}
+
+/// Visa direction as the lowercase word used in the zpl line.
+pub(super) fn dir_str(d: &VisaMatchDirection) -> &'static str {
+    match d {
+        VisaMatchDirection::Forward => "forward",
+        VisaMatchDirection::Reverse => "reverse",
+    }
 }
 
 /// One-line session-key summary — never prints key material, only the key
@@ -105,7 +113,9 @@ pub(super) fn ago_suffix(t: SystemTime, now: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{auth_hdr, flow_str, fmt_uptime, remaining_str, session_key_summary, ts_or};
+    use super::{
+        auth_hdr, dir_str, flow_str, fmt_uptime, remaining_str, session_key_summary, ts_or,
+    };
     use admin_api_types::{ApiKeySet, VisaDescriptor, VisaMatchDirection};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -193,6 +203,13 @@ mod tests {
     fn ts_or_timestamp_or_fallback() {
         assert!(ts_or(Some(UNIX_EPOCH), "never").contains("1970-01-01"));
         assert_eq!(ts_or(None, "never"), "never");
+    }
+
+    /// dir_str renders both directions as the lowercase wire spelling.
+    #[test]
+    fn dir_str_both_directions() {
+        assert_eq!(dir_str(&VisaMatchDirection::Forward), "forward");
+        assert_eq!(dir_str(&VisaMatchDirection::Reverse), "reverse");
     }
 
     /// fmt_uptime rolls seconds into d/h/m/s with zero-padding.

@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use thousands::Separable;
 
 use super::format::{
-    ago_suffix, auth_hdr, flow_str, hm, remaining_str, session_key_summary, ts_or,
+    ago_suffix, auth_hdr, dir_str, flow_str, hm, remaining_str, session_key_summary, ts_or,
 };
 use super::text::{ATTR_KEY_STYLE, ATTR_VAL_STYLE, HEADING_STYLE, LABEL_W, labeled};
 
@@ -37,7 +37,7 @@ pub(super) fn visa_detail_text(
     lines.extend(labeled("policy", &v.policy_id, width));
     lines.extend(labeled(
         "zpl",
-        &format!("[{}] {}", v.direction, v.zpl),
+        &format!("[{}] {}", dir_str(&v.direction), v.zpl),
         width,
     ));
     let requesting = match cn {

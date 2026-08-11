@@ -12,8 +12,10 @@ ZPR visa service implementation (under active development).
   a visa should be issued.
 - `zpt` - ZPR Policy Tester is a command line tool for testing how `libeval`
   evaluates policy.
-- `vs-admin` - Bare bones administration client for the visa service. Exercises
+- `vs-admin` - CLI based administration client for the visa service. Exercises
   the HTTPS admin api of `vs`.
+- `zpr-dashboard` - CLI based "GUI" dashboard for monitoring visa
+  service activity.
 - `admin-api-types` - Library crate for data structures used by `vs` and
   `vs-admin`.
 - `integration-test` - Shell-based integration tests. Includes evaluation tests

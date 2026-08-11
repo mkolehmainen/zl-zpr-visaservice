@@ -8,7 +8,7 @@ use zpr::policy_types::PolicyBundle;
 
 use admin_api_types::{
     ActorDescriptor, AuthRevokeDescriptor, CnEntry, DenyRecord, ListEntry, NamedListEntry,
-    NetworkDetails, Revokes, ServiceDescriptor, Stats, VisaDescriptor, reason_for,
+    NetworkDetails, Revokes, ServiceDescriptor, Stats, VisaDescriptor,
 };
 
 use crate::error::VsaError;
@@ -53,7 +53,7 @@ impl VsClient {
     fn ht_get(&self, url: &str) -> Result<reqwest::blocking::Response, VsaError> {
         let client = self.build_client()?;
         if !self.quiet {
-            print!("{}", format!(">> get {url}").dimmed());
+            eprint!("{}", format!(">> get {url}").dimmed());
         }
         let resp = client
             .get(url)
@@ -62,7 +62,7 @@ impl VsClient {
 
         let stat = resp.status();
         if !self.quiet {
-            println!("  {}", stat);
+            eprintln!("  {}", stat);
         }
 
         if stat.is_success() {
@@ -75,7 +75,7 @@ impl VsClient {
     fn ht_post(&self, url: &str) -> Result<reqwest::blocking::Response, VsaError> {
         let client = self.build_client()?;
         if !self.quiet {
-            print!("{}", format!(">> post {url}").dimmed());
+            eprint!("{}", format!(">> post {url}").dimmed());
         }
         let resp = client
             .post(url)
@@ -84,7 +84,7 @@ impl VsClient {
 
         let stat = resp.status();
         if !self.quiet {
-            println!("  {}", stat);
+            eprintln!("  {}", stat);
         }
 
         if stat.is_success() {
@@ -101,7 +101,7 @@ impl VsClient {
     ) -> Result<reqwest::blocking::Response, VsaError> {
         let client = self.build_client()?;
         if !self.quiet {
-            print!("{}", format!(">> post {url}").dimmed());
+            eprint!("{}", format!(">> post {url}").dimmed());
         }
         let resp = client
             .post(url)
@@ -111,7 +111,7 @@ impl VsClient {
 
         let stat = resp.status();
         if !self.quiet {
-            println!("  {}", stat);
+            eprintln!("  {}", stat);
         }
 
         if stat.is_success() {
@@ -124,7 +124,7 @@ impl VsClient {
     fn ht_delete(&self, url: &str) -> Result<reqwest::blocking::Response, VsaError> {
         let client = self.build_client()?;
         if !self.quiet {
-            print!("{}", format!(">> delete {url}").dimmed());
+            eprint!("{}", format!(">> delete {url}").dimmed());
         }
         let resp = client
             .delete(url)
@@ -133,7 +133,7 @@ impl VsClient {
 
         let stat = resp.status();
         if !self.quiet {
-            println!("  {}", stat);
+            eprintln!("  {}", stat);
         }
 
         if stat.is_success() {
@@ -151,7 +151,7 @@ impl VsClient {
             "{} {}: {}",
             "HTTP Error".red(),
             error_resp.status(),
-            reason_for(error_resp.status())
+            error_resp.status().canonical_reason().unwrap_or("unknown")
         );
         if let Ok(txt) = error_resp.text() {
             eprintln!("       {}", txt);
@@ -170,7 +170,7 @@ impl VsClient {
     /// `GET <api_url>/admin/actors[?role=node|adapter]`
     ///
     /// Returns a list of CN values.
-    pub fn get_actors(&self, filter: RoleFilter) -> Result<Vec<String>, VsaError> {
+    pub fn get_actors(&self, filter: RoleFilter) -> Result<Vec<CnEntry>, VsaError> {
         let query = match filter {
             RoleFilter::NodesOnly => "?role=node",
             RoleFilter::AdaptersOnly => "?role=adapter",
@@ -180,8 +180,7 @@ impl VsClient {
             "{}/admin/actors{}",
             self.api_url, query
         ))?;
-        let cn_list: Vec<String> = entry_vec.into_iter().map(|e| e.cn).collect();
-        Ok(cn_list)
+        Ok(entry_vec)
     }
 
     /// `GET <api_url>/admin/actors/<cn>`
@@ -196,13 +195,12 @@ impl VsClient {
     /// `GET <api_url>/admin/services`
     ///
     /// Returns a list of service IDs (whihch are names)
-    pub fn get_services(&self) -> Result<Vec<String>, VsaError> {
+    pub fn get_services(&self) -> Result<Vec<NamedListEntry>, VsaError> {
         let entry_vec = self.request_get_list_entries::<NamedListEntry>(&format!(
             "{}/admin/services",
             self.api_url
         ))?;
-        let service_ids: Vec<String> = entry_vec.into_iter().map(|e| e.id).collect();
-        Ok(service_ids)
+        Ok(entry_vec)
     }
 
     /// `GET <api_url>/admin/services/<id>`
@@ -226,11 +224,10 @@ impl VsClient {
     }
 
     /// `GET <api_url>/admin/visas`
-    pub fn get_visas(&self) -> Result<Vec<u64>, VsaError> {
+    pub fn get_visas(&self) -> Result<Vec<ListEntry>, VsaError> {
         let entry_vec =
             self.request_get_list_entries::<ListEntry>(&format!("{}/admin/visas", self.api_url))?;
-        let visa_ids: Vec<u64> = entry_vec.into_iter().map(|e| e.id).collect();
-        Ok(visa_ids)
+        Ok(entry_vec)
     }
 
     /// `GET <api_url>/admin/visas/<id>`
