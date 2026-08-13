@@ -47,6 +47,9 @@ pub mod key {
 
     /// Link cost
     pub const LINK_COST: &str = "link.zpr.cost";
+
+    /// A2A DH Public Key
+    pub const A2A_DH_PUBKEY: &str = "zpr.a2a_dh_pubkey";
 }
 
 #[derive(Debug, Error)]
