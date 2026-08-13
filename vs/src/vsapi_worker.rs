@@ -14,8 +14,9 @@ use tracing::{debug, error, info, trace, warn};
 use ::zpr::vsapi::v1 as vsapi;
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
+use libeval::pubkey::encode_public_key;
 use zpr::vsapi_types::{
-    ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, SockAddr,
+    ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, PublicKey, SockAddr,
     VSConnectRequest, VisaOp, pname,
 };
 use zpr::write_to::WriteTo;
@@ -153,6 +154,7 @@ struct VisaServiceImpl {
 
 #[allow(dead_code)]
 struct VSGateImpl {
+    a2a_dh_pubkey: Option<String>,
     asm: Arc<Assembly>,
     remote: SocketAddr,
     remote_cn: String,
@@ -179,6 +181,7 @@ impl VSGateImpl {
         remote: SocketAddr,
         remote_cn: String,
         req_zpr_addr: IpAddr,
+        a2a_dh_pubkey: Option<String>,
         reconnect: bool,
     ) -> Self {
         VSGateImpl {
@@ -187,6 +190,7 @@ impl VSGateImpl {
             remote_cn,
             challenge_data: Cell::new([0u8; 32]),
             req_zpr_addr,
+            a2a_dh_pubkey,
             reconnect,
         }
     }
@@ -321,13 +325,17 @@ fn ipaddr_from_capnp(addr: vsapi::ip_addr::Reader) -> Result<std::net::IpAddr, c
 }
 
 impl VisaServiceImpl {
-    /// Helper for the connect routine -- returns the one connect param we require: zpr_addr.
-    /// Older code used to pass in the AAA_PREFIX here but now we send that over the
-    /// VSS.
+    /// Helper for the connect routine -- returns the one connect param we require, zpr_addr,
+    /// plus the node's A2A DH public key if it sent one. Older code used to pass in the
+    /// AAA_PREFIX here but now we send that over the VSS.
     ///
     /// During this transition period we will error out if node passes use AAA_PREFIX.
-    fn parse_my_connect_params(&self, params: &[Param]) -> Result<IpAddr, ServiceError> {
+    fn parse_my_connect_params(
+        &self,
+        params: &[Param],
+    ) -> Result<(IpAddr, Option<String>), ServiceError> {
         let mut node_zpr_addr = None;
+        let mut a2a_dh_pubkey = None;
 
         for pp in params {
             match pp.name.as_str() {
@@ -348,6 +356,18 @@ impl VisaServiceImpl {
                     )));
                 }
 
+                pname::A2A_DH_PUBKEY => match &pp.value {
+                    ParamValue::X25519PubKey(pubkey) => {
+                        a2a_dh_pubkey = Some(encode_public_key(&PublicKey::new(pubkey.as_bytes())))
+                    }
+                    _ => {
+                        return Err(ServiceError::Param(format!(
+                            "param {} has invalid type",
+                            pname::A2A_DH_PUBKEY
+                        )));
+                    }
+                },
+
                 name => info!(target: API, "ignored connect param {}", name),
             }
         }
@@ -355,7 +375,7 @@ impl VisaServiceImpl {
         if node_zpr_addr.is_none() {
             return Err(ServiceError::Param("ZPR_ADDR param missing".into()));
         }
-        Ok(node_zpr_addr.unwrap())
+        Ok((node_zpr_addr.unwrap(), a2a_dh_pubkey))
     }
 
     /// Helper to handle errors during connect call.
@@ -424,8 +444,8 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             }
         };
 
-        let node_zpr_addr = match self.parse_my_connect_params(&parsed_params) {
-            Ok(addr) => addr,
+        let (node_zpr_addr, a2a_dh_pubkey) = match self.parse_my_connect_params(&parsed_params) {
+            Ok(addr_and_key) => addr_and_key,
             Err(e) => {
                 return self.ok_with_connect_error(
                     results,
@@ -484,6 +504,7 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             self.remote,
             vs_connect_request.cn,
             node_zpr_addr,
+            a2a_dh_pubkey,
             vs_connect_request.ctype == ConnectType::Reconnect,
         ));
 
@@ -677,6 +698,13 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                 );
             }
         };
+
+        match &self.a2a_dh_pubkey {
+            Some(encoded_key) => node_actor
+                .add_attribute(Attribute::builder(key::A2A_DH_PUBKEY).value(encoded_key))
+                .unwrap(),
+            None => warn!(target: API, "node {} sent no A2A DH public key", self.remote_cn),
+        }
 
         // At this point we may have taken an IP addr and assigned it to the actor.
         let mut undo = AuthenticateUndo::default();
@@ -973,10 +1001,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             capnp::Error::failed(format!("failed to parse ConnectionRequest: {}", e))
         })?;
 
+        // PublicKey::try_from does not check length. Store nothing unless it is a real X25519 key.
+        let key_len = creq.a2a_dh_public_key.public_key.len();
+        let encoded_pubkey = if key_len == 32 {
+            Some(encode_public_key(&creq.a2a_dh_public_key))
+        } else {
+            None
+        };
+
         let connect_via = self.node.get_zpr_addr().unwrap();
         self.update_last_seen_time(connect_via).await;
-
-        let actor = match self
+        let mut actor = match self
             .asm
             .cc
             .authenticate_adapter_or_node(self.asm.clone(), creq, connect_via)
@@ -995,6 +1030,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 return Ok(());
             }
         };
+
+        match encoded_pubkey {
+            Some(key) => actor
+                .add_attribute(Attribute::builder(key::A2A_DH_PUBKEY).value(key))
+                .unwrap(),
+            None => warn!(
+                target: API,
+                "adapter {:?} sent no usable A2A DH public key ({key_len} bytes)",
+                actor.get_cn(),
+            ),
+        }
 
         let actor_addr = actor.get_zpr_addr().unwrap().clone(); // MUST have an addr by now.
 
