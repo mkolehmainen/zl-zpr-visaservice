@@ -15,10 +15,12 @@ use dashmap::DashMap;
 use libeval::actor::Actor;
 use libeval::attribute::Attribute;
 use libeval::attribute::key;
+use libeval::pubkey::decode_public_key;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
+use zpr::vsapi_types::PublicKey;
 
 use crate::db::{DbConnection, DbOp, KeyString, ZAddr, gen_timestamp};
 use crate::error::StoreError;
@@ -355,6 +357,27 @@ impl ActorRepo {
             }
         }
         Ok(attrs)
+    }
+
+    /// Load and decode the actor's A2A DH public key. Returns Ok(None) when no key is stored.
+    pub async fn get_a2a_dh_pubkey_by_zpr_addr(
+        &self,
+        zpra: &IpAddr,
+    ) -> Result<Option<PublicKey>, StoreError> {
+        let attrs = self.get_actor_attrs(zpra, &[key::A2A_DH_PUBKEY]).await?;
+        let Some(attr) = attrs.first() else {
+            return Ok(None);
+        };
+        let value = attr
+            .get_single_value()
+            .map_err(|e| StoreError::InvalidData(format!("actor {zpra}: {e}")))?;
+        let pubkey = decode_public_key(value).map_err(|e| {
+            StoreError::InvalidData(format!(
+                "invalid {} for actor {zpra}: {e}",
+                key::A2A_DH_PUBKEY
+            ))
+        })?;
+        Ok(Some(pubkey))
     }
 
     /// Get a list of services offered by the actor.
@@ -780,6 +803,73 @@ mod test {
         assert_eq!(attrs[0].get_single_value().unwrap(), "actor-attrs");
         assert_eq!(attrs[1].get_key(), key::ROLE);
         assert_eq!(attrs[1].get_single_value().unwrap(), ROLE_ADAPTER);
+    }
+
+    /// An actor that never sent a key reads back as absent rather than as an error.
+    #[tokio::test]
+    async fn test_get_a2a_dh_pubkey_none_when_absent() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let actor = make_actor_for_pubkey_test("fd5a:5052::60", "no-key", None);
+        let zpr_addr: IpAddr = "fd5a:5052::60".parse().unwrap();
+
+        repo.add_actor(&actor).await.unwrap();
+
+        let pubkey = repo.get_a2a_dh_pubkey_by_zpr_addr(&zpr_addr).await.unwrap();
+        assert!(pubkey.is_none());
+    }
+
+    /// A stored FMT:BASE64 value decodes back to the raw 32 key bytes.
+    #[tokio::test]
+    async fn test_get_a2a_dh_pubkey_decodes_stored_value() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let actor = make_actor_for_pubkey_test(
+            "fd5a:5052::61",
+            "keyed",
+            Some("ZprKF01:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="),
+        );
+        let zpr_addr: IpAddr = "fd5a:5052::61".parse().unwrap();
+
+        repo.add_actor(&actor).await.unwrap();
+
+        let pubkey = repo
+            .get_a2a_dh_pubkey_by_zpr_addr(&zpr_addr)
+            .await
+            .unwrap()
+            .expect("actor has a stored key");
+        assert_eq!(pubkey.public_key, (0..32u8).collect::<Vec<u8>>());
+    }
+
+    #[tokio::test]
+    async fn test_get_a2a_dh_pubkey_rejects_unknown_format() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let actor = make_actor_for_pubkey_test("fd5a:5052::62", "bad-key", Some("ZprKF99:AAEC"));
+        let zpr_addr: IpAddr = "fd5a:5052::62".parse().unwrap();
+
+        repo.add_actor(&actor).await.unwrap();
+
+        let err = repo
+            .get_a2a_dh_pubkey_by_zpr_addr(&zpr_addr)
+            .await
+            .unwrap_err();
+        match err {
+            StoreError::InvalidData(_) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    fn make_actor_for_pubkey_test(zpr_addr: &str, cn: &str, pubkey_value: Option<&str>) -> Actor {
+        let mut attrs = vec![
+            (key::ROLE, ROLE_ADAPTER),
+            (key::CN, cn),
+            (key::ZPR_ADDR, zpr_addr),
+        ];
+        if let Some(value) = pubkey_value {
+            attrs.push((key::A2A_DH_PUBKEY, value));
+        }
+        make_actor_defexp(&attrs)
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 use zpr::policy_types::{Scope, ServiceType};
-use zpr::vsapi_types::ServiceDescriptor;
+use zpr::vsapi_types::{PublicKey, ServiceDescriptor};
 
 use crate::assembly::Assembly;
 use crate::config;
@@ -292,6 +292,14 @@ impl ActorMgr {
             Ok(cn) => Ok(cn),
             Err(e) => Err(ServiceError::from(e)),
         }
+    }
+
+    /// Returns actors public key or None if no key is stored for it.
+    pub async fn get_a2a_dh_pubkey_by_zpr_addr(
+        &self,
+        zpra: &IpAddr,
+    ) -> Result<Option<PublicKey>, ServiceError> {
+        Ok(self.actor_db.get_a2a_dh_pubkey_by_zpr_addr(zpra).await?)
     }
 
     pub async fn get_actor_by_cn(&self, cn: &str) -> Result<Option<Actor>, ServiceError> {
