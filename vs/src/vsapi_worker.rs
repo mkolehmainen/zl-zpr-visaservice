@@ -14,7 +14,6 @@ use tracing::{debug, error, info, trace, warn};
 use ::zpr::vsapi::v1 as vsapi;
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
-use libeval::pubkey::encode_public_key;
 use zpr::vsapi_types::{
     ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, PublicKey, SockAddr,
     VSConnectRequest, VisaOp, pname,
@@ -296,6 +295,16 @@ fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message
     bldr.set_retry_in(0);
 }
 
+/// Helper for encoding an A2A DH public key for storage as an attribute, or None if it is not a
+/// usable X25519 key.
+fn encode_a2a_dh_pubkey(key: &PublicKey) -> Option<String> {
+    if key.public_key.len() == 32 {
+        Some(libeval::pubkey::encode_public_key(key))
+    } else {
+        None
+    }
+}
+
 /// Convert a vsapi schema IpAddr into a rust ip address.
 fn ipaddr_from_capnp(addr: vsapi::ip_addr::Reader) -> Result<std::net::IpAddr, capnp::Error> {
     match addr.which()? {
@@ -358,7 +367,7 @@ impl VisaServiceImpl {
 
                 pname::A2A_DH_PUBKEY => match &pp.value {
                     ParamValue::X25519PubKey(pubkey) => {
-                        a2a_dh_pubkey = Some(encode_public_key(&PublicKey::new(pubkey.as_bytes())))
+                        a2a_dh_pubkey = encode_a2a_dh_pubkey(&PublicKey::new(pubkey.as_bytes()));
                     }
                     _ => {
                         return Err(ServiceError::Param(format!(
@@ -1001,13 +1010,8 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             capnp::Error::failed(format!("failed to parse ConnectionRequest: {}", e))
         })?;
 
-        // PublicKey::try_from does not check length. Store nothing unless it is a real X25519 key.
         let key_len = creq.a2a_dh_public_key.public_key.len();
-        let encoded_pubkey = if key_len == 32 {
-            Some(encode_public_key(&creq.a2a_dh_public_key))
-        } else {
-            None
-        };
+        let encoded_pubkey = encode_a2a_dh_pubkey(&creq.a2a_dh_public_key);
 
         let connect_via = self.node.get_zpr_addr().unwrap();
         self.update_last_seen_time(connect_via).await;
