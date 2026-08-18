@@ -108,7 +108,7 @@ impl Hit {
         }
     }
 
-    /// Create Hit with a signal and no route.
+    /// Create Hit with a signal and without a route.
     pub fn new_with_signal(index: usize, direction: Direction, signal: Signal) -> Self {
         Hit {
             match_idx: index,

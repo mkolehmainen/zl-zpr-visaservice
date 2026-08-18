@@ -1130,6 +1130,10 @@ mod tests {
 
     use super::*;
 
+    /// Visa expiration used by the tests in this module.
+    const DEFAULT_VISA_EXPIRATION: std::time::Duration =
+        std::time::Duration::from_secs(4 * 60 * 60);
+
     use crate::apikey::ApiKey;
     use admin_api_types::VisaMatchDirection;
     use axum::body::Body;
@@ -1442,7 +1446,17 @@ mod tests {
         // Add a visa.
         let vwmd = asm
             .visa_mgr
-            .create_visa(&asm, &node_addr, &pdesc, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &node_addr,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+            )
             .await
             .unwrap();
 
@@ -1615,17 +1629,47 @@ mod tests {
 
         let v0 = asm
             .visa_mgr
-            .create_visa(&asm, &node_addr, &pdesc0, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &node_addr,
+                &pdesc0,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+            )
             .await
             .unwrap();
         let v1 = asm
             .visa_mgr
-            .create_visa(&asm, &node_addr, &pdesc1, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &node_addr,
+                &pdesc1,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+            )
             .await
             .unwrap();
         let v2 = asm
             .visa_mgr
-            .create_visa(&asm, &node_addr, &pdesc2, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &node_addr,
+                &pdesc2,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+            )
             .await
             .unwrap();
 
@@ -1862,6 +1906,7 @@ mod tests {
                 zpl_str,
                 policy_version,
                 0,
+                SystemTime::now() + DEFAULT_VISA_EXPIRATION,
             )
             .await
             .unwrap();
@@ -1908,7 +1953,17 @@ mod tests {
 
         let v = asm
             .visa_mgr
-            .create_visa(&asm, &node_addr, &pdesc, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &node_addr,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+            )
             .await
             .unwrap();
 
@@ -1952,7 +2007,17 @@ mod tests {
 
         let v = asm
             .visa_mgr
-            .create_visa(&asm, &node_addr, &pdesc, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &node_addr,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + DEFAULT_VISA_EXPIRATION,
+            )
             .await
             .unwrap();
 

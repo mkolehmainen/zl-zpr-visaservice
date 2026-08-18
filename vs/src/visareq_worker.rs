@@ -263,7 +263,18 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         PolicyOutcome::Allow {
             hits,
             default_route,
-        } => visa_from_allow(asm.clone(), job, &hits, &policy, default_route).await,
+        } => {
+            visa_from_allow(
+                asm.clone(),
+                job,
+                &hits,
+                &policy,
+                default_route,
+                &source_actor,
+                &dest_actor,
+            )
+            .await
+        }
         PolicyOutcome::Deny(code) => Ok(VisaDecision::Deny(code)),
     }
 }
@@ -295,12 +306,19 @@ fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
 /// `default_route` - A default route for the visa, only used if there is no route on the first hit.
 /// Creates and returns the visa for the requesting node, then spawns a background task to
 /// push actualized copies to any other nodes on the multihop path.
+///
+/// Note that an ALLOW decision can still come back as a [VisaDecision::Deny]: if the
+/// authentication or attribute expirations leave less than [config::MIN_VISA_LIFETIME] to
+/// work with, the visa would lapse before the nodes could install and use it, so we deny
+/// rather than issue it.
 async fn visa_from_allow(
     asm: Arc<Assembly>,
     job: &VisaRequestJob,
     hits: &[Hit],
     policy: &Policy,
     default_route: Option<Route>,
+    src_actor: &Actor,
+    dst_actor: &Actor,
 ) -> Result<VisaDecision, ServiceError> {
     debug_assert!(!hits.is_empty(), "allow decision with no hits"); // should never happen.
     let policy_version = policy.get_version().unwrap_or(0);
@@ -313,6 +331,18 @@ async fn visa_from_allow(
 
     let allowed_route: Route = route_for_allow(hits, default_route)?;
 
+    let expiration = compute_expiration(src_actor, dst_actor, policy, &hits[0])?;
+
+    // Too little time left to be usable. Deny rather than issue a visa that cannot be
+    // installed before it lapses -- and that the store would silently discard.
+    if expiration < SystemTime::now() + config::MIN_VISA_LIFETIME {
+        debug!(target: VREQ,
+            "visa request from {:?} denied: computed expiration {:?} leaves less than {:?}",
+            job.requesting_node, expiration, config::MIN_VISA_LIFETIME
+        );
+        return Ok(VisaDecision::Deny(DenyCode::NoReason));
+    }
+
     let visawmd = asm
         .visa_mgr
         .create_visa(
@@ -324,6 +354,7 @@ async fn visa_from_allow(
             zpl,
             policy_version,
             vinst,
+            expiration,
         )
         .await?;
 
@@ -340,6 +371,95 @@ async fn visa_from_allow(
         .actualize_visa_for_target_node(visa_for_requester, &job.requesting_node)
         .await?;
     Ok(VisaDecision::Allow(visa, allowed_route))
+}
+
+/// Compute a visa expiration value. The expiration is set to the soonest of:
+/// - source actor authentication expiration.
+/// - dest actor authentication expiration.
+/// - soonest attribute expiration used in the policy conditions for the hit.
+/// - the [key::SERVICES] attribute on the providing actor, which selected the policy.
+/// - the maximum visa lifetime [config::MAX_VISA_LIFETIME].
+///
+/// Note/(TODO?) that [key::SERVICES] holds every service id in a single attribute, so there is one
+/// expiration for the whole set: a provider whose service ids come from sources with
+/// different TTLs is bounded by the soonest of them.
+///
+/// TODO: In future we may want to specify a max lifetime in the matched communication policy.
+/// TODO: We may want max lifetime to be a policy setting, not compile time setting.
+///
+/// ### Errors
+/// - [ServiceError::Internal] if the hit does not name a communication policy in `policy`.
+///   An allow hit always does, so this means policy state is inconsistent. We refuse to
+///   guess an expiration rather than silently issue a visa with no attribute constraint.
+fn compute_expiration(
+    src_actor: &Actor,
+    dst_actor: &Actor,
+    policy: &Policy,
+    hit: &Hit,
+) -> Result<SystemTime, ServiceError> {
+    // Both sides come back Some for a valid index -- an empty vec means that side has no
+    // conditions -- so a None here is only ever a failed lookup or an undecodable list.
+    let (Some(client_keys), Some(service_keys)) =
+        policy.get_condition_keys_for_com_policy(hit.match_idx)
+    else {
+        return Err(ServiceError::Internal(format!(
+            "no communication policy at index {} for allow hit",
+            hit.match_idx
+        )));
+    };
+
+    let (client_actor, service_actor) = if hit.direction == libeval::eval_result::Direction::Forward
+    {
+        (src_actor, dst_actor)
+    } else {
+        (dst_actor, src_actor)
+    };
+
+    // zpr.services on the providing actor is what selected this policy -- eval only matches
+    // when the service side satisfies provides(service_id) -- so it bounds the visa as much
+    // as any condition attribute does.
+    let mut service_keys = service_keys;
+    service_keys.push(key::SERVICES.to_string());
+
+    // Sampled once so the clamp below compares and assigns against the same instant.
+    let now = SystemTime::now();
+    let mut soonest_expiration = now + libeval::attribute::NEVER_EXPIRES;
+    let mut expiration_gate = String::from("(none)"); // for debugging
+
+    for (keys, actor) in [(&client_keys, client_actor), (&service_keys, service_actor)] {
+        for key in keys {
+            if let Some(attr) = actor.get_attribute(key) {
+                if attr.get_expires() < soonest_expiration {
+                    soonest_expiration = attr.get_expires();
+                    expiration_gate = key.clone();
+                }
+            }
+        }
+    }
+
+    if let Some(exp) = src_actor.get_authentication_expiration() {
+        if exp < soonest_expiration {
+            soonest_expiration = exp;
+            expiration_gate = String::from("source_actor_auth");
+        }
+    }
+    if let Some(exp) = dst_actor.get_authentication_expiration() {
+        if exp < soonest_expiration {
+            soonest_expiration = exp;
+            expiration_gate = String::from("destination_actor_auth");
+        }
+    }
+
+    if soonest_expiration > now + config::MAX_VISA_LIFETIME {
+        soonest_expiration = now + config::MAX_VISA_LIFETIME;
+        expiration_gate = String::from("max_visa_lifetime");
+    }
+
+    debug!(target: VREQ,
+        "visa request computed expiration {:?} (gate: {})",
+        soonest_expiration, expiration_gate
+    );
+    Ok(soonest_expiration)
 }
 
 /// Pushes actualized copies of a visa to all non-requesting nodes on the path.
@@ -561,7 +681,8 @@ mod tests {
     use crate::assembly::Assembly;
     use crate::assembly::tests::new_assembly_for_tests;
     use crate::test_helpers::{
-        make_actor_with_services_defexp, make_container_bytes, make_node_actor_defexp,
+        make_actor, make_actor_with_services_defexp, make_container_bytes, make_node_actor_defexp,
+        make_policy_with_com_conditions,
     };
     use libeval::attribute::ROLE_ADAPTER;
     use libeval::eval_result::Direction;
@@ -667,11 +788,23 @@ mod tests {
         let (job, _rx) = VisaRequestJob::new(requesting_node, pkt_data);
 
         let hits = vec![Hit::new_no_signal(0, Direction::Forward)];
-        let mut policy = Policy::new_empty();
+        let mut policy = make_policy_with_com_conditions(&[], &[]);
         policy.set_vinst(7);
         let route = Route::new_direct(requesting_node.into());
 
-        let result = visa_from_allow(asm.clone(), &job, &hits, &policy, Some(route)).await;
+        let src_actor = make_node_actor_defexp("fd5a:5052:3000::1", "src", "10.0.0.1:1001");
+        let dst_actor = make_node_actor_defexp("fd5a:5052:3000::2", "dst", "10.0.0.2:1002");
+
+        let result = visa_from_allow(
+            asm.clone(),
+            &job,
+            &hits,
+            &policy,
+            Some(route),
+            &src_actor,
+            &dst_actor,
+        )
+        .await;
         let visa = match result {
             Ok(VisaDecision::Allow(visa, _)) => visa,
             _ => panic!("expected Allow"),
@@ -685,6 +818,164 @@ mod tests {
             .expect("metadata should be stored");
         assert_eq!(md.created_vinst, 7);
         assert_eq!(md.checked_vinst, 7);
+    }
+
+    // An actor whose authentication expires almost immediately leaves less than
+    // MIN_VISA_LIFETIME to work with, so an ALLOW must come back as a deny and no visa may
+    // be stored. Issuing here would half-succeed: the store drops a sub-second TTL silently
+    // but create_visa still returns Ok, so the caller would fail on actualize.
+    #[tokio::test]
+    async fn visa_from_allow_denies_when_expiration_below_min_lifetime() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let requesting_node: IpAddr = "fd5a:5052:3000::ff".parse().unwrap();
+        let pkt_data =
+            PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80).unwrap();
+        let (job, _rx) = VisaRequestJob::new(requesting_node, pkt_data);
+
+        let hits = vec![Hit::new_no_signal(0, Direction::Forward)];
+        let policy = make_policy_with_com_conditions(&[], &[]);
+        let route = Route::new_direct(requesting_node.into());
+
+        // AUTHORITY drives get_authentication_expiration; one second is well under the floor.
+        let mut src_actor = make_node_actor_defexp("fd5a:5052:3000::1", "src", "10.0.0.1:1001");
+        src_actor
+            .add_attribute(
+                Attribute::builder(key::AUTHORITY)
+                    .expires_in(Duration::from_secs(1))
+                    .value("about-to-expire"),
+            )
+            .unwrap();
+        let dst_actor = make_node_actor_defexp("fd5a:5052:3000::2", "dst", "10.0.0.2:1002");
+
+        let result = visa_from_allow(
+            asm.clone(),
+            &job,
+            &hits,
+            &policy,
+            Some(route),
+            &src_actor,
+            &dst_actor,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(VisaDecision::Deny(DenyCode::NoReason))),
+            "expected deny when expiration is under MIN_VISA_LIFETIME"
+        );
+        assert!(
+            asm.visa_mgr.list_all_visa_ids().await.unwrap().is_empty(),
+            "no visa may be stored when the request is denied"
+        );
+    }
+
+    // The attribute named by a policy condition expires before MAX_VISA_LIFETIME, so it
+    // sets the visa expiration.
+    #[test]
+    fn compute_expiration_uses_soonest_condition_attribute() {
+        let policy = make_policy_with_com_conditions(&["user.role"], &[]);
+        let src = make_actor(&[("user.role", "admin")], Duration::from_secs(600));
+        let dst = make_node_actor_defexp("fd5a:5052:3000::2", "dst", "10.0.0.2:1002");
+        let hit = Hit::new_no_signal(0, Direction::Forward);
+
+        let expected = src.get_attribute("user.role").unwrap().get_expires();
+        let exp = compute_expiration(&src, &dst, &policy, &hit).unwrap();
+        assert_eq!(exp, expected);
+    }
+
+    // Client conditions apply to the source on a Forward hit and to the dest on a Reverse
+    // hit, so the same policy must pick up a different actor's attribute per direction.
+    #[test]
+    fn compute_expiration_swaps_client_and_service_by_direction() {
+        let policy = make_policy_with_com_conditions(&["user.role"], &[]);
+        let src = make_actor(&[("user.role", "admin")], Duration::from_secs(600));
+        let dst = make_actor(&[("user.role", "admin")], Duration::from_secs(1200));
+
+        let fwd = compute_expiration(
+            &src,
+            &dst,
+            &policy,
+            &Hit::new_no_signal(0, Direction::Forward),
+        )
+        .unwrap();
+        let rev = compute_expiration(
+            &src,
+            &dst,
+            &policy,
+            &Hit::new_no_signal(0, Direction::Reverse),
+        )
+        .unwrap();
+
+        assert_eq!(fwd, src.get_attribute("user.role").unwrap().get_expires());
+        assert_eq!(rev, dst.get_attribute("user.role").unwrap().get_expires());
+    }
+
+    // The zpr.services attribute selected the policy, so its expiration bounds the visa even
+    // though it is not named by any policy condition. It lives on the providing actor, which
+    // is the dest on a Forward hit and the source on a Reverse one.
+    #[test]
+    fn compute_expiration_uses_services_attribute_of_provider() {
+        let policy = make_policy_with_com_conditions(&[], &[]);
+        let provider = make_actor(&[(key::SERVICES, "svc:x")], Duration::from_secs(600));
+        let client = make_node_actor_defexp("fd5a:5052:3000::1", "client", "10.0.0.1:1001");
+        let expected = provider.get_attribute(key::SERVICES).unwrap().get_expires();
+
+        // Forward: the dest provides the service.
+        let fwd = compute_expiration(
+            &client,
+            &provider,
+            &policy,
+            &Hit::new_no_signal(0, Direction::Forward),
+        )
+        .unwrap();
+        assert_eq!(fwd, expected);
+
+        // Reverse: the source provides the service.
+        let rev = compute_expiration(
+            &provider,
+            &client,
+            &policy,
+            &Hit::new_no_signal(0, Direction::Reverse),
+        )
+        .unwrap();
+        assert_eq!(rev, expected);
+    }
+
+    // With no condition attributes and no authentication expiration, the expiration falls
+    // back to the MAX_VISA_LIFETIME clamp.
+    #[test]
+    fn compute_expiration_clamps_to_max_visa_lifetime() {
+        let policy = make_policy_with_com_conditions(&[], &[]);
+        let src = make_actor(&[("some.attr", "x")], libeval::attribute::NEVER_EXPIRES);
+        let dst = make_actor(&[("some.attr", "y")], libeval::attribute::NEVER_EXPIRES);
+        let hit = Hit::new_no_signal(0, Direction::Forward);
+
+        let before = SystemTime::now();
+        let exp = compute_expiration(&src, &dst, &policy, &hit).unwrap();
+        assert!(exp >= before + config::MAX_VISA_LIFETIME);
+        assert!(exp <= SystemTime::now() + config::MAX_VISA_LIFETIME);
+    }
+
+    // A hit whose match_idx names no communication policy is a broken invariant, not a
+    // visa with no attribute constraints: fail rather than issue a full-lifetime visa.
+    #[test]
+    fn compute_expiration_errors_when_hit_names_no_com_policy() {
+        let policy = make_policy_with_com_conditions(&[], &[]);
+        let src = make_node_actor_defexp("fd5a:5052:3000::1", "src", "10.0.0.1:1001");
+        let dst = make_node_actor_defexp("fd5a:5052:3000::2", "dst", "10.0.0.2:1002");
+
+        // Index 9 is past the single com policy in the test policy.
+        let hit = Hit::new_no_signal(9, Direction::Forward);
+        assert!(matches!(
+            compute_expiration(&src, &dst, &policy, &hit),
+            Err(ServiceError::Internal(_))
+        ));
+
+        // Same for a policy with no com policies at all.
+        let hit = Hit::new_no_signal(0, Direction::Forward);
+        assert!(matches!(
+            compute_expiration(&src, &dst, &Policy::new_empty(), &hit),
+            Err(ServiceError::Internal(_))
+        ));
     }
 
     // When both actors are None the request cannot proceed: deny the source immediately.
