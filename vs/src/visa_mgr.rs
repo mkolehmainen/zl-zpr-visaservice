@@ -1534,7 +1534,17 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &src,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + config::MAX_VISA_LIFETIME,
+            )
             .await
             .unwrap();
 
@@ -1562,7 +1572,17 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &src,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + config::MAX_VISA_LIFETIME,
+            )
             .await
             .unwrap();
 
