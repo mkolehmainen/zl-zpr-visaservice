@@ -153,7 +153,7 @@ struct VisaServiceImpl {
 
 #[allow(dead_code)]
 struct VSGateImpl {
-    a2a_dh_pubkey: Option<String>,
+    a2a_dh_pubkey: Option<PublicKey>,
     asm: Arc<Assembly>,
     remote: SocketAddr,
     remote_cn: String,
@@ -180,7 +180,7 @@ impl VSGateImpl {
         remote: SocketAddr,
         remote_cn: String,
         req_zpr_addr: IpAddr,
-        a2a_dh_pubkey: Option<String>,
+        a2a_dh_pubkey: Option<PublicKey>,
         reconnect: bool,
     ) -> Self {
         VSGateImpl {
@@ -295,16 +295,6 @@ fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message
     bldr.set_retry_in(0);
 }
 
-/// Helper for encoding an A2A DH public key for storage as an attribute, or None if it is not a
-/// usable X25519 key.
-fn encode_a2a_dh_pubkey(key: &PublicKey) -> Option<String> {
-    if key.public_key.len() == 32 {
-        Some(libeval::pubkey::encode_public_key(key))
-    } else {
-        None
-    }
-}
-
 /// Convert a vsapi schema IpAddr into a rust ip address.
 fn ipaddr_from_capnp(addr: vsapi::ip_addr::Reader) -> Result<std::net::IpAddr, capnp::Error> {
     match addr.which()? {
@@ -342,7 +332,7 @@ impl VisaServiceImpl {
     fn parse_my_connect_params(
         &self,
         params: &[Param],
-    ) -> Result<(IpAddr, Option<String>), ServiceError> {
+    ) -> Result<(IpAddr, Option<PublicKey>), ServiceError> {
         let mut node_zpr_addr = None;
         let mut a2a_dh_pubkey = None;
 
@@ -367,7 +357,7 @@ impl VisaServiceImpl {
 
                 pname::A2A_DH_PUBKEY => match &pp.value {
                     ParamValue::X25519PubKey(pubkey) => {
-                        a2a_dh_pubkey = encode_a2a_dh_pubkey(&PublicKey::new(pubkey.as_bytes()));
+                        a2a_dh_pubkey = Some(PublicKey::new(pubkey.as_bytes()));
                     }
                     _ => {
                         return Err(ServiceError::Param(format!(
@@ -686,6 +676,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                 challenge_response,
                 self.remote,
                 self.req_zpr_addr,
+                self.a2a_dh_pubkey.as_ref(),
             )
             .await
         {
@@ -707,13 +698,6 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                 );
             }
         };
-
-        match &self.a2a_dh_pubkey {
-            Some(encoded_key) => node_actor
-                .add_attribute(Attribute::builder(key::A2A_DH_PUBKEY).value(encoded_key))
-                .unwrap(),
-            None => warn!(target: API, "node {} sent no A2A DH public key", self.remote_cn),
-        }
 
         // At this point we may have taken an IP addr and assigned it to the actor.
         let mut undo = AuthenticateUndo::default();
@@ -1010,12 +994,9 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             capnp::Error::failed(format!("failed to parse ConnectionRequest: {}", e))
         })?;
 
-        let key_len = creq.a2a_dh_public_key.public_key.len();
-        let encoded_pubkey = encode_a2a_dh_pubkey(&creq.a2a_dh_public_key);
-
         let connect_via = self.node.get_zpr_addr().unwrap();
         self.update_last_seen_time(connect_via).await;
-        let mut actor = match self
+        let actor = match self
             .asm
             .cc
             .authenticate_adapter_or_node(self.asm.clone(), creq, connect_via)
@@ -1034,17 +1015,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 return Ok(());
             }
         };
-
-        match encoded_pubkey {
-            Some(key) => actor
-                .add_attribute(Attribute::builder(key::A2A_DH_PUBKEY).value(key))
-                .unwrap(),
-            None => warn!(
-                target: API,
-                "adapter {:?} sent no usable A2A DH public key ({key_len} bytes)",
-                actor.get_cn(),
-            ),
-        }
 
         let actor_addr = actor.get_zpr_addr().unwrap().clone(); // MUST have an addr by now.
 
