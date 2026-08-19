@@ -407,11 +407,14 @@ impl VisaMgr {
             metadata.signal_msgs.push(sig.message.clone());
         }
 
+        let ingress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.source_addr).await?;
+        let egress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.dest_addr).await?;
+
         let pep = DockPep {
             pep,
             source_addr: pdesc.five_tuple.source_addr.clone(),
             dest_addr: pdesc.five_tuple.dest_addr.clone(),
-            session_key: KeySet::new("secret".as_bytes(), "secret".as_bytes()),
+            session_key: KeySet::new(&ingress_key, &egress_key),
         };
 
         let visa = Visa {
@@ -788,6 +791,18 @@ impl VisaMgr {
             Ok(md) => Ok(Some(md)),
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(e) => Err(ServiceError::from(e)),
+        }
+    }
+}
+
+/// Gets public key as bytes.
+/// Returns empty bytes when the actor's key is not found.
+async fn a2a_dh_pubkey_bytes(asm: &Assembly, addr: &IpAddr) -> Result<Vec<u8>, ServiceError> {
+    match asm.actor_mgr.get_a2a_dh_pubkey_by_zpr_addr(addr).await? {
+        Some(key) => Ok(key.public_key),
+        None => {
+            debug!(target: VISA, "actor {addr} sent no A2A DH public key; visa session key will be empty");
+            Ok(Vec::new())
         }
     }
 }
@@ -1468,6 +1483,112 @@ mod tests {
         // The egress node dst is not the target here, so this just confirms the visa
         // was created for the right endpoints.
         let _ = dst;
+    }
+
+    // --- A2A DH session key tests ---
+    // create_visa reads both adapters' stored zpr.a2a_dh_pubkey attributes and carries
+    // them in the DockPep session key.
+
+    use libeval::attribute::{Attribute, key};
+    use libeval::pubkey::encode_public_key;
+    use zpr::vsapi_types::PublicKey;
+
+    const SRC_ADAPTER: &str = "fd5a:5052:1234::a100";
+    const DST_ADAPTER: &str = "fd5a:5052:1234::a200";
+
+    async fn add_keyed_adapter(asm: &Assembly, zpr_addr: &str, cn: &str, key_bytes: &[u8]) {
+        let mut actor = make_adapter_actor_defexp(zpr_addr, cn);
+        actor
+            .add_attribute(
+                Attribute::builder(key::A2A_DH_PUBKEY)
+                    .value(encode_public_key(&PublicKey::new(key_bytes))),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .hack_add_adapter_no_node(&actor)
+            .await
+            .unwrap();
+    }
+
+    /// Both adapters' keys land in the session key, source as ingress and dest as egress.
+    #[tokio::test]
+    async fn test_create_visa_session_key_carries_adapter_pubkeys() {
+        let asm = make_multihop_assembly().await;
+        let src: IpAddr = MH_SRC.parse().unwrap();
+        let dst: IpAddr = MH_DST.parse().unwrap();
+
+        let src_key: Vec<u8> = (0..32u8).collect();
+        let dst_key: Vec<u8> = (32..64u8).collect();
+        add_keyed_adapter(&asm, SRC_ADAPTER, "src-adapter", &src_key).await;
+        add_keyed_adapter(&asm, DST_ADAPTER, "dst-adapter", &dst_key).await;
+
+        let pdesc = PacketDesc::new_tcp_with_addr(
+            SRC_ADAPTER.parse().unwrap(),
+            DST_ADAPTER.parse().unwrap(),
+            12345,
+            80,
+        )
+        .unwrap();
+        let hit = Hit::new_no_signal(0, Direction::Forward);
+        let route = asm.topo_mgr.get_best_route(&src, &dst).unwrap();
+
+        let visawmd = asm
+            .visa_mgr
+            .create_visa(
+                &asm,
+                &src,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + config::MAX_VISA_LIFETIME,
+            )
+            .await
+            .unwrap();
+
+        let session_key = &visawmd.visa.dock_pep.as_ref().unwrap().session_key;
+        assert_eq!(session_key.ingress_key, src_key);
+        assert_eq!(session_key.egress_key, dst_key);
+    }
+
+    /// Endpoints with no stored key produce an empty session key rather than failing the visas.
+    #[tokio::test]
+    async fn test_create_visa_session_key_empty_without_pubkeys() {
+        let asm = make_multihop_assembly().await;
+        let src: IpAddr = MH_SRC.parse().unwrap();
+        let dst: IpAddr = MH_DST.parse().unwrap();
+
+        let pdesc = PacketDesc::new_tcp_with_addr(
+            SRC_ADAPTER.parse().unwrap(),
+            DST_ADAPTER.parse().unwrap(),
+            12345,
+            80,
+        )
+        .unwrap();
+        let hit = Hit::new_no_signal(0, Direction::Forward);
+        let route = asm.topo_mgr.get_best_route(&src, &dst).unwrap();
+
+        let visawmd = asm
+            .visa_mgr
+            .create_visa(
+                &asm,
+                &src,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + config::MAX_VISA_LIFETIME,
+            )
+            .await
+            .unwrap();
+
+        let session_key = &visawmd.visa.dock_pep.as_ref().unwrap().session_key;
+        assert!(session_key.ingress_key.is_empty());
+        assert!(session_key.egress_key.is_empty());
     }
 
     // --- Phase 2 manager tests ---

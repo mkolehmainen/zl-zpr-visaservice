@@ -15,7 +15,7 @@ use ::zpr::vsapi::v1 as vsapi;
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
 use zpr::vsapi_types::{
-    ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, SockAddr,
+    ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, PublicKey, SockAddr,
     VSConnectRequest, VisaOp, pname,
 };
 use zpr::write_to::WriteTo;
@@ -153,6 +153,7 @@ struct VisaServiceImpl {
 
 #[allow(dead_code)]
 struct VSGateImpl {
+    a2a_dh_pubkey: Option<PublicKey>,
     asm: Arc<Assembly>,
     remote: SocketAddr,
     remote_cn: String,
@@ -179,6 +180,7 @@ impl VSGateImpl {
         remote: SocketAddr,
         remote_cn: String,
         req_zpr_addr: IpAddr,
+        a2a_dh_pubkey: Option<PublicKey>,
         reconnect: bool,
     ) -> Self {
         VSGateImpl {
@@ -187,6 +189,7 @@ impl VSGateImpl {
             remote_cn,
             challenge_data: Cell::new([0u8; 32]),
             req_zpr_addr,
+            a2a_dh_pubkey,
             reconnect,
         }
     }
@@ -321,13 +324,17 @@ fn ipaddr_from_capnp(addr: vsapi::ip_addr::Reader) -> Result<std::net::IpAddr, c
 }
 
 impl VisaServiceImpl {
-    /// Helper for the connect routine -- returns the one connect param we require: zpr_addr.
-    /// Older code used to pass in the AAA_PREFIX here but now we send that over the
-    /// VSS.
+    /// Helper for the connect routine -- returns the one connect param we require, zpr_addr,
+    /// plus the node's A2A DH public key if it sent one. Older code used to pass in the
+    /// AAA_PREFIX here but now we send that over the VSS.
     ///
     /// During this transition period we will error out if node passes use AAA_PREFIX.
-    fn parse_my_connect_params(&self, params: &[Param]) -> Result<IpAddr, ServiceError> {
+    fn parse_my_connect_params(
+        &self,
+        params: &[Param],
+    ) -> Result<(IpAddr, Option<PublicKey>), ServiceError> {
         let mut node_zpr_addr = None;
+        let mut a2a_dh_pubkey = None;
 
         for pp in params {
             match pp.name.as_str() {
@@ -348,6 +355,18 @@ impl VisaServiceImpl {
                     )));
                 }
 
+                pname::A2A_DH_PUBKEY => match &pp.value {
+                    ParamValue::X25519PubKey(pubkey) => {
+                        a2a_dh_pubkey = Some(PublicKey::new(pubkey.as_bytes()));
+                    }
+                    _ => {
+                        return Err(ServiceError::Param(format!(
+                            "param {} has invalid type",
+                            pname::A2A_DH_PUBKEY
+                        )));
+                    }
+                },
+
                 name => info!(target: API, "ignored connect param {}", name),
             }
         }
@@ -355,7 +374,7 @@ impl VisaServiceImpl {
         if node_zpr_addr.is_none() {
             return Err(ServiceError::Param("ZPR_ADDR param missing".into()));
         }
-        Ok(node_zpr_addr.unwrap())
+        Ok((node_zpr_addr.unwrap(), a2a_dh_pubkey))
     }
 
     /// Helper to handle errors during connect call.
@@ -424,8 +443,8 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             }
         };
 
-        let node_zpr_addr = match self.parse_my_connect_params(&parsed_params) {
-            Ok(addr) => addr,
+        let (node_zpr_addr, a2a_dh_pubkey) = match self.parse_my_connect_params(&parsed_params) {
+            Ok(addr_and_key) => addr_and_key,
             Err(e) => {
                 return self.ok_with_connect_error(
                     results,
@@ -484,6 +503,7 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             self.remote,
             vs_connect_request.cn,
             node_zpr_addr,
+            a2a_dh_pubkey,
             vs_connect_request.ctype == ConnectType::Reconnect,
         ));
 
@@ -656,6 +676,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                 challenge_response,
                 self.remote,
                 self.req_zpr_addr,
+                self.a2a_dh_pubkey.as_ref(),
             )
             .await
         {
@@ -975,7 +996,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
 
         let connect_via = self.node.get_zpr_addr().unwrap();
         self.update_last_seen_time(connect_via).await;
-
         let actor = match self
             .asm
             .cc

@@ -30,7 +30,7 @@ use libeval::eval::EvalContext;
 use libeval::policy::Policy;
 
 use zpr::vsapi::v1 as vsapi;
-use zpr::vsapi_types::{AuthBlob, ChallengeAlg, Claim, ConnectRequest, SelfSignedBlob};
+use zpr::vsapi_types::{AuthBlob, ChallengeAlg, Claim, ConnectRequest, PublicKey, SelfSignedBlob};
 
 use crate::assembly::Assembly;
 use crate::auth;
@@ -138,12 +138,17 @@ impl ConnectionControl {
         challenge_response: &[u8],
         remote: SocketAddr,
         node_req_addr: IpAddr,
+        a2a_dh_pubkey: Option<&PublicKey>,
     ) -> Result<Actor, ServiceError> {
         // Massage this node authentication request into something that looks like a generic
         // adapter request.
 
         let mut authd_claims: Vec<Attribute> = Vec::new();
         authd_claims.push(Attribute::builder(key::SUBSTRATE_ADDR).value(remote.to_string()));
+        match a2a_dh_pubkey.and_then(a2a_dh_pubkey_claim) {
+            Some(attr) => authd_claims.push(attr),
+            None => warn!(target: CC, "node {cn} sent no usable A2A DH public key"),
+        }
 
         let mut unauthd_claims: Vec<Attribute> = Vec::new();
         unauthd_claims.push(Attribute::builder(key::ZPR_ADDR).value(node_req_addr.to_string()));
@@ -201,6 +206,10 @@ impl ConnectionControl {
         authd_claims.push(Attribute::builder(key::CONNECT_VIA).value(connect_via.to_string()));
         authd_claims
             .push(Attribute::builder(key::SUBSTRATE_ADDR).value(req.substrate_addr.to_string()));
+        match a2a_dh_pubkey_claim(&req.a2a_dh_public_key) {
+            Some(attr) => authd_claims.push(attr),
+            None => warn!(target: CC, "adapter via {connect_via} sent no usable A2A DH public key"),
+        }
 
         let actor = match &req.blobs[0] {
             AuthBlob::SS(ssb) => match ssb.alg {
@@ -619,6 +628,13 @@ fn scrub_adapter_claims(claims: Vec<Claim>) -> Result<Vec<Attribute>, ServiceErr
     Ok(scrubbed_claims)
 }
 
+/// The A2A DH public key as an attribute claim, or None if it is not a usable X25519 key.
+fn a2a_dh_pubkey_claim(key: &PublicKey) -> Option<Attribute> {
+    (key.public_key.len() == 32).then(|| {
+        Attribute::builder(key::A2A_DH_PUBKEY).value(libeval::pubkey::encode_public_key(key))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +867,7 @@ mod tests {
                 &[],
                 "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                None,
             )
             .await;
         assert!(matches!(result, Err(ServiceError::AuthenticationFailed(_))));
@@ -880,6 +897,7 @@ mod tests {
                 b"not-a-valid-rsa-sig",
                 "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                None,
             )
             .await;
         assert!(matches!(result, Err(ServiceError::AuthenticationFailed(_))));
@@ -907,6 +925,7 @@ mod tests {
                 &bad_sig,
                 "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                None,
             )
             .await;
         assert!(matches!(result, Err(ServiceError::AuthenticationFailed(_))));
@@ -974,6 +993,7 @@ mod tests {
                 &sig,
                 "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                None,
             )
             .await;
         assert!(
@@ -1006,6 +1026,7 @@ mod tests {
                 &sig,
                 "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                None,
             )
             .await
             .expect("authentication should succeed");
@@ -1031,5 +1052,12 @@ mod tests {
         // Due to libeval not actually paying attention to what attributes are part of "identity",
         // it will add the CN claim.
         assert_eq!(identity[1], cn);
+    }
+
+    /// A 32-byte X25519 key becomes a claim, any other length does not.
+    #[test]
+    fn test_a2a_dh_pubkey_claim_length_gate() {
+        assert!(a2a_dh_pubkey_claim(&PublicKey::new(&[7u8; 32])).is_some());
+        assert!(a2a_dh_pubkey_claim(&PublicKey::new(&[7u8; 31])).is_none());
     }
 }

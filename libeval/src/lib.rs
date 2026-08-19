@@ -8,5 +8,6 @@ pub mod joinpolicy;
 pub mod logging;
 pub mod pio;
 pub mod policy;
+pub mod pubkey;
 pub mod route;
 pub mod visa;

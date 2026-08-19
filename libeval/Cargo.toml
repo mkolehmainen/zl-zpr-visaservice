@@ -6,6 +6,7 @@ license.workspace = true
 description = "Packet/Actor evaluator library; a component of the ZPR visa service"
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 capnp.workspace = true
 enumset = "1.1.10"
