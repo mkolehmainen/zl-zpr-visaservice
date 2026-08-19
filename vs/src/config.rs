@@ -68,13 +68,21 @@ pub const VS_ZPR_ADDR: Ipv6Addr = Ipv6Addr::new(
 /// Maximum allowed clock skew allowed during node authentication, in seconds.
 pub const MAX_CLOCK_SKEW_SECS: u64 = 180;
 
-pub const DEFAULT_VISA_EXPIRATION: Duration = Duration::from_secs(4 * 60 * 60); // 4 hours
+pub const MAX_VISA_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+
+/// A visa must be valid for at least this long to be worth issuing. Below this the node
+/// install (see [VSS_START_DELAY]) plus the round trip eats the whole lifetime, and under
+/// one second the visa store's seconds-granularity TTL truncates to zero and drops it.
+pub const MIN_VISA_LIFETIME: Duration = Duration::from_secs(30);
 
 pub const DEFAULT_AUTH_EXPIRATION: Duration = Duration::from_secs(4 * 60 * 60); // 4 hours
 
 /// When an actor is using an AAA address to do an exchange with an auth
 /// service, the credentials it is using last this long.
-pub const DEFAULT_ANON_AUTH_EXPIRATION: Duration = Duration::from_secs(5 * 60); // 5 minutes
+///
+/// TODO: Figure out what we are really ding with AAA addresses. For now setting to
+/// the `DEFAULT_AUTH_EXPIRATION` value.
+pub const DEFAULT_ANON_AUTH_EXPIRATION: Duration = DEFAULT_AUTH_EXPIRATION;
 
 /// How long to wait after getting the VSS addr from the node and opening a connection back to it.
 /// This delay allows time for the node to install the visa before we try to use it.

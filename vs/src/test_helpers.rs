@@ -3,6 +3,7 @@
 #![cfg(test)]
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::time::{Duration, SystemTime};
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, AttributeSource, ROLE_ADAPTER, ROLE_NODE, key};
 use libeval::eval_result::{Direction, Hit};
+use libeval::policy::Policy;
 use libeval::route::{LinkId, Route};
 
 use zpr::policy::v1 as capnp_policy;
@@ -177,6 +179,30 @@ pub fn make_pdesc() -> PacketDesc {
 /// `ServiceType::Trusted(api)` service named `id`, plus (when `expiration_seconds` is
 /// `Some`) the matching `TrustedService` record carrying `mappings`.
 ///
+/// Build a [Policy] holding a single communication policy whose client and service
+/// condition lists carry the given attribute keys (values/ops are left unset -- only the
+/// keys matter to callers that look up condition keys). Pass empty slices for a com policy
+/// with no conditions on that side.
+pub fn make_policy_with_com_conditions(client_keys: &[&str], service_keys: &[&str]) -> Policy {
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
+        let mut coms = policy_bldr.reborrow().init_com_policies(1);
+        let mut com = coms.reborrow().get(0);
+        let mut client = com.reborrow().init_client_conds(client_keys.len() as u32);
+        for (i, k) in client_keys.iter().enumerate() {
+            client.reborrow().get(i as u32).set_key(k);
+        }
+        let mut service = com.reborrow().init_service_conds(service_keys.len() as u32);
+        for (i, k) in service_keys.iter().enumerate() {
+            service.reborrow().get(i as u32).set_key(k);
+        }
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+    Policy::new_from_policy_bytes(Bytes::from(bytes)).unwrap()
+}
+
 /// Pass `None` for `expiration_seconds` to get the "service declared but no record"
 /// case. Each entry of `mappings` is a `"<service key> -> <attr spec>"` string.
 pub fn make_trusted_service_policy(
@@ -340,7 +366,17 @@ pub async fn create_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: u64) ->
     let route = Route::new_direct((*req).into());
     let vwmd = asm
         .visa_mgr
-        .create_visa(asm, req, &pdesc, &hit, &route, "", 0, vinst)
+        .create_visa(
+            asm,
+            req,
+            &pdesc,
+            &hit,
+            &route,
+            "",
+            0,
+            vinst,
+            SystemTime::now() + DEFAULT_EXPIRES,
+        )
         .await
         .unwrap();
     vwmd.visa.issuer_id

@@ -257,6 +257,48 @@ impl Policy {
         self.cpol_sources.get(idx).map(|s| s.as_str())
     }
 
+    /// Get the attribute keys for the `client` and `service` conditions of the
+    /// communication policy at index `idx`.
+    ///
+    /// Returns tuple of (CLIENT_KEYS, SERVICE_KEYS). Both are None when there is no
+    /// communication policy at `idx`; an empty vec means that side has no conditions.
+    ///
+    /// It is up to caller to make sure the ComPolicy index passed here is valid for
+    /// this policy.
+    ///
+    /// All parsing errors, etc are ignored here and most end up returning (None, None).
+    pub fn get_condition_keys_for_com_policy(
+        &self,
+        idx: usize,
+    ) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        // Helper to pull the `key` field out of every attribute expression in a condition list.
+        fn keys(conds: capnp::struct_list::Reader<policy_capnp::attr_expr::Owned>) -> Vec<String> {
+            conds
+                .iter()
+                .filter_map(|c| c.get_key().ok()?.to_string().ok())
+                .collect()
+        }
+
+        let Some(rdr) = self.policy_rdr.as_ref() else {
+            return (None, None);
+        };
+        let Ok(proot) = rdr.get_root::<policy_capnp::policy::Reader>() else {
+            return (None, None);
+        };
+        let Ok(coms) = proot.get_com_policies() else {
+            return (None, None);
+        };
+        // struct_list::get panics when out of bounds, so bounds-check first.
+        if idx >= coms.len() as usize {
+            return (None, None);
+        }
+        let com = coms.get(idx as u32);
+        (
+            com.get_client_conds().ok().map(keys),
+            com.get_service_conds().ok().map(keys),
+        )
+    }
+
     /// Pass the node ZPR address to get the list of peers (if any).
     pub fn get_peers_for_node(&self, node_zpr_addr: &IpAddr) -> Option<&[Peer]> {
         self.peer_table
@@ -579,6 +621,40 @@ mod test {
         let policy = Policy::new_empty();
 
         assert!(policy.get_cpol_source(0).is_none());
+    }
+
+    #[test]
+    /// get_condition_keys_for_com_policy returns the client/service condition keys for a
+    /// valid index, an empty vec for a side with no conditions, and (None, None) when the
+    /// index is out of bounds (which must not panic).
+    fn test_get_condition_keys_for_com_policy() {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
+            let mut coms = policy.reborrow().init_com_policies(1);
+            let mut com = coms.reborrow().get(0);
+            let mut client = com.reborrow().init_client_conds(2);
+            client.reborrow().get(0).set_key("user.role");
+            client.reborrow().get(1).set_key("user.dept");
+            com.reborrow().init_service_conds(0);
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+        let policy = Policy::new_from_policy_bytes(Bytes::from(bytes)).unwrap();
+
+        let (client, service) = policy.get_condition_keys_for_com_policy(0);
+        assert_eq!(client.unwrap(), vec!["user.role", "user.dept"]);
+        assert_eq!(service.unwrap(), Vec::<String>::new());
+
+        assert_eq!(
+            policy.get_condition_keys_for_com_policy(9),
+            (None, None),
+            "out-of-range index must return (None, None)"
+        );
+        assert_eq!(
+            Policy::new_empty().get_condition_keys_for_com_policy(0),
+            (None, None)
+        );
     }
 
     /// Build policy bytes carrying the given trusted service records (ids may repeat, so

@@ -469,6 +469,12 @@ impl EvalContext {
         Ok(hits)
     }
 
+    /// Check that all conditions on the passed `com_policy` are satisfied by
+    /// the `client_actor` and `service_actor`.  The policies "client
+    /// conditions" are checked against the client_actor, and the "service
+    /// conditions" are checked against the service_actor.
+    ///
+    /// To get an "allow/match", ALL conditions must be satisfied.
     fn match_policy_conditions(
         &self,
         client_actor: &Actor,

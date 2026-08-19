@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tracing::{debug, error, warn};
 
 use crate::assembly::Assembly;
@@ -320,7 +321,6 @@ impl VisaMgr {
 
     /// Placeholder implementation, called concurrently.
     /// Called after making use of libeval to check policy.
-    /// Using a const expiration (4 hrs).
     /// No checking to see if visa already exists.
     /// Fake keys.
     ///
@@ -339,18 +339,8 @@ impl VisaMgr {
         source_zpl: impl Into<String>,
         policy_version: u64,
         vinst: u64,
+        expiration_time: SystemTime,
     ) -> Result<VisaWithMetadata, ServiceError> {
-        // TODO: The visa expiration needs to be computed as watever is soonest:
-        //   - expiration of authentication of source actor
-        //   - expiration of authentication of destination actor
-        //   - expiration of any single attribute used to produce the visa (ie, a matching attribute)
-        //   - the system default maximum visa lifetime
-        let expiration_time = std::time::SystemTime::now()
-            .checked_add(config::DEFAULT_VISA_EXPIRATION)
-            .ok_or_else(|| {
-                ServiceError::Internal("failed to compute visa expiration time".to_string())
-            })?;
-
         let (source_port, dest_port) = match pdesc.five_tuple.l4_protocol {
             ip_proto::TCP | ip_proto::UDP => {
                 if pdesc.comm_flags == CommFlag::BiDirectional {
@@ -1317,7 +1307,17 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &src,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + config::MAX_VISA_LIFETIME,
+            )
             .await
             .unwrap();
 
@@ -1344,7 +1344,17 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &src,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + config::MAX_VISA_LIFETIME,
+            )
             .await
             .unwrap();
 
@@ -1390,7 +1400,17 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &dst, &pdesc, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &dst,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + config::MAX_VISA_LIFETIME,
+            )
             .await
             .unwrap();
 
@@ -1429,7 +1449,17 @@ mod tests {
 
         let visawmd = asm
             .visa_mgr
-            .create_visa(&asm, &src, &pdesc, &hit, &route, "", 0, 0)
+            .create_visa(
+                &asm,
+                &src,
+                &pdesc,
+                &hit,
+                &route,
+                "",
+                0,
+                0,
+                SystemTime::now() + config::MAX_VISA_LIFETIME,
+            )
             .await
             .unwrap();
 
