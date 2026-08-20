@@ -7,6 +7,7 @@ use tokio::sync::oneshot;
 use tokio::task::LocalSet;
 use tracing::{debug, info};
 
+use libeval::policy::Policy;
 use zpr::vsapi_types::{Link, ServiceDescriptor, Visa};
 
 use crate::assembly::Assembly;
@@ -205,10 +206,15 @@ impl VssHandle {
         resp_rx.await.map_err(|_| VssSyncError::ConnClosed)?
     }
 
-    /// Send a `setTopology` message to the node.
-    pub async fn set_topology(&self, links: Vec<Link>) -> Result<(), VssSyncError> {
+    /// Send a `setTopology` message to the node. `policy` must be the snapshot `links` was
+    /// computed from -- the worker resolves peers against it to mint bootstrap visas.
+    pub async fn set_topology(
+        &self,
+        links: Vec<Link>,
+        policy: Arc<Policy>,
+    ) -> Result<(), VssSyncError> {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let cmd = VssCmd::SetTopology(links, resp_tx);
+        let cmd = VssCmd::SetTopology(links, policy, resp_tx);
         self.send_command(cmd).await?;
         resp_rx.await.map_err(|_| VssSyncError::ConnClosed)?
     }

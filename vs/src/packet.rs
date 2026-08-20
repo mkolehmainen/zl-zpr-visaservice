@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 
-use zpr::vsapi_types::VsapiFiveTuple;
 use zpr::vsapi_types::vsapi_ip_number as ip_proto;
+use zpr::vsapi_types::{PacketDesc, VsapiFiveTuple};
 
 use crate::error::ServiceError;
 
@@ -29,4 +29,13 @@ pub fn make_fivetuple_tcp(
         source_port,
         dest_port,
     })
+}
+
+/// One-line `src:port -> dst:port proto` for logging a request's flow.
+pub fn describe_five_tuple(pdesc: &PacketDesc) -> String {
+    let ft = &pdesc.five_tuple;
+    format!(
+        "{}:{} -> {}:{} proto {}",
+        ft.source_addr, ft.source_port, ft.dest_addr, ft.dest_port, ft.l4_protocol
+    )
 }

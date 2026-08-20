@@ -46,6 +46,18 @@ fn resolve_docking_node(asm: &Assembly, actor: &Actor, zpr_addr: &IpAddr) -> Opt
         .or_else(|| asm.actor_mgr.get_docking_node_for_aaa(zpr_addr))
 }
 
+/// Docking node of whatever actor owns `zpr_addr` -- the node its traffic enters the fabric
+/// at. As [resolve_docking_node] but starting from the address alone, for callers holding a
+/// five-tuple rather than an actor. `None` if the actor is unknown or undocked.
+pub(crate) async fn docking_node_for_addr(asm: &Assembly, zpr_addr: &IpAddr) -> Option<IpAddr> {
+    match asm.actor_mgr.get_actor_by_zpr_addr(zpr_addr).await {
+        Ok(Some(actor)) => resolve_docking_node(asm, &actor, zpr_addr),
+        // Anonymous actors are fabricated per request and never stored, so for an AAA
+        // address the AAA table is the only record of where it docked.
+        _ => asm.actor_mgr.get_docking_node_for_aaa(zpr_addr),
+    }
+}
+
 /// Shared policy-evaluation core: resolve both docking nodes, require a route,
 /// then run the actors and packet through the policy (handling `NeedsRoute` route
 /// evaluation). An undocked endpoint or no best route falls out as `Deny`.

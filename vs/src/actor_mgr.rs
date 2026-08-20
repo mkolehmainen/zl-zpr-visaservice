@@ -340,13 +340,19 @@ impl ActorMgr {
             actor.get_zpr_addr().copied()
         } else {
             if let Some(actor_addr) = actor.get_zpr_addr() {
-                self.connection_table
-                    .get(actor_addr)
-                    .map(|entry| *entry.value())
+                self.get_docking_node_for_adapter(actor_addr)
             } else {
                 None
             }
         }
+    }
+
+    /// Docking node of an adapter identified by its ZPR address alone -- used where we
+    /// have the address but no actor, e.g. the visa service's own adapter address.
+    pub fn get_docking_node_for_adapter(&self, adapter_addr: &IpAddr) -> Option<IpAddr> {
+        self.connection_table
+            .get(adapter_addr)
+            .map(|entry| *entry.value())
     }
 
     /// Register the docking node for an AAA actor. Called on the request side when an

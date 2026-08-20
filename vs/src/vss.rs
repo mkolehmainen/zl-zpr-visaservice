@@ -1,8 +1,10 @@
 //! Shared VSS related types.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
+use libeval::policy::Policy;
 use zpr::vsapi_types::{Link, Param, ServiceDescriptor, Visa};
 
 use crate::error::VssSyncError;
@@ -25,5 +27,11 @@ pub enum VssCmd {
         oneshot::Sender<VssSetServicesResponse>,
     ), // (version, services-descriptor-list, channel)
     Configure(Vec<Param>, oneshot::Sender<VssConfigureResponse>),
-    SetTopology(Vec<Link>, oneshot::Sender<VssSetTopologyResponse>),
+    /// The links plus the policy snapshot they were computed from. The snapshot rides along
+    /// so bootstrap-visa minting resolves peers against the same view that produced the links.
+    SetTopology(
+        Vec<Link>,
+        Arc<Policy>,
+        oneshot::Sender<VssSetTopologyResponse>,
+    ),
 }

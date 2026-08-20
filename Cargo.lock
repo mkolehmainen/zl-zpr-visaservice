@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "admin-api-types"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2205,7 +2205,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libeval"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "base64",
  "bytes",
@@ -4516,7 +4516,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vs"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "admin-api-types",
  "arc-swap",
@@ -4570,7 +4570,7 @@ dependencies = [
 
 [[package]]
 name = "vs-admin"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "admin-api-types",
  "base64",
@@ -5382,8 +5382,8 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zpr"
-version = "0.22.0"
-source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.21.1#f58b46b7c26f31cba69cc7761b03bd470cbd66ee"
+version = "0.22.1"
+source = "git+https://github.com/org-zpr/zpr-common.git?tag=v0.22.1#017b7b5881dc934fce1a374cf8a4bfc32e7df7ba"
 dependencies = [
  "base64",
  "bytes",
@@ -5405,7 +5405,7 @@ dependencies = [
 
 [[package]]
 name = "zpt"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bytes",
  "capnp",

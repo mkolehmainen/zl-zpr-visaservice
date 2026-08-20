@@ -7,6 +7,7 @@ use rand::{RngCore, SeedableRng};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
+use zpr::addrs;
 
 use crate::config;
 use crate::error::ServiceError;
@@ -21,6 +22,18 @@ const NODE_AAA_PREFIX_LEN: u8 = 88;
 /// ZPRnet AAA network is a /64.
 pub const AAA_NET: Ipv6Net =
     Ipv6Net::new_assert(Ipv6Addr::new(0xfd5a, 0x5052, 0, 0x0aaa, 0, 0, 0, 0), 64);
+
+/// The whole ZPRnet address space.
+const ZPR_NET: Ipv6Net = Ipv6Net::new_assert(addrs::ZPR_INTERNAL_NETWORK, addrs::ZPRNET_PREFIX_LEN);
+
+/// True if `addr` is a ZPR address, i.e. a peer at this address reached us over ZPR rather
+/// than over the substrate.
+pub fn is_zpr_addr(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V6(v6) => ZPR_NET.contains(v6),
+        IpAddr::V4(_) => false,
+    }
+}
 
 pub struct NetMgr {
     node_addrs: Arc<Mutex<dyn AddrAllocator + Send>>,
@@ -392,6 +405,16 @@ impl AddrAllocator for Addr4Allocator {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// Only ZPRnet addresses are ZPR addresses: a substrate address (of either family) is
+    /// not, which is what distinguishes a node arriving over a link from the first node.
+    #[test]
+    fn test_is_zpr_addr() {
+        assert!(is_zpr_addr(&"fd5a:5052:90de:1::1".parse().unwrap()));
+        assert!(is_zpr_addr(&"fd5a:5052::1".parse().unwrap()));
+        assert!(!is_zpr_addr(&"fd00:1234::1".parse().unwrap()));
+        assert!(!is_zpr_addr(&"10.0.0.1".parse().unwrap()));
+    }
 
     #[tokio::test]
     async fn v6_allocate_release_adapter_and_node() {

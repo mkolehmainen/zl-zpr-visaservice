@@ -104,6 +104,10 @@ pub enum CounterType {
 
     AuthorizeConnectSuccess,
     AuthorizeConnectFailed,
+
+    /// A policy-declared link could not be installed during a VSAPI join. The node is
+    /// connected but has no route over that link until an endpoint reconnects.
+    LinkInstallFailed,
 }
 
 impl CounterType {

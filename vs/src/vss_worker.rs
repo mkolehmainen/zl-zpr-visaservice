@@ -13,6 +13,7 @@ use tokio_rustls::TlsConnector;
 use tokio_util::compat::*;
 use tracing::{debug, error, info, trace, warn};
 
+use libeval::policy::Policy;
 use zpr::vsapi::v1;
 use zpr::vsapi_types::{ApiResponseError, Link, Param, ServiceDescriptor, Visa, VisaOp, pname};
 use zpr::write_to::WriteTo;
@@ -23,6 +24,7 @@ use crate::counters::CounterType;
 use crate::error::VssSyncError;
 use crate::logging::targets::VSS;
 use crate::net_mgr;
+use crate::visa_bootstrap;
 use crate::vss::VssCmd;
 
 /// Default timeout for a single Cap'n Proto RPC call.
@@ -174,9 +176,9 @@ pub async fn vss_worker_loop(
                                 asm.counters.incr(CounterType::VssErrors);
                             }
                         }
-                        VssCmd::SetTopology(links, resp_tx) => {
+                        VssCmd::SetTopology(links, policy, resp_tx) => {
                             state.mark_topology_updated();
-                            if let Err(e) = resp_tx.send(vss_do_set_topology(&vss_handle, &links).await) {
+                            if let Err(e) = resp_tx.send(vss_do_set_topology(&vss_handle, asm.clone(), &node_addr.ip(), policy, links).await) {
                                 error!(target: VSS, "failed to send response for set-topology command: {:?}", e);
                                 asm.counters.incr(CounterType::VssErrors);
                             }
@@ -460,10 +462,20 @@ async fn send_topology(
     node_addr: &IpAddr,
     vss_handle: &v1::v_s_s_handle::Client,
 ) {
-    let links = asm.policy_mgr.resolved_links_for_node(node_addr);
+    // One snapshot for both the links and the bootstrap-visa peer lookup inside.
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    let links = psnap.links_for_node(node_addr);
 
     debug!(target: VSS, "sending initial topology to VSS at {}", node_addr);
-    if let Err(e) = vss_do_set_topology(vss_handle, &links).await {
+    if let Err(e) = vss_do_set_topology(
+        vss_handle,
+        asm.clone(),
+        node_addr,
+        psnap.policy_arc(),
+        links,
+    )
+    .await
+    {
         error!(target: VSS, "failed to send initial topology to VSS at {}: {}", node_addr, e);
         asm.counters.incr(CounterType::VssErrors);
     } else {
@@ -660,12 +672,60 @@ async fn vss_do_configure(
     check_ok_or_error(configure_response_ok_or_err.get_res().unwrap())
 }
 
-/// Pass an empty slice to indicate no peers.
+/// Send the node's links via the `setTopology` RPC. Pass an empty slice to indicate no peers.
 ///
+/// `node_addr` is the ZPR address of the node on the other end of `vss_handle`; the links are
+/// that node's view of the topology, so the peer lookup below must be keyed by it.
+///
+/// `policy` must be the snapshot `peers` was computed from. Reacquiring the current policy here
+/// would let a newly installed one pair its peers with the older snapshot's links.
 async fn vss_do_set_topology(
     vss_handle: &v1::v_s_s_handle::Client,
-    peers: &[Link],
+    asm: Arc<Assembly>,
+    node_addr: &IpAddr,
+    policy: Arc<Policy>,
+    mut peers: Vec<Link>,
 ) -> Result<(), VssSyncError> {
+    // HACK -> This hack here is to support our intial MULTINODE implementation.
+    // We create "bootstrap" visas for each peer in the topology message, every
+    // time we send it: one for the peer's own SYN to VSAPI, one for the visa
+    // service's reply to it.
+    //
+    // The visas belong to the peer, not to the node to whom we are sending the
+    // message: that node holds them and hands them off when the peer connects.
+    //
+    // Minting bypasses policy evaluation entirely -- see
+    // [crate::visa_bootstrap], which is where all of this lives and where it
+    // gets deleted from.
+    //
+    // TODO: Reevaluate this.
+
+    // Both ends of an edge share a link_id, and each end's `remote_zpr_addr` is only
+    // meaningful under its own node key -- so resolve the link within `node_addr`'s peers.
+    let node_peers = policy.get_peers_for_node(node_addr).unwrap_or_default();
+    for link in &mut peers {
+        let Some(peer) = node_peers.iter().find(|p| p.link_id == link.link_id) else {
+            warn!(target: VSS, "no peer entry for link {} under node {node_addr}; sending it without bootstrap visas", link.link_id);
+            continue;
+        };
+        // The link is between `node_addr` and `peer.remote_zpr_addr`. Fail the whole call rather
+        // than sending the link bare: without the visas the peer cannot reach VSAPI, so the link
+        // is useless, and returning Ok would let `send_topology` mark topology synced and stop
+        // housekeeping from ever retrying. Minting is idempotent, so the retry is free.
+        //
+        // An already-connected peer is the exception and yields no visas -- it has a VSAPI
+        // session of its own and asks for what it needs.
+        let visas = visa_bootstrap::visas_for_link(&asm, &policy, &peer.remote_zpr_addr, node_addr)
+            .await
+            .map_err(|e| {
+                VssSyncError::Internal(format!(
+                    "failed to create bootstrap visas for future peer {}: {e}",
+                    peer.remote_zpr_addr
+                ))
+            })?;
+        link.visas.extend(visas);
+    }
+
     let mut req = vss_handle.set_topology_request();
     let req_builder = req.get();
     let mut peer_list_builder = req_builder.init_links(peers.len() as u32);

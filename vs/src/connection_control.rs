@@ -129,6 +129,12 @@ impl ConnectionControl {
     ///
     /// See https://github.com/org-zpr/zpr-visaservice/issues/205
     ///
+    /// The `remote` arg is the TCP peer address of the node.  So it will be a ZPR address and an
+    /// ephemeral socket. Not very useful.  Originally this was supposed to be a substrate address
+    /// but we are not yet told that.
+    ///
+    /// See https://github.com/org-zpr/zpr-visaservice/issues/299
+    ///
     pub async fn authenticate_node(
         &self,
         asm: Arc<Assembly>,
@@ -144,7 +150,21 @@ impl ConnectionControl {
         // adapter request.
 
         let mut authd_claims: Vec<Attribute> = Vec::new();
-        authd_claims.push(Attribute::builder(key::SUBSTRATE_ADDR).value(remote.to_string()));
+
+        // Policy might contain the real substrate address.
+        // Otherwise we just use the peer address. Not ideal, but doesn't matter yet since no one is actually
+        // using the SUBSTRATE_ADDR property yet -- BUT code later (db/node.rs) requires that this property
+        // is set.
+        // See: https://github.com/org-zpr/zpr-visaservice/issues/299
+        let substrate_addr = match substrate_addr_from_topology(&asm, &node_req_addr) {
+            Some(sa) => sa,
+            None => {
+                warn!(target: CC, "node {cn} has no substrate address in policy - using peer address {remote}");
+                remote
+            }
+        };
+        authd_claims
+            .push(Attribute::builder(key::SUBSTRATE_ADDR).value(substrate_addr.to_string()));
         match a2a_dh_pubkey.and_then(a2a_dh_pubkey_claim) {
             Some(attr) => authd_claims.push(attr),
             None => warn!(target: CC, "node {cn} sent no usable A2A DH public key"),
@@ -549,6 +569,29 @@ impl ConnectionControl {
     }
 }
 
+/// A node's own substrate address, taken from the resolved topology: for a peer `P` sharing
+/// a link with `node_addr`, `P`'s resolved link points back at `node_addr`'s substrate. That
+/// value is authoritative (it is what policy declares and what every peer dials) and is
+/// already DNS-resolved, so it parses as a `SocketAddr`.
+///
+/// Returns `None` when policy declares no peering for the node, or none of its links appear
+/// in the resolved topology -- both mean policy cannot tell us.
+///
+/// Does not support multi-homed nodes!
+fn substrate_addr_from_topology(asm: &Assembly, node_addr: &IpAddr) -> Option<SocketAddr> {
+    let psnap = asm.policy_mgr.get_current_snapshot();
+    for peer in psnap.policy().get_peers_for_node(node_addr)? {
+        if let Some(link) = psnap
+            .links_for_node(&peer.remote_zpr_addr)
+            .into_iter()
+            .find(|l| l.link_id == peer.link_id)
+        {
+            return Some(SocketAddr::new(link.peer.addr, link.peer.port));
+        }
+    }
+    None
+}
+
 /// Required claims must be present and non-empty.
 fn check_required_claims(claims: &[Claim], required: &[&str]) -> Result<(), ServiceError> {
     let mut required_set = std::collections::HashSet::new();
@@ -650,6 +693,45 @@ mod tests {
 
     fn make_cc(ident: &str) -> ConnectionControl {
         ConnectionControl::new(ident.to_string())
+    }
+
+    /// A node's substrate address comes from its peer's view of their shared link, and is
+    /// `None` when policy declares no peering for it.
+    #[tokio::test]
+    async fn test_substrate_addr_from_topology() {
+        use crate::assembly::tests::new_assembly_for_tests;
+        use crate::db::PolicyRepo;
+        use crate::policy_mgr::PolicyMgr;
+        use crate::test_helpers::{FakeResolver, make_peering, policy_with_peerings};
+        use crate::trusted_services::TrustedServicesMgr;
+        use std::path::PathBuf;
+
+        let a: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
+        let b: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
+        let unpeered: IpAddr = "fd5a:5052:90de:1::9".parse().unwrap();
+
+        let mut asm = new_assembly_for_tests(None).await;
+        asm.policy_mgr = PolicyMgr::new_with_initial_policy(
+            policy_with_peerings(&[make_peering(a, b, "link-ab", vec![])]),
+            PolicyRepo::new(asm.state_db.clone()),
+            Arc::new(FakeResolver::ip_only()),
+            Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
+        )
+        .await
+        .unwrap();
+
+        // make_peering uses each node's own address as its substrate, port 0.
+        assert_eq!(
+            substrate_addr_from_topology(&asm, &b),
+            Some(SocketAddr::new(b, 0)),
+            "node B's substrate is the address peer A dials it at"
+        );
+        assert_eq!(
+            substrate_addr_from_topology(&asm, &unpeered),
+            None,
+            "a node with no peering has no policy-derived substrate"
+        );
     }
 
     fn decode_jwt(token: &str, secret: &str) -> Result<JwtClaims, jwt::errors::Error> {

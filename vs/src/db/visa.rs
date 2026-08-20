@@ -58,6 +58,9 @@ pub enum NodeVisaState {
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisaMetadata {
+    /// The node this visa was issued to. NOT necessarily the node the flow ingresses at --
+    /// the visa service also mints visas pre-emptively for flows it originates itself -- so
+    /// do not derive path geometry from it. Use `path` ordering for that.
     pub requesting_node: IpAddr,
     #[serde_as(as = "TimestampSeconds<i64>")]
     pub ctime: SystemTime,
@@ -67,7 +70,10 @@ pub struct VisaMetadata {
     pub zpl: String,
     pub signal_msgs: Vec<String>, // note we do not keep the signal destination
     pub direction: Direction,
-    pub path: Option<Vec<IpAddr>>, // ZPR addresses of nodes on the path only set if a link needs to be traversed.
+    /// ZPR addresses of the nodes on the path, in flow order: ingress node first, egress node
+    /// last. Only set if a link needs to be traversed. Actualization reads each node's role
+    /// off this ordering, so whoever builds one must keep it in flow order.
+    pub path: Option<Vec<IpAddr>>,
     pub five_tuple: VsapiFiveTuple,
 }
 
@@ -652,6 +658,14 @@ impl VisaRepo {
         let mut visas = Vec::new();
         for_each_node_visa_in_state(&store, node_addr, state, |_, e| visas.push(e.visa.clone()));
         Ok(visas)
+    }
+
+    /// The state a live visa is in on one node, or `None` when the visa is unknown/expired or
+    /// was never staged for that node. Read-only, for explaining a failed state transition.
+    pub fn get_node_visa_state(&self, visa_id: u64, node_addr: &IpAddr) -> Option<NodeVisaState> {
+        let store = self.inner.store.read().unwrap();
+        let entry = live_entry(&store, visa_id)?;
+        entry.node_states.get(node_addr).map(|ns| ns.state)
     }
 
     /// The visa IDs for a node filtered by state, without cloning the visas.
