@@ -581,12 +581,12 @@ impl ConnectionControl {
 fn substrate_addr_from_topology(asm: &Assembly, node_addr: &IpAddr) -> Option<SocketAddr> {
     let psnap = asm.policy_mgr.get_current_snapshot();
     for peer in psnap.policy().get_peers_for_node(node_addr)? {
-        if let Some(link) = psnap
-            .links_for_node(&peer.remote_zpr_addr)
+        if let Some((_, sock_addr)) = psnap
+            .resolved_peers_for_node(&peer.remote_zpr_addr)
             .into_iter()
-            .find(|l| l.link_id == peer.link_id)
+            .find(|(link_id, _)| *link_id == peer.link_id)
         {
-            return Some(SocketAddr::new(link.peer.addr, link.peer.port));
+            return Some(sock_addr);
         }
     }
     None

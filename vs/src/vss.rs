@@ -5,9 +5,10 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use libeval::policy::Policy;
-use zpr::vsapi_types::{Link, Param, ServiceDescriptor, Visa};
+use zpr::vsapi_types::{Param, ServiceDescriptor, Visa};
 
 use crate::error::VssSyncError;
+use crate::policy_mgr::ResolvedPeer;
 
 pub type VssPushResponse = Result<usize, VssSyncError>; // usize is number items pushed.
 pub type VssRevokeAuthResponse = Result<usize, VssSyncError>; // usize is number of items revoked.
@@ -27,10 +28,11 @@ pub enum VssCmd {
         oneshot::Sender<VssSetServicesResponse>,
     ), // (version, services-descriptor-list, channel)
     Configure(Vec<Param>, oneshot::Sender<VssConfigureResponse>),
-    /// The links plus the policy snapshot they were computed from. The snapshot rides along
-    /// so bootstrap-visa minting resolves peers against the same view that produced the links.
+    /// The resolved peers plus the policy snapshot they were computed from. The snapshot
+    /// rides along so the worker can build the wire-level `Link` structs (including
+    /// bootstrap-visa minting) against the same view that produced the peers.
     SetTopology(
-        Vec<Link>,
+        Vec<ResolvedPeer>,
         Arc<Policy>,
         oneshot::Sender<VssSetTopologyResponse>,
     ),

@@ -22,7 +22,6 @@ use tracing::{debug, info};
 use libeval::policy::{LinkDescription, Peer, Policy};
 
 use zpr::policy_types::{NetAddr, NetworkHost, PolicyContainerBytes};
-use zpr::vsapi_types::{Link, LinkRole, SockAddr};
 
 use crate::config;
 use crate::db;
@@ -46,12 +45,18 @@ pub trait DnsResolver: Send + Sync {
 /// active, including policies for different domains.
 pub const DEFAULT_POLICY_ID: u64 = 0;
 
+/// A peer link resolved from policy topology: the link id paired with the peer's
+/// DNS-resolved substrate address. This is all the policy manager computes; the
+/// wire-level vsapi `Link` struct is built from it only when a topology message
+/// is actually sent (see `vss_worker::vss_do_set_topology`).
+pub type ResolvedPeer = (String, SocketAddr);
+
 /// Combined policy, source container, and resolved topology — swapped atomically
 /// as a unit so the three can never drift apart.
 struct PolicyState {
     policy: Arc<Policy>,
     container: PolicyContainerBytes,
-    links_by_node: HashMap<IpAddr, Vec<Link>>,
+    resolved_peers_by_node: HashMap<IpAddr, Vec<ResolvedPeer>>,
     /// Attribute stores for the trusted services this policy declares. Republished to
     /// `ts_mgr` on every successful swap so the stores can never outlive their policy.
     trusted_services: Vec<Arc<dyn TrustedServiceInterface>>,
@@ -100,9 +105,13 @@ impl PolicySnapshot {
         self.0.container.clone()
     }
 
-    /// The resolved links for `node` as captured by this snapshot.
-    pub fn links_for_node(&self, node: &IpAddr) -> Vec<Link> {
-        self.0.links_by_node.get(node).cloned().unwrap_or_default()
+    /// The resolved peers for `node` as captured by this snapshot.
+    pub fn resolved_peers_for_node(&self, node: &IpAddr) -> Vec<ResolvedPeer> {
+        self.0
+            .resolved_peers_by_node
+            .get(node)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Dispatches to [Policy::describe_link] on the captured policy.
@@ -251,7 +260,7 @@ impl PolicyMgr {
         previous: Option<&PolicyState>,
     ) -> Result<PolicyState, ServiceError> {
         let policy = loaded.policy();
-        let links_by_node = resolver.resolve_topology(&policy).await?;
+        let resolved_peers_by_node = resolver.resolve_topology(&policy).await?;
         let ts_definitions = trusted_service_definitions(&policy)?;
         let trusted_services = match previous {
             // Identical declarations mean the live stores are still correct.
@@ -264,7 +273,7 @@ impl PolicyMgr {
         Ok(PolicyState {
             policy,
             container: loaded.container().clone(),
-            links_by_node,
+            resolved_peers_by_node,
             trusted_services,
             ts_definitions,
         })
@@ -386,21 +395,22 @@ impl PolicyResolver {
     async fn resolve_topology(
         &self,
         policy: &Policy,
-    ) -> Result<HashMap<IpAddr, Vec<Link>>, ResolverError> {
-        let mut links_by_node: HashMap<IpAddr, Vec<Link>> = HashMap::new();
+    ) -> Result<HashMap<IpAddr, Vec<ResolvedPeer>>, ResolverError> {
+        let mut resolved_by_node: HashMap<IpAddr, Vec<ResolvedPeer>> = HashMap::new();
         for node_addr in policy.all_peered_nodes() {
             if let Some(peers) = policy.get_peers_for_node(node_addr) {
-                let links = self.peers_to_links(peers).await?;
-                links_by_node.insert(*node_addr, links);
+                let resolved = self.resolve_peers(peers).await?;
+                resolved_by_node.insert(*node_addr, resolved);
             }
         }
-        Ok(links_by_node)
+        Ok(resolved_by_node)
     }
 
     /// Peers from policy may include hostnames. Here we run any hostnames through a
-    /// DNS lookup and create concrete `Link` objects with IP addresses. Returns an error
-    /// if any peer's address fails to resolve.
-    async fn peers_to_links(&self, peers: &[Peer]) -> Result<Vec<Link>, ResolverError> {
+    /// DNS lookup, pairing each peer's link id with its concrete socket address.
+    /// Returns an error if any peer's address fails to resolve. Building the wire-level
+    /// vsapi `Link` struct is deliberately deferred to the topology-message send path.
+    async fn resolve_peers(&self, peers: &[Peer]) -> Result<Vec<ResolvedPeer>, ResolverError> {
         // Parallelize the DNS lookups then check for the first error.
         let futs = peers.iter().map(|peer| async move {
             (
@@ -412,19 +422,7 @@ impl PolicyResolver {
         futures::future::join_all(futs)
             .await
             .into_iter()
-            .map(|(peer, result)| {
-                result.map(|sock_addr| Link {
-                    link_id: peer.link_id.clone(),
-                    role: LinkRole::Active, // only "active" support at the moment.
-                    peer: SockAddr {
-                        addr: sock_addr.ip(),
-                        port: sock_addr.port(),
-                    },
-                    visas: Vec::new(), // this is used only when sending topology messages
-                                       // TODO: Why are use re-using a vsapi type here anyway?
-                                       // See https://github.com/org-zpr/zpr-visaservice/issues/300
-                })
-            })
+            .map(|(peer, result)| result.map(|sock_addr| (peer.link_id.clone(), sock_addr)))
             .collect()
     }
 }
@@ -639,7 +637,7 @@ mod tests {
         assert_eq!(mgr.get_current().vinst(), 1);
         assert!(
             mgr.get_current_snapshot()
-                .links_for_node(&ip("fd5a:5052::1"))
+                .resolved_peers_for_node(&ip("fd5a:5052::1"))
                 .is_empty()
         );
 
@@ -656,7 +654,7 @@ mod tests {
         // Topology swapped in: node now has a resolved link.
         assert!(
             !mgr.get_current_snapshot()
-                .links_for_node(&ip("fd5a:5052::1"))
+                .resolved_peers_for_node(&ip("fd5a:5052::1"))
                 .is_empty()
         );
         // Container swapped in and round-trips.
@@ -711,7 +709,7 @@ mod tests {
         let snap = mgr.get_current_snapshot();
         assert_eq!(snap.vinst(), 1);
         assert!(
-            !snap.links_for_node(&a).is_empty(),
+            !snap.resolved_peers_for_node(&a).is_empty(),
             "snapshot must see the link its policy describes"
         );
 
@@ -725,18 +723,18 @@ mod tests {
         // The already-held snapshot is unchanged: still vinst 1, still has the old link.
         assert_eq!(snap.vinst(), 1, "held snapshot must not see the new vinst");
         assert!(
-            !snap.links_for_node(&a).is_empty(),
+            !snap.resolved_peers_for_node(&a).is_empty(),
             "held snapshot must retain its captured links"
         );
 
         // A freshly taken snapshot reflects the update.
         let snap2 = mgr.get_current_snapshot();
         assert_eq!(snap2.vinst(), 2);
-        assert!(snap2.links_for_node(&a).is_empty());
+        assert!(snap2.resolved_peers_for_node(&a).is_empty());
     }
 
     /// Build a `Peer` whose substrate is a plain IP address (no hostname), so
-    /// `peers_to_links` resolves it without any DNS lookup.
+    /// `resolve_peers` resolves it without any DNS lookup.
     fn ip_peer(link_id: &str, ip: IpAddr, port: u16) -> Peer {
         let substrate = NetAddr {
             host: NetworkHost::Ip(ip),
@@ -745,57 +743,55 @@ mod tests {
         Peer {
             link_id: link_id.to_string(),
             remote_zpr_addr: "fd5a:5052::1".parse().unwrap(),
-            // local end is irrelevant to peers_to_links, so reuse the remote one.
+            // local end is irrelevant to resolve_peers, so reuse the remote one.
             local_substrate: substrate.clone(),
             remote_substrate: substrate,
         }
     }
 
-    /// Empty peer slice produces an empty link list.
+    /// Empty peer slice produces an empty resolved-peer list.
     #[tokio::test]
-    async fn test_peers_to_links_empty() {
+    async fn test_resolve_peers_empty() {
         let presolver = PolicyResolver::new(Arc::new(FakeResolver::ip_only()));
-        let links = presolver.peers_to_links(&[]).await.unwrap();
-        assert!(links.is_empty());
+        let resolved = presolver.resolve_peers(&[]).await.unwrap();
+        assert!(resolved.is_empty());
     }
 
-    /// A single IP peer maps to a single Link with the correct fields.
+    /// A single IP peer maps to a single (link_id, addr) pair with the correct fields.
     #[tokio::test]
-    async fn test_peers_to_links_single_ip() {
+    async fn test_resolve_peers_single_ip() {
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let peer = ip_peer("link-a", ip, 4000);
         let presolver = PolicyResolver::new(Arc::new(FakeResolver::ip_only()));
 
-        let links = presolver.peers_to_links(&[peer]).await.unwrap();
+        let resolved = presolver.resolve_peers(&[peer]).await.unwrap();
 
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].link_id, "link-a");
-        assert_eq!(links[0].role, LinkRole::Active);
-        assert_eq!(links[0].peer.addr, ip);
-        assert_eq!(links[0].peer.port, 4000);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "link-a");
+        assert_eq!(resolved[0].1, SocketAddr::new(ip, 4000));
     }
 
-    /// Multiple IP peers produce one Link each, in the same order.
+    /// Multiple IP peers produce one resolved pair each, in the same order.
     #[tokio::test]
-    async fn test_peers_to_links_multiple_ips() {
+    async fn test_resolve_peers_multiple_ips() {
         let ip_a: IpAddr = "192.0.2.1".parse().unwrap();
         let ip_b: IpAddr = "192.0.2.2".parse().unwrap();
         let peers = [ip_peer("link-a", ip_a, 4000), ip_peer("link-b", ip_b, 5000)];
         let presolver = PolicyResolver::new(Arc::new(FakeResolver::ip_only()));
 
-        let links = presolver.peers_to_links(&peers).await.unwrap();
+        let resolved = presolver.resolve_peers(&peers).await.unwrap();
 
-        assert_eq!(links.len(), 2);
-        assert_eq!(links[0].link_id, "link-a");
-        assert_eq!(links[0].peer.addr, ip_a);
-        assert_eq!(links[1].link_id, "link-b");
-        assert_eq!(links[1].peer.addr, ip_b);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].0, "link-a");
+        assert_eq!(resolved[0].1.ip(), ip_a);
+        assert_eq!(resolved[1].0, "link-b");
+        assert_eq!(resolved[1].1.ip(), ip_b);
     }
 
-    /// A peer with an unresolvable hostname causes peers_to_links to return an error.
+    /// A peer with an unresolvable hostname causes resolve_peers to return an error.
     /// FakeResolver has no entries, so any hostname lookup returns NoAddresses.
     #[tokio::test]
-    async fn test_peers_to_links_bad_hostname_errors() {
+    async fn test_resolve_peers_bad_hostname_errors() {
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let good = ip_peer("link-good", ip, 4000);
         let bad = Peer {
@@ -812,7 +808,7 @@ mod tests {
         };
         let presolver = PolicyResolver::new(Arc::new(FakeResolver::ip_only()));
 
-        let result = presolver.peers_to_links(&[good, bad]).await;
+        let result = presolver.resolve_peers(&[good, bad]).await;
 
         assert!(result.is_err());
     }
@@ -924,7 +920,7 @@ mod tests {
 
     /// A hostname peer is resolved to the expected IP address via the FakeResolver.
     #[tokio::test]
-    async fn test_peers_to_links_hostname_resolved() {
+    async fn test_resolve_peers_hostname_resolved() {
         let resolved_ip: IpAddr = "192.0.2.99".parse().unwrap();
         let peer = Peer {
             link_id: "link-h".to_string(),
@@ -945,11 +941,10 @@ mod tests {
         );
         let presolver = PolicyResolver::new(Arc::new(FakeResolver::new(entries)));
 
-        let links = presolver.peers_to_links(&[peer]).await.unwrap();
+        let resolved = presolver.resolve_peers(&[peer]).await.unwrap();
 
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].link_id, "link-h");
-        assert_eq!(links[0].peer.addr, resolved_ip);
-        assert_eq!(links[0].peer.port, 5000);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "link-h");
+        assert_eq!(resolved[0].1, SocketAddr::new(resolved_ip, 5000));
     }
 }

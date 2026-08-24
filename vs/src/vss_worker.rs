@@ -15,7 +15,9 @@ use tracing::{debug, error, info, trace, warn};
 
 use libeval::policy::Policy;
 use zpr::vsapi::v1;
-use zpr::vsapi_types::{ApiResponseError, Link, Param, ServiceDescriptor, Visa, VisaOp, pname};
+use zpr::vsapi_types::{
+    ApiResponseError, Link, LinkRole, Param, ServiceDescriptor, SockAddr, Visa, VisaOp, pname,
+};
 use zpr::write_to::WriteTo;
 
 use crate::assembly::Assembly;
@@ -24,6 +26,7 @@ use crate::counters::CounterType;
 use crate::error::VssSyncError;
 use crate::logging::targets::VSS;
 use crate::net_mgr;
+use crate::policy_mgr::ResolvedPeer;
 use crate::visa_bootstrap;
 use crate::vss::VssCmd;
 
@@ -462,9 +465,9 @@ async fn send_topology(
     node_addr: &IpAddr,
     vss_handle: &v1::v_s_s_handle::Client,
 ) {
-    // One snapshot for both the links and the bootstrap-visa peer lookup inside.
+    // One snapshot for both the resolved peers and the bootstrap-visa peer lookup inside.
     let psnap = asm.policy_mgr.get_current_snapshot();
-    let links = psnap.links_for_node(node_addr);
+    let peers = psnap.resolved_peers_for_node(node_addr);
 
     debug!(target: VSS, "sending initial topology to VSS at {}", node_addr);
     if let Err(e) = vss_do_set_topology(
@@ -472,7 +475,7 @@ async fn send_topology(
         asm.clone(),
         node_addr,
         psnap.policy_arc(),
-        links,
+        peers,
     )
     .await
     {
@@ -672,19 +675,24 @@ async fn vss_do_configure(
     check_ok_or_error(configure_response_ok_or_err.get_res().unwrap())
 }
 
-/// Send the node's links via the `setTopology` RPC. Pass an empty slice to indicate no peers.
+/// Send the node's links via the `setTopology` RPC. Pass an empty vec to indicate no peers.
+///
+/// This is the one place the wire-level vsapi `Link` structs are built: `peers` carries
+/// only what the policy manager computed (link id + resolved substrate address), and the
+/// full `Link` — role, peer address, bootstrap visas — is materialized here, just before
+/// it goes on the wire.
 ///
 /// `node_addr` is the ZPR address of the node on the other end of `vss_handle`; the links are
 /// that node's view of the topology, so the peer lookup below must be keyed by it.
 ///
 /// `policy` must be the snapshot `peers` was computed from. Reacquiring the current policy here
-/// would let a newly installed one pair its peers with the older snapshot's links.
+/// would let a newly installed one pair its peers with the older snapshot's resolved peers.
 async fn vss_do_set_topology(
     vss_handle: &v1::v_s_s_handle::Client,
     asm: Arc<Assembly>,
     node_addr: &IpAddr,
     policy: Arc<Policy>,
-    mut peers: Vec<Link>,
+    peers: Vec<ResolvedPeer>,
 ) -> Result<(), VssSyncError> {
     // HACK -> This hack here is to support our intial MULTINODE implementation.
     // We create "bootstrap" visas for each peer in the topology message, every
@@ -703,9 +711,20 @@ async fn vss_do_set_topology(
     // Both ends of an edge share a link_id, and each end's `remote_zpr_addr` is only
     // meaningful under its own node key -- so resolve the link within `node_addr`'s peers.
     let node_peers = policy.get_peers_for_node(node_addr).unwrap_or_default();
-    for link in &mut peers {
+    let mut links: Vec<Link> = Vec::with_capacity(peers.len());
+    for (link_id, sock_addr) in peers {
+        let mut link = Link {
+            link_id,
+            role: LinkRole::Active, // only "active" support at the moment.
+            peer: SockAddr {
+                addr: sock_addr.ip(),
+                port: sock_addr.port(),
+            },
+            visas: Vec::new(),
+        };
         let Some(peer) = node_peers.iter().find(|p| p.link_id == link.link_id) else {
             warn!(target: VSS, "no peer entry for link {} under node {node_addr}; sending it without bootstrap visas", link.link_id);
+            links.push(link);
             continue;
         };
         // The link is between `node_addr` and `peer.remote_zpr_addr`. Fail the whole call rather
@@ -724,15 +743,16 @@ async fn vss_do_set_topology(
                 ))
             })?;
         link.visas.extend(visas);
+        links.push(link);
     }
 
     let mut req = vss_handle.set_topology_request();
     let req_builder = req.get();
-    let mut peer_list_builder = req_builder.init_links(peers.len() as u32);
+    let mut peer_list_builder = req_builder.init_links(links.len() as u32);
 
-    for (i, peer) in peers.iter().enumerate() {
+    for (i, link) in links.iter().enumerate() {
         let mut peer_builder = peer_list_builder.reborrow().get(i as u32);
-        peer.write_to(&mut peer_builder);
+        link.write_to(&mut peer_builder);
     }
     let set_response_rdr =
         rpc_with_timeout("set-topology", DEFAULT_RPC_TIMEOUT, req.send().promise).await?;

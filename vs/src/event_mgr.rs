@@ -270,11 +270,12 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
 
         // Queue up setTopology messages in parallel.
         let futs = valid_node_addrs.iter().filter_map(|naddr| {
-            let links = psnap.links_for_node(naddr);
-            // Same snapshot the links came from: the worker mints bootstrap visas off it.
+            let peers = psnap.resolved_peers_for_node(naddr);
+            // Same snapshot the peers came from: the worker builds the wire Links and
+            // mints bootstrap visas off it.
             let policy = psnap.policy_arc();
             asm.vss_mgr.get_handle(naddr).map(|vss_handle| async move {
-                if let Err(e) = vss_handle.set_topology(links, policy).await {
+                if let Err(e) = vss_handle.set_topology(peers, policy).await {
                     error!(target: EVENT, "failed to set topology for node {}: {}", naddr, e);
                 }
             })
