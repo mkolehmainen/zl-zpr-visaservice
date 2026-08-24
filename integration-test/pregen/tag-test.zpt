@@ -1,0 +1,28 @@
+load zpt-test.bin2
+
+
+set alice user.bas_id:1000
+set alice user.color:red
+set alice #device.hardened
+
+
+set bob user.bas_id:1001
+set bob user.color:red
+
+set carol user.bas_id:1002
+set carol #device.hardened
+
+
+set web zpr.services:web1
+set web user.bas_id:4567
+
+# allowed
+eval TCP alice > web.80 [S]
+
+# denied - bob not on hardened device
+eval TCP bob > web.80 [S]
+
+# denied - carol not color:red
+eval TCP carol > web.80 [S]
+
+

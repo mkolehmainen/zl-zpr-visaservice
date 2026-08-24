@@ -474,10 +474,7 @@ impl State {
             .entry(actor_name.to_string())
             .or_insert_with(|| Actor::new());
 
-        // TODO: Attribute allows duplicate attribute keys -- it should not.
-
-        // Humans enter multi value attributes as comma separated values.
-        let values: Vec<String> = value.split(',').map(|s| s.trim().to_string()).collect();
+        let values = crate::parser::split_values(value);
         let attr = Attribute::builder(key)
             .expires_in(Duration::from_secs(3600))
             .values(values);

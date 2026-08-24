@@ -66,14 +66,19 @@ fn parse_key_value(expr: String) -> Result<(String, String), ParseError> {
         ));
     }
     if expr.starts_with('#') {
-        // Tag
+        // Tag. Encoded as a valueless per-tag key: `#user.red` -> `user.zpr.tag.red`.
         let tag = expr[1..].trim();
-        if tag.is_empty() {
+        let Some((domain, name)) = tag.split_once('.') else {
+            return Err(ParseError::InvalidFormat(format!(
+                "tag must be domain-qualified, e.g. #user.red: '{expr}'"
+            )));
+        };
+        if domain.is_empty() || name.is_empty() {
             return Err(ParseError::InvalidFormat(
                 "empty tag in attribute expression".to_string(),
             ));
         }
-        Ok(("zpr.tag".to_string(), tag.to_string()))
+        Ok((format!("{domain}.zpr.tag.{name}"), String::new()))
     } else if let Some(colon_pos) = expr.find(':') {
         let key = expr[..colon_pos].trim();
         let value = expr[colon_pos + 1..].trim();
@@ -107,6 +112,17 @@ fn parse_key_value(expr: String) -> Result<(String, String), ParseError> {
     }
 }
 
+/// Split the value returned by [parse_key_value] into its attribute values.
+/// Humans enter multi value attributes as a comma separated list; an empty
+/// value (e.g. a tag) means no values, not one empty value.
+pub fn split_values(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        value.split(',').map(|s| s.trim().to_string()).collect()
+    }
+}
+
 // format of a connect expression is:
 //   `connect <claim_expr> [<claim_expr> ...]`
 //
@@ -121,24 +137,36 @@ fn parse_connect_expr(expr: String) -> Result<Instruction, ParseError> {
     let mut authd_claims = Vec::new();
     let mut unauthd_claims = Vec::new();
 
-    let toks = expr.split_whitespace();
-
-    let mut toks_iter = toks.into_iter();
+    let mut toks_iter = expr.split_whitespace();
     while let Some(claim_type) = toks_iter.next() {
-        let claim_kv = toks_iter.next().ok_or_else(|| {
-            ParseError::InvalidFormat(
-                "missing key:value for claim in connect expression".to_string(),
-            )
-        })?;
-        let (key, value) = parse_key_value(claim_kv.to_string())?;
+        let mut claim_kv = toks_iter
+            .next()
+            .ok_or_else(|| {
+                ParseError::InvalidFormat(
+                    "missing key:value for claim in connect expression".to_string(),
+                )
+            })?
+            .to_string();
+        // A multi-value claim like `colors:{red, blue}` may contain spaces, so
+        // keep consuming tokens until the brace closes.
+        while claim_kv.contains('{') && !claim_kv.contains('}') {
+            let more = toks_iter.next().ok_or_else(|| {
+                ParseError::InvalidFormat(
+                    "unterminated '{' in multi-value claim in connect expression".to_string(),
+                )
+            })?;
+            claim_kv.push(' ');
+            claim_kv.push_str(more);
+        }
+        let (key, value) = parse_key_value(claim_kv)?;
+        let values = split_values(&value);
 
-        // TODO: for humans, a multi value claim is entered as a comma separated list. Need to parse that here.
         match claim_type {
             "--ac" => {
-                authd_claims.push(Attribute::builder(key).value(value));
+                authd_claims.push(Attribute::builder(key).values(values));
             }
             "--uc" => {
-                unauthd_claims.push(Attribute::builder(key).value(value));
+                unauthd_claims.push(Attribute::builder(key).values(values));
             }
             _ => {
                 return Err(ParseError::InvalidFormat(format!(
@@ -556,15 +584,22 @@ mod test {
 
     #[test]
     fn test_parses_simple_set_tag() {
-        let ins = parse("set alice #red").unwrap();
+        let ins = parse("set alice #user.red").unwrap();
         match ins {
             Instruction::Set { name, key, value } => {
                 assert_eq!(name, "alice");
-                assert_eq!(key, "zpr.tag");
-                assert_eq!(value, "red");
+                assert_eq!(key, "user.zpr.tag.red");
+                assert_eq!(value, "");
             }
             _ => panic!("expected Set instruction"),
         }
+    }
+
+    // A tag must be domain qualified (`#user.red`), since the encoded key is
+    // `<domain>.zpr.tag.<name>`; a bare `#red` has no domain and is rejected.
+    #[test]
+    fn test_set_tag_requires_domain() {
+        assert!(parse("set alice #red").is_err());
     }
 
     #[test]
@@ -577,6 +612,30 @@ mod test {
                 assert_eq!(value, "red, blue");
             }
             _ => panic!("expected Set instruction"),
+        }
+    }
+
+    // A connect claim must encode tags and multi-values the same way `set` does:
+    // a tag is a valueless per-tag key, a `{a, b}` claim is two values.
+    #[test]
+    fn test_parses_connect_claims() {
+        let ins = parse("connect --ac #user.red --uc colors:{red, blue} --ac color:green").unwrap();
+        match ins {
+            Instruction::Connect {
+                authd_claims,
+                unauthd_claims,
+            } => {
+                let ac = authd_claims.expect("expected authenticated claims");
+                assert_eq!(ac[0].get_key(), "user.zpr.tag.red");
+                assert!(ac[0].get_value().is_empty());
+                assert_eq!(ac[1].get_key(), "color");
+                assert_eq!(ac[1].get_value(), &["green"]);
+
+                let uc = unauthd_claims.expect("expected unauthenticated claims");
+                assert_eq!(uc[0].get_key(), "colors");
+                assert_eq!(uc[0].get_value(), &["red", "blue"]);
+            }
+            _ => panic!("expected Connect instruction"),
         }
     }
 

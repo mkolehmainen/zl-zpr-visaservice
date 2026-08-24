@@ -150,7 +150,8 @@ impl TrustedServiceInterface for FileAttributeStore {
                         builder.value(values.first().cloned().unwrap_or_default())
                     }
                     AttrHint::MultiValued => builder.values(values),
-                    AttrHint::Tag(tag_value) => builder.value(tag_value),
+                    // A tag is valueless: presence of the per-tag key is the tag.
+                    AttrHint::Tag => builder.values(Vec::<String>::new()),
                 };
                 result.push(attribute);
             }

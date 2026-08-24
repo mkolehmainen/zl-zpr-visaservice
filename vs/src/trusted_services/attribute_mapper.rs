@@ -18,15 +18,16 @@ pub(super) enum AttrHint {
     /// Attribute is declared as multi valued.
     MultiValued,
 
-    /// Attribute is declared as a tag.
-    Tag(String),
+    /// Attribute is declared as a tag: a valueless attribute whose per-tag key
+    /// (`<domain>.zpr.tag.<name>`) is the tag; presence of the key is the value.
+    Tag,
 }
 
 impl AttributeMapper {
     /// Map a trusted-service attribute name into its ZPR name and value behavior.
     pub(super) fn map_attribute(&self, ts_key: &str) -> Option<(String, AttrHint)> {
-        // `AttrMapping::attr` already carries the decoded RHS spec, so `zpl_key`/`zpl_value`
-        // handle the tag class translation ("#user.lazy" -> "user.zpr.tag" + "user.lazy").
+        // `AttrMapping::attr` already carries the decoded RHS spec, so `zpl_key`
+        // handles the tag class translation ("#user.lazy" -> "user.zpr.tag.lazy").
         let attr = &self
             .mappings
             .iter()
@@ -34,7 +35,7 @@ impl AttributeMapper {
             .attr;
 
         let hint = if attr.is_tag() {
-            AttrHint::Tag(attr.zpl_value())
+            AttrHint::Tag
         } else if attr.is_multi_valued() {
             AttrHint::MultiValued
         } else {
@@ -63,8 +64,8 @@ mod tests {
         assert!(matches!(hint, AttrHint::MultiValued));
 
         let (key, hint) = mapper.map_attribute("lazy").unwrap();
-        assert_eq!(key, "user.zpr.tag");
-        assert!(matches!(hint, AttrHint::Tag(t) if t == "user.lazy"));
+        assert_eq!(key, "user.zpr.tag.lazy");
+        assert!(matches!(hint, AttrHint::Tag));
 
         assert!(mapper.map_attribute("not_in_the_mapping").is_none());
     }

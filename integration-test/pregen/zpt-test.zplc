@@ -42,3 +42,8 @@ port = 3999
 [services.pingy]
 protocol = "ping"
 provider = [[ "user.bas_id", "1233" ]]
+
+[services.web1]
+protocol = "http"
+provider = [[ "user.bas_id", "4567" ]]
+

@@ -64,7 +64,7 @@ jobs:
 
     - name: ZPT Test
       timeout-minutes: 5
-      run: ./integration-test/zpt-test.sh && ./integration-test/zpt-test-connect.sh
+      run: cd ./integration-test && make test
 
 
 

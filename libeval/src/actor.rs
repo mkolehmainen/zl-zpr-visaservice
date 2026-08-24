@@ -99,24 +99,23 @@ impl Actor {
     /// Adds or replaces the attribute on the actor.
     pub fn add_attribute(&mut self, attr: Attribute) -> Result<(), AttributeError> {
         let key = attr.get_key().to_string();
-        let value = attr.get_value();
+        // Attributes may be valueless (e.g. tags); the keys below require one value.
+        let first_value = attr.get_value().first().map(|s| s.as_str()).unwrap_or("");
         match key.as_str() {
             key::ZPR_ADDR => {
-                if let Ok(ip) = value[0].parse::<IpAddr>() {
+                if let Ok(ip) = first_value.parse::<IpAddr>() {
                     self.zpr_addr = Some(ip);
                 } else {
                     return Err(AttributeError::AttributeError(format!(
-                        "Invalid IP address in zpr.addr attribute: '{}'",
-                        value[0]
+                        "Invalid IP address in zpr.addr attribute: '{first_value}'"
                     )));
                 }
             }
             // Validated on the way in so the getters can trust what is in the map.
             key::ROLE => {
-                if value[0] != ROLE_ADAPTER && value[0] != ROLE_NODE {
+                if first_value != ROLE_ADAPTER && first_value != ROLE_NODE {
                     return Err(AttributeError::AttributeError(format!(
-                        "role must be 'node' or 'adapter', not: '{}'",
-                        value[0]
+                        "role must be 'node' or 'adapter', not: '{first_value}'"
                     )));
                 }
             }
@@ -155,8 +154,10 @@ impl Actor {
         } else {
             let mut identity_values: Vec<String> = Vec::new();
             for key in &self.identity_keys {
-                if let Some(attr) = self.get_attribute(key) {
-                    identity_values.push(attr.get_value()[0].clone());
+                if let Some(attr) = self.get_attribute(key)
+                    && let Some(v) = attr.get_value().first()
+                {
+                    identity_values.push(v.clone());
                 }
             }
             Some(identity_values)

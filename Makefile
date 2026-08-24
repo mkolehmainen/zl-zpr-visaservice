@@ -33,6 +33,8 @@ build-release:
 test:
 	cargo test
 	$(MAKE) -C zpr-dashboard $@
+	$(MAKE) -C zpt build
+	$(MAKE) -C integration-test
 
 release:
 	$(MAKE) clean

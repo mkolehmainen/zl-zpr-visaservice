@@ -755,7 +755,7 @@ mod test {
 
         // should let red users access content:red databases.
         let mut user = Actor::new();
-        user.add_attr_from_parts("user.zpr.tag", "user.red", Duration::from_secs(60))
+        user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
 
         let mut service = Actor::new();
@@ -772,7 +772,7 @@ mod test {
         match decision {
             PartialEvalResult::AllowWithoutRoute(hits) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 1);
+                assert_eq!(hits[0].match_idx, 3);
                 assert!(hits[0].direction == Direction::Forward);
             }
             _ => panic!("expected allow decision, not {:?}", decision),
@@ -781,13 +781,13 @@ mod test {
         // Should deny access to green tagged users.
         let mut green_user = Actor::new();
         green_user
-            .add_attr_from_parts("user.zpr.tag", "user.green", Duration::from_secs(60))
+            .add_attr_from_parts("user.zpr.tag.green", "", Duration::from_secs(60))
             .unwrap();
         let decision = ctx.eval_request(&green_user, &service, &packet).unwrap();
         match decision {
             PartialEvalResult::Deny(FinalDeny::Deny(hits)) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 0);
+                assert_eq!(hits[0].match_idx, 2);
                 assert!(hits[0].direction == Direction::Forward);
             }
             _ => panic!("expected deny decision, not {:?}", decision),
@@ -802,7 +802,7 @@ mod test {
 
         // should let red users access content:red databases.
         let mut user = Actor::new();
-        user.add_attr_from_parts("user.zpr.tag", "user.red", Duration::from_secs(60))
+        user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
 
         let mut service = Actor::new();
@@ -844,7 +844,7 @@ mod test {
 
         // User with bas_id and color:red should be able to access database service.
         let mut user = Actor::new();
-        user.add_attr_from_parts("user.zpr.tag", "user.red", Duration::from_secs(60))
+        user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
         user.add_attr_from_parts("user.bas_id", "1000", Duration::from_secs(60))
             .unwrap();
@@ -863,7 +863,7 @@ mod test {
         match decision {
             PartialEvalResult::AllowWithoutRoute(hits) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 2);
+                assert_eq!(hits[0].match_idx, 4);
                 assert!(hits[0].direction == Direction::Forward);
             }
             _ => panic!("expected allow decision, not {:?}", decision),
@@ -898,7 +898,7 @@ mod test {
         match decision {
             PartialEvalResult::AllowWithoutRoute(hits) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 2);
+                assert_eq!(hits[0].match_idx, 4);
                 assert!(hits[0].direction == Direction::Forward);
                 assert!(hits[0].signal.is_some());
                 let signal = hits[0].signal.as_ref().unwrap();
@@ -917,7 +917,7 @@ mod test {
 
         // should let red users ping pingdb
         let mut user = Actor::new();
-        user.add_attr_from_parts("user.zpr.tag", "user.red", Duration::from_secs(60))
+        user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
 
         let mut service = Actor::new();
@@ -954,7 +954,7 @@ mod test {
 
         // should let red users ping pingdb
         let mut user = Actor::new();
-        user.add_attr_from_parts("user.zpr.tag", "user.red", Duration::from_secs(60))
+        user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
 
         let mut service = Actor::new();
@@ -994,7 +994,7 @@ mod test {
 
         // should let red users ping pingdb -- should not let randos send echo-reply to red users.
         let mut user = Actor::new();
-        user.add_attr_from_parts("user.zpr.tag", "user.red", Duration::from_secs(60))
+        user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
 
         let mut service = Actor::new();
@@ -1195,8 +1195,7 @@ mod test {
         let ctx = EvalContext::new(Arc::new(pol));
 
         let mut user = Actor::new();
-        user.add_attribute(expired("user.zpr.tag", "user.red"))
-            .unwrap();
+        user.add_attribute(expired("user.zpr.tag.red", "")).unwrap();
 
         let mut service = Actor::new();
         service
@@ -1225,7 +1224,7 @@ mod test {
 
         let mut green_user = Actor::new();
         green_user
-            .add_attribute(expired("user.zpr.tag", "user.green"))
+            .add_attribute(expired("user.zpr.tag.green", ""))
             .unwrap();
 
         let mut service = Actor::new();
@@ -1242,7 +1241,7 @@ mod test {
         match decision {
             PartialEvalResult::Deny(FinalDeny::Deny(hits)) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 0);
+                assert_eq!(hits[0].match_idx, 2);
             }
             _ => panic!("expected deny decision, not {:?}", decision),
         }
