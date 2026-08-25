@@ -130,10 +130,6 @@ pub enum SubCmd {
     /// Show visa service statistics
     #[command()]
     Stats,
-
-    /// Enter GUI mode
-    #[command()]
-    Gui,
 }
 
 /// Parses a `<N><unit>` duration into milliseconds, where the unit is exactly

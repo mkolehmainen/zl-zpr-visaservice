@@ -1,6 +1,5 @@
 mod error;
 mod executor;
-mod gui;
 mod main_args;
 mod vsclient;
 
@@ -99,8 +98,6 @@ fn main() {
             remove,
             id,
         }) => exec.do_cmd_auth_revoke(clear, add, remove, id),
-
-        Some(SubCmd::Gui) => gui::enter_gui(&args.svc_url, ca_cert, api_key),
 
         Some(SubCmd::Network) => exec.do_cmd_network(),
 
