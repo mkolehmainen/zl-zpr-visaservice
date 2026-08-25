@@ -302,24 +302,49 @@ impl EvalContext {
             )
             .unwrap();
 
-        // Policy configuration also tells us what attributes are tied to identity.
-        // TODO: use policy to figure out the identity attributes. (https://github.com/org-zpr/zpr-visaservice/issues/201)
-        // For now this is just a hack: we try CN, address, and if those fail we use the hash.
+        // Policy tells us which attributes are tied to identity, and there is one identity
+        // attribute libeval knows on its own: the adapter CN, established by the builtin RSA
+        // authentication. That mirrors zplc's builtin `default` trusted service
+        // (`identity_attributes = ["device.zpr.adapter.cn"]`), which the compiler synthesizes
+        // internally and emits no TrustedService record for, so we cannot read it from policy.
+        //
+        // The two are a UNION, not a fallback: an actor authenticated by CN that also carries a
+        // policy-declared identity attribute has both as identity keys.
+        //
+        // Everything is appended (usize::MAX) so CN stays first and the policy-declared keys keep
+        // policy order. Callers layer their own keys around this set -- the Visa Service prepends
+        // its JWT at order 0 and appends zpr.authority at the end -- so this must not reorder.
+        //
+        // Presence on the actor is a sufficient test: every attribute committed above is either an
+        // authenticated claim or a zpr.addr validated by a matching join policy, so a peer cannot
+        // self-assert an identity attribute into this set.
         if actor.has_attribute_named(key::CN) {
-            // use cn
-            actor.add_identity_key(0, key::CN).unwrap();
-        } else if actor.has_attribute_named(key::ZPR_ADDR) {
-            // use addr
-            actor.add_identity_key(0, key::ZPR_ADDR).unwrap();
-        } else {
-            // use hash
-            let mut s = DefaultHasher::new();
-            actor.hash(&mut s);
-            let hash_str = format!("hash:{:x}", s.finish());
-            actor
-                .add_attribute(Attribute::builder(key::ACTOR_HASH).value(hash_str))
-                .unwrap();
-            actor.add_identity_key(0, key::ACTOR_HASH).unwrap();
+            actor.add_identity_key(usize::MAX, key::CN).unwrap();
+        }
+        for ikey in self.policy.identity_attr_keys() {
+            // CN is handled above; policy can name it again via a returns_attributes mapping,
+            // and add_identity_key does not dedupe.
+            if ikey != key::CN && actor.has_attribute_named(ikey) {
+                // Only fails when the attribute is absent, which was just checked.
+                actor.add_identity_key(usize::MAX, ikey).unwrap();
+            }
+        }
+
+        // Last resort. An actor with no identity key at all reads as "never authenticated":
+        // get_authentication_expiration returns None, and the Visa Service *skips* its
+        // expiry check when it is None. So this set must never be left empty.
+        if actor.identity_keys_iter().next().is_none() {
+            if actor.has_attribute_named(key::ZPR_ADDR) {
+                actor.add_identity_key(usize::MAX, key::ZPR_ADDR).unwrap();
+            } else {
+                let mut s = DefaultHasher::new();
+                actor.hash(&mut s);
+                let hash_str = format!("hash:{:x}", s.finish());
+                actor
+                    .add_attribute(Attribute::builder(key::ACTOR_HASH).value(hash_str))
+                    .unwrap();
+                actor.add_identity_key(usize::MAX, key::ACTOR_HASH).unwrap();
+            }
         }
 
         Ok(actor)
@@ -338,7 +363,9 @@ impl EvalContext {
         //
         // Any services offered by the actor must be allowed by policy.
         // The policy may have more services for the actor, but that must be picked up
-        // by doing a re-auth.
+        // by doing a re-auth. Identity keys are in the same bucket: a policy update does
+        // not retroactively re-key a connected actor; new identity attributes are picked
+        // up on re-auth via approve_connection.
 
         // Re-run join-policy matching against the actor's current attributes.
         let claims: Vec<Attribute> = connected_actor.attrs_iter().cloned().collect();
@@ -1312,6 +1339,214 @@ mod test {
             }
         }
         msg
+    }
+
+    /// An actor that authenticates with a CN gets exactly the CN as its identity key,
+    /// even when it also carries a zpr.addr (guard test for the identity-key cascade).
+    #[test]
+    fn test_identity_keys_default_to_cn() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value("node.zpr.org")];
+        let unauthenticated_claims =
+            vec![Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::1")];
+        let actor = ctx
+            .approve_connection(
+                Some(authenticated_claims.as_slice()),
+                Some(unauthenticated_claims.as_slice()),
+            )
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec![key::CN]);
+        assert_eq!(actor.get_identity(), Some(vec!["node.zpr.org".to_string()]));
+    }
+
+    /// Without a CN, an actor carrying a zpr.addr uses that address as its identity key.
+    #[test]
+    fn test_identity_keys_fall_back_to_zpr_addr_without_cn() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims =
+            vec![Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::2")];
+        let actor = ctx
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec![key::ZPR_ADDR]);
+    }
+
+    /// With neither CN nor zpr.addr, a synthesized zpr.actor_hash attribute becomes the
+    /// identity key, so the identity-key set is never empty.
+    #[test]
+    fn test_identity_keys_fall_back_to_actor_hash() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims = vec![Attribute::builder("user.color").value("red")];
+        let actor = ctx
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec![key::ACTOR_HASH]);
+        let hash_attr = actor.get_attribute(key::ACTOR_HASH).unwrap();
+        assert!(hash_attr.get_value().first().unwrap().starts_with("hash:"));
+    }
+
+    /// Build a TrustedService test record from attribute-mapping strings and the
+    /// service-side names of its identity attributes.
+    fn ts(id: &str, mappings: &[&str], identity: &[&str]) -> zpr::policy_types::TrustedService {
+        zpr::policy_types::TrustedService {
+            service_id: id.to_string(),
+            expiration_seconds: 3600,
+            returns_attrs: mappings
+                .iter()
+                .map(|m| zpr::policy_types::parse_attribute_mapping(m).unwrap())
+                .collect(),
+            identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Build an EvalContext over an in-memory policy carrying the given trusted services.
+    fn ctx_with_trusted_services(records: &[zpr::policy_types::TrustedService]) -> EvalContext {
+        let bytes = crate::policy::policy_bytes_with_trusted_services(records);
+        EvalContext::new(Arc::new(Policy::new_from_policy_bytes(bytes).unwrap()))
+    }
+
+    /// A policy-declared identity attribute joins the builtin CN identity key: the two
+    /// are a union, not a fallback. The core behavior of issue #201.
+    #[test]
+    fn test_policy_identity_attr_unions_with_cn() {
+        setup();
+        let ctx = ctx_with_trusted_services(&[ts("bas", &["bas_id -> user.bas_id"], &["bas_id"])]);
+
+        let authenticated_claims = vec![
+            Attribute::builder(key::CN).value("a.zpr"),
+            Attribute::builder("user.bas_id").value("1233"),
+        ];
+        let actor = ctx
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec![key::CN, "user.bas_id"]);
+        assert_eq!(
+            actor.get_identity(),
+            Some(vec!["a.zpr".to_string(), "1233".to_string()])
+        );
+    }
+
+    /// An actor identified by a policy-declared attribute alone gets that key and no
+    /// synthesized actor hash.
+    #[test]
+    fn test_policy_identity_attr_without_cn_is_not_hashed() {
+        setup();
+        let ctx = ctx_with_trusted_services(&[ts("bas", &["bas_id -> user.bas_id"], &["bas_id"])]);
+
+        let authenticated_claims = vec![Attribute::builder("user.bas_id").value("1233")];
+        let actor = ctx
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec!["user.bas_id"]);
+        assert!(actor.get_attribute(key::ACTOR_HASH).is_none());
+    }
+
+    /// A declared identity attribute the actor does not carry changes nothing: the CN
+    /// stays the sole identity key (the no-regression case every current caller hits).
+    #[test]
+    fn test_policy_identity_attr_absent_from_actor_leaves_cn() {
+        setup();
+        let ctx = ctx_with_trusted_services(&[ts("bas", &["bas_id -> user.bas_id"], &["bas_id"])]);
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value("a.zpr")];
+        let actor = ctx
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec![key::CN]);
+    }
+
+    /// Declaring an identity attribute must not suppress the last-resort hash for an
+    /// actor that carries neither the CN nor the declared attribute.
+    #[test]
+    fn test_no_identity_attr_present_still_hashes() {
+        setup();
+        let ctx = ctx_with_trusted_services(&[ts("bas", &["bas_id -> user.bas_id"], &["bas_id"])]);
+
+        let authenticated_claims = vec![Attribute::builder("user.color").value("red")];
+        let actor = ctx
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec![key::ACTOR_HASH]);
+    }
+
+    /// Policy-declared keys keep policy order after the CN; fails if the loop inserts
+    /// at order 0 (which would reverse them).
+    #[test]
+    fn test_policy_identity_keys_follow_policy_order() {
+        setup();
+        let ctx =
+            ctx_with_trusted_services(&[ts("bas", &["a -> user.a", "z -> user.z"], &["z", "a"])]);
+
+        let authenticated_claims = vec![
+            Attribute::builder(key::CN).value("a.zpr"),
+            Attribute::builder("user.a").value("va"),
+            Attribute::builder("user.z").value("vz"),
+        ];
+        let actor = ctx
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec![key::CN, "user.z", "user.a"]);
+    }
+
+    /// A policy that names the CN itself as an identity attribute must not duplicate it:
+    /// add_identity_key does not dedupe, so the union loop has to.
+    #[test]
+    fn test_policy_identity_cn_is_not_duplicated() {
+        setup();
+        let ctx =
+            ctx_with_trusted_services(&[ts("bas", &["cn -> device.zpr.adapter.cn"], &["cn"])]);
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value("a.zpr")];
+        let actor = ctx
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec![key::CN]);
+    }
+
+    /// A tag mapping declared as identity resolves to nothing: tags are valueless, so
+    /// carrying the tag attribute never adds an identity key.
+    #[test]
+    fn test_policy_identity_tag_spec_is_not_an_identity_key() {
+        setup();
+        let ctx = ctx_with_trusted_services(&[ts("bas", &["gov -> #user.government"], &["gov"])]);
+
+        let authenticated_claims = vec![
+            Attribute::builder(key::CN).value("a.zpr"),
+            Attribute::builder("user.zpr.tag.government").value(""),
+        ];
+        let actor = ctx
+            .approve_connection(Some(authenticated_claims.as_slice()), None)
+            .unwrap();
+
+        let keys: Vec<&String> = actor.identity_keys_iter().collect();
+        assert_eq!(keys, vec![key::CN]);
     }
 
     /// Conditions libeval cannot evaluate -- valueless EQ/NE/EXCLUDES, and set-valued

@@ -408,6 +408,13 @@ impl ConnectionControl {
         // satisfied by a missing key. Refuse the connection rather than authorize
         // against a partial claim set. Note this means a trusted-service outage blocks
         // new connections.
+        //
+        // TODO(#201 follow-up): this keys trusted-service lookups on the CN alone, but
+        // policy can now declare identity attributes (Policy::identity_attr_keys), so a
+        // service may want to key on a non-CN identity. Rework get_attributes_for_actor
+        // to receive all of the actor's identity attributes and let each source pick.
+        // Note the ordering wrinkle: this lookup runs BEFORE approve_connection assigns
+        // identity keys, so keying on a policy-derived identity needs restructuring here.
         for ts_results in asm.ts_mgr.get_attributes_for_actor(endpoint_cn).await {
             match ts_results {
                 Ok(ts_attrs) => {
@@ -1131,8 +1138,8 @@ mod tests {
             .expect("actor must have identity values");
         assert_eq!(identity[0], jwt_str);
 
-        // Due to libeval not actually paying attention to what attributes are part of "identity",
-        // it will add the CN claim.
+        // The CN is an identity key in its own right (established by the builtin RSA
+        // authentication; see libeval's approve_connection, #201), so it follows the JWT.
         assert_eq!(identity[1], cn);
     }
 

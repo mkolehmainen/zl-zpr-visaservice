@@ -9,6 +9,8 @@ use thiserror::Error;
 
 use crate::attribute::{Attribute, key};
 use crate::joinpolicy::JPolicy;
+use crate::logging::targets::EVAL;
+use tracing::warn;
 
 use zpr::policy::v1 as policy_capnp;
 use zpr::policy_types::{
@@ -62,6 +64,10 @@ pub struct Policy {
     /// Trusted service records, keyed by `service_id`. Pairs with the `services` entry
     /// whose `kind` is [`ServiceType::Trusted`].
     trusted_services: HashMap<String, TrustedService>,
+    /// ZPR attribute keys that policy declares as identity attributes, resolved out of the
+    /// trusted services' `identity_attrs`. Precomputed at load: the per-connection path must
+    /// not depend on `trusted_services` HashMap iteration order.
+    identity_attr_keys: Vec<String>,
     cpol_sources: Vec<String>,
     serialized: Bytes,
     peer_table: Option<HashMap<IpAddr, Vec<Peer>>>, // zpr_addr -> peers
@@ -119,6 +125,7 @@ impl Policy {
         let join_policies = load_join_policies(&policy)?;
         let services = load_services(&policy)?;
         let trusted_services = load_trusted_services(&policy)?;
+        let identity_attr_keys = resolve_identity_attr_keys(&trusted_services);
         let cpol_sources = load_cpol_sources(&policy)?;
         let peerings = load_peerings(&policy)?;
         let peer_table = if let Some(ref peerings) = peerings {
@@ -142,6 +149,7 @@ impl Policy {
             join_policies,
             services,
             trusted_services,
+            identity_attr_keys,
             cpol_sources,
             serialized,
             peer_table,
@@ -250,6 +258,23 @@ impl Policy {
     /// The trusted service record declared for `id`, if this policy has one.
     pub fn trusted_service_by_id(&self, id: &str) -> Option<&TrustedService> {
         self.trusted_services.get(id)
+    }
+
+    /// The ZPR attribute keys this policy declares as identity attributes.
+    ///
+    /// `identity_attributes` names attributes the way the *service* names them (the LHS of a
+    /// `returns_attributes` mapping), so each entry is resolved through that mapping into the
+    /// ZPR key the attribute actually lands on the actor under. That is the same resolution
+    /// `vs/src/trusted_services/attribute_mapper.rs` performs when ingesting a service reply,
+    /// so these keys match the keys that appear on the actor.
+    ///
+    /// Ordering is stable for a given policy: trusted services in `service_id` order, and
+    /// within a service the declared order. Cross-service duplicates collapse to the first.
+    ///
+    /// This is NOT the complete identity key set — libeval also treats [key::CN] as an
+    /// identity key on its own. See [crate::eval::EvalContext::approve_connection].
+    pub fn identity_attr_keys(&self) -> &[String] {
+        &self.identity_attr_keys
     }
 
     /// Get the ZPL source for the communication policy by policy index.
@@ -517,6 +542,67 @@ fn load_trusted_services(
     Ok(trusted_services)
 }
 
+// Resolve each trusted service's `identity_attrs` (service-side names) into the ZPR attribute
+// keys those attributes land on the actor under. Services are visited in `service_id` order
+// because HashMap iteration order is random and the resulting key order is user visible.
+//
+// An entry that cannot serve as an identity is dropped with a warning rather than failing the
+// whole policy load:
+//   - no matching `returns_attributes` mapping: nothing would ever set that attribute.
+//   - a tag spec (`#user.gov`): tags are valueless, so there is no identity value to read.
+//   - a multi-valued spec (`user.roles{}`): which value is "the" identity is undefined.
+// zplc forbids `identity_attributes` on api="file" services but screens for none of the above.
+fn resolve_identity_attr_keys(trusted_services: &HashMap<String, TrustedService>) -> Vec<String> {
+    let mut service_ids: Vec<&String> = trusted_services.keys().collect();
+    service_ids.sort();
+
+    let mut keys: Vec<String> = Vec::new();
+    for sid in service_ids {
+        let ts = &trusted_services[sid];
+        for entry in &ts.identity_attrs {
+            let Some(mapping) = ts
+                .returns_attrs
+                .iter()
+                .find(|m| &m.service_attr_key == entry)
+            else {
+                warn!(target: EVAL, "trusted service '{sid}': identity attribute '{entry}' has no returns_attributes mapping; ignoring");
+                continue;
+            };
+            if mapping.attr.is_tag() || mapping.attr.is_multi_valued() {
+                warn!(target: EVAL, "trusted service '{sid}': identity attribute '{entry}' maps to '{}', which cannot carry an identity value; ignoring", mapping.zpr_attr_spec);
+                continue;
+            }
+            // Linear scan: an identity list is a handful of entries at most.
+            let key = mapping.attr.zpl_key();
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Build policy bytes carrying the given trusted service records (ids may repeat, so
+/// the duplicate-id path can be exercised). Test helper shared with `eval.rs`.
+#[cfg(test)]
+pub(crate) fn policy_bytes_with_trusted_services(records: &[TrustedService]) -> Bytes {
+    use zpr::write_to::WriteTo;
+
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
+        let mut list = policy
+            .reborrow()
+            .init_trusted_services(records.len() as u32);
+        for (i, ts) in records.iter().enumerate() {
+            ts.write_to(&mut list.reborrow().get(i as u32));
+        }
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+    Bytes::from(bytes)
+}
+
 fn load_peerings(
     policy: &policy_capnp::policy::Reader,
 ) -> Result<Option<Vec<Peering>>, PolicyError> {
@@ -657,24 +743,6 @@ mod test {
         );
     }
 
-    /// Build policy bytes carrying the given trusted service records (ids may repeat, so
-    /// the duplicate-id path can be exercised).
-    fn policy_bytes_with_trusted_services(records: &[TrustedService]) -> Bytes {
-        let mut msg = capnp::message::Builder::new_default();
-        {
-            let mut policy = msg.init_root::<policy_capnp::policy::Builder>();
-            let mut list = policy
-                .reborrow()
-                .init_trusted_services(records.len() as u32);
-            for (i, ts) in records.iter().enumerate() {
-                ts.write_to(&mut list.reborrow().get(i as u32));
-            }
-        }
-        let mut bytes = Vec::new();
-        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
-        Bytes::from(bytes)
-    }
-
     /// A trusted service record and its attribute mappings survive the capnp round trip
     /// and are reachable by id.
     #[test]
@@ -708,6 +776,104 @@ mod test {
         let result =
             Policy::new_from_policy_bytes(policy_bytes_with_trusted_services(&[ts.clone(), ts]));
         assert!(matches!(result, Err(PolicyError::InvalidFormat(_))));
+    }
+
+    /// Build a TrustedService test record from attribute-mapping strings and the
+    /// service-side names of its identity attributes.
+    fn ts(id: &str, mappings: &[&str], identity: &[&str]) -> TrustedService {
+        TrustedService {
+            service_id: id.to_string(),
+            expiration_seconds: 3600,
+            returns_attrs: mappings
+                .iter()
+                .map(|m| parse_attribute_mapping(m).unwrap())
+                .collect(),
+            identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Build a Policy from trusted service records and return its resolved identity keys.
+    fn keys_for(records: &[TrustedService]) -> Vec<String> {
+        let policy =
+            Policy::new_from_policy_bytes(policy_bytes_with_trusted_services(records)).unwrap();
+        policy.identity_attr_keys().to_vec()
+    }
+
+    /// A service-side identity name resolves through returns_attributes to the ZPR key,
+    /// and mappings not named as identity are excluded.
+    #[test]
+    fn test_identity_attr_keys_resolves_service_side_name() {
+        let record = ts(
+            "bas",
+            &["tint -> device.tint", "bas_id -> user.bas_id"],
+            &["bas_id"],
+        );
+        assert_eq!(keys_for(&[record]), vec!["user.bas_id"]);
+    }
+
+    /// No identity declarations means no identity keys, on both a built and an empty policy.
+    #[test]
+    fn test_identity_attr_keys_empty_when_none_declared() {
+        let record = ts("attrfile", &["color -> user.color"], &[]);
+        assert!(keys_for(&[record]).is_empty());
+        assert!(Policy::new_empty().identity_attr_keys().is_empty());
+    }
+
+    /// An identity entry with no matching returns_attributes mapping is dropped without
+    /// failing the policy load.
+    #[test]
+    fn test_identity_attr_keys_unresolvable_entry_ignored() {
+        let record = ts("bas", &["bas_id -> user.bas_id"], &["nope"]);
+        assert!(keys_for(&[record]).is_empty());
+    }
+
+    /// Tag and multi-valued mappings cannot carry an identity value and are dropped;
+    /// the single-valued entry survives.
+    #[test]
+    fn test_identity_attr_keys_skips_tag_and_multi_valued() {
+        let record = ts(
+            "bas",
+            &[
+                "gov -> #user.government",
+                "roles -> user.role{}",
+                "id -> user.id",
+            ],
+            &["gov", "roles", "id"],
+        );
+        assert_eq!(keys_for(&[record]), vec!["user.id"]);
+    }
+
+    /// Within one service, keys keep the declared identity order, not alphabetical order.
+    #[test]
+    fn test_identity_attr_keys_preserves_declared_order() {
+        let record = ts("bas", &["a -> user.a", "b -> user.b"], &["b", "a"]);
+        assert_eq!(keys_for(&[record]), vec!["user.b", "user.a"]);
+    }
+
+    /// Across services the order is service_id-sorted and duplicates collapse to the
+    /// first occurrence; repeated parses agree (guards against HashMap-order flakiness).
+    #[test]
+    fn test_identity_attr_keys_is_deterministic_across_services() {
+        let records = [
+            ts(
+                "zeta",
+                &["shared -> user.shared", "z -> user.z"],
+                &["shared", "z"],
+            ),
+            ts(
+                "alpha",
+                &["a -> user.a", "shared -> user.shared"],
+                &["a", "shared"],
+            ),
+        ];
+        let bytes = policy_bytes_with_trusted_services(&records);
+        for _ in 0..20 {
+            let policy = Policy::new_from_policy_bytes(bytes.clone()).unwrap();
+            assert_eq!(
+                policy.identity_attr_keys(),
+                &["user.a", "user.shared", "user.z"]
+            );
+        }
     }
 
     fn ip(s: &str) -> IpAddr {
