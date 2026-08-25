@@ -713,6 +713,13 @@ async fn vss_do_set_topology(
     let node_peers = policy.get_peers_for_node(node_addr).unwrap_or_default();
     let mut links: Vec<Link> = Vec::with_capacity(peers.len());
     for (link_id, sock_addr) in peers {
+        // `zpr_addr` is required on the wire (the reader rejects a link without it), so a
+        // link with no peer entry cannot be sent at all anymore: skip it instead of the old
+        // "send without bootstrap visas" fallback.
+        let Some(peer) = node_peers.iter().find(|p| p.link_id == link_id) else {
+            warn!(target: VSS, "no peer entry for link {link_id} under node {node_addr}; skipping it (zprAddr unknown)");
+            continue;
+        };
         let mut link = Link {
             link_id,
             role: LinkRole::Active, // only "active" support at the moment.
@@ -721,11 +728,7 @@ async fn vss_do_set_topology(
                 port: sock_addr.port(),
             },
             visas: Vec::new(),
-        };
-        let Some(peer) = node_peers.iter().find(|p| p.link_id == link.link_id) else {
-            warn!(target: VSS, "no peer entry for link {} under node {node_addr}; sending it without bootstrap visas", link.link_id);
-            links.push(link);
-            continue;
+            zpr_addr: peer.remote_zpr_addr,
         };
         // The link is between `node_addr` and `peer.remote_zpr_addr`. Fail the whole call rather
         // than sending the link bare: without the visas the peer cannot reach VSAPI, so the link
