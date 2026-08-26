@@ -159,6 +159,7 @@ struct VSGateImpl {
     remote: SocketAddr,
     remote_cn: String,
     req_zpr_addr: IpAddr,
+    req_substrate_addr: SocketAddr,
 
     // This is set in `challenge` call and read in the `authenticate` call.
     // Safe to use here since the capn proto rpc is confined to a single thread.
@@ -181,6 +182,7 @@ impl VSGateImpl {
         remote: SocketAddr,
         remote_cn: String,
         req_zpr_addr: IpAddr,
+        req_substrate_addr: SocketAddr,
         a2a_dh_pubkey: Option<PublicKey>,
         reconnect: bool,
     ) -> Self {
@@ -190,6 +192,7 @@ impl VSGateImpl {
             remote_cn,
             challenge_data: Cell::new([0u8; 32]),
             req_zpr_addr,
+            req_substrate_addr,
             a2a_dh_pubkey,
             reconnect,
         }
@@ -394,17 +397,61 @@ fn ipaddr_from_capnp(addr: vsapi::ip_addr::Reader) -> Result<std::net::IpAddr, c
     }
 }
 
+/// Parse and validate a substrate address param value. Unparseable, unspecified-IP
+/// (e.g. 0.0.0.0) and port-0 values are rejected -- the VS cannot verify reachability
+/// of an advertised address, but it can reject values that are structurally unusable.
+fn parse_substrate_addr_str(s: &str) -> Result<SocketAddr, ServiceError> {
+    let sa: SocketAddr = s.parse().map_err(|_| {
+        ServiceError::Param(format!(
+            "param {} is not a valid socket address: '{s}'",
+            pname::SUBSTRATE_ADDR
+        ))
+    })?;
+    if sa.ip().is_unspecified() || sa.port() == 0 {
+        return Err(ServiceError::Param(format!(
+            "param {} must be a specific address with a non-zero port, got '{sa}'",
+            pname::SUBSTRATE_ADDR
+        )));
+    }
+    Ok(sa)
+}
+
+/// Find and parse the required `substrate_addr` param. Used by `open`, which (unlike
+/// `connect`) requires no other params. See
+/// https://github.com/org-zpr/zpr-visaservice/issues/299
+fn parse_substrate_addr_param(params: &[Param]) -> Result<SocketAddr, ServiceError> {
+    for pp in params {
+        if pp.name.as_str() == pname::SUBSTRATE_ADDR {
+            return match &pp.value {
+                ParamValue::StrParam(s) => parse_substrate_addr_str(s),
+                _ => Err(ServiceError::Param(format!(
+                    "param {} has invalid type",
+                    pname::SUBSTRATE_ADDR
+                ))),
+            };
+        }
+    }
+    Err(ServiceError::Param("SUBSTRATE_ADDR param missing".into()))
+}
+
 impl VisaServiceImpl {
-    /// Helper for the connect routine -- returns the one connect param we require, zpr_addr,
-    /// plus the node's A2A DH public key if it sent one. Older code used to pass in the
-    /// AAA_PREFIX here but now we send that over the VSS.
+    /// Helper for the connect routine -- returns the two connect params we require, zpr_addr
+    /// and substrate_addr, plus the node's A2A DH public key if it sent one. Older code used
+    /// to pass in the AAA_PREFIX here but now we send that over the VSS.
     ///
     /// During this transition period we will error out if node passes use AAA_PREFIX.
+    ///
+    /// `substrate_addr` is the node's advertised substrate address (the address peers dial),
+    /// sent as a string param and parsed as a `SocketAddr`. Unparseable, unspecified-IP
+    /// (e.g. 0.0.0.0) and port-0 values are rejected -- the VS cannot verify reachability,
+    /// but it can reject values that are structurally unusable.
+    /// See https://github.com/org-zpr/zpr-visaservice/issues/299
     fn parse_my_connect_params(
         &self,
         params: &[Param],
-    ) -> Result<(IpAddr, Option<PublicKey>), ServiceError> {
+    ) -> Result<(IpAddr, SocketAddr, Option<PublicKey>), ServiceError> {
         let mut node_zpr_addr = None;
+        let mut node_substrate_addr = None;
         let mut a2a_dh_pubkey = None;
 
         for pp in params {
@@ -415,6 +462,18 @@ impl VisaServiceImpl {
                         return Err(ServiceError::Param(format!(
                             "param {} has invalid type",
                             pname::ZPR_ADDR
+                        )));
+                    }
+                },
+
+                pname::SUBSTRATE_ADDR => match &pp.value {
+                    ParamValue::StrParam(s) => {
+                        node_substrate_addr = Some(parse_substrate_addr_str(s)?);
+                    }
+                    _ => {
+                        return Err(ServiceError::Param(format!(
+                            "param {} has invalid type",
+                            pname::SUBSTRATE_ADDR
                         )));
                     }
                 },
@@ -442,10 +501,13 @@ impl VisaServiceImpl {
             }
         }
 
-        if node_zpr_addr.is_none() {
+        let Some(node_zpr_addr) = node_zpr_addr else {
             return Err(ServiceError::Param("ZPR_ADDR param missing".into()));
-        }
-        Ok((node_zpr_addr.unwrap(), a2a_dh_pubkey))
+        };
+        let Some(node_substrate_addr) = node_substrate_addr else {
+            return Err(ServiceError::Param("SUBSTRATE_ADDR param missing".into()));
+        };
+        Ok((node_zpr_addr, node_substrate_addr, a2a_dh_pubkey))
     }
 
     /// Helper to handle errors during connect call.
@@ -481,7 +543,7 @@ impl VisaServiceImpl {
 
 impl vsapi::visa_service::Server for VisaServiceImpl {
     // Node connection request to the Visa Service.
-    // Currently the node must pass its ZPR_ADDRESS and AAA_PREFIX as connect params.
+    // The node must pass its ZPR_ADDR and SUBSTRATE_ADDR as connect params.
     async fn connect(
         self: Rc<Self>,
         params: vsapi::visa_service::ConnectParams,
@@ -514,16 +576,17 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             }
         };
 
-        let (node_zpr_addr, a2a_dh_pubkey) = match self.parse_my_connect_params(&parsed_params) {
-            Ok(addr_and_key) => addr_and_key,
-            Err(e) => {
-                return self.ok_with_connect_error(
-                    results,
-                    vsapi::ErrorCode::Internal,
-                    format!("{e}").as_str(),
-                );
-            }
-        };
+        let (node_zpr_addr, node_substrate_addr, a2a_dh_pubkey) =
+            match self.parse_my_connect_params(&parsed_params) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    return self.ok_with_connect_error(
+                        results,
+                        vsapi::ErrorCode::ParamError,
+                        format!("{e}").as_str(),
+                    );
+                }
+            };
 
         info!(target: API, "node {} requests zpr addr {} (CONNECT_TYPE={:?})", vs_connect_request.cn, node_zpr_addr, vs_connect_request.ctype);
 
@@ -592,6 +655,7 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             self.remote,
             vs_connect_request.cn,
             node_zpr_addr,
+            node_substrate_addr,
             a2a_dh_pubkey,
             vs_connect_request.ctype == ConnectType::Reconnect,
         ));
@@ -620,10 +684,27 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             }
         };
 
-        // TODO: are there any needed params for an Open call?
+        // The one param `open` requires is the node's advertised substrate address; the
+        // same policy-mismatch check as `connect` applies. `zpr_addr` remains
+        // optional/ignored here -- the node should be using its real ZPR address already
+        // authenticated/granted during authorize_connect.
+        // See https://github.com/org-zpr/zpr-visaservice/issues/299
 
-        // The node should be using its real ZPR address already authenticated/granted during
-        // authorize_conenct.
+        let reported_substrate = match vs_connect_request
+            .params
+            .as_deref()
+            .ok_or_else(|| ServiceError::Param("connect params missing".into()))
+            .and_then(parse_substrate_addr_param)
+        {
+            Ok(sa) => sa,
+            Err(e) => {
+                return self.ok_with_open_error(
+                    results,
+                    vsapi::ErrorCode::ParamError,
+                    format!("{e}").as_str(),
+                );
+            }
+        };
 
         let node_zpr_addr = self.remote.ip();
         info!(target: API, "node {} requests open from addr {} (CONNECT_TYPE={:?})", vs_connect_request.cn, node_zpr_addr, vs_connect_request.ctype);
@@ -654,6 +735,48 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
                 vsapi::ErrorCode::InvalidOperation,
                 "address in use",
             );
+        }
+        let mut existing_actor = existing_actor;
+
+        // If policy topology declares a substrate for this node it must agree with the
+        // reported one; with no topology entry the reported value stands.
+        if let Some(sa) =
+            crate::connection_control::substrate_addr_from_topology(&self.asm, &node_zpr_addr)
+            && sa != reported_substrate
+        {
+            return self.ok_with_open_error(
+                results,
+                vsapi::ErrorCode::ParamError,
+                &format!(
+                    "substrate address mismatch: policy declares {sa}, node reported {reported_substrate}"
+                ),
+            );
+        }
+
+        // A soft reconnect may carry a changed dock address; keep the stored claim current.
+        let stored = existing_actor
+            .get_attribute(key::SUBSTRATE_ADDR)
+            .and_then(|a| a.get_value().first().cloned());
+        if stored.as_deref() != Some(reported_substrate.to_string().as_str()) {
+            info!(target: API, "node {} substrate address {} -> {} on open", vs_connect_request.cn, stored.unwrap_or_default(), reported_substrate);
+            if let Err(e) = existing_actor.add_attribute(
+                Attribute::builder(key::SUBSTRATE_ADDR).value(reported_substrate.to_string()),
+            ) {
+                error!(target: API, "failed to update substrate addr claim for {}: {}", vs_connect_request.cn, e);
+                return self.ok_with_open_error(
+                    results,
+                    vsapi::ErrorCode::Internal,
+                    "internal error during open",
+                );
+            }
+            if let Err(e) = self.asm.actor_mgr.update_actor(&existing_actor).await {
+                error!(target: API, "failed to persist substrate addr claim for {}: {}", vs_connect_request.cn, e);
+                return self.ok_with_open_error(
+                    results,
+                    vsapi::ErrorCode::Internal,
+                    "internal error during open",
+                );
+            }
         }
 
         // Not yet sure if we support a RESET over this channel...but might make sense.
@@ -763,8 +886,8 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                 unix_ts,
                 &self.remote_cn,
                 challenge_response,
-                self.remote,
                 self.req_zpr_addr,
+                self.req_substrate_addr,
                 self.a2a_dh_pubkey.as_ref(),
             )
             .await
@@ -776,6 +899,14 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                     results,
                     vsapi::ErrorCode::AuthError,
                     format!("authentication failed: {reason}").as_str(),
+                );
+            }
+            Err(ServiceError::Param(reason)) => {
+                warn!(target: API, "param error during authentication for {}: {}", self.remote_cn, reason);
+                return self.ok_with_authenticate_error(
+                    results,
+                    vsapi::ErrorCode::ParamError,
+                    format!("param error: {reason}").as_str(),
                 );
             }
             Err(e) => {

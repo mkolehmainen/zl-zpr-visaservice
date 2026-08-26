@@ -129,11 +129,12 @@ impl ConnectionControl {
     ///
     /// See https://github.com/org-zpr/zpr-visaservice/issues/205
     ///
-    /// The `remote` arg is the TCP peer address of the node.  So it will be a ZPR address and an
-    /// ephemeral socket. Not very useful.  Originally this was supposed to be a substrate address
-    /// but we are not yet told that.
-    ///
-    /// See https://github.com/org-zpr/zpr-visaservice/issues/299
+    /// `reported_substrate` is the substrate address the node advertised in its connect
+    /// params (the address peers dial). When policy topology also declares a substrate for
+    /// this node the two must agree; when it declares none (e.g. a single-node deploy with
+    /// no peerings) the reported value is used as-is. Either way the resolved value becomes
+    /// the node's `key::SUBSTRATE_ADDR` claim -- there is no longer a TCP-peer-address
+    /// fallback (see https://github.com/org-zpr/zpr-visaservice/issues/299).
     ///
     pub async fn authenticate_node(
         &self,
@@ -142,8 +143,8 @@ impl ConnectionControl {
         timestamp: u64,
         cn: &str,
         challenge_response: &[u8],
-        remote: SocketAddr,
         node_req_addr: IpAddr,
+        reported_substrate: SocketAddr,
         a2a_dh_pubkey: Option<&PublicKey>,
     ) -> Result<Actor, ServiceError> {
         // Massage this node authentication request into something that looks like a generic
@@ -151,17 +152,20 @@ impl ConnectionControl {
 
         let mut authd_claims: Vec<Attribute> = Vec::new();
 
-        // Policy might contain the real substrate address.
-        // Otherwise we just use the peer address. Not ideal, but doesn't matter yet since no one is actually
-        // using the SUBSTRATE_ADDR property yet -- BUT code later (db/node.rs) requires that this property
-        // is set.
-        // See: https://github.com/org-zpr/zpr-visaservice/issues/299
+        // Policy topology may declare this node's substrate address; if so the node's
+        // advertised value must match it. With no topology entry (single-node deploy,
+        // no peerings) the advertised value is all we have, and it is trusted operator
+        // config just like a policy-declared substrate.
         let substrate_addr = match substrate_addr_from_topology(&asm, &node_req_addr) {
-            Some(sa) => sa,
-            None => {
-                warn!(target: CC, "node {cn} has no substrate address in policy - using peer address {remote}");
-                remote
+            Some(sa) => {
+                if sa != reported_substrate {
+                    return Err(ServiceError::Param(format!(
+                        "substrate address mismatch: policy declares {sa}, node reported {reported_substrate}"
+                    )));
+                }
+                sa
             }
+            None => reported_substrate,
         };
         authd_claims
             .push(Attribute::builder(key::SUBSTRATE_ADDR).value(substrate_addr.to_string()));
@@ -585,7 +589,7 @@ impl ConnectionControl {
 /// in the resolved topology -- both mean policy cannot tell us.
 ///
 /// Does not support multi-homed nodes!
-fn substrate_addr_from_topology(asm: &Assembly, node_addr: &IpAddr) -> Option<SocketAddr> {
+pub fn substrate_addr_from_topology(asm: &Assembly, node_addr: &IpAddr) -> Option<SocketAddr> {
     let psnap = asm.policy_mgr.get_current_snapshot();
     for peer in psnap.policy().get_peers_for_node(node_addr)? {
         if let Some((_, sock_addr)) = psnap
@@ -954,8 +958,8 @@ mod tests {
                 12345678,
                 "unknown.zpr",
                 &[],
-                "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await;
@@ -984,8 +988,8 @@ mod tests {
                 12345678,
                 cn,
                 b"not-a-valid-rsa-sig",
-                "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await;
@@ -1012,8 +1016,8 @@ mod tests {
                 timestamp,
                 cn,
                 &bad_sig,
-                "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await;
@@ -1080,8 +1084,8 @@ mod tests {
                 timestamp,
                 cn,
                 &sig,
-                "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await;
@@ -1090,6 +1094,169 @@ mod tests {
             "expected failure got {:?}",
             result
         );
+    }
+
+    /// As [make_policy_with_node_join_policy], plus a topology peering so the policy
+    /// declares a substrate address for the peered nodes.
+    fn make_policy_with_node_join_and_peering(
+        cn: &str,
+        pubkey_der: &[u8],
+        peering: &zpr::policy_types::Peering,
+    ) -> Vec<u8> {
+        use zpr::write_to::WriteTo;
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut policy_bldr = msg.init_root::<v1::policy::Builder>();
+            policy_bldr.set_created("2024-01-01T00:00:00Z");
+            policy_bldr.set_version(1);
+            policy_bldr.set_metadata("");
+            {
+                let mut keys = policy_bldr.reborrow().init_keys(1);
+                keys.reborrow().get(0).set_id(cn);
+                keys.reborrow()
+                    .get(0)
+                    .set_key_type(v1::KeyMaterialT::RsaPub);
+                keys.reborrow()
+                    .get(0)
+                    .init_key_allows(1)
+                    .set(0, v1::KeyAllowance::Bootstrap);
+                keys.reborrow().get(0).set_key_data(pubkey_der);
+            }
+            {
+                let mut jps = policy_bldr.reborrow().init_join_policies(1);
+                jps.reborrow()
+                    .get(0)
+                    .init_flags(1)
+                    .set(0, v1::JoinFlag::Node);
+            }
+            {
+                let mut topo = policy_bldr.reborrow().init_topology(1);
+                peering.write_to(&mut topo.reborrow().get(0));
+            }
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+        make_container_bytes(
+            config::POLICY_MIN_COMPILER_MAJOR,
+            config::POLICY_MIN_COMPILER_MINOR,
+            config::POLICY_MIN_COMPILER_PATCH,
+            &bytes,
+        )
+    }
+
+    /// With no topology entry for the node, the reported substrate address is stored
+    /// as the node's `key::SUBSTRATE_ADDR` claim (no TCP-peer fallback exists anymore).
+    #[tokio::test]
+    async fn authenticate_node_no_topology_stores_reported_substrate() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+        let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap();
+
+        let actor = cc
+            .authenticate_node(
+                asm,
+                challenge,
+                timestamp,
+                cn,
+                &sig,
+                "fd5a:5052::1".parse().unwrap(),
+                reported,
+                None,
+            )
+            .await
+            .expect("authentication should succeed");
+
+        let stored = actor
+            .get_attribute(key::SUBSTRATE_ADDR)
+            .expect("substrate addr claim must be present")
+            .get_value()[0]
+            .clone();
+        assert_eq!(stored, reported.to_string());
+    }
+
+    /// When policy topology declares a substrate for the node and the node reports a
+    /// different one, authentication fails with a param error.
+    #[tokio::test]
+    async fn authenticate_node_topology_mismatch_is_param_error() {
+        use crate::test_helpers::make_peering;
+
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        let a: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
+        let b: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
+        // make_peering declares each node's own address (port 0) as its substrate.
+        let peering = make_peering(a, b, "link-ab", vec![]);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
+                cn,
+                &pubkey_der,
+                &peering,
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+        let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap(); // != policy's [b]:0
+
+        let result = cc
+            .authenticate_node(asm, challenge, timestamp, cn, &sig, b, reported, None)
+            .await;
+        assert!(
+            matches!(result, Err(ServiceError::Param(_))),
+            "expected param error, got {:?}",
+            result
+        );
+    }
+
+    /// When policy topology declares a substrate and the node reports the same value,
+    /// authentication succeeds and that value is stored.
+    #[tokio::test]
+    async fn authenticate_node_topology_match_succeeds() {
+        use crate::test_helpers::make_peering;
+
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        let a: IpAddr = "fd5a:5052:90de:1::1".parse().unwrap();
+        let b: IpAddr = "fd5a:5052:90de:1::2".parse().unwrap();
+        let peering = make_peering(a, b, "link-ab", vec![]);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_and_peering(
+                cn,
+                &pubkey_der,
+                &peering,
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+        let reported = SocketAddr::new(b, 0); // matches make_peering's declaration
+
+        let actor = cc
+            .authenticate_node(asm, challenge, timestamp, cn, &sig, b, reported, None)
+            .await
+            .expect("authentication should succeed");
+
+        let stored = actor
+            .get_attribute(key::SUBSTRATE_ADDR)
+            .expect("substrate addr claim must be present")
+            .get_value()[0]
+            .clone();
+        assert_eq!(stored, reported.to_string());
     }
 
     #[tokio::test]
@@ -1113,8 +1280,8 @@ mod tests {
                 timestamp,
                 cn,
                 &sig,
-                "127.0.0.1:1234".parse().unwrap(),
                 "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
                 None,
             )
             .await
