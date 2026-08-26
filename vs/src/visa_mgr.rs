@@ -610,8 +610,13 @@ impl VisaMgr {
             metadata.signal_msgs.push(sig.message.clone());
         }
 
-        let ingress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.source_addr).await?;
-        let egress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.dest_addr).await?;
+        let mut ingress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.source_addr).await?;
+        let mut egress_key = a2a_dh_pubkey_bytes(asm, &pdesc.five_tuple.dest_addr).await?;
+
+        if ingress_key.is_empty() || egress_key.is_empty() {
+            ingress_key.clear();
+            egress_key.clear();
+        }
 
         let pep = DockPep {
             pep,
