@@ -20,7 +20,7 @@ use jsonwebtoken as jwt;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::usize;
 use tracing::{debug, error, info, warn};
 
@@ -84,11 +84,10 @@ impl ConnectionControl {
     /// VS uses this to create an "identity" token for bootstrap authenticated actors.
     ///
     /// `sub` should be 'node/<CN>' or 'adapter/<CN>'
-    fn gen_jwt(&self, sub: String) -> Result<String, ServiceError> {
+    /// `lifetime` is how long the token is valid for.
+    fn gen_jwt(&self, sub: String, lifetime: Duration) -> Result<String, ServiceError> {
         let expiration = Utc::now()
-            .checked_add_signed(chrono::Duration::seconds(
-                config::DEFAULT_AUTH_EXPIRATION.as_secs() as i64,
-            ))
+            .checked_add_signed(chrono::Duration::seconds(lifetime.as_secs() as i64))
             .expect("valid timestamp")
             .timestamp() as u64;
         let claims = JwtClaims {
@@ -268,7 +267,13 @@ impl ConnectionControl {
                     actor.get_zpr_addr()
                 )));
             }
-            actor.add_attribute(Attribute::builder(key::AUTHORITY).value(&self.authority))?;
+            // The ordinary adapter path already stamped AUTHORITY with the default (4 hour)
+            // expiration; re-add it with the VS expiration so the VS does not expire itself.
+            actor.add_attribute(
+                Attribute::builder(key::AUTHORITY)
+                    .expires_in(config::VS_AUTH_EXPIRATION)
+                    .value(&self.authority),
+            )?;
         }
 
         Ok(actor)
@@ -296,7 +301,11 @@ impl ConnectionControl {
 
         // The `authorized_connection` call will add the default expiration on the authority key. We
         // want to make vs not expire.
-        vs_actor.add_attribute(Attribute::builder(key::AUTHORITY).value(&self.authority))?;
+        vs_actor.add_attribute(
+            Attribute::builder(key::AUTHORITY)
+                .expires_in(config::VS_AUTH_EXPIRATION)
+                .value(&self.authority),
+        )?;
 
         Ok(vs_actor)
     }
@@ -363,21 +372,24 @@ impl ConnectionControl {
             )
             .await?;
 
-        // The visa service issues itself no JWT: the token expires, which would expire its own
-        // authentication and start denying its own visas. AUTHORITY is its only identity key.
-        if ssb.cn != config::VS_CN {
-            let actor_jwt = if actor.is_node() {
-                self.gen_jwt(format!("node/{}", ssb.cn))?
-            } else {
-                self.gen_jwt(format!("adapter/{}", ssb.cn))?
-            };
-            let _ = actor.add_attribute(
-                Attribute::builder(ATTR_KEY_VS_IDENT)
-                    .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
-                    .value(actor_jwt),
-            );
-            let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
-        }
+        // The visa service's own token gets the VS expiration. A 4 hour token would expire its
+        // own authentication and it would start denying its own visas.
+        let auth_expiration = if ssb.cn == config::VS_CN {
+            config::VS_AUTH_EXPIRATION
+        } else {
+            config::DEFAULT_AUTH_EXPIRATION
+        };
+        let actor_jwt = if actor.is_node() {
+            self.gen_jwt(format!("node/{}", ssb.cn), auth_expiration)?
+        } else {
+            self.gen_jwt(format!("adapter/{}", ssb.cn), auth_expiration)?
+        };
+        let _ = actor.add_attribute(
+            Attribute::builder(ATTR_KEY_VS_IDENT)
+                .expires(SystemTime::now() + auth_expiration)
+                .value(actor_jwt),
+        );
+        let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
 
         Ok(actor)
     }
@@ -783,7 +795,9 @@ mod tests {
     #[test]
     fn gen_jwt_node_has_correct_claims() {
         let cc = make_cc("test-vs");
-        let token = cc.gen_jwt("node/my-node".to_string()).unwrap();
+        let token = cc
+            .gen_jwt("node/my-node".to_string(), config::DEFAULT_AUTH_EXPIRATION)
+            .unwrap();
         let claims = decode_jwt(&token, "test-vs").expect("token must decode");
 
         assert_eq!(claims.sub, "node/my-node");
@@ -793,8 +807,9 @@ mod tests {
     #[test]
     fn gen_jwt_jti_is_unique_per_call() {
         let cc = make_cc("test-vs");
-        let t1 = decode_jwt(&cc.gen_jwt("node/cn".to_string()).unwrap(), "test-vs").unwrap();
-        let t2 = decode_jwt(&cc.gen_jwt("node/cn".to_string()).unwrap(), "test-vs").unwrap();
+        let exp = config::DEFAULT_AUTH_EXPIRATION;
+        let t1 = decode_jwt(&cc.gen_jwt("node/cn".to_string(), exp).unwrap(), "test-vs").unwrap();
+        let t2 = decode_jwt(&cc.gen_jwt("node/cn".to_string(), exp).unwrap(), "test-vs").unwrap();
         assert_ne!(t1.jti, t2.jti);
     }
 
