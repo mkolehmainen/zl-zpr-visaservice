@@ -235,7 +235,7 @@ impl ConnectionControl {
             None => warn!(target: CC, "adapter via {connect_via} sent no usable A2A DH public key"),
         }
 
-        let actor = match &req.blobs[0] {
+        let mut actor = match &req.blobs[0] {
             AuthBlob::SS(ssb) => match ssb.alg {
                 ChallengeAlg::RsaSha256Pkcs1v15 => {
                     // We are the authority since we are checking RSA locally.
@@ -257,6 +257,19 @@ impl ConnectionControl {
                 ));
             }
         };
+
+        // Our own adapter connects late: the node self-authorizes it during bootstrap and
+        // sends the real request once it has VSAPI access.
+        if actor.get_cn() == Some(config::VS_CN) {
+            let vs_addr = IpAddr::V6(config::VS_ZPR_ADDR);
+            if actor.get_zpr_addr() != Some(&vs_addr) {
+                return Err(ServiceError::AuthenticationFailed(format!(
+                    "visa service adapter claimed address {:?}, expected {vs_addr}",
+                    actor.get_zpr_addr()
+                )));
+            }
+            actor.add_attribute(Attribute::builder(key::AUTHORITY).value(&self.authority))?;
+        }
 
         Ok(actor)
     }
@@ -350,17 +363,21 @@ impl ConnectionControl {
             )
             .await?;
 
-        let actor_jwt = if actor.is_node() {
-            self.gen_jwt(format!("node/{}", ssb.cn))?
-        } else {
-            self.gen_jwt(format!("adapter/{}", ssb.cn))?
-        };
-        let _ = actor.add_attribute(
-            Attribute::builder(ATTR_KEY_VS_IDENT)
-                .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
-                .value(actor_jwt),
-        );
-        let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
+        // The visa service issues itself no JWT: the token expires, which would expire its own
+        // authentication and start denying its own visas. AUTHORITY is its only identity key.
+        if ssb.cn != config::VS_CN {
+            let actor_jwt = if actor.is_node() {
+                self.gen_jwt(format!("node/{}", ssb.cn))?
+            } else {
+                self.gen_jwt(format!("adapter/{}", ssb.cn))?
+            };
+            let _ = actor.add_attribute(
+                Attribute::builder(ATTR_KEY_VS_IDENT)
+                    .expires(SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
+                    .value(actor_jwt),
+            );
+            let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
+        }
 
         Ok(actor)
     }
