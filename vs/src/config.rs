@@ -77,6 +77,10 @@ pub const MIN_VISA_LIFETIME: Duration = Duration::from_secs(30);
 
 pub const DEFAULT_AUTH_EXPIRATION: Duration = Duration::from_secs(4 * 60 * 60); // 4 hours
 
+/// Expiration used on the visa service's own identity attributes. The VS must not expire its own
+/// authentication so this is set far enough out to never be reached.
+pub const VS_AUTH_EXPIRATION: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60); // ~100 years
+
 /// When an actor is using an AAA address to do an exchange with an auth
 /// service, the credentials it is using last this long.
 ///
