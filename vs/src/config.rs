@@ -175,11 +175,36 @@ impl Default for CoreSection {
 }
 
 impl VSConfig {
-    /// Load configuration from a file.
+    /// Load configuration from a file. Relative paths in the file resolve
+    /// relative to the directory containing the file, not the CWD.
     pub fn from_file(path: &std::path::Path) -> Result<Self, ServiceError> {
         let contents = std::fs::read_to_string(path)?;
-        let cfg: VSConfig = toml::from_str(&contents)?;
+        let mut cfg: VSConfig = toml::from_str(&contents)?;
+        // An empty parent (e.g. plain "vs.toml") means the config sits in the
+        // CWD; joining an empty base is a no-op, preserving that behavior.
+        if let Some(base) = path.parent() {
+            cfg.resolve_paths(base);
+        }
         Ok(cfg)
+    }
+
+    /// Rebase every relative path setting onto `base` (the config file's
+    /// directory). Absolute paths are left untouched.
+    fn resolve_paths(&mut self, base: &std::path::Path) {
+        // Joining a relative path onto `base` anchors it to the config file's
+        // location; `Path::join` replaces the base entirely for absolute paths,
+        // so those pass through unchanged.
+        fn rebase(base: &std::path::Path, p: &mut PathBuf) {
+            *p = base.join(&*p);
+        }
+        rebase(base, &mut self.core.admin_cert);
+        rebase(base, &mut self.core.admin_key);
+        if let Some(p) = self.core.api_keys.as_mut() {
+            rebase(base, p);
+        }
+        if let Some(p) = self.core.file_ts_dir.as_mut() {
+            rebase(base, p);
+        }
     }
 
     pub fn get_vs_addr(&self) -> IpAddr {
@@ -224,5 +249,82 @@ mod test {
         .unwrap();
         assert_eq!(cfg.core.vk_uri, Some(VALKEY_URI.to_string()));
         assert_eq!(cfg.core.vsapi_port, Some(9999));
+    }
+
+    // Write `contents` into a temp dir as vs.toml and load it via from_file,
+    // returning the parsed config and the temp dir (kept alive by the caller).
+    fn load_from_temp_dir(contents: &str) -> (VSConfig, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("vs.toml");
+        std::fs::write(&cfg_path, contents).unwrap();
+        let cfg = VSConfig::from_file(&cfg_path).unwrap();
+        (cfg, dir)
+    }
+
+    // Relative path fields in the config file must resolve relative to the
+    // config file's directory, not the process's working directory.
+    #[test]
+    fn test_relative_paths_resolve_relative_to_config_file() {
+        let (cfg, dir) = load_from_temp_dir(
+            r#"
+        [core]
+        admin_cert = "certs/cert.pem"
+        admin_key = "certs/key.pem"
+        api_keys = "keys.toml"
+        file_ts_dir = "include"
+        "#,
+        );
+        let base = dir.path();
+        assert_eq!(cfg.core.admin_cert, base.join("certs/cert.pem"));
+        assert_eq!(cfg.core.admin_key, base.join("certs/key.pem"));
+        assert_eq!(cfg.core.api_keys, Some(base.join("keys.toml")));
+        assert_eq!(cfg.core.file_ts_dir, Some(base.join("include")));
+    }
+
+    // Absolute path fields must be left exactly as written; anchoring only
+    // applies to relative paths.
+    #[test]
+    fn test_absolute_paths_are_untouched() {
+        let (cfg, _dir) = load_from_temp_dir(
+            r#"
+        [core]
+        admin_cert = "/etc/zpr/cert.pem"
+        api_keys = "/etc/zpr/keys.toml"
+        "#,
+        );
+        assert_eq!(cfg.core.admin_cert, PathBuf::from("/etc/zpr/cert.pem"));
+        assert_eq!(cfg.core.api_keys, Some(PathBuf::from("/etc/zpr/keys.toml")));
+    }
+
+    #[test]
+    fn test_unset_path_fields_default_relative_to_config_dir() {
+        // Fields absent from the file take the struct defaults, which are
+        // relative and therefore also anchor to the config file's directory.
+        let (cfg, dir) = load_from_temp_dir(
+            r#"
+        [core]
+        vsapi_port = 9999
+        "#,
+        );
+        let base = dir.path();
+        assert_eq!(cfg.core.admin_cert, base.join("admin-tls-cert.pem"));
+        assert_eq!(cfg.core.admin_key, base.join("admin-tls-key.pem"));
+        assert_eq!(cfg.core.api_keys, Some(base.join(DEFAULT_API_KEYS_FILE)));
+        assert_eq!(cfg.core.file_ts_dir, Some(base.join(".")));
+    }
+
+    #[test]
+    fn test_bare_filename_config_path_keeps_cwd_relative_paths() {
+        // A config path with no directory component ("vs.toml") has an empty
+        // parent; rebasing onto it must leave relative paths unchanged.
+        let mut cfg: VSConfig = toml::from_str(
+            r#"
+        [core]
+        admin_cert = "cert.pem"
+        "#,
+        )
+        .unwrap();
+        cfg.resolve_paths(std::path::Path::new("vs.toml").parent().unwrap());
+        assert_eq!(cfg.core.admin_cert, PathBuf::from("cert.pem"));
     }
 }

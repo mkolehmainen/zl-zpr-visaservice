@@ -58,4 +58,5 @@ uuid = { version = "1.22.0", features = ["v4"] }
 zpr.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 tower = "0.5.3"
