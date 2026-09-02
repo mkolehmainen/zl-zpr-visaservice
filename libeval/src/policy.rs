@@ -277,6 +277,32 @@ impl Policy {
         &self.identity_attr_keys
     }
 
+    /// Attribute keys that may be used as external attribute-store lookup keys: the
+    /// builtin CN plus every policy-declared identity attribute, in that order.
+    ///
+    /// This is the same UNION [crate::eval::EvalContext::approve_connection] applies when
+    /// assigning identity keys to an actor (and that code is written in terms of this
+    /// accessor, so the two definitions cannot drift): libeval treats [key::CN] as an
+    /// identity key on its own — mirroring zplc's builtin `default` trusted service,
+    /// which emits no `TrustedService` record — while [Policy::identity_attr_keys]
+    /// excludes CN by construction.
+    ///
+    /// Because it is an allow-list, caller-layered identity keys (the Visa Service's
+    /// bootstrap JWT and `zpr.authority`) and internal keys (`zpr.addr`,
+    /// `zpr.actor_hash`) are excluded without a deny-list to maintain. Callers
+    /// intersect this set with the authenticated claims (or actor attributes) in hand
+    /// and send (key, value) pairs to attribute stores — never bare values.
+    pub fn lookup_identity_keys(&self) -> Vec<&str> {
+        let mut keys = vec![key::CN];
+        for ikey in &self.identity_attr_keys {
+            // Policy can name CN again via a returns_attributes mapping; dedupe it.
+            if ikey != key::CN {
+                keys.push(ikey.as_str());
+            }
+        }
+        keys
+    }
+
     /// Get the ZPL source for the communication policy by policy index.
     pub fn get_cpol_source(&self, idx: usize) -> Option<&str> {
         self.cpol_sources.get(idx).map(|s| s.as_str())
@@ -848,6 +874,34 @@ mod test {
     fn test_identity_attr_keys_preserves_declared_order() {
         let record = ts("bas", &["a -> user.a", "b -> user.b"], &["b", "a"]);
         assert_eq!(keys_for(&[record]), vec!["user.b", "user.a"]);
+    }
+
+    /// lookup_identity_keys is the builtin CN followed by the policy-declared identity
+    /// keys in policy order, and a policy that names CN again via a returns_attributes
+    /// mapping does not produce a duplicate.
+    #[test]
+    fn test_lookup_identity_keys_is_cn_union_policy_keys() {
+        // Empty policy: CN alone (identity_attr_keys excludes it by construction).
+        assert_eq!(Policy::new_empty().lookup_identity_keys(), vec![key::CN]);
+
+        // Declared keys follow CN in policy order.
+        let record = ts("bas", &["a -> user.a", "b -> user.b"], &["b", "a"]);
+        let policy =
+            Policy::new_from_policy_bytes(policy_bytes_with_trusted_services(&[record])).unwrap();
+        assert_eq!(
+            policy.lookup_identity_keys(),
+            vec![key::CN, "user.b", "user.a"]
+        );
+
+        // A mapping re-declaring CN as identity is deduped, not repeated.
+        let record = ts(
+            "bas",
+            &[&format!("cn -> {}", key::CN), "id -> user.id"],
+            &["cn", "id"],
+        );
+        let policy =
+            Policy::new_from_policy_bytes(policy_bytes_with_trusted_services(&[record])).unwrap();
+        assert_eq!(policy.lookup_identity_keys(), vec![key::CN, "user.id"]);
     }
 
     /// Across services the order is service_id-sorted and duplicates collapse to the

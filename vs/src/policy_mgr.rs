@@ -500,7 +500,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("attrfile.json"),
-            r#"{"alice": {"color": ["red"]}}"#,
+            r#"{"device.zpr.adapter.cn": {"alice": {"color": ["red"]}}}"#,
         )
         .unwrap();
 
@@ -508,9 +508,12 @@ mod tests {
         let good = make_trusted_service_policy("attrfile", "file", Some(3600), &[]);
         let mgr = make_policy_mgr_with_ts(good, ts_mgr.clone(), &dir).await;
 
+        // The lookup-identity set for the fixture's "alice" entry.
+        let alice = [(libeval::attribute::key::CN.to_string(), "alice".to_string())];
+
         // The declared store is live: looking it up by source id no longer reports it missing.
         let results = ts_mgr
-            .get_attributes_from_source_for_actor("attrfile", "alice")
+            .get_attributes_from_source_for_actor("attrfile", &alice)
             .await;
         assert!(results[0].is_ok());
 
@@ -521,7 +524,7 @@ mod tests {
         // ...leaving the current policy and its published stores untouched.
         assert_eq!(mgr.get_current().vinst(), 1);
         let results = ts_mgr
-            .get_attributes_from_source_for_actor("attrfile", "alice")
+            .get_attributes_from_source_for_actor("attrfile", &alice)
             .await;
         assert!(results[0].is_ok());
 
@@ -537,7 +540,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("attrfile.json"),
-            r#"{"alice": {"color": ["red"]}}"#,
+            r#"{"device.zpr.adapter.cn": {"alice": {"color": ["red"]}}}"#,
         )
         .unwrap();
 
@@ -545,24 +548,25 @@ mod tests {
         let policy = make_trusted_service_policy("attrfile", "file", Some(3600), &[]);
         let mgr = make_policy_mgr_with_ts(policy.clone(), ts_mgr.clone(), &dir).await;
 
-        // Catch "alice" up with the store's current revision.
-        let stale = ts_mgr.stale_sources_for_actor("alice");
+        // Catch the actor at this address up with the store's current revision.
+        let addr: std::net::IpAddr = "fd5a:5052::a1".parse().unwrap();
+        let stale = ts_mgr.stale_sources_for_actor(&addr);
         assert_eq!(stale.len(), 1);
-        ts_mgr.record_revision("alice", &stale[0].0, stale[0].1);
-        assert!(ts_mgr.stale_sources_for_actor("alice").is_empty());
+        ts_mgr.record_revision(&addr, &stale[0].0, stale[0].1);
+        assert!(ts_mgr.stale_sources_for_actor(&addr).is_empty());
 
         // Same trusted-service declarations: the store (and its revision) is carried over.
         mgr.update_policy_from_container_bytes(policy)
             .await
             .unwrap();
-        assert!(ts_mgr.stale_sources_for_actor("alice").is_empty());
+        assert!(ts_mgr.stale_sources_for_actor(&addr).is_empty());
 
         // A changed declaration rebuilds the store, so the actor is stale again.
         let changed = make_trusted_service_policy("attrfile", "file", Some(7200), &[]);
         mgr.update_policy_from_container_bytes(changed)
             .await
             .unwrap();
-        assert_eq!(ts_mgr.stale_sources_for_actor("alice").len(), 1);
+        assert_eq!(ts_mgr.stale_sources_for_actor(&addr).len(), 1);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

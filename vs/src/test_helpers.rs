@@ -211,6 +211,19 @@ pub fn make_trusted_service_policy(
     expiration_seconds: Option<u32>,
     mappings: &[&str],
 ) -> Vec<u8> {
+    make_trusted_service_policy_with_identity(id, api, expiration_seconds, mappings, &[])
+}
+
+/// As [make_trusted_service_policy], but also declaring the given service-side
+/// attribute names as identity attributes (they resolve through `mappings` to their
+/// ZPR keys, feeding `Policy::identity_attr_keys` / `lookup_identity_keys`).
+pub fn make_trusted_service_policy_with_identity(
+    id: &str,
+    api: &str,
+    expiration_seconds: Option<u32>,
+    mappings: &[&str],
+    identity: &[&str],
+) -> Vec<u8> {
     let service = Service {
         id: id.to_string(),
         endpoints: Vec::new(),
@@ -238,7 +251,7 @@ pub fn make_trusted_service_policy(
                     .iter()
                     .map(|m| parse_attribute_mapping(m).unwrap())
                     .collect(),
-                identity_attrs: Vec::new(),
+                identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
             };
             ts.write_to(&mut policy_bldr.reborrow().init_trusted_services(1).get(0));
         }
@@ -401,7 +414,7 @@ pub struct MutableTrustedService {
 impl crate::trusted_services::TrustedServiceInterface for MutableTrustedService {
     async fn get_attributes_for_actor(
         &self,
-        _actor_ident: &str,
+        _identities: &[(String, String)],
     ) -> Result<Vec<Attribute>, ServiceError> {
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ServiceError::TrustedServiceInit("down".into()));

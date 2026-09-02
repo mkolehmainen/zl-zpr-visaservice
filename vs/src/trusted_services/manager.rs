@@ -4,6 +4,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::future::join_all;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use libeval::attribute::Attribute;
@@ -15,8 +16,11 @@ use super::TrustedServiceInterface;
 /// Coordinates concurrent access to the configured trusted-service implementations.
 pub struct TrustedServicesMgr {
     services: ArcSwap<Vec<Arc<dyn TrustedServiceInterface>>>,
-    /// Per actor and source, the revision from which attributes were last refreshed.
-    actor_revisions: DashMap<String, HashMap<String, u64>>,
+    /// Per actor (keyed by ZPR address) and source, the revision from which attributes
+    /// were last refreshed. ZPR addresses are recycled from a pool, so entries MUST be
+    /// purged on disconnect ([TrustedServicesMgr::forget_actor_revisions]) before the
+    /// address can be reassigned.
+    actor_revisions: DashMap<IpAddr, HashMap<String, u64>>,
 }
 
 impl TrustedServicesMgr {
@@ -28,14 +32,15 @@ impl TrustedServicesMgr {
         }
     }
 
-    /// Return sources whose current revision differs from the actor's record. A source
-    /// with no record at all is stale: the actor has never been refreshed from it (or
-    /// the last attempt failed), so it must be consulted even when the actor holds no
-    /// attribute from it -- otherwise a source that vended nothing on the first lookup
-    /// would be skipped forever, including after a flush adds attributes for the actor.
-    pub fn stale_sources_for_actor(&self, actor_ident: &str) -> Vec<(String, u64)> {
+    /// Return sources whose current revision differs from the record for the actor at
+    /// `zpr_addr`. A source with no record at all is stale: the actor has never been
+    /// refreshed from it (or the last attempt failed), so it must be consulted even
+    /// when the actor holds no attribute from it -- otherwise a source that vended
+    /// nothing on the first lookup would be skipped forever, including after a flush
+    /// adds attributes for the actor.
+    pub fn stale_sources_for_actor(&self, zpr_addr: &IpAddr) -> Vec<(String, u64)> {
         let services = self.services.load_full();
-        let recorded = self.actor_revisions.get(actor_ident);
+        let recorded = self.actor_revisions.get(zpr_addr);
         services
             .iter()
             .filter_map(|service| {
@@ -50,12 +55,18 @@ impl TrustedServicesMgr {
             .collect()
     }
 
-    /// Record the source revision used to refresh an actor's attributes.
-    pub fn record_revision(&self, actor_ident: &str, source: &str, revision: u64) {
+    /// Record the source revision used to refresh the attributes of the actor at `zpr_addr`.
+    pub fn record_revision(&self, zpr_addr: &IpAddr, source: &str, revision: u64) {
         self.actor_revisions
-            .entry(actor_ident.to_string())
+            .entry(*zpr_addr)
             .or_default()
             .insert(source.to_string(), revision);
+    }
+
+    /// Drop all recorded per-source revisions for the actor at `zpr_addr`. Call before
+    /// the address returns to the pool, so a recycled address cannot inherit them.
+    pub fn forget_actor_revisions(&self, zpr_addr: &IpAddr) {
+        self.actor_revisions.remove(zpr_addr);
     }
 
     /// Atomically replace the entire trusted-service list.
@@ -64,23 +75,29 @@ impl TrustedServicesMgr {
     }
 
     /// Query every trusted service concurrently for an actor's attributes.
+    ///
+    /// `identities` is the actor's lookup-identity (key, value) set; see
+    /// [TrustedServiceInterface::get_attributes_for_actor].
     pub async fn get_attributes_for_actor(
         &self,
-        actor_ident: &str,
+        identities: &[(String, String)],
     ) -> Vec<Result<Vec<Attribute>, ServiceError>> {
         let snapshot = self.services.load_full();
         let futures = snapshot.iter().map(|service| {
             let service = service.clone();
-            async move { service.get_attributes_for_actor(actor_ident).await }
+            async move { service.get_attributes_for_actor(identities).await }
         });
         join_all(futures).await
     }
 
     /// Query one named trusted service for an actor's attributes.
+    ///
+    /// `identities` is the actor's lookup-identity (key, value) set; see
+    /// [TrustedServiceInterface::get_attributes_for_actor].
     pub async fn get_attributes_from_source_for_actor(
         &self,
         source_ident: &str,
-        actor_ident: &str,
+        identities: &[(String, String)],
     ) -> Vec<Result<Vec<Attribute>, ServiceError>> {
         let snapshot = self.services.load_full();
         if let Some(service) = snapshot
@@ -88,7 +105,7 @@ impl TrustedServicesMgr {
             .find(|service| service.get_source_id() == source_ident)
         {
             let service = service.clone();
-            return vec![service.get_attributes_for_actor(actor_ident).await];
+            return vec![service.get_attributes_for_actor(identities).await];
         }
 
         vec![Err(ServiceError::TrustedServiceNotFound(
@@ -135,7 +152,10 @@ mod tests {
     /// Flushing all services reaches each registered implementation.
     #[tokio::test]
     async fn test_manager_flush_all_reaches_every_service() {
-        let fp = write_fixture("vs-fas-flush-all.json", r#"{"alice": {"color": ["red"]}}"#);
+        let fp = write_fixture(
+            "vs-fas-flush-all.json",
+            r#"{"device.zpr.adapter.cn": {"alice": {"color": ["red"]}}}"#,
+        );
         let manager = TrustedServicesMgr::new();
         let store = Arc::new(
             FileAttributeStore::new(
@@ -160,7 +180,10 @@ mod tests {
     /// Actor revision records become stale whenever a relevant service advances.
     #[tokio::test]
     async fn test_stale_sources_for_actor_tracks_revisions() {
-        let fp = write_fixture("vs-fas-stale.json", r#"{"alice": {"color": ["red"]}}"#);
+        let fp = write_fixture(
+            "vs-fas-stale.json",
+            r#"{"device.zpr.adapter.cn": {"alice": {"color": ["red"]}}}"#,
+        );
         let manager = TrustedServicesMgr::new();
         let store = Arc::new(
             FileAttributeStore::new(
@@ -176,15 +199,26 @@ mod tests {
         // A configured source the actor has no record for is stale, even though the
         // actor holds no attribute from it -- otherwise a source that vended nothing on
         // the first lookup would never be consulted again.
-        let stale = manager.stale_sources_for_actor("alice");
+        let addr: IpAddr = "fd5a:5052::a1".parse().unwrap();
+        let stale = manager.stale_sources_for_actor(&addr);
         assert_eq!(stale, vec![("test".to_string(), store.current_revision())]);
 
-        manager.record_revision("alice", "test", stale[0].1);
-        assert!(manager.stale_sources_for_actor("alice").is_empty());
+        manager.record_revision(&addr, "test", stale[0].1);
+        assert!(manager.stale_sources_for_actor(&addr).is_empty());
 
         store.flush().await.unwrap();
         assert_eq!(
-            manager.stale_sources_for_actor("alice"),
+            manager.stale_sources_for_actor(&addr),
+            vec![("test".to_string(), store.current_revision())]
+        );
+
+        // Forgetting the actor's records makes the source stale again, so a recycled
+        // address cannot inherit the previous actor's revision history.
+        manager.record_revision(&addr, "test", store.current_revision());
+        assert!(manager.stale_sources_for_actor(&addr).is_empty());
+        manager.forget_actor_revisions(&addr);
+        assert_eq!(
+            manager.stale_sources_for_actor(&addr),
             vec![("test".to_string(), store.current_revision())]
         );
 

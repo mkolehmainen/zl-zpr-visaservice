@@ -119,7 +119,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("attrfile.json"),
-            r#"{"alice": {"color": ["red"]}}"#,
+            r#"{"device.zpr.adapter.cn": {"alice": {"color": ["red"]}}}"#,
         )
         .unwrap();
 
@@ -133,7 +133,10 @@ mod tests {
 
         assert_eq!(stores.len(), 1);
         assert_eq!(stores[0].get_source_id(), "attrfile");
-        let attrs = stores[0].get_attributes_for_actor("alice").await.unwrap();
+        let attrs = stores[0]
+            .get_attributes_for_actor(&[("device.zpr.adapter.cn".to_string(), "alice".to_string())])
+            .await
+            .unwrap();
         assert_eq!(attrs.len(), 1);
         assert_eq!(attrs[0].get_key(), "user.color");
         assert!(attrs[0].value_has("red"));

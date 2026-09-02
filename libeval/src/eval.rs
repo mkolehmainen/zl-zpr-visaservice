@@ -304,12 +304,10 @@ impl EvalContext {
 
         // Policy tells us which attributes are tied to identity, and there is one identity
         // attribute libeval knows on its own: the adapter CN, established by the builtin RSA
-        // authentication. That mirrors zplc's builtin `default` trusted service
-        // (`identity_attributes = ["device.zpr.adapter.cn"]`), which the compiler synthesizes
-        // internally and emits no TrustedService record for, so we cannot read it from policy.
-        //
-        // The two are a UNION, not a fallback: an actor authenticated by CN that also carries a
-        // policy-declared identity attribute has both as identity keys.
+        // authentication. Policy::lookup_identity_keys() carries that UNION (builtin CN
+        // first, then the policy-declared keys in policy order, CN deduped), and is also
+        // what the Visa Service intersects with claims when querying trusted services --
+        // sharing the accessor keeps the two definitions from drifting.
         //
         // Everything is appended (usize::MAX) so CN stays first and the policy-declared keys keep
         // policy order. Callers layer their own keys around this set -- the Visa Service prepends
@@ -318,13 +316,8 @@ impl EvalContext {
         // Presence on the actor is a sufficient test: every attribute committed above is either an
         // authenticated claim or a zpr.addr validated by a matching join policy, so a peer cannot
         // self-assert an identity attribute into this set.
-        if actor.has_attribute_named(key::CN) {
-            actor.add_identity_key(usize::MAX, key::CN).unwrap();
-        }
-        for ikey in self.policy.identity_attr_keys() {
-            // CN is handled above; policy can name it again via a returns_attributes mapping,
-            // and add_identity_key does not dedupe.
-            if ikey != key::CN && actor.has_attribute_named(ikey) {
+        for ikey in self.policy.lookup_identity_keys() {
+            if actor.has_attribute_named(ikey) {
                 // Only fails when the attribute is absent, which was just checked.
                 actor.add_identity_key(usize::MAX, ikey).unwrap();
             }
@@ -1098,6 +1091,39 @@ mod test {
                 assert!(actor.get_zpr_addr().is_none());
             }
         };
+    }
+
+    // Even when a join policy matches, only zpr.addr is taken from the
+    // unauthenticated claims: a self-asserted identity-shaped claim (e.g.
+    // `user.sub`) must never reach the actor, or the refresh path would send
+    // it to trusted services as a lookup identity and leak another identity's
+    // attributes to the claimant.
+    #[test]
+    fn test_join_match_does_not_commit_non_addr_unauth_claims() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        // node.zpr.org matches a join policy in basic.bin2 (see
+        // test_node_can_connect), so the zpr.addr claim IS validated and kept.
+        let authenticated_claims = vec![Attribute::builder(key::CN).value("node.zpr.org")];
+        let unauthenticated_claims = vec![
+            Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::1"),
+            Attribute::builder("user.sub").value("someone-else"),
+        ];
+
+        let actor = ctx
+            .approve_connection(
+                Some(authenticated_claims.as_slice()),
+                Some(unauthenticated_claims.as_slice()),
+            )
+            .unwrap();
+
+        // The join policy matched: the requested address was committed...
+        assert!(actor.is_node());
+        assert!(actor.get_zpr_addr().is_some());
+        // ...but the self-asserted user.sub claim was not.
+        assert!(!actor.has_attribute_named("user.sub"));
     }
 
     // A node approved under the current policy should still pass re-check.

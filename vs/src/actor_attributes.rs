@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 use crate::assembly::Assembly;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
-use crate::trusted_services::{REVISION_NEVER, TrustedServicesMgr};
+use crate::trusted_services::{REVISION_NEVER, TrustedServicesMgr, lookup_identities};
 
 /// What a refresh pass found. Kept separate from the act of applying it so the caller
 /// can persist the actor before any of it is committed -- see [refresh_and_persist_actor].
@@ -35,14 +35,13 @@ struct RefreshOutcome {
 }
 
 impl RefreshOutcome {
-    /// Direct [TrustedServicesMgr] to Record the pending source revisions
-    /// against `actor_ident`. Deliberately not done during the refresh itself:
-    /// a revision must never say "current" for an actor whose refreshed
-    /// attributes did not reach the database, or the next request would trust
-    /// the stale copy it loads.
-    fn commit_revisions(&self, ts_mgr: &TrustedServicesMgr, actor_ident: &str) {
+    /// Direct [TrustedServicesMgr] to record the pending source revisions against the
+    /// actor's ZPR address. Deliberately not done during the refresh itself: a revision
+    /// must never say "current" for an actor whose refreshed attributes did not reach
+    /// the database, or the next request would trust the stale copy it loads.
+    fn commit_revisions(&self, ts_mgr: &TrustedServicesMgr, zpr_addr: &IpAddr) {
         for (source, revision) in &self.revisions {
-            ts_mgr.record_revision(actor_ident, source, *revision);
+            ts_mgr.record_revision(zpr_addr, source, *revision);
         }
     }
 }
@@ -65,21 +64,25 @@ pub(crate) async fn refresh_and_persist_actor(
     asm: &Assembly,
     actor: &mut Actor,
 ) -> Result<bool, ServiceError> {
-    let outcome = refresh_expired_attributes(&asm.ts_mgr, actor).await;
+    let policy = asm.policy_mgr.get_current();
+    let outcome =
+        refresh_expired_attributes(&asm.ts_mgr, &policy.lookup_identity_keys(), actor).await;
     if outcome.changed {
         asm.actor_mgr.update_actor(actor).await?;
     }
 
-    // No CN means refresh_expired_attributes did nothing at all.
-    let Some(actor_ident) = actor.get_cn().map(|cn| cn.to_string()) else {
+    // No ZPR address means refresh_expired_attributes did nothing at all (an actor
+    // without an address has not completed a connection, so there is nothing to key
+    // its revision records on).
+    let Some(zpr_addr) = actor.get_zpr_addr().copied() else {
         return Ok(outcome.changed);
     };
-    outcome.commit_revisions(&asm.ts_mgr, &actor_ident);
+    outcome.commit_revisions(&asm.ts_mgr, &zpr_addr);
 
     if !outcome.indeterminate.is_empty() {
         return Err(ServiceError::AttributesIndeterminate(format!(
             "actor {} could not be refreshed from source(s): {}",
-            actor_ident,
+            zpr_addr,
             outcome.indeterminate.join(", ")
         )));
     }
@@ -110,13 +113,21 @@ pub(crate) async fn refresh_and_persist_actor(
 /// [RefreshOutcome].
 async fn refresh_expired_attributes(
     ts_mgr: &TrustedServicesMgr,
+    lookup_keys: &[&str],
     actor: &mut Actor,
 ) -> RefreshOutcome {
     let mut outcome = RefreshOutcome::default();
-    let actor_ident = match actor.get_cn() {
-        Some(cn) => cn.to_string(),
-        None => return outcome,
+    // Revision records are keyed on the ZPR address; an actor without one has not
+    // completed a connection and cannot be refreshed.
+    let Some(zpr_addr) = actor.get_zpr_addr().copied() else {
+        return outcome;
     };
+    // The lookup-identity (key, value) set: the policy's lookup-identity keys
+    // intersected with the actor's attributes. Every attribute on the actor is either
+    // an authenticated claim or validated by a join policy, so this cannot include a
+    // self-asserted identity. May legitimately be empty (e.g. an actor with no CN and
+    // no policy-declared identity attribute); sources then match nothing.
+    let identities = lookup_identities(lookup_keys, actor.attrs_iter());
 
     let mut sources = HashSet::new();
     for attr in actor.attrs_iter() {
@@ -128,7 +139,7 @@ async fn refresh_expired_attributes(
     // Sources whose snapshot revision the actor has not caught up with, and the
     // revision to record once a refresh from them succeeds.
     let stale: HashMap<String, u64> = ts_mgr
-        .stale_sources_for_actor(&actor_ident)
+        .stale_sources_for_actor(&zpr_addr)
         .into_iter()
         .collect();
     sources.extend(stale.keys().cloned());
@@ -136,7 +147,7 @@ async fn refresh_expired_attributes(
     for source in &sources {
         let stale_rev = stale.get(source);
         for ts_result in ts_mgr
-            .get_attributes_from_source_for_actor(source, &actor_ident)
+            .get_attributes_from_source_for_actor(source, &identities)
             .await
         {
             match ts_result {
@@ -145,7 +156,7 @@ async fn refresh_expired_attributes(
                         ts_attrs.iter().map(|a| a.get_key().to_string()).collect();
                     for attr in ts_attrs {
                         if let Err(e) = actor.add_attribute(attr) {
-                            warn!(target: VREQ, "failed to add attribute for actor {}: {}", actor_ident, e);
+                            warn!(target: VREQ, "failed to add attribute for actor {}: {}", zpr_addr, e);
                         } else {
                             outcome.changed = true;
                         }
@@ -166,7 +177,7 @@ async fn refresh_expired_attributes(
                     }
                 }
                 Err(e) => {
-                    warn!(target: VREQ, "ts service attr lookup failed for actor {}: {}", actor_ident, e);
+                    warn!(target: VREQ, "ts service attr lookup failed for actor {}: {}", zpr_addr, e);
                     if stale_rev.is_some() {
                         // Stale-revision attributes must never satisfy an allow policy
                         // just because their TTL has not run out, so strip them -- but
@@ -245,11 +256,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    /// A trusted service that records the actor idents it was asked about and returns
-    /// one canned, freshly-expiring attribute. Its revision starts at 1 and bumps on
-    /// every flush, like the real store.
+    /// A trusted service that records the lookup-identity sets it was asked about and
+    /// returns one canned, freshly-expiring attribute. Its revision starts at 1 and
+    /// bumps on every flush, like the real store.
     struct FakeTrustedService {
-        calls: std::sync::Mutex<Vec<String>>,
+        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
         revision: std::sync::atomic::AtomicU64,
     }
 
@@ -260,9 +271,9 @@ mod tests {
     impl crate::trusted_services::TrustedServiceInterface for FakeTrustedService {
         async fn get_attributes_for_actor(
             &self,
-            actor_ident: &str,
+            identities: &[(String, String)],
         ) -> Result<Vec<Attribute>, ServiceError> {
-            self.calls.lock().unwrap().push(actor_ident.to_string());
+            self.calls.lock().unwrap().push(identities.to_vec());
             Ok(vec![
                 AttributeSource::new(FAKE_SOURCE)
                     .builder(FAKE_ATTR_KEY)
@@ -297,17 +308,27 @@ mod tests {
         (mgr, fake)
     }
 
-    /// Refresh an actor and commit the resulting revisions, as the request path does once
-    /// the actor is persisted. Returns whether the actor changed.
+    /// The ZPR address every test actor carries, and the calls made with it.
+    const TEST_ADDR: &str = "fd5a:5052::42";
+
+    /// Parse the shared test ZPR address.
+    fn test_addr() -> IpAddr {
+        TEST_ADDR.parse().unwrap()
+    }
+
+    /// Refresh an actor (with CN as the only lookup-identity key, matching the default
+    /// builtin identity) and commit the resulting revisions, as the request path does
+    /// once the actor is persisted. Returns whether the actor changed.
     async fn refresh_and_commit(mgr: &TrustedServicesMgr, actor: &mut Actor) -> bool {
-        let outcome = refresh_expired_attributes(mgr, actor).await;
-        if let Some(cn) = actor.get_cn().map(|cn| cn.to_string()) {
-            outcome.commit_revisions(mgr, &cn);
+        let outcome = refresh_expired_attributes(mgr, &[key::CN], actor).await;
+        if let Some(zpr_addr) = actor.get_zpr_addr().copied() {
+            outcome.commit_revisions(mgr, &zpr_addr);
         }
         outcome.changed
     }
 
-    /// An actor with a CN and one attribute (expired or still fresh) from the given source.
+    /// An actor with a CN, a ZPR address, and one attribute (expired or still fresh)
+    /// from the given source.
     fn actor_with_attr(cn: &str, source: &str, expired: bool) -> Actor {
         let mut actor = Actor::new();
         actor
@@ -316,6 +337,9 @@ mod tests {
                     .expires_in(Duration::from_secs(600))
                     .value(cn),
             )
+            .unwrap();
+        actor
+            .add_attribute(Attribute::builder(key::ZPR_ADDR).value(TEST_ADDR))
             .unwrap();
         let expires = if expired {
             SystemTime::now() - Duration::from_secs(1)
@@ -333,6 +357,27 @@ mod tests {
         actor
     }
 
+    /// An actor with a CN and a ZPR address, but no trusted-service attributes.
+    fn actor_with_cn(cn: &str) -> Actor {
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::CN)
+                    .expires_in(Duration::from_secs(600))
+                    .value(cn),
+            )
+            .unwrap();
+        actor
+            .add_attribute(Attribute::builder(key::ZPR_ADDR).value(TEST_ADDR))
+            .unwrap();
+        actor
+    }
+
+    /// The (key, value) lookup set expected for a CN-only test actor.
+    fn cn_ident(cn: &str) -> Vec<(String, String)> {
+        vec![(key::CN.to_string(), cn.to_string())]
+    }
+
     /// An expired attribute whose source is a registered trusted service is refreshed
     /// from that service, and only that service is queried.
     #[tokio::test]
@@ -343,7 +388,10 @@ mod tests {
 
         assert!(refresh_and_commit(&mgr, &mut actor).await);
         assert!(!actor.get_attribute(FAKE_ATTR_KEY).unwrap().is_expired());
-        assert_eq!(*fake.calls.lock().unwrap(), vec!["someone.zpr.org"]);
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            vec![cn_ident("someone.zpr.org")]
+        );
     }
 
     /// The hot path: nothing expired and every source's revision already recorded means
@@ -351,15 +399,8 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_expired_attributes_skips_when_nothing_expired() {
         let (mgr, fake) = ts_mgr_with_fake();
-        let mut actor = Actor::new();
-        actor
-            .add_attribute(
-                Attribute::builder(key::CN)
-                    .expires_in(Duration::from_secs(600))
-                    .value("someone.zpr.org"),
-            )
-            .unwrap();
-        mgr.record_revision("someone.zpr.org", FAKE_SOURCE, fake.current_revision());
+        let mut actor = actor_with_cn("someone.zpr.org");
+        mgr.record_revision(&test_addr(), FAKE_SOURCE, fake.current_revision());
 
         assert!(!refresh_and_commit(&mgr, &mut actor).await);
         assert!(fake.calls.lock().unwrap().is_empty());
@@ -371,25 +412,56 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_queries_source_with_no_prior_attributes() {
         let (mgr, fake) = ts_mgr_with_fake();
-        let mut actor = Actor::new();
-        actor
-            .add_attribute(
-                Attribute::builder(key::CN)
-                    .expires_in(Duration::from_secs(600))
-                    .value("someone.zpr.org"),
-            )
-            .unwrap();
+        let mut actor = actor_with_cn("someone.zpr.org");
 
         assert!(refresh_and_commit(&mgr, &mut actor).await);
         assert_eq!(
             actor.get_attribute(FAKE_ATTR_KEY).unwrap().get_value(),
             ["engineering".to_string()]
         );
-        assert_eq!(*fake.calls.lock().unwrap(), vec!["someone.zpr.org"]);
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            vec![cn_ident("someone.zpr.org")]
+        );
 
         // The revision was recorded, so the next pass is a no-op.
         assert!(!refresh_and_commit(&mgr, &mut actor).await);
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    }
+
+    /// #310 regression: a user-only actor (no CN at all, identified by a policy-declared
+    /// identity attribute) still gets its attributes refreshed — the old code early-
+    /// returned on `get_cn() == None`, silently never refreshing such actors.
+    #[tokio::test]
+    async fn test_refresh_works_for_actor_without_cn() {
+        let (mgr, fake) = ts_mgr_with_fake();
+
+        const USER_KEY: &str = "user.sub";
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(USER_KEY)
+                    .expires_in(Duration::from_secs(600))
+                    .value("google-sub-123"),
+            )
+            .unwrap();
+        actor
+            .add_attribute(Attribute::builder(key::ZPR_ADDR).value(TEST_ADDR))
+            .unwrap();
+
+        // Lookup keys include the builtin CN and the policy-declared user key; only the
+        // latter is present on this actor, so it alone forms the lookup set.
+        let outcome = refresh_expired_attributes(&mgr, &[key::CN, USER_KEY], &mut actor).await;
+        assert!(outcome.changed);
+        assert!(actor.get_attribute(FAKE_ATTR_KEY).is_some());
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            vec![vec![(USER_KEY.to_string(), "google-sub-123".to_string())]]
+        );
+
+        // And the revisions commit against the address, so the refresh sticks.
+        outcome.commit_revisions(&mgr, &test_addr());
+        assert!(mgr.stale_sources_for_actor(&test_addr()).is_empty());
     }
 
     /// A trusted service that knows nothing about any actor: every lookup succeeds and
@@ -400,7 +472,7 @@ mod tests {
     impl crate::trusted_services::TrustedServiceInterface for EmptyTrustedService {
         async fn get_attributes_for_actor(
             &self,
-            _actor_ident: &str,
+            _identities: &[(String, String)],
         ) -> Result<Vec<Attribute>, ServiceError> {
             Ok(Vec::new())
         }
@@ -433,8 +505,8 @@ mod tests {
         assert!(actor.get_attribute(key::CN).is_some());
     }
 
-    /// An unroutable source (no registered service) and an actor with no CN must both
-    /// fall through quietly rather than panic.
+    /// An unroutable source (no registered service) and an actor with no ZPR address
+    /// must both fall through quietly rather than panic.
     #[tokio::test]
     async fn test_refresh_expired_attributes_handles_unrefreshable() {
         let (mgr, fake) = ts_mgr_with_fake();
@@ -442,13 +514,13 @@ mod tests {
         // SOURCE_ZPR is internal -- no trusted service vends it. The fake's revision is
         // recorded up front so it is not stale, isolating the unroutable-source path.
         let mut internal = actor_with_attr("someone.zpr.org", SOURCE_ZPR, true);
-        mgr.record_revision("someone.zpr.org", FAKE_SOURCE, fake.current_revision());
+        mgr.record_revision(&test_addr(), FAKE_SOURCE, fake.current_revision());
         assert!(!refresh_and_commit(&mgr, &mut internal).await);
         assert!(fake.calls.lock().unwrap().is_empty());
 
-        // No CN means no ident to look up.
-        let mut no_cn = Actor::new();
-        no_cn
+        // No ZPR address means no revision key, so there is nothing to refresh.
+        let mut no_addr = Actor::new();
+        no_addr
             .add_attribute(
                 AttributeSource::new(FAKE_SOURCE)
                     .builder(FAKE_ATTR_KEY)
@@ -456,7 +528,7 @@ mod tests {
                     .value("engineering"),
             )
             .unwrap();
-        assert!(!refresh_and_commit(&mgr, &mut no_cn).await);
+        assert!(!refresh_and_commit(&mgr, &mut no_addr).await);
         assert!(fake.calls.lock().unwrap().is_empty());
     }
 
@@ -509,7 +581,7 @@ mod tests {
     impl crate::trusted_services::TrustedServiceInterface for FailingTrustedService {
         async fn get_attributes_for_actor(
             &self,
-            _actor_ident: &str,
+            _identities: &[(String, String)],
         ) -> Result<Vec<Attribute>, ServiceError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(ServiceError::Internal("service is down".to_string()))
@@ -563,9 +635,9 @@ mod tests {
         let mut actor = actor_with_attr("someone.zpr.org", FAKE_SOURCE, true);
 
         // Mark the actor current for this source so only the TTL path triggers.
-        mgr.record_revision("someone.zpr.org", FAKE_SOURCE, 1);
+        mgr.record_revision(&test_addr(), FAKE_SOURCE, 1);
 
-        let outcome = refresh_expired_attributes(&mgr, &mut actor).await;
+        let outcome = refresh_expired_attributes(&mgr, &[key::CN], &mut actor).await;
         assert!(!outcome.changed);
         assert!(actor.get_attribute(FAKE_ATTR_KEY).unwrap().is_expired());
         assert_eq!(failing.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -585,7 +657,7 @@ mod tests {
         })]);
         let mut actor = actor_with_attr("someone.zpr.org", FAKE_SOURCE, false);
 
-        let outcome = refresh_expired_attributes(&mgr, &mut actor).await;
+        let outcome = refresh_expired_attributes(&mgr, &[key::CN], &mut actor).await;
         assert_eq!(outcome.indeterminate, vec![FAKE_SOURCE.to_string()]);
         assert!(actor.get_attribute(FAKE_ATTR_KEY).is_none());
     }
@@ -598,16 +670,16 @@ mod tests {
         let (mgr, fake) = ts_mgr_with_fake();
         let mut actor = actor_with_attr("someone.zpr.org", FAKE_SOURCE, false);
 
-        let outcome = refresh_expired_attributes(&mgr, &mut actor).await;
+        let outcome = refresh_expired_attributes(&mgr, &[key::CN], &mut actor).await;
         assert_eq!(
             outcome.revisions,
             vec![(FAKE_SOURCE.to_string(), fake.current_revision())]
         );
         // Uncommitted: the source is still stale, so a dropped write costs a re-fetch
         // rather than a silently skipped one.
-        assert!(!mgr.stale_sources_for_actor("someone.zpr.org").is_empty());
+        assert!(!mgr.stale_sources_for_actor(&test_addr()).is_empty());
 
-        outcome.commit_revisions(&mgr, "someone.zpr.org");
-        assert!(mgr.stale_sources_for_actor("someone.zpr.org").is_empty());
+        outcome.commit_revisions(&mgr, &test_addr());
+        assert!(mgr.stale_sources_for_actor(&test_addr()).is_empty());
     }
 }

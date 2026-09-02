@@ -245,7 +245,6 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
             // What is the state of our topology manager now?
             // Visa service is porbably hosed.
         }
-        // TODO: If ActorLeaves event ever does anything we may need it here.
     }
 
     // Only do these steps if we managed to get a set of connected nodes. If

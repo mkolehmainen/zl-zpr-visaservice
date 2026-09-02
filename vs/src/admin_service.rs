@@ -2350,7 +2350,7 @@ mod tests {
     impl crate::trusted_services::TrustedServiceInterface for FlushCountingService {
         async fn get_attributes_for_actor(
             &self,
-            _actor_ident: &str,
+            _identities: &[(String, String)],
         ) -> Result<Vec<Attribute>, ServiceError> {
             Ok(Vec::new())
         }

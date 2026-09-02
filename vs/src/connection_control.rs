@@ -37,6 +37,7 @@ use crate::auth;
 use crate::config;
 use crate::error::ServiceError;
 use crate::logging::targets::CC;
+use crate::trusted_services::lookup_identities;
 
 // TODO: move to libeval
 const CLASS_DEVICE: &str = "device";
@@ -287,6 +288,9 @@ impl ConnectionControl {
         let mut authd_claims = Vec::new();
 
         authd_claims.push(Attribute::builder(key::AUTHORITY).value(&self.authority));
+        // The VS authorizes itself: its own CN is authenticated by construction, so it
+        // is promoted here (authorize_connection no longer promotes the CN).
+        authd_claims.push(Attribute::builder(key::CN).value(config::VS_CN));
 
         for claim in claims {
             authd_claims.push(Attribute::builder(claim.key).value(claim.value));
@@ -360,6 +364,12 @@ impl ConnectionControl {
             ));
         }
 
+        // The RSA blob signature verified against the bootstrap key policy binds to this
+        // CN, so the CN is authenticated -- promote it here, at the point where the
+        // authentication actually happened. authorize_connection no longer does this.
+        let mut authd_claims = authd_claims;
+        authd_claims.push(Attribute::builder(key::CN).value(&ssb.cn));
+
         // Ok checks out -- now run through policy.
         let mut actor = self
             .authorize_connection(
@@ -421,34 +431,32 @@ impl ConnectionControl {
         // Actor may be denied by CN -- we can detect that before calling into policy.
         // In the future actor may be denied if the credential associated with the auth service is revoked.
 
-        authd_claims.push(Attribute::builder(key::CN).value(endpoint_cn));
+        // NOTE: the CN is deliberately NOT promoted to an authenticated claim here.
+        // Classification is the caller's job: a path that verified the CN (e.g. an RSA
+        // blob signature) pushes it into `authd_claims` itself, and a path that only
+        // received a claimed CN leaves it unauthenticated. `endpoint_cn` is log-only.
         authd_claims.push(
             Attribute::builder(key::CONFIG_ID)
                 .value(format!("{}", current_policy.get_version().unwrap_or(0))),
         );
 
-        // There may in the future be additional network I/O in the next step
-        // for example if VS needs to talk to attribute service.
-
-        // This function is POST authentication - so we already have some notion of an ID for this actor.
-
-        // TODO: Need to figure out what we are using for an ID. For now using CN (which comes from our RSA auth).
-        // TODO: But why don't we set CN as the identity attribute on the actor? Why mess with the JWT?
-        // TODO: We will need some formal way to pass an IDENTITY value to this function.
+        // The trusted-service lookup is keyed on the actor's lookup-identity set: the
+        // policy's lookup-identity keys intersected with the *authenticated* claims, as
+        // (key, value) pairs so a source can tell a device CN from a user subject. Both
+        // are in hand before approve_connection runs and before any ZPR address exists,
+        // which matters because the attributes fetched here feed the join decision
+        // itself. Nothing is recorded with the revision cache on this fetch (it is
+        // keyed on the ZPR address, which does not exist yet); the first post-connect
+        // refresh treats every source as stale and re-fetches once.
+        let lookup_keys = current_policy.lookup_identity_keys();
+        let identities = lookup_identities(&lookup_keys, authd_claims.iter());
 
         // A lookup failure is indeterminate, not "the actor has no such attribute", and
         // the two are indistinguishable once evaluation starts: a join policy can be
         // satisfied by a missing key. Refuse the connection rather than authorize
         // against a partial claim set. Note this means a trusted-service outage blocks
         // new connections.
-        //
-        // TODO(#201 follow-up): this keys trusted-service lookups on the CN alone, but
-        // policy can now declare identity attributes (Policy::identity_attr_keys), so a
-        // service may want to key on a non-CN identity. Rework get_attributes_for_actor
-        // to receive all of the actor's identity attributes and let each source pick.
-        // Note the ordering wrinkle: this lookup runs BEFORE approve_connection assigns
-        // identity keys, so keying on a policy-derived identity needs restructuring here.
-        for ts_results in asm.ts_mgr.get_attributes_for_actor(endpoint_cn).await {
+        for ts_results in asm.ts_mgr.get_attributes_for_actor(&identities).await {
             match ts_results {
                 Ok(ts_attrs) => {
                     for attr in ts_attrs {
@@ -536,7 +544,12 @@ impl ConnectionControl {
         }
 
         match asm.actor_mgr.remove_actor_by_zpr_addr(&zpr_addr).await {
-            Ok(()) => (),
+            Ok(()) => {
+                // Purge recorded trusted-service revisions before the address returns to
+                // the pool: addresses are recycled, and a later actor at this address
+                // must not inherit them.
+                asm.ts_mgr.forget_actor_revisions(&zpr_addr);
+            }
             Err(e) => {
                 // Caller can't do anything with this. So just log and continue.
                 error!(target: CC, "failed to remove disconnected actor with addr {zpr_addr} from actor db: {e}");
@@ -570,6 +583,9 @@ impl ConnectionControl {
                 for adapter_addr in connected_adapters {
                     match asm.actor_mgr.remove_actor_by_zpr_addr(&adapter_addr).await {
                         Ok(()) => {
+                            // Same as the main actor above: purge before the cascaded
+                            // adapter's address can be recycled.
+                            asm.ts_mgr.forget_actor_revisions(&adapter_addr);
                             removed_zpr_addrs.push(adapter_addr);
                         }
                         Err(e) => {
@@ -938,7 +954,7 @@ mod tests {
     impl crate::trusted_services::TrustedServiceInterface for FailingTrustedService {
         async fn get_attributes_for_actor(
             &self,
-            _actor_ident: &str,
+            _identities: &[(String, String)],
         ) -> Result<Vec<Attribute>, ServiceError> {
             Err(ServiceError::Internal("service is down".to_string()))
         }
@@ -1347,5 +1363,222 @@ mod tests {
     fn test_a2a_dh_pubkey_claim_length_gate() {
         assert!(a2a_dh_pubkey_claim(&PublicKey::new(&[7u8; 32])).is_some());
         assert!(a2a_dh_pubkey_claim(&PublicKey::new(&[7u8; 31])).is_none());
+    }
+
+    // ---- lookup-identity derivation at connect time (#310) ----
+
+    /// A trusted service that records the lookup-identity set of every call and vends
+    /// a fixed attribute set for one specific identity value -- standing in for an
+    /// attribute store holding a privileged device's attributes.
+    struct CapturingTrustedService {
+        /// Identity value that owns `vends`.
+        known_value: String,
+        /// (ZPR attribute key, value) pairs vended when `known_value` matches.
+        vends: Vec<(String, String)>,
+        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services::TrustedServiceInterface for CapturingTrustedService {
+        async fn get_attributes_for_actor(
+            &self,
+            identities: &[(String, String)],
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            self.calls.lock().unwrap().push(identities.to_vec());
+            if identities.iter().any(|(_, v)| *v == self.known_value) {
+                return Ok(self
+                    .vends
+                    .iter()
+                    .map(|(k, v)| {
+                        libeval::attribute::AttributeSource::new("capture")
+                            .builder(k)
+                            .expires_in(Duration::from_secs(600))
+                            .value(v)
+                    })
+                    .collect());
+            }
+            Ok(Vec::new())
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        // Never flushed in these tests.
+        fn current_revision(&self) -> u64 {
+            1
+        }
+
+        fn get_source_id(&self) -> &str {
+            "capture"
+        }
+    }
+
+    /// Register a capturing service on the assembly and return a handle for assertions.
+    fn register_capturing_ts(
+        asm: &Arc<Assembly>,
+        known_value: &str,
+        vends: &[(&str, &str)],
+    ) -> Arc<CapturingTrustedService> {
+        let svc = Arc::new(CapturingTrustedService {
+            known_value: known_value.to_string(),
+            vends: vends
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        asm.ts_mgr.update_services(vec![svc.clone()]);
+        svc
+    }
+
+    /// Decode a test policy container into its policy representation.
+    fn policy_from_container(container_bytes: Vec<u8>) -> Arc<Policy> {
+        crate::loaded_policy::LoadedPolicy::from_container(
+            zpr::policy_types::PolicyContainerBytes::from(container_bytes),
+            &config::POLICY_MIN_VERSION,
+        )
+        .unwrap()
+        .policy()
+    }
+
+    /// Regression test for the CN-claiming escalation (#310): a user-only actor whose
+    /// claimed CN is UNAUTHENTICATED must not have that CN sent to trusted services as
+    /// a lookup identity, and must not inherit the claimed device's attributes. The
+    /// lookup set handed to the source is the security boundary, so it is what gets
+    /// pinned.
+    #[tokio::test]
+    async fn user_only_actor_cannot_inherit_claimed_cn_attributes() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+
+        // Policy declares `sub -> user.sub` as an identity attribute.
+        let policy = policy_from_container(
+            crate::test_helpers::make_trusted_service_policy_with_identity(
+                "capture",
+                "file",
+                Some(3600),
+                &["sub -> user.sub"],
+                &["sub"],
+            ),
+        );
+        // The store knows the privileged device's CN and vends its attributes.
+        let svc = register_capturing_ts(&asm, "privileged.zpr.org", &[("user.privileged", "yes")]);
+
+        // Authenticated: only the user identity. The claimed CN is unauthenticated.
+        let authd = vec![
+            Attribute::builder("user.sub")
+                .expires_in(Duration::from_secs(600))
+                .value("google-sub-12345"),
+        ];
+        let unauthd = vec![Attribute::builder(key::CN).value("privileged.zpr.org")];
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &policy,
+                "privileged.zpr.org",
+                unauthd,
+                authd,
+                0,
+            )
+            .await
+            .expect("user-only connection should authorize");
+
+        // The lookup set contains exactly the authenticated user identity -- the
+        // claimed CN never reaches the source.
+        assert_eq!(
+            *svc.calls.lock().unwrap(),
+            vec![vec![(
+                "user.sub".to_string(),
+                "google-sub-12345".to_string()
+            )]]
+        );
+        // And the actor carries none of the privileged device's attributes, nor an
+        // authenticated CN.
+        assert!(actor.get_attribute("user.privileged").is_none());
+        assert!(actor.get_attribute(key::CN).is_none());
+    }
+
+    /// Existing device-only actors keep working: under the builtin CN identity the
+    /// connect-time lookup set is exactly [(device.zpr.adapter.cn, <cn>)] -- CN
+    /// survives the switch away from `identity_attr_keys()` (which excludes it).
+    #[tokio::test]
+    async fn device_only_actor_lookup_set_is_authenticated_cn() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+
+        // No policy-declared identity attributes: the builtin CN is the only lookup key.
+        let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
+            "capture",
+            "file",
+            Some(3600),
+            &["color -> user.color"],
+        ));
+        let svc = register_capturing_ts(&asm, "device-1.zpr.org", &[("user.color", "red")]);
+
+        // As authenticate_zpr_entity_rsa would after signature verification.
+        let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &policy,
+                "device-1.zpr.org",
+                Vec::new(),
+                authd,
+                0,
+            )
+            .await
+            .expect("device connection should authorize");
+
+        assert_eq!(
+            *svc.calls.lock().unwrap(),
+            vec![vec![(key::CN.to_string(), "device-1.zpr.org".to_string())]]
+        );
+        // The vended attribute reached the actor through the authenticated-claims path.
+        assert!(actor.get_attribute("user.color").is_some());
+    }
+
+    /// Disconnect purges recorded trusted-service revisions for the actor AND for every
+    /// cascaded adapter, before the addresses return to the pool -- so a recycled ZPR
+    /// address cannot inherit the previous actor's revision records. This same
+    /// `disconnect` is the path for API, policy-driven, and node-cascade disconnects,
+    /// none of which may rely on an ActorLeaves event.
+    #[tokio::test]
+    async fn disconnect_purges_revisions_for_actor_and_cascaded_adapters() {
+        use crate::test_helpers::{make_adapter_actor_defexp, make_node_actor_defexp, register_ts};
+
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        register_ts(&asm, &[("user.dept", "eng")]);
+
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let adapter_addr: IpAddr = "fd5a:5052::11".parse().unwrap();
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        let adapter = make_adapter_actor_defexp("fd5a:5052::11", "adapter-1");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, &node_addr)
+            .await
+            .unwrap();
+
+        // Both actors are caught up with the source.
+        for addr in [&node_addr, &adapter_addr] {
+            let stale = asm.ts_mgr.stale_sources_for_actor(addr);
+            assert_eq!(stale.len(), 1);
+            asm.ts_mgr.record_revision(addr, &stale[0].0, stale[0].1);
+            assert!(asm.ts_mgr.stale_sources_for_actor(addr).is_empty());
+        }
+
+        // Node disconnect cascades to the attached adapter.
+        cc.disconnect(asm.clone(), node_addr, vsapi::DisconnectReason::Admin)
+            .await
+            .unwrap();
+
+        // Every source is stale again for both addresses: the records are gone, so a
+        // recycled address starts from scratch.
+        assert_eq!(asm.ts_mgr.stale_sources_for_actor(&node_addr).len(), 1);
+        assert_eq!(asm.ts_mgr.stale_sources_for_actor(&adapter_addr).len(), 1);
     }
 }
