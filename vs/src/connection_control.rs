@@ -186,11 +186,11 @@ impl ConnectionControl {
             signature: challenge_response.to_vec(),
         };
 
-        // We are the authority since we are checking RSA locally.
+        // Built-in RSA verification is the device authority (Contract 7).
         authd_claims.push(
-            Attribute::builder(key::AUTHORITY)
+            Attribute::builder(key::DEVICE_AUTHORITY)
                 .expires_in(config::DEFAULT_AUTH_EXPIRATION)
-                .value(&self.authority),
+                .value(key::AUTHORITY_METHOD_BOOTSTRAP),
         );
 
         let node_actor = self
@@ -238,8 +238,12 @@ impl ConnectionControl {
         let mut actor = match &req.blobs[0] {
             AuthBlob::SS(ssb) => match ssb.alg {
                 ChallengeAlg::RsaSha256Pkcs1v15 => {
-                    // We are the authority since we are checking RSA locally.
-                    authd_claims.push(Attribute::builder(key::AUTHORITY).value(&self.authority));
+                    // Built-in RSA verification is the device authority (Contract 7).
+                    authd_claims.push(
+                        Attribute::builder(key::DEVICE_AUTHORITY)
+                            .expires_in(config::DEFAULT_AUTH_EXPIRATION)
+                            .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+                    );
 
                     self.authenticate_zpr_entity_rsa(
                         asm,
@@ -268,12 +272,13 @@ impl ConnectionControl {
                     actor.get_zpr_addr()
                 )));
             }
-            // The ordinary adapter path already stamped AUTHORITY with the default (4 hour)
-            // expiration; re-add it with the VS expiration so the VS does not expire itself.
+            // The ordinary adapter path already stamped DEVICE_AUTHORITY with the default
+            // (4 hour) expiration; re-add it with the VS expiration so the VS does not
+            // expire itself.
             actor.add_attribute(
-                Attribute::builder(key::AUTHORITY)
+                Attribute::builder(key::DEVICE_AUTHORITY)
                     .expires_in(config::VS_AUTH_EXPIRATION)
-                    .value(&self.authority),
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
             )?;
         }
 
@@ -287,7 +292,12 @@ impl ConnectionControl {
     ) -> Result<Actor, ServiceError> {
         let mut authd_claims = Vec::new();
 
-        authd_claims.push(Attribute::builder(key::AUTHORITY).value(&self.authority));
+        // The VS authenticates itself by construction; that is the device authority.
+        authd_claims.push(
+            Attribute::builder(key::DEVICE_AUTHORITY)
+                .expires_in(config::VS_AUTH_EXPIRATION)
+                .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+        );
         // The VS authorizes itself: its own CN is authenticated by construction, so it
         // is promoted here (authorize_connection no longer promotes the CN).
         authd_claims.push(Attribute::builder(key::CN).value(config::VS_CN));
@@ -299,17 +309,12 @@ impl ConnectionControl {
         let policy = asm.policy_mgr.get_current();
 
         // Ok checks out -- now run through policy.
-        let mut vs_actor = self
+        let vs_actor = self
             .authorize_connection(asm, &policy, &config::VS_CN, Vec::new(), authd_claims, 0)
             .await?;
 
-        // The `authorized_connection` call will add the default expiration on the authority key. We
-        // want to make vs not expire.
-        vs_actor.add_attribute(
-            Attribute::builder(key::AUTHORITY)
-                .expires_in(config::VS_AUTH_EXPIRATION)
-                .value(&self.authority),
-        )?;
+        // authorize_connection no longer stamps a blanket authority, so the
+        // VS-expiration DEVICE_AUTHORITY pushed above survives as-is.
 
         Ok(vs_actor)
     }
@@ -415,8 +420,10 @@ impl ConnectionControl {
     ///
     /// Caller should set ROLE in unauthd_claims before calling.
     ///
-    /// This always adds the `key::AUTHORITY` key as an identity attribute with the default
-    /// auth expiration on it.
+    /// This does NOT add any authority attribute itself: the authentication path
+    /// (blob arm) that verified the entity owns stamping the namespaced authority
+    /// (e.g. [key::DEVICE_AUTHORITY] on the RSA bootstrap path). Whichever
+    /// namespaced authorities are present are registered as identity attributes.
     async fn authorize_connection(
         &self,
         asm: Arc<Assembly>,
@@ -486,12 +493,14 @@ impl ConnectionControl {
                 }
             };
 
-        authd_actor.add_attribute(
-            Attribute::builder(key::AUTHORITY)
-                .expires_in(config::DEFAULT_AUTH_EXPIRATION)
-                .value(&self.authority),
-        )?;
-        authd_actor.add_identity_key(usize::MAX, key::AUTHORITY)?;
+        // The blob arms own the authority: register whichever namespaced authority
+        // attributes the authentication path stamped as identity attributes, rather
+        // than adding a blanket one here (Contract 7).
+        for authority_key in [key::DEVICE_AUTHORITY, key::USER_AUTHORITY] {
+            if authd_actor.get_attribute(authority_key).is_some() {
+                authd_actor.add_identity_key(usize::MAX, authority_key)?;
+            }
+        }
 
         let actor_role = if authd_actor.is_node() {
             Role::Node
@@ -1192,6 +1201,61 @@ mod tests {
         )
     }
 
+    /// The RSA-verified (bootstrap) path installs the namespaced device authority
+    /// `device.zpr.authority = "zpr-bootstrap"` as an identity attribute, and no
+    /// legacy `zpr.authority` or `user.zpr.authority` attribute exists (Contract 7).
+    #[tokio::test]
+    async fn test_rsa_path_installs_device_authority_bootstrap() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+
+        let actor = cc
+            .authenticate_node(
+                asm,
+                challenge,
+                timestamp,
+                cn,
+                &sig,
+                "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
+                None,
+            )
+            .await
+            .expect("authentication should succeed");
+
+        assert_eq!(
+            actor
+                .get_attribute(key::DEVICE_AUTHORITY)
+                .expect("device authority must be present")
+                .get_value(),
+            &vec![key::AUTHORITY_METHOD_BOOTSTRAP.to_string()],
+            "RSA path must stamp device.zpr.authority = zpr-bootstrap"
+        );
+        assert!(
+            actor.get_attribute("zpr.authority").is_none(),
+            "legacy un-namespaced zpr.authority must not exist"
+        );
+        assert!(
+            actor.get_attribute(key::USER_AUTHORITY).is_none(),
+            "device-only bootstrap must not assert a user authority"
+        );
+        assert!(
+            actor
+                .identity_keys_iter()
+                .any(|k| k == key::DEVICE_AUTHORITY),
+            "device.zpr.authority must be registered as an identity key"
+        );
+    }
+
     /// With no topology entry for the node, the reported substrate address is stored
     /// as the node's `key::SUBSTRATE_ADDR` claim (no TCP-peer fallback exists anymore).
     #[tokio::test]
@@ -1347,7 +1411,7 @@ mod tests {
         assert_eq!(claims.sub, format!("node/{}", cn));
         assert_eq!(claims.iss, "vs.zpr/test-vs");
 
-        // get_identity() returns [jwt, cn, authority] in that order
+        // get_identity() returns [jwt, cn, device authority] in that order
         let identity = actor
             .get_identity()
             .expect("actor must have identity values");

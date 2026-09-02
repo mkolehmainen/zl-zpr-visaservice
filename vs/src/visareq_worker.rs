@@ -311,8 +311,8 @@ fn fabricate_aaa_actor(anon_addr: &IpAddr, expiration: SystemTime) -> Actor {
     let mut anon_actor = Actor::new();
     let _ =
         anon_actor.add_attribute(Attribute::builder(key::ZPR_ADDR).value(anon_addr.to_string()));
-    let _ =
-        anon_actor.add_attribute(Attribute::builder(key::AUTHORITY).value("vs_hack_anon_to_auth"));
+    let _ = anon_actor
+        .add_attribute(Attribute::builder(key::DEVICE_AUTHORITY).value("vs_hack_anon_to_auth"));
     let _ = anon_actor.add_attribute(Attribute::builder(key::ROLE).value(ROLE_ADAPTER));
     let _ = anon_actor.add_attribute(
         Attribute::builder(key::CN)
@@ -892,11 +892,11 @@ mod tests {
         let policy = make_policy_with_com_conditions(&[], &[]);
         let route = Route::new_direct(requesting_node.into());
 
-        // AUTHORITY drives get_authentication_expiration; one second is well under the floor.
+        // DEVICE_AUTHORITY drives get_authentication_expiration; one second is well under the floor.
         let mut src_actor = make_node_actor_defexp("fd5a:5052:3000::1", "src", "10.0.0.1:1001");
         src_actor
             .add_attribute(
-                Attribute::builder(key::AUTHORITY)
+                Attribute::builder(key::DEVICE_AUTHORITY)
                     .expires_in(Duration::from_secs(1))
                     .value("about-to-expire"),
             )

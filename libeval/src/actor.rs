@@ -167,15 +167,18 @@ impl Actor {
     /// TODO: Figure out all the details of how we hold authentication data.
     ///
     /// Returns the minimum expiration time from:
-    /// - [key::AUTHORITY] attribute, if present.
+    /// - [key::DEVICE_AUTHORITY] attribute, if present.
+    /// - [key::USER_AUTHORITY] attribute, if present.
     /// - any `identity` attributes, if present.
     /// - ELSE: None.
     ///
     /// If there are no identity keys we assume there is no authentication and return None.
     pub fn get_authentication_expiration(&self) -> Option<SystemTime> {
-        let authority_expiration = self
-            .get_attribute(key::AUTHORITY)
-            .map(|attr| attr.get_expires());
+        let authority_expiration = [key::DEVICE_AUTHORITY, key::USER_AUTHORITY]
+            .iter()
+            .filter_map(|key| self.get_attribute(key))
+            .map(|attr| attr.get_expires())
+            .min();
         let identity_expiration = self
             .identity_keys
             .iter()
@@ -254,6 +257,45 @@ impl Actor {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// With both namespaced authority attributes present at different expiries,
+    /// get_authentication_expiration returns the minimum of the two.
+    #[test]
+    fn test_expiration_min_over_namespaced_authorities() {
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::DEVICE_AUTHORITY)
+                    .expires_in(Duration::from_secs(7200))
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+        actor
+            .add_attribute(
+                Attribute::builder(key::USER_AUTHORITY)
+                    .expires_in(Duration::from_secs(60))
+                    .value("some-oidc-issuer"),
+            )
+            .unwrap();
+
+        let user_expiry = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .unwrap()
+            .get_expires();
+        assert_eq!(
+            actor.get_authentication_expiration(),
+            Some(user_expiry),
+            "expiration must be the min over the namespaced authority attributes"
+        );
+    }
+
+    /// With no authority attribute and no identity keys there is no authentication,
+    /// so get_authentication_expiration is None.
+    #[test]
+    fn test_expiration_none_without_authority_or_identity() {
+        let actor = Actor::new();
+        assert_eq!(actor.get_authentication_expiration(), None);
+    }
 
     #[test]
     fn test_add_attribute_zpr_addr_ipv4() {

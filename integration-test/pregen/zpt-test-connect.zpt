@@ -8,3 +8,11 @@ connect --ac device.zpr.adapter.cn:bazz.zpr.org
 
 # test that a policy-declared identity attribute joins the builtin CN identity
 connect --ac device.zpr.adapter.cn:bas.zpr.org --ac user.bas_id:1233
+
+# fail-closed proof (#144 + issue #324): a device-only actor (no
+# user.zpr.authority) must NOT match `allow users to access Webby.`
+set devonly device.zpr.authority:zpr-bootstrap
+set webby zpr.services:Webby
+set webby user.bas_id:4567
+set webby user.zpr.authority:bas
+eval TCP devonly > webby.80 [S]

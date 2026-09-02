@@ -27,8 +27,16 @@ pub mod key {
     /// CN value
     pub const CN: &str = "device.zpr.adapter.cn";
 
-    /// "zpr.authority" attribute key
-    pub const AUTHORITY: &str = "zpr.authority";
+    /// Authority attribute for the device (node/adapter) identity namespace.
+    /// Value names the authentication method/issuer, e.g. [AUTHORITY_METHOD_BOOTSTRAP].
+    pub const DEVICE_AUTHORITY: &str = "device.zpr.authority";
+
+    /// Authority attribute for the user identity namespace (e.g. an OIDC issuer).
+    pub const USER_AUTHORITY: &str = "user.zpr.authority";
+
+    /// Value of [DEVICE_AUTHORITY] set by the VS's built-in RSA bootstrap-key
+    /// authentication path.
+    pub const AUTHORITY_METHOD_BOOTSTRAP: &str = "zpr-bootstrap";
 
     /// "zpr.config_id"
     pub const CONFIG_ID: &str = "zpr.config_id";

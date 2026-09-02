@@ -27,7 +27,7 @@ pub const EVENT_QUEUE_DEPTH: usize = 1024;
 
 // We only load policy files built by this version or later.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 15;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 16;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 0;
 
 /// Minimum policy compiler version this build will load.
