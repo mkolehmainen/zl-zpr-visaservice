@@ -10,6 +10,14 @@ pub enum ServiceError {
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// An I/O error annotated with what was being attempted and on which path,
+    /// so operators do not have to read the source to find the failing file.
+    #[error("{context}: {source}")]
+    IoContext {
+        context: String,
+        source: std::io::Error,
+    },
+
     #[error("configuration error: {0}")]
     Config(#[from] toml::de::Error),
 

@@ -4,7 +4,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::ServiceError;
@@ -213,21 +213,37 @@ impl VSConfig {
 }
 
 // Return the path to the data home directory.
+//
+// Resolution order follows the XDG Base Directory spec: `$XDG_DATA_HOME` if
+// set, otherwise `$HOME/.local/share` (whether or not it exists yet -- the
+// caller creates it), otherwise `/var/lib` for processes with no HOME at all
+// (e.g. some systemd units). We deliberately never fall back to `/var/run`:
+// it is tmpfs, so anything stored there is silently lost on reboot.
 pub fn get_data_home() -> PathBuf {
-    let mut dh = match env::var("XDG_DATA_HOME") {
-        Ok(val) => PathBuf::from(val),
-        Err(_) => match env::var("HOME") {
-            Ok(val) => {
+    data_home_from(
+        env::var("XDG_DATA_HOME").ok().as_deref(),
+        env::var("HOME").ok().as_deref(),
+    )
+}
+
+// Pure helper behind [get_data_home]: computes the data home directory from
+// the given values of `XDG_DATA_HOME` and `HOME`. Split out so the resolution
+// logic is unit-testable without mutating process environment variables.
+fn data_home_from(xdg_data_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    // The XDG Base Directory spec requires these variables to hold absolute
+    // paths and says invalid (relative) values must be ignored. Honouring a
+    // relative value would tie the identity location to the process's working
+    // directory, so a restart from elsewhere would mint a new identity.
+    let mut dh = match xdg_data_home {
+        Some(val) if !val.trim().is_empty() && Path::new(val).is_absolute() => PathBuf::from(val),
+        _ => match home {
+            Some(val) if !val.trim().is_empty() => {
                 let mut pb = PathBuf::from(val);
                 pb.push(".local/share");
-                // Now we will only take this if user already has a .local/share dir.
-                if pb.exists() {
-                    pb
-                } else {
-                    PathBuf::from("/var/run")
-                }
+                pb
             }
-            Err(_) => PathBuf::from("/var/run"),
+            // No HOME: persistent variable state belongs in /var/lib (FHS).
+            _ => PathBuf::from("/var/lib"),
         },
     };
     dh.push("zpr");
@@ -237,6 +253,56 @@ pub fn get_data_home() -> PathBuf {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    // XDG_DATA_HOME, when set and non-empty, wins outright.
+    #[test]
+    fn test_data_home_prefers_xdg_data_home() {
+        assert_eq!(
+            data_home_from(Some("/custom/data"), Some("/home/u")),
+            PathBuf::from("/custom/data/zpr")
+        );
+    }
+
+    // Without XDG_DATA_HOME, HOME/.local/share is used even if it does not
+    // exist yet -- the caller is responsible for creating it (XDG spec).
+    #[test]
+    fn test_data_home_uses_home_local_share_without_existence_gate() {
+        let nonexistent = "/definitely/not/a/real/home";
+        assert_eq!(
+            data_home_from(None, Some(nonexistent)),
+            PathBuf::from(nonexistent).join(".local/share/zpr")
+        );
+        // Empty XDG_DATA_HOME is treated as unset.
+        assert_eq!(
+            data_home_from(Some(""), Some(nonexistent)),
+            PathBuf::from(nonexistent).join(".local/share/zpr")
+        );
+    }
+
+    // A relative XDG_DATA_HOME violates the XDG spec and must be ignored,
+    // falling through to the HOME-based (or /var/lib) resolution.
+    #[test]
+    fn test_data_home_ignores_relative_xdg_data_home() {
+        assert_eq!(
+            data_home_from(Some(".data"), Some("/home/u")),
+            PathBuf::from("/home/u/.local/share/zpr")
+        );
+        assert_eq!(
+            data_home_from(Some("relative/path"), None),
+            PathBuf::from("/var/lib/zpr")
+        );
+    }
+
+    // With neither variable set, fall back to /var/lib (persistent, per FHS),
+    // never /var/run (tmpfs, wiped on reboot).
+    #[test]
+    fn test_data_home_falls_back_to_var_lib() {
+        assert_eq!(data_home_from(None, None), PathBuf::from("/var/lib/zpr"));
+        assert_eq!(
+            data_home_from(Some(""), Some("")),
+            PathBuf::from("/var/lib/zpr")
+        );
+    }
 
     #[test]
     fn test_override_one_field_deserialize() {
