@@ -141,7 +141,11 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    let identity = match initialize_identity(&cfg.core.identity, &cli.regen_identity) {
+    let identity = match initialize_identity(
+        &cfg.core.identity,
+        &cli.regen_identity,
+        &config::get_data_home(),
+    ) {
         Ok(id) => id,
         Err(e) => {
             error!(target: MAIN, "failed to initialize identity: {}", e);
@@ -472,7 +476,23 @@ async fn self_authorize(asm: Arc<Assembly>, vs_addr: &IpAddr) -> Result<(), Serv
 fn initialize_identity(
     config_identity: &Option<String>,
     regen_identity: &bool,
+    data_home: &std::path::Path,
 ) -> Result<String, ServiceError> {
+    // Wrap an I/O error with the operation and path being attempted, and --
+    // when the problem is permissions -- with the two operator escapes: the
+    // `core.identity` config setting (which skips the file entirely) and
+    // XDG_DATA_HOME (which relocates it).
+    fn io_context(what: &str, path: &std::path::Path, source: std::io::Error) -> ServiceError {
+        let mut context = format!("{} {}", what, path.display());
+        if source.kind() == std::io::ErrorKind::PermissionDenied {
+            context.push_str(
+                " (set core.identity in the config file to skip identity storage, \
+                 or set XDG_DATA_HOME to a writable directory)",
+            );
+        }
+        ServiceError::IoContext { context, source }
+    }
+
     // If user has supplied a non-empty identity string, use it and ignore any stored
     // identity file.
     if let Some(id) = config_identity {
@@ -482,10 +502,10 @@ fn initialize_identity(
     }
 
     // If we have an identity stored locally, use that -- unless user wants a regen.
-    let mut id_path = config::get_data_home();
-    id_path.push("vs_identity.txt");
+    let id_path = data_home.join("vs_identity.txt");
     if id_path.exists() && !regen_identity {
-        let contents = fs::read_to_string(&id_path)?;
+        let contents = fs::read_to_string(&id_path)
+            .map_err(|e| io_context("could not read visa service identity file", &id_path, e))?;
         let id_str = contents.trim();
         if !id_str.is_empty() {
             debug!(target: MAIN, "loaded existing identity from {}", id_path.display());
@@ -495,8 +515,10 @@ fn initialize_identity(
 
     // Else create a new identity, store it, and return it.
     let new_identity = uuid::Uuid::new_v4().to_string();
-    fs::create_dir_all(config::get_data_home())?;
-    fs::write(&id_path, &new_identity)?;
+    fs::create_dir_all(data_home)
+        .map_err(|e| io_context("could not create visa service data directory", data_home, e))?;
+    fs::write(&id_path, &new_identity)
+        .map_err(|e| io_context("could not write visa service identity file", &id_path, e))?;
     debug!(target: MAIN, "created new identity file at {}", id_path.display());
     Ok(new_identity)
 }
@@ -518,4 +540,66 @@ async fn synchronize_state(actor_mgr: &ActorMgr, net_mgr: &NetMgr) -> Result<(),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    // A configured non-empty identity wins and touches no files.
+    #[test]
+    fn test_config_identity_skips_storage() {
+        let id = initialize_identity(
+            &Some("my-vs".to_string()),
+            &false,
+            std::path::Path::new("/nonexistent/should/not/be/touched"),
+        )
+        .unwrap();
+        assert_eq!(id, "my-vs");
+    }
+
+    // A fresh data home directory is created (no pre-existence required) and
+    // the generated identity is persisted and re-read on the next call.
+    #[test]
+    fn test_creates_data_home_and_persists_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("does/not/exist/yet");
+        let id1 = initialize_identity(&None, &false, &data_home).unwrap();
+        assert!(data_home.join("vs_identity.txt").exists());
+        let id2 = initialize_identity(&None, &false, &data_home).unwrap();
+        assert_eq!(id1, id2);
+    }
+
+    // On permission failure the error must name the operation and the path,
+    // and point the operator at the config/env escapes.
+    #[test]
+    fn test_permission_denied_error_names_path_and_remedies() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Read-only parent so creating the data home fails with EACCES.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root (or CAP_DAC_OVERRIDE, common in build containers) bypasses
+        // mode bits, so the setup above cannot produce the permission
+        // failure this test is about. Probe for that and skip explicitly
+        // rather than let unwrap_err() panic on a spurious Ok.
+        let probe = dir.path().join("probe");
+        if std::fs::create_dir(&probe).is_ok() {
+            std::fs::remove_dir(&probe).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: privileges bypass file permission bits");
+            return;
+        }
+        let data_home = dir.path().join("zpr");
+        let err = initialize_identity(&None, &false, &data_home).unwrap_err();
+        let msg = err.to_string();
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            msg.contains("could not create visa service data directory"),
+            "{msg}"
+        );
+        assert!(msg.contains(&data_home.display().to_string()), "{msg}");
+        assert!(msg.contains("core.identity"), "{msg}");
+        assert!(msg.contains("XDG_DATA_HOME"), "{msg}");
+    }
 }
