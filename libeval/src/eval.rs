@@ -1437,6 +1437,7 @@ mod test {
                 .map(|m| zpr::policy_types::parse_attribute_mapping(m).unwrap())
                 .collect(),
             identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
+            oidc: None,
         }
     }
 

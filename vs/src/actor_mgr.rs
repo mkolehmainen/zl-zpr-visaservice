@@ -427,6 +427,10 @@ impl ActorMgr {
             for s_ent in &service_entries {
                 if let Some(svc) = svc_map.get(&s_ent.name) {
                     let sdesc = ServiceDescriptor {
+                        // This path only lists policy `ServiceType::Authentication`
+                        // services, which are on-net actor-authentication services;
+                        // off-net OIDC providers are declared in policy, not connected.
+                        stype: zpr::vsapi_types::ServiceT::ActorAuthentication,
                         service_id: svc.id.clone(),
                         service_uri: uri_for_service(
                             &svc.kind,
@@ -434,6 +438,7 @@ impl ActorMgr {
                             svc.endpoints.as_slice(),
                         )?,
                         zpr_addr: s_ent.zpr_addr.clone(),
+                        oidc: None,
                     };
                     services.push(sdesc);
                 }
