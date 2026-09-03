@@ -46,6 +46,44 @@ const CLASS_SERVICE: &str = "service";
 
 const ATTR_KEY_VS_IDENT: &str = "zpr.vs.bootstrap.ident";
 
+/// Identity namespace one auth blob authenticates. A connection may present at most
+/// one blob per namespace (zipline#7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Namespace {
+    Device,
+    // Constructed first by the C5 OIDC arm (zipline#11); part of the C1 contract shape.
+    #[allow(dead_code)]
+    User,
+}
+
+impl std::fmt::Display for Namespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Namespace::Device => write!(f, "device"),
+            Namespace::User => write!(f, "user"),
+        }
+    }
+}
+
+/// What one successfully-validated auth blob contributes to the connection: the
+/// claims it authenticated and the identity namespace it covers (zipline#7).
+struct BlobOutcome {
+    authd: Vec<Attribute>,
+    namespace: Namespace,
+}
+
+/// The endpoint CN for logging/JWT purposes: the authenticated CN when a device blob
+/// verified one, else the (unauthenticated) claimed CN, else empty.
+fn authd_or_claimed_cn(authd_claims: &[Attribute], unauthd_claims: &[Attribute]) -> String {
+    authd_claims
+        .iter()
+        .chain(unauthd_claims.iter())
+        .find(|a| a.get_key() == key::CN)
+        .and_then(|a| a.get_single_value().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct JwtClaims {
     iss: String, // Issuer eg, 'vs.zpr/<IDENT>'
@@ -218,8 +256,10 @@ impl ConnectionControl {
         req: ConnectRequest,
         connect_via: &IpAddr,
     ) -> Result<Actor, ServiceError> {
-        if req.blobs.is_empty() || req.blobs.len() > 1 {
-            return Err(ServiceError::Param("expected exactly one auth blob".into()));
+        if req.blobs.is_empty() {
+            return Err(ServiceError::Param(
+                "at least one auth blob is required".into(),
+            ));
         }
 
         check_required_claims(&req.claims, &[key::CN])?;
@@ -235,32 +275,78 @@ impl ConnectionControl {
             None => warn!(target: CC, "adapter via {connect_via} sent no usable A2A DH public key"),
         }
 
-        let mut actor = match &req.blobs[0] {
-            AuthBlob::SS(ssb) => match ssb.alg {
-                ChallengeAlg::RsaSha256Pkcs1v15 => {
-                    // Built-in RSA verification is the device authority (Contract 7).
-                    authd_claims.push(
-                        Attribute::builder(key::DEVICE_AUTHORITY)
-                            .expires_in(config::DEFAULT_AUTH_EXPIRATION)
-                            .value(key::AUTHORITY_METHOD_BOOTSTRAP),
-                    );
-
-                    self.authenticate_zpr_entity_rsa(
-                        asm,
-                        ssb,
-                        scrubbed_claims,
-                        authd_claims,
-                        req.dock_interface,
-                    )
-                    .await?
+        // Validate every presented blob (spec: presented-and-invalid fails the whole
+        // connection; absent is not a failure). Each arm authenticates one identity
+        // namespace and yields its authenticated claims; the first error aborts, and
+        // a repeated namespace is a protocol error.
+        let mut seen_namespaces: Vec<Namespace> = Vec::new();
+        for blob in &req.blobs {
+            let outcome = match blob {
+                AuthBlob::SS(ssb) => match ssb.alg {
+                    ChallengeAlg::RsaSha256Pkcs1v15 => {
+                        // Built-in RSA verification is the device authority (Contract 7).
+                        let mut authd = vec![
+                            Attribute::builder(key::DEVICE_AUTHORITY)
+                                .expires_in(config::DEFAULT_AUTH_EXPIRATION)
+                                .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+                        ];
+                        authd.extend(self.authenticate_ss_blob(&asm, ssb, &scrubbed_claims)?);
+                        BlobOutcome {
+                            authd,
+                            namespace: Namespace::Device,
+                        }
+                    }
+                },
+                AuthBlob::AC(_acb) => {
+                    return Err(ServiceError::Internal(
+                        "external auth not yet supported".into(),
+                    ));
                 }
-            },
-            AuthBlob::AC(_acb) => {
-                return Err(ServiceError::Internal(
-                    "external auth not yet supported".into(),
-                ));
+                // Replaced with real OIDC validation in C5 (zipline#11).
+                AuthBlob::Oidc(_) => {
+                    return Err(ServiceError::Internal("OIDC not yet supported".into()));
+                }
+            };
+            if seen_namespaces.contains(&outcome.namespace) {
+                return Err(ServiceError::Param(format!(
+                    "duplicate {} authentication",
+                    outcome.namespace
+                )));
             }
+            seen_namespaces.push(outcome.namespace);
+            authd_claims.extend(outcome.authd);
+        }
+
+        // Every presented blob validated -- now run through policy.
+        let policy = asm.policy_mgr.get_current();
+        let endpoint_cn = authd_or_claimed_cn(&authd_claims, &scrubbed_claims);
+        let mut actor = self
+            .authorize_connection(
+                asm,
+                &policy,
+                &endpoint_cn,
+                scrubbed_claims,
+                authd_claims,
+                req.dock_interface,
+            )
+            .await?;
+
+        let auth_expiration = if endpoint_cn == config::VS_CN {
+            config::VS_AUTH_EXPIRATION
+        } else {
+            config::DEFAULT_AUTH_EXPIRATION
         };
+        let actor_jwt = if actor.is_node() {
+            self.gen_jwt(format!("node/{}", endpoint_cn), auth_expiration)?
+        } else {
+            self.gen_jwt(format!("adapter/{}", endpoint_cn), auth_expiration)?
+        };
+        let _ = actor.add_attribute(
+            Attribute::builder(ATTR_KEY_VS_IDENT)
+                .expires(SystemTime::now() + auth_expiration)
+                .value(actor_jwt),
+        );
+        let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
 
         // Our own adapter connects late: the node self-authorizes it during bootstrap and
         // sends the real request once it has VSAPI access.
@@ -319,21 +405,17 @@ impl ConnectionControl {
         Ok(vs_actor)
     }
 
-    /// Preform authentication of an adapter or a node, then run through policy.
-    /// `unauthed_claims` - must include CN.
-    async fn authenticate_zpr_entity_rsa(
+    /// Verify one self-signed (RSA bootstrap) auth blob: the claimed CN must match
+    /// the blob's CN, and the blob signature must verify against the policy's
+    /// bootstrap key for that CN. On success returns the claims this blob
+    /// authenticated -- the CN, promoted at the point where the authentication
+    /// actually happened (authorize_connection never promotes it).
+    fn authenticate_ss_blob(
         &self,
-        asm: Arc<Assembly>,
+        asm: &Arc<Assembly>,
         ssb: &SelfSignedBlob,
-        unauthd_claims: Vec<Attribute>,
-        authd_claims: Vec<Attribute>,
-        dock_interface: u8,
-    ) -> Result<Actor, ServiceError> {
-        // a) is the auth correct (check policy for CN, check sig.)
-        // b) is connection allowed by policy?
-        //
-        // Note that (b) is also needed for the AC type auth.
-
+        unauthd_claims: &[Attribute],
+    ) -> Result<Vec<Attribute>, ServiceError> {
         {
             // Make sure there is a CN attribute.
             if !unauthd_claims.iter().any(|c| c.get_key() == key::CN) {
@@ -369,13 +451,31 @@ impl ConnectionControl {
             ));
         }
 
-        // The RSA blob signature verified against the bootstrap key policy binds to this
-        // CN, so the CN is authenticated -- promote it here, at the point where the
-        // authentication actually happened. authorize_connection no longer does this.
+        // The RSA blob signature verified against the bootstrap key policy binds to
+        // this CN, so the CN is authenticated.
+        Ok(vec![Attribute::builder(key::CN).value(&ssb.cn)])
+    }
+
+    /// Preform authentication of an adapter or a node, then run through policy.
+    /// `unauthed_claims` - must include CN.
+    async fn authenticate_zpr_entity_rsa(
+        &self,
+        asm: Arc<Assembly>,
+        ssb: &SelfSignedBlob,
+        unauthd_claims: Vec<Attribute>,
+        authd_claims: Vec<Attribute>,
+        dock_interface: u8,
+    ) -> Result<Actor, ServiceError> {
+        // a) is the auth correct (check policy for CN, check sig.)
+        // b) is connection allowed by policy?
+        //
+        // Note that (b) is also needed for the AC type auth.
+
         let mut authd_claims = authd_claims;
-        authd_claims.push(Attribute::builder(key::CN).value(&ssb.cn));
+        authd_claims.extend(self.authenticate_ss_blob(&asm, ssb, &unauthd_claims)?);
 
         // Ok checks out -- now run through policy.
+        let policy = asm.policy_mgr.get_current();
         let mut actor = self
             .authorize_connection(
                 asm,
@@ -1806,5 +1906,207 @@ mod tests {
         // recycled address starts from scratch.
         assert_eq!(asm.ts_mgr.stale_sources_for_actor(&node_addr).len(), 1);
         assert_eq!(asm.ts_mgr.stale_sources_for_actor(&adapter_addr).len(), 1);
+    }
+
+    // ---- multi-blob authentication (zipline#7, C1) ----
+
+    fn make_connect_request(blobs: Vec<AuthBlob>, cn: &str) -> ConnectRequest {
+        ConnectRequest {
+            blobs,
+            claims: vec![claim(key::CN, cn)],
+            substrate_addr: "127.0.0.1".parse().unwrap(),
+            dock_interface: 0,
+            a2a_dh_public_key: PublicKey::new(&[7u8; 32]),
+        }
+    }
+
+    /// An SS blob whose signature verifies against the keypair's policy bootstrap key.
+    fn make_valid_ss_blob(privkey: &PKey<Private>, cn: &str) -> AuthBlob {
+        let challenge = b"multi-blob-challenge";
+        let timestamp = 12345678u64;
+        let signature = sign_node_challenge(privkey, timestamp, cn, challenge);
+        AuthBlob::SS(SelfSignedBlob {
+            alg: ChallengeAlg::RsaSha256Pkcs1v15,
+            challenge: challenge.to_vec(),
+            cn: cn.to_string(),
+            timestamp,
+            signature,
+        })
+    }
+
+    /// A syntactically-present OIDC blob; its contents never matter in C1 because the
+    /// arm is a stub that rejects.
+    fn oidc_stub_blob() -> AuthBlob {
+        AuthBlob::Oidc(zpr::vsapi_types::OidcBlob {
+            issuer: "https://issuer.example".to_string(),
+            id_token: "stub-token".to_string(),
+            nonce: "stub-nonce".to_string(),
+        })
+    }
+
+    /// Zero auth blobs is a malformed request: authentication requires at least one.
+    #[tokio::test]
+    async fn test_zero_blobs_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(Vec::new(), "test-node.zpr");
+        let result = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+        match result {
+            Err(ServiceError::Param(msg)) => {
+                assert_eq!(msg, "at least one auth blob is required")
+            }
+            other => panic!("expected Param error, got {:?}", other),
+        }
+    }
+
+    /// Presented-and-invalid fails closed: a connection carrying a VALID SS blob plus
+    /// an (unsupported) OIDC blob fails as a whole -- the valid device authentication
+    /// does not rescue it -- and no actor is persisted.
+    #[tokio::test]
+    async fn test_two_blobs_ss_and_oidc_stub_fails_whole_connection() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let req =
+            make_connect_request(vec![make_valid_ss_blob(&privkey, cn), oidc_stub_blob()], cn);
+
+        let result = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+
+        match result {
+            Err(ServiceError::Internal(msg)) => assert_eq!(msg, "OIDC not yet supported"),
+            other => panic!("expected Internal error, got {:?}", other),
+        }
+        // The failed connection must not leave an actor behind.
+        assert!(
+            asm.actor_mgr.get_actor_by_cn(cn).await.unwrap().is_none(),
+            "no actor may be persisted for a failed multi-blob connection"
+        );
+    }
+
+    /// Two blobs authenticating the same namespace are a protocol error, even when
+    /// both are individually valid.
+    #[tokio::test]
+    async fn test_duplicate_device_blob_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(
+            vec![
+                make_valid_ss_blob(&privkey, cn),
+                make_valid_ss_blob(&privkey, cn),
+            ],
+            cn,
+        );
+
+        let result = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+
+        match result {
+            Err(ServiceError::Param(msg)) => {
+                assert_eq!(msg, "duplicate device authentication")
+            }
+            other => panic!("expected Param error, got {:?}", other),
+        }
+    }
+
+    /// A connection with no device blob must not end up with an authenticated CN: the
+    /// claimed CN stays unauthenticated through authorize_connection. Pins the
+    /// no-CN-promotion behaviour the multi-blob loop relies on (zipline#7).
+    #[tokio::test]
+    async fn test_cn_not_authenticated_without_device_blob() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(
+            crate::test_helpers::make_trusted_service_policy_with_identity(
+                "idp",
+                "file",
+                Some(3600),
+                &["oidc-subject -> user.oidc-subject"],
+                &["oidc-subject"],
+            ),
+        );
+
+        // Authenticated: user identity only (as the C5 OIDC arm will produce).
+        let authd = vec![
+            Attribute::builder(key::USER_AUTHORITY)
+                .expires_in(Duration::from_secs(600))
+                .value("idp"),
+            Attribute::builder("user.oidc-subject")
+                .expires_in(Duration::from_secs(600))
+                .value("alice-sub"),
+        ];
+        let unauthd = vec![Attribute::builder(key::CN).value("some-device.zpr")];
+
+        let actor = cc
+            .authorize_connection(asm, &policy, "some-device.zpr", unauthd, authd, 0)
+            .await
+            .expect("user-only connection should authorize");
+
+        // The claimed CN was never authenticated, so the actor carries no CN
+        // attribute and the CN is not an identity key.
+        assert!(actor.get_attribute(key::CN).is_none());
+        assert!(!actor.identity_keys_iter().any(|k| k == key::CN));
+    }
+
+    /// Spec regression (OIDC.md failure rule): a user-only actor claiming a foreign
+    /// device CN must not have that CN sent to trusted services as a lookup identity,
+    /// and must not inherit the claimed device's attributes.
+    #[tokio::test]
+    async fn test_user_only_actor_claiming_foreign_cn_gets_no_cn_attributes() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(
+            crate::test_helpers::make_trusted_service_policy_with_identity(
+                "capture",
+                "file",
+                Some(3600),
+                &["oidc-subject -> user.oidc-subject"],
+                &["oidc-subject"],
+            ),
+        );
+        // The store holds the privileged device's attributes, keyed by its CN value.
+        let svc = register_capturing_ts(&asm, "server1.zpr", &[("device.role", "admin")]);
+
+        // Authenticated: only the user subject. The foreign CN is a bare claim.
+        let authd = vec![
+            Attribute::builder("user.oidc-subject")
+                .expires_in(Duration::from_secs(600))
+                .value("alice-sub"),
+        ];
+        let unauthd = vec![Attribute::builder(key::CN).value("server1.zpr")];
+
+        let actor = cc
+            .authorize_connection(asm, &policy, "server1.zpr", unauthd, authd, 0)
+            .await
+            .expect("user-only connection should authorize");
+
+        // The lookup identities sent to the source were only the user subject pair.
+        assert_eq!(
+            *svc.calls.lock().unwrap(),
+            vec![vec![(
+                "user.oidc-subject".to_string(),
+                "alice-sub".to_string()
+            )]]
+        );
+        // And none of the claimed device's attributes reached the actor.
+        assert!(
+            actor.get_attribute("device.role").is_none(),
+            "actor must not inherit the claimed device's attributes"
+        );
     }
 }

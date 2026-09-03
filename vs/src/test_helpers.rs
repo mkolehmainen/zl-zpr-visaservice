@@ -252,6 +252,7 @@ pub fn make_trusted_service_policy_with_identity(
                     .map(|m| parse_attribute_mapping(m).unwrap())
                     .collect(),
                 identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
+                oidc: None,
             };
             ts.write_to(&mut policy_bldr.reborrow().init_trusted_services(1).get(0));
         }
