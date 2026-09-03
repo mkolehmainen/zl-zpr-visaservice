@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use libeval::attribute::Attribute;
+use libeval::attribute::{Attribute, AttributeSource, key};
 
 use crate::error::ServiceError;
 
@@ -51,6 +51,40 @@ pub(crate) fn lookup_identities<'a>(
     identities
 }
 
+/// Prefix of attribute keys in the user identity namespace.
+const USER_NAMESPACE_PREFIX: &str = "user.";
+
+/// Derive the bootstrap-era `user.zpr.authority` attribute from one trusted service's
+/// results (#324 follow-up). A trusted service that vends `user.*` attributes for an
+/// actor is the authority asserting that user identity, so the service's source id
+/// becomes the authority value — the same shape as the RSA bootstrap path using
+/// `zpr-bootstrap` as the `device.zpr.authority` value. The derived attribute expires
+/// with the earliest-expiring vended user attribute, so the authority never outlives
+/// the user record it vouches for, and is stamped with the service's source so the
+/// refresh path prunes it together with that record.
+///
+/// Returns None when the service vended no `user.*` attributes (a device with no user
+/// record in any trusted service must still not match a bare `allow users ...` rule —
+/// the fail-closed property of #144 survives), and when the service explicitly vended
+/// `user.zpr.authority` itself (it is asserting the authority directly; nothing to
+/// derive).
+pub(crate) fn derive_user_authority(source_id: &str, ts_attrs: &[Attribute]) -> Option<Attribute> {
+    if ts_attrs.iter().any(|a| a.get_key() == key::USER_AUTHORITY) {
+        return None;
+    }
+    let expires = ts_attrs
+        .iter()
+        .filter(|a| a.get_key().starts_with(USER_NAMESPACE_PREFIX))
+        .map(|a| a.get_expires())
+        .min()?;
+    Some(
+        AttributeSource::new(source_id)
+            .builder(key::USER_AUTHORITY)
+            .expires(expires)
+            .value(source_id),
+    )
+}
+
 /// Interface for trusted services that can provide attributes for actors.
 #[async_trait]
 pub trait TrustedServiceInterface: Send + Sync {
@@ -76,4 +110,62 @@ pub trait TrustedServiceInterface: Send + Sync {
 
     /// Return the stable source identifier stamped on this service's attributes.
     fn get_source_id(&self) -> &str;
+}
+
+#[cfg(test)]
+mod derive_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    /// Build a source-stamped attribute expiring `secs` seconds from now.
+    fn attr(source: &str, key: &str, value: &str, secs: u64) -> Attribute {
+        AttributeSource::new(source)
+            .builder(key)
+            .expires(SystemTime::now() + Duration::from_secs(secs))
+            .value(value)
+    }
+
+    /// A source vending `user.*` attributes yields a derived `user.zpr.authority`
+    /// valued with the source id, stamped with that source, and expiring with the
+    /// earliest-expiring vended user attribute.
+    #[test]
+    fn test_derive_user_authority_from_user_attrs() {
+        let attrs = vec![
+            attr("bas", "user.clearance", "classified", 600),
+            attr("bas", "user.dept", "engineering", 300),
+            attr("bas", "device.zpr.location", "hq", 60),
+        ];
+        let authority = derive_user_authority("bas", &attrs).expect("authority expected");
+        assert_eq!(authority.get_key(), key::USER_AUTHORITY);
+        assert_eq!(authority.get_value(), ["bas".to_string()]);
+        assert_eq!(authority.get_source(), "bas");
+        // Tracks the earliest user.* expiration (user.dept at ~300s), not the
+        // device attribute's 60s and not user.clearance's 600s.
+        assert_eq!(
+            authority.get_expires(),
+            attrs[1].get_expires(),
+            "authority must expire with the earliest-expiring user attribute"
+        );
+    }
+
+    /// A source vending only device attributes (or nothing) derives no user
+    /// authority, preserving the fail-closed property of #144 for bare
+    /// `allow users ...` rules.
+    #[test]
+    fn test_derive_user_authority_none_without_user_attrs() {
+        let device_only = vec![attr("bas", "device.zpr.location", "hq", 600)];
+        assert!(derive_user_authority("bas", &device_only).is_none());
+        assert!(derive_user_authority("bas", &[]).is_none());
+    }
+
+    /// A source that vends `user.zpr.authority` itself asserts the authority
+    /// directly; nothing is derived on top of it.
+    #[test]
+    fn test_derive_user_authority_defers_to_explicit() {
+        let attrs = vec![
+            attr("bas", key::USER_AUTHORITY, "custom-authority", 600),
+            attr("bas", "user.dept", "engineering", 300),
+        ];
+        assert!(derive_user_authority("bas", &attrs).is_none());
+    }
 }

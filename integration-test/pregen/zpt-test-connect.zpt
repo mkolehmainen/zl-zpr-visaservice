@@ -16,3 +16,13 @@ set webby zpr.services:Webby
 set webby user.bas_id:4567
 set webby user.zpr.authority:bas
 eval TCP devonly > webby.80 [S]
+
+# positive counterpart (#324 follow-up): an actor whose user record came from a
+# trusted service. The VS derives user.zpr.authority = <source id> from the
+# lookup results (connection_control.rs / actor_attributes.rs); zpt has no
+# trusted-service loop, so the derived attribute is modeled with `set`, valued
+# with the source id (bas) exactly as the derivation installs it.
+set usered device.zpr.authority:zpr-bootstrap
+set usered user.bas_id:9999
+set usered user.zpr.authority:bas
+eval TCP usered > webby.80 [S]

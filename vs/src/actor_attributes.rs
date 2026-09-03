@@ -19,7 +19,9 @@ use tracing::{debug, warn};
 use crate::assembly::Assembly;
 use crate::error::ServiceError;
 use crate::logging::targets::VREQ;
-use crate::trusted_services::{REVISION_NEVER, TrustedServicesMgr, lookup_identities};
+use crate::trusted_services::{
+    REVISION_NEVER, TrustedServicesMgr, derive_user_authority, lookup_identities,
+};
 
 /// What a refresh pass found. Kept separate from the act of applying it so the caller
 /// can persist the actor before any of it is committed -- see [refresh_and_persist_actor].
@@ -152,6 +154,20 @@ async fn refresh_expired_attributes(
         {
             match ts_result {
                 Ok(ts_attrs) => {
+                    // A source vending `user.*` attributes also installs the derived
+                    // `user.zpr.authority = <source id>` (#324 follow-up), so the
+                    // authority tracks the user record it vouches for: re-derived while
+                    // the record is vended, pruned with the record when it disappears
+                    // (the derived key is stamped with this source and, when absent
+                    // from `returned`, falls to the pruning below like any other
+                    // attribute the source stopped vending).
+                    let ts_attrs = {
+                        let mut ts_attrs = ts_attrs;
+                        if let Some(authority) = derive_user_authority(source, &ts_attrs) {
+                            ts_attrs.push(authority);
+                        }
+                        ts_attrs
+                    };
                     let returned: HashSet<String> =
                         ts_attrs.iter().map(|a| a.get_key().to_string()).collect();
                     for attr in ts_attrs {
@@ -681,5 +697,50 @@ mod tests {
 
         outcome.commit_revisions(&mgr, &test_addr());
         assert!(mgr.stale_sources_for_actor(&test_addr()).is_empty());
+    }
+
+    /// #324 follow-up: the refresh path derives `user.zpr.authority` the same way the
+    /// connect path does -- a source vending `user.*` attributes (the fake vends
+    /// `user.dept`) installs the authority on refresh, so a user record that first
+    /// appears post-connect still gets its authority.
+    #[tokio::test]
+    async fn test_refresh_installs_user_authority_with_user_attrs() {
+        let (mgr, _fake) = ts_mgr_with_fake();
+        let mut actor = actor_with_cn("someone.zpr.org");
+
+        assert!(refresh_and_commit(&mgr, &mut actor).await);
+        let authority = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .expect("refresh should install user.zpr.authority");
+        assert_eq!(authority.get_value(), [FAKE_SOURCE.to_string()]);
+        assert_eq!(authority.get_source(), FAKE_SOURCE);
+    }
+
+    /// #324 follow-up: when a revision refresh stops vending the user record, the
+    /// derived `user.zpr.authority` is pruned with it -- the authority tracks the
+    /// attributes it vouches for.
+    #[tokio::test]
+    async fn test_refresh_prunes_user_authority_when_user_record_gone() {
+        let mgr = TrustedServicesMgr::new();
+        mgr.update_services(vec![Arc::new(EmptyTrustedService)]);
+        // Actor connected while the source vended user attributes, so it carries both
+        // the user attribute and the derived authority from that source.
+        let mut actor = actor_with_attr("someone.zpr.org", FAKE_SOURCE, false);
+        actor
+            .add_attribute(
+                AttributeSource::new(FAKE_SOURCE)
+                    .builder(key::USER_AUTHORITY)
+                    .expires_in(Duration::from_secs(600))
+                    .value(FAKE_SOURCE),
+            )
+            .unwrap();
+
+        // The (stale) source now vends nothing: user attribute AND authority go.
+        assert!(refresh_and_commit(&mgr, &mut actor).await);
+        assert!(actor.get_attribute(FAKE_ATTR_KEY).is_none());
+        assert!(
+            actor.get_attribute(key::USER_AUTHORITY).is_none(),
+            "the derived authority must not outlive the user record it vouches for"
+        );
     }
 }

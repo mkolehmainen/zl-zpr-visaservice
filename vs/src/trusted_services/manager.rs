@@ -78,14 +78,23 @@ impl TrustedServicesMgr {
     ///
     /// `identities` is the actor's lookup-identity (key, value) set; see
     /// [TrustedServiceInterface::get_attributes_for_actor].
+    ///
+    /// Each result is paired with the service's source id so the caller can attribute
+    /// it (e.g. to derive `user.zpr.authority` from the vending source) without
+    /// trusting the source string stamped on the returned attributes themselves.
     pub async fn get_attributes_for_actor(
         &self,
         identities: &[(String, String)],
-    ) -> Vec<Result<Vec<Attribute>, ServiceError>> {
+    ) -> Vec<(String, Result<Vec<Attribute>, ServiceError>)> {
         let snapshot = self.services.load_full();
         let futures = snapshot.iter().map(|service| {
             let service = service.clone();
-            async move { service.get_attributes_for_actor(identities).await }
+            async move {
+                (
+                    service.get_source_id().to_string(),
+                    service.get_attributes_for_actor(identities).await,
+                )
+            }
         });
         join_all(futures).await
     }
