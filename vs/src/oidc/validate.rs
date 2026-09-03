@@ -117,7 +117,7 @@ pub fn validate_id_token(
     let data =
         jwt::decode::<serde_json::Map<String, serde_json::Value>>(id_token, &key, &validation)
             .map_err(|e| OidcError::Signature(e.to_string()))?;
-    let claims = data.claims;
+    let mut claims = data.claims;
 
     // `nonce` binds the token to this connection attempt. Missing and
     // mismatched are the same failure; the expected value is never echoed.
@@ -153,15 +153,20 @@ pub fn validate_id_token(
                 ));
             }
             Some(d) if !params.allowed_domains.contains(d) => {
-                return Err(OidcError::Rejected(format!(
-                    "hosted domain '{d}' not in allowed_domains"
-                )));
+                // Claim names only, never values: the token's `hd` is
+                // attacker-influenced bytes and must not reach logs.
+                return Err(OidcError::Rejected(
+                    "hd claim not in allowed_domains".to_string(),
+                ));
             }
             Some(_) => (),
         }
     }
 
-    // `email` is only trustworthy when the provider says it verified it.
+    // `email` is only trustworthy when the provider says it verified it. An
+    // unverified email is also stripped from `raw_claims`, which feeds the
+    // `returns_attributes` mapping (C4) — otherwise the unverified value
+    // would still be ingested through that path.
     let email_verified = claims
         .get("email_verified")
         .and_then(|v| v.as_bool())
@@ -172,6 +177,7 @@ pub fn validate_id_token(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     } else {
+        claims.remove("email");
         None
     };
 
@@ -181,7 +187,14 @@ pub fn validate_id_token(
         .and_then(|v| v.as_u64())
         .or_else(|| claims.get("iat").and_then(|v| v.as_u64()))
         .ok_or_else(|| OidcError::Signature("neither auth_time nor iat present".to_string()))?;
-    let auth_time = UNIX_EPOCH + Duration::from_secs(auth_time_secs);
+    // Checked: a huge value (e.g. u64::MAX) is unrepresentable as SystemTime
+    // and would panic on `UNIX_EPOCH + Duration`. Such a token is nonsense —
+    // reject it like any other bad `auth_time`.
+    let auth_time = UNIX_EPOCH
+        .checked_add(Duration::from_secs(auth_time_secs))
+        .ok_or_else(|| {
+            OidcError::Rejected("auth_time/iat out of representable range".to_string())
+        })?;
 
     // Freshness: the authentication event must be recent enough when policy
     // demands it (`max_auth_age_seconds`), with clock-skew leeway.
@@ -427,13 +440,18 @@ mod tests {
         assert!(matches!(err, OidcError::Rejected(_)), "{err}");
     }
 
-    // hd not in allowed_domains -> Rejected
+    // hd not in allowed_domains -> Rejected, and the error names the claim
+    // without echoing the token-supplied value (claim names, never values)
     #[test]
     fn wrong_hd_rejected() {
         let mut c = base_claims();
         c["hd"] = json!("not-allowed.example.org");
         let err = validate(c).unwrap_err();
         assert!(matches!(err, OidcError::Rejected(_)), "{err}");
+        assert!(
+            !err.to_string().contains("not-allowed.example.org"),
+            "error must not echo the token's hd value: {err}"
+        );
     }
 
     // email_verified: false -> Ok with email == None
@@ -445,6 +463,27 @@ mod tests {
         assert_eq!(tok.email, None);
         // the identity itself is still valid
         assert_eq!(tok.sub, "10769150350006150715113082367");
+    }
+
+    // email_verified: false -> email removed from raw_claims too, so the
+    // returns_attributes mapping (C4) can never ingest an unverified email
+    #[test]
+    fn unverified_email_stripped_from_raw_claims() {
+        let mut c = base_claims();
+        c["email_verified"] = json!(false);
+        let tok = validate(c).unwrap();
+        assert!(
+            !tok.raw_claims.contains_key("email"),
+            "unverified email must not survive in raw_claims"
+        );
+        // missing email_verified counts as unverified, same rule
+        let mut c2 = base_claims();
+        c2.as_object_mut().unwrap().remove("email_verified");
+        let tok2 = validate(c2).unwrap();
+        assert!(!tok2.raw_claims.contains_key("email"));
+        // and a verified email is retained
+        let tok3 = validate(base_claims()).unwrap();
+        assert!(tok3.raw_claims.contains_key("email"));
     }
 
     // unknown kid -> UnknownKid
@@ -512,6 +551,24 @@ mod tests {
         c2["auth_time"] = json!(iat - 100);
         let tok2 = validate(c2).unwrap();
         assert_eq!(tok2.auth_time, UNIX_EPOCH + Duration::from_secs(iat - 100));
+    }
+
+    // auth_time near u64::MAX -> Rejected, never a panic on
+    // UNIX_EPOCH + Duration (unrepresentable SystemTime)
+    #[test]
+    fn huge_auth_time_rejected_not_panic() {
+        let mut c = base_claims();
+        c["auth_time"] = json!(u64::MAX);
+        let err = validate(c).unwrap_err();
+        assert!(matches!(err, OidcError::Rejected(_)), "{err}");
+
+        // same guard on the iat fallback path
+        let mut c2 = base_claims();
+        c2.as_object_mut().unwrap().remove("auth_time");
+        c2["iat"] = json!(u64::MAX);
+        // a u64::MAX iat also fails the library's iat sanity; either way it
+        // must be an error, not a panic
+        let _ = validate(c2).unwrap_err();
     }
 
     // empty key set -> NoKeys (not a table row; completes the error taxonomy)
