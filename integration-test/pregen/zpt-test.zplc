@@ -47,3 +47,7 @@ provider = [[ "user.bas_id", "1233" ]]
 protocol = "http"
 provider = [[ "user.bas_id", "4567" ]]
 
+[services.Webby]
+protocol = "http"
+provider = [[ "user.bas_id", "4567" ]]
+

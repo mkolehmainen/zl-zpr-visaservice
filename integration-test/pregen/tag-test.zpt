@@ -1,20 +1,29 @@
 load zpt-test.bin2
 
+# Compiler >= 0.16 emits presence conditions for class specs (#144): user rules
+# require user.zpr.authority and device conditions require device.zpr.authority.
 
 set alice user.bas_id:1000
 set alice user.color:red
 set alice #device.hardened
+set alice user.zpr.authority:bas
+set alice device.zpr.authority:zpr-bootstrap
 
 
 set bob user.bas_id:1001
 set bob user.color:red
+set bob user.zpr.authority:bas
+set bob device.zpr.authority:zpr-bootstrap
 
 set carol user.bas_id:1002
 set carol #device.hardened
+set carol user.zpr.authority:bas
+set carol device.zpr.authority:zpr-bootstrap
 
 
 set web zpr.services:web1
 set web user.bas_id:4567
+set web user.zpr.authority:bas
 
 # allowed
 eval TCP alice > web.80 [S]
@@ -24,5 +33,4 @@ eval TCP bob > web.80 [S]
 
 # denied - carol not color:red
 eval TCP carol > web.80 [S]
-
 

@@ -8,3 +8,21 @@ connect --ac device.zpr.adapter.cn:bazz.zpr.org
 
 # test that a policy-declared identity attribute joins the builtin CN identity
 connect --ac device.zpr.adapter.cn:bas.zpr.org --ac user.bas_id:1233
+
+# fail-closed proof (#144 + issue #324): a device-only actor (no
+# user.zpr.authority) must NOT match `allow users to access Webby.`
+set devonly device.zpr.authority:zpr-bootstrap
+set webby zpr.services:Webby
+set webby user.bas_id:4567
+set webby user.zpr.authority:bas
+eval TCP devonly > webby.80 [S]
+
+# positive counterpart (#324 follow-up): an actor whose user record came from a
+# trusted service. The VS derives user.zpr.authority = <source id> from the
+# lookup results (connection_control.rs / actor_attributes.rs); zpt has no
+# trusted-service loop, so the derived attribute is modeled with `set`, valued
+# with the source id (bas) exactly as the derivation installs it.
+set usered device.zpr.authority:zpr-bootstrap
+set usered user.bas_id:9999
+set usered user.zpr.authority:bas
+eval TCP usered > webby.80 [S]

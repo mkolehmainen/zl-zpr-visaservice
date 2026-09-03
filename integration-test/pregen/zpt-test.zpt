@@ -3,9 +3,13 @@ load zpt-test.bin2
 # This make alice an employee
 set alice user.bas_id:1000
 set alice user.color:red
+# Compiler >= 0.16 emits `has user.zpr.authority` for user class specs (#144);
+# a user actor must carry the authority attribute to match any user rule.
+set alice user.zpr.authority:bas
 
 set db zpr.services:database,pingy
 set db user.bas_id:1233
+set db user.zpr.authority:bas
 
 eval TCP alice > db.80 [S]
 

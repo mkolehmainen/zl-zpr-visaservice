@@ -311,7 +311,7 @@ impl EvalContext {
         //
         // Everything is appended (usize::MAX) so CN stays first and the policy-declared keys keep
         // policy order. Callers layer their own keys around this set -- the Visa Service prepends
-        // its JWT at order 0 and appends zpr.authority at the end -- so this must not reorder.
+        // its JWT at order 0 and appends the namespaced authorities at the end -- so this must not reorder.
         //
         // Presence on the actor is a sufficient test: every attribute committed above is either an
         // authenticated claim or a zpr.addr validated by a matching join policy, so a peer cannot

@@ -686,6 +686,17 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Policies compiled below the 0.16 floor are rejected: they emit bare
+    /// `zpr.authority` semantics that this VS no longer implements (issue #324).
+    async fn test_policy_below_0_16_rejected() {
+        use crate::test_helpers::make_container_bytes;
+        let container = make_container_bytes(0, 15, 0, &[]);
+        let pcb = PolicyContainerBytes::from(container);
+        let result = LoadedPolicy::from_container(pcb, &config::POLICY_MIN_VERSION);
+        assert!(result.is_err(), "0.15 policy must be refused, got Ok");
+    }
+
+    #[tokio::test]
     /// LoadedPolicy::from_container rejects bytes that are not a valid container.
     async fn test_loaded_policy_rejects_garbage() {
         let pcb = PolicyContainerBytes::from(b"not a capnp container".to_vec());

@@ -288,7 +288,8 @@ impl Policy {
     /// excludes CN by construction.
     ///
     /// Because it is an allow-list, caller-layered identity keys (the Visa Service's
-    /// bootstrap JWT and `zpr.authority`) and internal keys (`zpr.addr`,
+    /// bootstrap JWT and the namespaced authorities `device.zpr.authority` /
+    /// `user.zpr.authority`) and internal keys (`zpr.addr`,
     /// `zpr.actor_hash`) are excluded without a deny-list to maintain. Callers
     /// intersect this set with the authenticated claims (or actor attributes) in hand
     /// and send (key, value) pairs to attribute stores — never bare values.

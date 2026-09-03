@@ -64,17 +64,25 @@ func VisaAuthorizedBy(width, height int, visa *dataplane.VisaDescriptor, actors 
 	return detailPanel(width, height, "Authorized By", "Why the visa exists", body)
 }
 
+// visaIssuer names the authority that authenticated the requesting actor.
+// Authorities are per identity namespace (device.zpr.authority /
+// user.zpr.authority); when both are present, both are shown.
 func visaIssuer(visa dataplane.VisaDescriptor, actors []dataplane.ActorDescriptor) string {
 	actor, ok := actorByAddr(actors, visa.RequestingNode)
 	if !ok {
 		return "—"
 	}
 
-	if authority := actor.Attr("zpr.authority"); len(authority) > 0 {
-		return authority[0]
+	var authorities []string
+	for _, key := range []string{"device.zpr.authority", "user.zpr.authority"} {
+		authorities = append(authorities, actor.Attr(key)...)
 	}
 
-	return "—"
+	if len(authorities) == 0 {
+		return "—"
+	}
+
+	return strings.Join(authorities, ", ")
 }
 
 func visaSignalLine(visa dataplane.VisaDescriptor, width int) string {

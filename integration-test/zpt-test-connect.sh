@@ -10,6 +10,7 @@ PROG_CMD=("$ZPT_BIN" -i "$INPUT" --json)
 obj1="$("${PROG_CMD[@]}" | sed -n '1p')"
 obj2="$("${PROG_CMD[@]}" | sed -n '2p')"
 obj3="$("${PROG_CMD[@]}" | sed -n '3p')"
+obj4="$("${PROG_CMD[@]}" | sed -n '4p')"
 
 echo "TESTING CONNECT SHOULD SUCCEED AS A SERVICE PROVIDER"
 jq -e \
@@ -34,6 +35,24 @@ jq -e \
     '.kind == "APPROVE_CONNECTION"
      and .actor.identity_keys == ["device.zpr.adapter.cn", "user.bas_id"]' \
     >/dev/null <<<"$obj3"
+echo "TEST OK"
+
+echo "TESTING DEVICE-ONLY ACTOR DOES NOT MATCH A BARE 'allow users' RULE (FAIL-CLOSED)"
+# Compiler >= 0.16 emits `has user.zpr.authority` for bare user specs (#144);
+# an actor with only device.zpr.authority must get NO_MATCH, not ALLOW (#324).
+jq -e \
+    '.kind == "EVAL" and .decision == "NO_MATCH"' \
+    >/dev/null <<<"$obj4"
+echo "TEST OK"
+
+echo "TESTING ACTOR WITH TRUSTED-SERVICE-DERIVED user.zpr.authority MATCHES 'allow users'"
+# Positive counterpart (#324 follow-up): with user.zpr.authority:bas installed —
+# as the VS derives it from a trusted service vending user.* attributes — the
+# same `allow users to access Webby.` rule matches.
+obj5="$("${PROG_CMD[@]}" | sed -n '5p')"
+jq -e \
+    '.kind == "EVAL" and .decision == "ALLOW"' \
+    >/dev/null <<<"$obj5"
 echo "TEST OK"
 
 echo "OK"

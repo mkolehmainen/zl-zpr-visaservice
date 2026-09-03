@@ -37,7 +37,7 @@ use crate::auth;
 use crate::config;
 use crate::error::ServiceError;
 use crate::logging::targets::CC;
-use crate::trusted_services::lookup_identities;
+use crate::trusted_services::{derive_user_authority, lookup_identities};
 
 // TODO: move to libeval
 const CLASS_DEVICE: &str = "device";
@@ -186,11 +186,11 @@ impl ConnectionControl {
             signature: challenge_response.to_vec(),
         };
 
-        // We are the authority since we are checking RSA locally.
+        // Built-in RSA verification is the device authority (Contract 7).
         authd_claims.push(
-            Attribute::builder(key::AUTHORITY)
+            Attribute::builder(key::DEVICE_AUTHORITY)
                 .expires_in(config::DEFAULT_AUTH_EXPIRATION)
-                .value(&self.authority),
+                .value(key::AUTHORITY_METHOD_BOOTSTRAP),
         );
 
         let node_actor = self
@@ -238,8 +238,12 @@ impl ConnectionControl {
         let mut actor = match &req.blobs[0] {
             AuthBlob::SS(ssb) => match ssb.alg {
                 ChallengeAlg::RsaSha256Pkcs1v15 => {
-                    // We are the authority since we are checking RSA locally.
-                    authd_claims.push(Attribute::builder(key::AUTHORITY).value(&self.authority));
+                    // Built-in RSA verification is the device authority (Contract 7).
+                    authd_claims.push(
+                        Attribute::builder(key::DEVICE_AUTHORITY)
+                            .expires_in(config::DEFAULT_AUTH_EXPIRATION)
+                            .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+                    );
 
                     self.authenticate_zpr_entity_rsa(
                         asm,
@@ -268,12 +272,13 @@ impl ConnectionControl {
                     actor.get_zpr_addr()
                 )));
             }
-            // The ordinary adapter path already stamped AUTHORITY with the default (4 hour)
-            // expiration; re-add it with the VS expiration so the VS does not expire itself.
+            // The ordinary adapter path already stamped DEVICE_AUTHORITY with the default
+            // (4 hour) expiration; re-add it with the VS expiration so the VS does not
+            // expire itself.
             actor.add_attribute(
-                Attribute::builder(key::AUTHORITY)
+                Attribute::builder(key::DEVICE_AUTHORITY)
                     .expires_in(config::VS_AUTH_EXPIRATION)
-                    .value(&self.authority),
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
             )?;
         }
 
@@ -287,7 +292,12 @@ impl ConnectionControl {
     ) -> Result<Actor, ServiceError> {
         let mut authd_claims = Vec::new();
 
-        authd_claims.push(Attribute::builder(key::AUTHORITY).value(&self.authority));
+        // The VS authenticates itself by construction; that is the device authority.
+        authd_claims.push(
+            Attribute::builder(key::DEVICE_AUTHORITY)
+                .expires_in(config::VS_AUTH_EXPIRATION)
+                .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+        );
         // The VS authorizes itself: its own CN is authenticated by construction, so it
         // is promoted here (authorize_connection no longer promotes the CN).
         authd_claims.push(Attribute::builder(key::CN).value(config::VS_CN));
@@ -299,17 +309,12 @@ impl ConnectionControl {
         let policy = asm.policy_mgr.get_current();
 
         // Ok checks out -- now run through policy.
-        let mut vs_actor = self
+        let vs_actor = self
             .authorize_connection(asm, &policy, &config::VS_CN, Vec::new(), authd_claims, 0)
             .await?;
 
-        // The `authorized_connection` call will add the default expiration on the authority key. We
-        // want to make vs not expire.
-        vs_actor.add_attribute(
-            Attribute::builder(key::AUTHORITY)
-                .expires_in(config::VS_AUTH_EXPIRATION)
-                .value(&self.authority),
-        )?;
+        // authorize_connection no longer stamps a blanket authority, so the
+        // VS-expiration DEVICE_AUTHORITY pushed above survives as-is.
 
         Ok(vs_actor)
     }
@@ -415,8 +420,10 @@ impl ConnectionControl {
     ///
     /// Caller should set ROLE in unauthd_claims before calling.
     ///
-    /// This always adds the `key::AUTHORITY` key as an identity attribute with the default
-    /// auth expiration on it.
+    /// This does NOT add any authority attribute itself: the authentication path
+    /// (blob arm) that verified the entity owns stamping the namespaced authority
+    /// (e.g. [key::DEVICE_AUTHORITY] on the RSA bootstrap path). Whichever
+    /// namespaced authorities are present are registered as identity attributes.
     async fn authorize_connection(
         &self,
         asm: Arc<Assembly>,
@@ -456,9 +463,16 @@ impl ConnectionControl {
         // satisfied by a missing key. Refuse the connection rather than authorize
         // against a partial claim set. Note this means a trusted-service outage blocks
         // new connections.
-        for ts_results in asm.ts_mgr.get_attributes_for_actor(&identities).await {
+        for (source_id, ts_results) in asm.ts_mgr.get_attributes_for_actor(&identities).await {
             match ts_results {
                 Ok(ts_attrs) => {
+                    // A source that vends `user.*` attributes is the authority asserting
+                    // that user identity, so it installs `user.zpr.authority = <source id>`
+                    // alongside them (#324 follow-up); see [derive_user_authority]. The
+                    // identity-key registration below then picks it up unchanged.
+                    if let Some(authority) = derive_user_authority(&source_id, &ts_attrs) {
+                        authd_claims.push(authority);
+                    }
                     for attr in ts_attrs {
                         authd_claims.push(attr);
                     }
@@ -486,12 +500,14 @@ impl ConnectionControl {
                 }
             };
 
-        authd_actor.add_attribute(
-            Attribute::builder(key::AUTHORITY)
-                .expires_in(config::DEFAULT_AUTH_EXPIRATION)
-                .value(&self.authority),
-        )?;
-        authd_actor.add_identity_key(usize::MAX, key::AUTHORITY)?;
+        // The blob arms own the authority: register whichever namespaced authority
+        // attributes the authentication path stamped as identity attributes, rather
+        // than adding a blanket one here (Contract 7).
+        for authority_key in [key::DEVICE_AUTHORITY, key::USER_AUTHORITY] {
+            if authd_actor.get_attribute(authority_key).is_some() {
+                authd_actor.add_identity_key(usize::MAX, authority_key)?;
+            }
+        }
 
         let actor_role = if authd_actor.is_node() {
             Role::Node
@@ -1192,6 +1208,61 @@ mod tests {
         )
     }
 
+    /// The RSA-verified (bootstrap) path installs the namespaced device authority
+    /// `device.zpr.authority = "zpr-bootstrap"` as an identity attribute, and no
+    /// legacy `zpr.authority` or `user.zpr.authority` attribute exists (Contract 7).
+    #[tokio::test]
+    async fn test_rsa_path_installs_device_authority_bootstrap() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+
+        let actor = cc
+            .authenticate_node(
+                asm,
+                challenge,
+                timestamp,
+                cn,
+                &sig,
+                "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
+                None,
+            )
+            .await
+            .expect("authentication should succeed");
+
+        assert_eq!(
+            actor
+                .get_attribute(key::DEVICE_AUTHORITY)
+                .expect("device authority must be present")
+                .get_value(),
+            &vec![key::AUTHORITY_METHOD_BOOTSTRAP.to_string()],
+            "RSA path must stamp device.zpr.authority = zpr-bootstrap"
+        );
+        assert!(
+            actor.get_attribute("zpr.authority").is_none(),
+            "legacy un-namespaced zpr.authority must not exist"
+        );
+        assert!(
+            actor.get_attribute(key::USER_AUTHORITY).is_none(),
+            "device-only bootstrap must not assert a user authority"
+        );
+        assert!(
+            actor
+                .identity_keys_iter()
+                .any(|k| k == key::DEVICE_AUTHORITY),
+            "device.zpr.authority must be registered as an identity key"
+        );
+    }
+
     /// With no topology entry for the node, the reported substrate address is stored
     /// as the node's `key::SUBSTRATE_ADDR` claim (no TCP-peer fallback exists anymore).
     #[tokio::test]
@@ -1347,7 +1418,7 @@ mod tests {
         assert_eq!(claims.sub, format!("node/{}", cn));
         assert_eq!(claims.iss, "vs.zpr/test-vs");
 
-        // get_identity() returns [jwt, cn, authority] in that order
+        // get_identity() returns [jwt, cn, device authority] in that order
         let identity = actor
             .get_identity()
             .expect("actor must have identity values");
@@ -1538,6 +1609,161 @@ mod tests {
         );
         // The vended attribute reached the actor through the authenticated-claims path.
         assert!(actor.get_attribute("user.color").is_some());
+    }
+
+    /// A trusted service with a configurable source id that vends a fixed attribute
+    /// set for every lookup. Minimal stand-in for the user-authority derivation tests,
+    /// where the source id IS the asserted authority value.
+    struct NamedTrustedService {
+        source_id: String,
+        /// (ZPR attribute key, value) pairs vended on every lookup.
+        vends: Vec<(String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services::TrustedServiceInterface for NamedTrustedService {
+        async fn get_attributes_for_actor(
+            &self,
+            _identities: &[(String, String)],
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            Ok(self
+                .vends
+                .iter()
+                .map(|(k, v)| {
+                    libeval::attribute::AttributeSource::new(self.source_id.clone())
+                        .builder(k)
+                        .expires_in(Duration::from_secs(600))
+                        .value(v)
+                })
+                .collect())
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        // Never flushed in these tests.
+        fn current_revision(&self) -> u64 {
+            1
+        }
+
+        fn get_source_id(&self) -> &str {
+            &self.source_id
+        }
+    }
+
+    /// Build a [NamedTrustedService] for registration with the test assembly.
+    fn named_ts(source_id: &str, vends: &[(&str, &str)]) -> Arc<NamedTrustedService> {
+        Arc::new(NamedTrustedService {
+            source_id: source_id.to_string(),
+            vends: vends
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        })
+    }
+
+    /// #324 follow-up (1): a trusted service vending `user.*` attributes installs
+    /// `user.zpr.authority = <source id>` on the actor, and it is registered as an
+    /// identity key -- the trusted service is the authority asserting the user
+    /// identity, exactly as the RSA bootstrap path asserts the device identity.
+    #[tokio::test]
+    async fn ts_user_attrs_install_user_authority() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
+            "bas",
+            "file",
+            Some(3600),
+            &["dept -> user.dept"],
+        ));
+        asm.ts_mgr
+            .update_services(vec![named_ts("bas", &[("user.dept", "engineering")])]);
+
+        let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
+        let actor = cc
+            .authorize_connection(asm, &policy, "device-1.zpr.org", Vec::new(), authd, 0)
+            .await
+            .expect("connection should authorize");
+
+        let authority = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .expect("user.zpr.authority should be installed");
+        assert_eq!(authority.get_value(), ["bas".to_string()]);
+        // Expires with the vended user attributes, so the authority never outlives
+        // the user record it vouches for.
+        assert_eq!(
+            authority.get_expires(),
+            actor.get_attribute("user.dept").unwrap().get_expires()
+        );
+        // And it is registered as an identity key, like any namespaced authority.
+        assert!(
+            actor.identity_keys_iter().any(|k| k == key::USER_AUTHORITY),
+            "user.zpr.authority should be an identity key"
+        );
+    }
+
+    /// #324 follow-up (2): a trusted service vending only device attributes (or
+    /// nothing) installs no `user.zpr.authority` -- a device with no user record in
+    /// any trusted service still does not match a bare `allow users ...` rule, so the
+    /// fail-closed property of #144 survives.
+    #[tokio::test]
+    async fn ts_device_only_attrs_install_no_user_authority() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
+            "bas",
+            "file",
+            Some(3600),
+            &["location -> device.zpr.location"],
+        ));
+        asm.ts_mgr
+            .update_services(vec![named_ts("bas", &[("device.zpr.location", "hq")])]);
+
+        let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
+        let actor = cc
+            .authorize_connection(asm, &policy, "device-1.zpr.org", Vec::new(), authd, 0)
+            .await
+            .expect("connection should authorize");
+
+        assert!(actor.get_attribute("device.zpr.location").is_some());
+        assert!(
+            actor.get_attribute(key::USER_AUTHORITY).is_none(),
+            "device-only trusted-service results must not install user.zpr.authority"
+        );
+    }
+
+    /// #324 follow-up (3): with two sources of which only one vends user attributes,
+    /// exactly that source's id becomes the (single) authority value.
+    #[tokio::test]
+    async fn ts_two_sources_one_user_authority_value() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
+            "bas",
+            "file",
+            Some(3600),
+            &["dept -> user.dept"],
+        ));
+        asm.ts_mgr.update_services(vec![
+            named_ts("bas", &[("user.dept", "engineering")]),
+            named_ts("inventory", &[("device.zpr.location", "hq")]),
+        ]);
+
+        let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
+        let actor = cc
+            .authorize_connection(asm, &policy, "device-1.zpr.org", Vec::new(), authd, 0)
+            .await
+            .expect("connection should authorize");
+
+        let authority = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .expect("user.zpr.authority should be installed");
+        assert_eq!(
+            authority.get_value(),
+            ["bas".to_string()],
+            "exactly the user-vending source names the authority"
+        );
     }
 
     /// Disconnect purges recorded trusted-service revisions for the actor AND for every
