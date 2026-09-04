@@ -10,12 +10,18 @@ use std::sync::Arc;
 use libeval::attribute::Attribute;
 
 use crate::error::ServiceError;
+use crate::oidc::OidcTrustedService;
 
 use super::TrustedServiceInterface;
 
 /// Coordinates concurrent access to the configured trusted-service implementations.
 pub struct TrustedServicesMgr {
     services: ArcSwap<Vec<Arc<dyn TrustedServiceInterface>>>,
+    /// The OIDC subset of `services`, kept typed so the connect path (C5) can
+    /// reach provider-specific state (`params`, `keys`, `admit`) that the
+    /// `dyn` interface deliberately does not expose. Every store in here is
+    /// also in `services`; both lists are replaced together on policy install.
+    oidc_services: ArcSwap<Vec<Arc<OidcTrustedService>>>,
     /// Per actor (keyed by ZPR address) and source, the revision from which attributes
     /// were last refreshed. ZPR addresses are recycled from a pool, so entries MUST be
     /// purged on disconnect ([TrustedServicesMgr::forget_actor_revisions]) before the
@@ -28,6 +34,7 @@ impl TrustedServicesMgr {
     pub fn new() -> Self {
         Self {
             services: ArcSwap::new(Arc::new(Vec::new())),
+            oidc_services: ArcSwap::new(Arc::new(Vec::new())),
             actor_revisions: DashMap::new(),
         }
     }
@@ -69,9 +76,37 @@ impl TrustedServicesMgr {
         self.actor_revisions.remove(zpr_addr);
     }
 
-    /// Atomically replace the entire trusted-service list.
+    /// Atomically replace the entire trusted-service list. The typed OIDC list
+    /// is cleared. Production code publishes via [Self::update_services_with_oidc];
+    /// this shorthand serves the many tests that register plain stores.
+    #[cfg(test)]
     pub fn update_services(&self, services: Vec<Arc<dyn TrustedServiceInterface>>) {
+        self.update_services_with_oidc(services, Vec::new());
+    }
+
+    /// Replace the trusted-service list together with its typed OIDC subset
+    /// (each OIDC store appears in both). Two swaps, not one atom: readers of
+    /// one list never join it against the other, they only look services up
+    /// by id or issuer, so a momentary mismatch cannot misattribute a store.
+    pub fn update_services_with_oidc(
+        &self,
+        services: Vec<Arc<dyn TrustedServiceInterface>>,
+        oidc_services: Vec<Arc<OidcTrustedService>>,
+    ) {
         self.services.store(Arc::new(services));
+        self.oidc_services.store(Arc::new(oidc_services));
+    }
+
+    /// The OIDC trusted service pinned to `issuer`, when the current policy
+    /// declares one. The connect path (C5) resolves the provider for an
+    /// incoming token by its `iss` claim through this.
+    #[allow(dead_code)] // consumed by the C5 connect path
+    pub fn oidc_service_for_issuer(&self, issuer: &str) -> Option<Arc<OidcTrustedService>> {
+        self.oidc_services
+            .load()
+            .iter()
+            .find(|service| service.issuer() == issuer)
+            .cloned()
     }
 
     /// Query every trusted service concurrently for an actor's attributes.

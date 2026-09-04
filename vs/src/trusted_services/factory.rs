@@ -8,6 +8,7 @@ use libeval::policy::Policy;
 use zpr::policy_types::{ServiceType, TrustedService};
 
 use crate::error::ServiceError;
+use crate::oidc::{KeySource, OidcTrustedService, ProxyResolver};
 
 use super::TrustedServiceInterface;
 use super::attribute_mapper::AttributeMapper;
@@ -16,9 +17,14 @@ use super::file_attribute_store::FileAttributeStore;
 /// API name used by file-backed trusted services.
 const TS_API_FILE: &str = "file";
 
+/// API name used by OIDC identity-provider trusted services.
+pub const TS_API_OIDC: &str = "oidc";
+
 /// One policy-declared trusted service, reduced to the inputs that determine its store
 /// instance. Comparing these across policies tells us whether the live stores are still
-/// correct, so an unchanged declaration can keep its store (and its revision).
+/// correct, so an unchanged declaration can keep its store (and its revision). The
+/// embedded `record` carries the `oidc` config, so an OIDC config change (issuer,
+/// client_id, keys, ...) breaks equality and rebuilds the store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrustedServiceDefinition {
     id: String,
@@ -26,23 +32,40 @@ pub struct TrustedServiceDefinition {
     record: TrustedService,
 }
 
+impl TrustedServiceDefinition {
+    /// The declared trusted-service id (also the store's source id), the key
+    /// unchanged declarations are matched under across policy installs.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// Validate and extract the trusted services a policy declares.
+///
+/// Two `api = "oidc"` declarations sharing an issuer are rejected: token
+/// validation resolves the provider by its `iss` claim, so a duplicate issuer
+/// would make which client configuration checks a token depend on unordered
+/// service iteration. The error names both services and the issuer, mirroring
+/// the compiler-side collision diagnostics.
 pub fn trusted_service_definitions(
     policy: &Policy,
 ) -> Result<Vec<TrustedServiceDefinition>, ServiceError> {
     let mut definitions = Vec::new();
+    let mut issuer_owners: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for service in policy.list_services() {
         let ServiceType::Trusted(api) = &service.kind else {
             continue;
         };
-        if api != TS_API_FILE {
+        if api != TS_API_FILE && api != TS_API_OIDC {
             return Err(ServiceError::Param(format!(
                 "trusted service '{}': unsupported api '{api}'",
                 service.id
             )));
         }
-        if service.id.contains('/') || service.id.contains("..") {
+        // File stores resolve `<id>.json` on disk, so the id must be a plain filename.
+        if api == TS_API_FILE && (service.id.contains('/') || service.id.contains("..")) {
             return Err(ServiceError::Param(format!(
                 "trusted service '{}': id is not a plain filename",
                 service.id
@@ -54,6 +77,29 @@ pub fn trusted_service_definitions(
                 service.id
             )));
         };
+        if api == TS_API_OIDC {
+            let Some(cfg) = &trusted_service.oidc else {
+                return Err(ServiceError::Param(format!(
+                    "trusted service '{}': api 'oidc' requires an oidc config in the policy record",
+                    service.id
+                )));
+            };
+            if let Some(other) = issuer_owners.insert(cfg.issuer.clone(), service.id.clone()) {
+                // Sort the pair: list_services iterates a HashMap, and the
+                // diagnostic must not depend on its order.
+                let (first, second) = if other <= service.id {
+                    (other, service.id.clone())
+                } else {
+                    (service.id.clone(), other)
+                };
+                return Err(ServiceError::Param(format!(
+                    "trusted services '{first}' and '{second}' both declare oidc issuer \
+                     '{}': issuers must be unique so a token's iss claim selects exactly \
+                     one provider",
+                    cfg.issuer
+                )));
+            }
+        }
 
         definitions.push(TrustedServiceDefinition {
             id: service.id.clone(),
@@ -65,25 +111,63 @@ pub fn trusted_service_definitions(
     Ok(definitions)
 }
 
-/// Build one store per declaration, loading each initial attribute snapshot.
+/// Build one store per declaration. File stores load their initial attribute
+/// snapshot from `file_ts_dir`; OIDC stores build their JWKS key source from the
+/// policy config, with `proxy_for(service_id)` supplying the CONNECT-proxy
+/// resolver each refresh consults (see `crate::oidc::ProxyResolver`).
+///
+/// Returns the full `dyn` store list plus its typed OIDC subset (each OIDC
+/// store appears in both), so `TrustedServicesMgr` can serve
+/// `oidc_service_for_issuer` lookups for the connect path.
 pub fn build_services(
     definitions: &[TrustedServiceDefinition],
     file_ts_dir: &Path,
-) -> Result<Vec<Arc<dyn TrustedServiceInterface>>, ServiceError> {
-    definitions
-        .iter()
-        .map(|definition| {
-            let store = FileAttributeStore::new(
-                definition.id.clone(),
-                AttributeMapper {
-                    mappings: definition.record.returns_attrs.clone(),
-                },
-                Duration::from_secs(definition.record.expiration_seconds as u64),
-                &file_ts_dir.join(format!("{}.json", definition.id)),
-            )?;
-            Ok(Arc::new(store) as Arc<dyn TrustedServiceInterface>)
-        })
-        .collect()
+    proxy_for: &dyn Fn(&str) -> ProxyResolver,
+) -> Result<
+    (
+        Vec<Arc<dyn TrustedServiceInterface>>,
+        Vec<Arc<OidcTrustedService>>,
+    ),
+    ServiceError,
+> {
+    let mut services: Vec<Arc<dyn TrustedServiceInterface>> = Vec::new();
+    let mut oidc_services: Vec<Arc<OidcTrustedService>> = Vec::new();
+    for definition in definitions {
+        match definition.api.as_str() {
+            TS_API_OIDC => {
+                let Some(cfg) = &definition.record.oidc else {
+                    // trusted_service_definitions already rejects this; fail
+                    // closed anyway rather than panic on a hand-built definition.
+                    return Err(ServiceError::Param(format!(
+                        "trusted service '{}': api 'oidc' requires an oidc config",
+                        definition.id
+                    )));
+                };
+                let keys =
+                    KeySource::from_policy(cfg, proxy_for(&definition.id)).map_err(|error| {
+                        ServiceError::TrustedServiceInit(format!(
+                            "TS '{}' failed to build JWKS key source: {error}",
+                            definition.id
+                        ))
+                    })?;
+                let store = Arc::new(OidcTrustedService::new(&definition.record, Arc::new(keys))?);
+                oidc_services.push(store.clone());
+                services.push(store);
+            }
+            _ => {
+                let store = FileAttributeStore::new(
+                    definition.id.clone(),
+                    AttributeMapper {
+                        mappings: definition.record.returns_attrs.clone(),
+                    },
+                    Duration::from_secs(definition.record.expiration_seconds as u64),
+                    &file_ts_dir.join(format!("{}.json", definition.id)),
+                )?;
+                services.push(Arc::new(store));
+            }
+        }
+    }
+    Ok((services, oidc_services))
 }
 
 #[cfg(test)]
@@ -92,7 +176,10 @@ mod tests {
     use zpr::policy_types::PolicyContainerBytes;
 
     use crate::loaded_policy::LoadedPolicy;
-    use crate::test_helpers::make_trusted_service_policy;
+    use crate::oidc::static_proxy;
+    use crate::test_helpers::{
+        make_oidc_policy, make_test_oidc_config, make_trusted_service_policy,
+    };
 
     /// Decode a test policy container into its policy representation.
     fn policy_from_container(container_bytes: Vec<u8>) -> Arc<Policy> {
@@ -105,11 +192,15 @@ mod tests {
     }
 
     /// Validate and build in one step, as `PolicyMgr` does for a brand-new policy.
+    /// Yields only the `dyn` list; the typed OIDC subset is manager plumbing.
     fn build_from_policy(
         policy: &Policy,
         dir: &std::path::Path,
     ) -> Result<Vec<Arc<dyn TrustedServiceInterface>>, ServiceError> {
-        build_services(&trusted_service_definitions(policy)?, dir)
+        build_services(&trusted_service_definitions(policy)?, dir, &|_id| {
+            static_proxy(None)
+        })
+        .map(|(services, _oidc)| services)
     }
 
     /// A valid file declaration constructs a working mapped attribute store.
@@ -164,6 +255,112 @@ mod tests {
                 "expected failure for id={id} api={api} seconds={seconds:?}"
             );
         }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An `api = "oidc"` declaration builds an OIDC trusted-service store (today the
+    /// whole policy is rejected — the C4 acceptance case).
+    #[test]
+    fn test_oidc_definition_builds_oidc_store() {
+        let dir = std::env::temp_dir().join("vs-bsfp-oidc-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let policy = policy_from_container(make_oidc_policy(
+            "google",
+            300,
+            &["sub -> user.oidc-subject", "email -> user.email"],
+            &["sub"],
+            make_test_oidc_config(),
+        ));
+        let stores = build_from_policy(&policy, &dir).unwrap();
+
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].get_source_id(), "google");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two oidc declarations differing only in `OidcConfig.client_id` compare unequal,
+    /// so a policy install rebuilds the store (the definition carries the full record,
+    /// including its oidc config).
+    #[test]
+    fn test_oidc_definition_change_rebuilds_store() {
+        let make_defs = |client_id: &str| {
+            let mut cfg = make_test_oidc_config();
+            cfg.client_id = client_id.to_string();
+            let policy = policy_from_container(make_oidc_policy(
+                "google",
+                300,
+                &["sub -> user.oidc-subject"],
+                &["sub"],
+                cfg,
+            ));
+            trusted_service_definitions(&policy).unwrap()
+        };
+
+        let defs_a = make_defs("client-a.apps.googleusercontent.com");
+        let defs_a_again = make_defs("client-a.apps.googleusercontent.com");
+        let defs_b = make_defs("client-b.apps.googleusercontent.com");
+
+        assert_eq!(
+            defs_a, defs_a_again,
+            "identical declarations must compare equal"
+        );
+        assert_ne!(
+            defs_a, defs_b,
+            "an oidc config change must break definition equality"
+        );
+    }
+
+    /// Two oidc declarations for the SAME issuer are ambiguous (PR #5 review):
+    /// which store validates a token would depend on unordered service
+    /// iteration, so the policy is rejected with an error naming both services
+    /// and the issuer — mirroring the compiler-side collision handling.
+    #[test]
+    fn test_duplicate_oidc_issuer_rejected() {
+        use crate::test_helpers::{TrustedServiceSpec, make_trusted_services_policy};
+
+        let spec = |id: &'static str| TrustedServiceSpec {
+            id,
+            api: "oidc",
+            expiration_seconds: Some(300),
+            mappings: &["sub -> user.oidc-subject"],
+            identity: &["sub"],
+            oidc: Some(make_test_oidc_config()), // same issuer both times
+        };
+        let policy = policy_from_container(make_trusted_services_policy(&[
+            spec("idp-a"),
+            spec("idp-b"),
+        ]));
+
+        let err = match trusted_service_definitions(&policy) {
+            Err(e) => e,
+            Ok(_) => panic!("duplicate oidc issuers must be rejected"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("idp-a") && msg.contains("idp-b"), "{msg}");
+        assert!(msg.contains("https://accounts.google.com"), "{msg}");
+    }
+
+    /// `api = "oidc"` with no oidc record in the TrustedService is a policy error.
+    #[test]
+    fn test_oidc_definition_without_oidc_record_rejected() {
+        let dir = std::env::temp_dir().join("vs-bsfp-oidc-norec");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // make_trusted_service_policy writes a TrustedService record with oidc: None.
+        let policy = policy_from_container(make_trusted_service_policy(
+            "google",
+            "oidc",
+            Some(300),
+            &["sub -> user.oidc-subject"],
+        ));
+        let err = match build_from_policy(&policy, &dir) {
+            Err(e) => e,
+            Ok(_) => panic!("oidc service without an oidc record must be rejected"),
+        };
+        assert!(matches!(err, ServiceError::Param(_)), "{err:?}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

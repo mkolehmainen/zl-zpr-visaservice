@@ -5,13 +5,13 @@ use dashmap::DashMap;
 use libeval::actor::Actor;
 use libeval::attribute::key;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
-use zpr::policy_types::{Scope, ServiceType};
-use zpr::vsapi_types::{PublicKey, ServiceDescriptor};
+use zpr::policy_types::{OidcConfig, Scope, ServiceType};
+use zpr::vsapi_types::{OidcClientConfig, PublicKey, ServiceDescriptor};
 
 use crate::assembly::Assembly;
 use crate::config;
@@ -20,6 +20,7 @@ use crate::db;
 use crate::db::ServiceEntry;
 use crate::error::{ServiceError, StoreError};
 use crate::logging::targets::ACTOR;
+use crate::trusted_services::TS_API_OIDC;
 
 pub struct ActorMgr {
     actor_db: db::ActorRepo,
@@ -405,7 +406,9 @@ impl ActorMgr {
         .collect())
     }
 
-    /// Get the list of connected authentication services.
+    /// Get the list of authentication services: connected on-net actor-authentication
+    /// services, plus policy-declared off-net OIDC identity providers (which never
+    /// appear in the actor DB — they are not on the ZPR network).
     pub async fn get_auth_services_list(
         &self,
         asm: Arc<Assembly>,
@@ -429,13 +432,14 @@ impl ActorMgr {
                     let sdesc = ServiceDescriptor {
                         // This path only lists policy `ServiceType::Authentication`
                         // services, which are on-net actor-authentication services;
-                        // off-net OIDC providers are declared in policy, not connected.
+                        // off-net OIDC providers are handled below.
                         stype: zpr::vsapi_types::ServiceT::ActorAuthentication,
                         service_id: svc.id.clone(),
                         service_uri: uri_for_service(
                             &svc.kind,
                             &s_ent.zpr_addr,
                             svc.endpoints.as_slice(),
+                            None,
                         )?,
                         zpr_addr: s_ent.zpr_addr.clone(),
                         oidc: None,
@@ -443,6 +447,37 @@ impl ActorMgr {
                     services.push(sdesc);
                 }
             }
+        }
+
+        // Off-net OIDC identity providers come straight from policy: they are
+        // never connected actors, so the DB join above can never surface them.
+        for svc in pol.list_services_by_kind(ServiceType::Trusted(TS_API_OIDC.to_string())) {
+            let Some(record) = pol.trusted_service_by_id(&svc.id) else {
+                // trusted_service_definitions validated this at policy install.
+                continue;
+            };
+            let Some(cfg) = &record.oidc else {
+                continue; // same: rejected at install, fail soft here
+            };
+            services.push(ServiceDescriptor {
+                stype: zpr::vsapi_types::ServiceT::OidcAuthentication,
+                service_id: svc.id.clone(),
+                service_uri: uri_for_service(
+                    &svc.kind,
+                    &IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    svc.endpoints.as_slice(),
+                    Some(cfg),
+                )?,
+                // Off-net services carry the unspecified address.
+                zpr_addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                oidc: Some(OidcClientConfig {
+                    issuer: cfg.issuer.clone(),
+                    client_id: cfg.client_id.clone(),
+                    client_secret: cfg.client_secret.clone(),
+                    scopes: cfg.scopes.clone(),
+                    allow_offline_access: cfg.allow_offline_access,
+                }),
+            });
         }
 
         Ok(services)
@@ -572,8 +607,9 @@ impl ActorMgr {
 //
 // The 'zpr-oauthrsa' scheme implies "https" and "/preauthorize" and "/authorize" endpoints.
 //
-// Currently "zpr-oauthrsa" is the only supported scheme and the service type of "auth"
-// implies this scheme.
+// For an off-net OIDC identity provider (`ServiceType::Trusted("oidc")`) the URI is
+// the provider's issuer URL, straight from the policy `OidcConfig` — no on-net
+// address or endpoint scope is involved, so `addr` and `endpoints` are ignored.
 //
 // TODO: Eventually we need to expand zplc and the compiler to have richer set of
 // auth service types.
@@ -582,15 +618,26 @@ impl ActorMgr {
 // mechanics of zpr-oauthrsa are built in or something.  This all needs a clean up.
 //
 // Errors:
-// - The only supported auth serice type requires a single scope, so you get an error
-//   if there are none or more than one.
+// - The only supported on-net auth service type requires a single scope, so you get an
+//   error if there are none or more than one.
+// - An oidc service without its `OidcConfig` is an internal error (policy install
+//   validates the record exists).
 fn uri_for_service(
     skind: &ServiceType,
     addr: &IpAddr,
     endpoints: &[Scope],
+    oidc: Option<&OidcConfig>,
 ) -> Result<String, ServiceError> {
     let scheme = match skind {
         ServiceType::Authentication => "zpr-oauthrsa",
+        ServiceType::Trusted(api) if api == TS_API_OIDC => {
+            let Some(cfg) = oidc else {
+                return Err(ServiceError::Internal(
+                    "oidc auth service has no oidc config".into(),
+                ));
+            };
+            return Ok(cfg.issuer.clone());
+        }
         _ => {
             return Err(ServiceError::Internal(
                 format!("unsupported service type for auth service URI: {skind:?}").into(),
@@ -781,8 +828,30 @@ mod test {
             port_range: None,
         }];
 
-        let uri = uri_for_service(&ServiceType::Authentication, &addr, &endpoints).unwrap();
+        let uri = uri_for_service(&ServiceType::Authentication, &addr, &endpoints, None).unwrap();
         assert_eq!(uri, "zpr-oauthrsa://[fd5a:5052::9]:4000");
+    }
+
+    /// The oidc arm: an `api = "oidc"` trusted service's URI is its issuer, straight
+    /// from the policy `OidcConfig` (no endpoints, no on-net address involved).
+    #[test]
+    fn test_uri_for_service_oidc_returns_issuer() {
+        let addr: IpAddr = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        let cfg = crate::test_helpers::make_test_oidc_config();
+
+        let uri = uri_for_service(
+            &ServiceType::Trusted("oidc".to_string()),
+            &addr,
+            &[],
+            Some(&cfg),
+        )
+        .unwrap();
+        assert_eq!(uri, "https://accounts.google.com");
+
+        // An oidc service without its config is an internal error, not a panic.
+        let err = uri_for_service(&ServiceType::Trusted("oidc".to_string()), &addr, &[], None)
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Internal(_)), "{err:?}");
     }
 
     #[test]
@@ -796,14 +865,14 @@ mod test {
         }];
 
         // Non-auth service types are not supported for auth service URIs.
-        let err = uri_for_service(&ServiceType::Regular, &addr, &endpoints).unwrap_err();
+        let err = uri_for_service(&ServiceType::Regular, &addr, &endpoints, None).unwrap_err();
         match err {
             ServiceError::Internal(_) => {}
             other => panic!("unexpected error: {:?}", other),
         }
 
         // Auth services must declare exactly one endpoint scope.
-        let err = uri_for_service(&ServiceType::Authentication, &addr, &[]).unwrap_err();
+        let err = uri_for_service(&ServiceType::Authentication, &addr, &[], None).unwrap_err();
         match err {
             ServiceError::Internal(_) => {}
             other => panic!("unexpected error: {:?}", other),
@@ -816,8 +885,13 @@ mod test {
             port_range: None,
         }];
         // Auth service scope must include a concrete port number.
-        let err = uri_for_service(&ServiceType::Authentication, &addr, &endpoints_missing_port)
-            .unwrap_err();
+        let err = uri_for_service(
+            &ServiceType::Authentication,
+            &addr,
+            &endpoints_missing_port,
+            None,
+        )
+        .unwrap_err();
         match err {
             ServiceError::Internal(_) => {}
             other => panic!("unexpected error: {:?}", other),
@@ -910,6 +984,49 @@ mod test {
 
         let services = mgr.get_auth_services_list(asm).await.unwrap();
         assert!(services.is_empty());
+    }
+
+    /// A policy declaring an `api = "oidc"` trusted service yields an off-net IdP
+    /// descriptor even though no actor provides the service: stype
+    /// `OidcAuthentication`, `service_uri` = issuer, `zpr_addr` = `::`, and the
+    /// `OidcClientConfig` carrying issuer/client_id/scopes.
+    #[tokio::test]
+    async fn test_auth_services_list_includes_oidc_descriptor() {
+        let mgr = make_mgr();
+
+        let oidc_cfg = crate::test_helpers::make_test_oidc_config();
+        let container_bytes = crate::test_helpers::make_oidc_policy(
+            "google",
+            300,
+            &["sub -> user.oidc-subject", "email -> user.email"],
+            &["sub"],
+            oidc_cfg.clone(),
+        );
+
+        let asm = new_assembly_for_tests(None).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(container_bytes)
+            .await
+            .unwrap();
+        let asm = Arc::new(asm);
+
+        let services = mgr.get_auth_services_list(asm).await.unwrap();
+        assert_eq!(services.len(), 1);
+        let sdesc = &services[0];
+        assert_eq!(sdesc.stype, zpr::vsapi_types::ServiceT::OidcAuthentication);
+        assert_eq!(sdesc.service_id, "google");
+        assert_eq!(sdesc.service_uri, oidc_cfg.issuer);
+        assert_eq!(
+            sdesc.zpr_addr,
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            "off-net services carry the unspecified address"
+        );
+        let client = sdesc.oidc.as_ref().expect("oidc client config");
+        assert_eq!(client.issuer, oidc_cfg.issuer);
+        assert_eq!(client.client_id, oidc_cfg.client_id);
+        assert_eq!(client.client_secret, oidc_cfg.client_secret);
+        assert_eq!(client.scopes, oidc_cfg.scopes);
+        assert_eq!(client.allow_offline_access, oidc_cfg.allow_offline_access);
     }
 
     #[tokio::test]

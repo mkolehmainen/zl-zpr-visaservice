@@ -28,6 +28,7 @@ use crate::db;
 use crate::error::{ResolverError, ServiceError, StoreError, TopologyError};
 use crate::loaded_policy::LoadedPolicy;
 use crate::logging::targets::MAIN;
+use crate::oidc::{OidcTrustedService, static_proxy};
 use crate::trusted_services::{
     TrustedServiceDefinition, TrustedServiceInterface, TrustedServicesMgr, build_services,
     trusted_service_definitions,
@@ -60,6 +61,9 @@ struct PolicyState {
     /// Attribute stores for the trusted services this policy declares. Republished to
     /// `ts_mgr` on every successful swap so the stores can never outlive their policy.
     trusted_services: Vec<Arc<dyn TrustedServiceInterface>>,
+    /// The typed OIDC subset of `trusted_services` (each store is in both), so the
+    /// manager can serve `oidc_service_for_issuer` lookups for the connect path.
+    oidc_services: Vec<Arc<OidcTrustedService>>,
     /// The declarations `trusted_services` was built from. Carried alongside the stores so
     /// the next policy can be compared against them and reuse the stores when unchanged.
     ts_definitions: Vec<TrustedServiceDefinition>,
@@ -262,19 +266,63 @@ impl PolicyMgr {
         let policy = loaded.policy();
         let resolved_peers_by_node = resolver.resolve_topology(&policy).await?;
         let ts_definitions = trusted_service_definitions(&policy)?;
-        let trusted_services = match previous {
-            // Identical declarations mean the live stores are still correct.
-            // Reusing them keeps their revisions, otherwise a policy install
-            // makes every actor revision-stale against every source. Cached
-            // attribute data now only moves on a TTL reload or an admin flush.
-            Some(prev) if prev.ts_definitions == ts_definitions => prev.trusted_services.clone(),
-            _ => build_services(&ts_definitions, file_ts_dir)?,
-        };
+        // Stores are matched per service definition: a declaration identical to
+        // the live one keeps its store (and revision, and any cached/admitted
+        // data — an OIDC store rebuilt with an empty admitted cache would strip
+        // connected users' attributes until reconnect), while changed or new
+        // declarations build fresh. Matching is keyed on the service id, never
+        // on definition-vector equality: `Policy::list_services` iterates a
+        // HashMap, so vector order is meaningless across installs.
+        //
+        // No proxy resolution yet for new stores: `build_state` has no actor-DB
+        // access, so a policy-named `jwks_proxy_service` resolves to "no proxy
+        // connected" and the key source serves its policy seed (C3 stale
+        // tolerance). Live proxy resolution and periodic refresh land with the
+        // connect path (C5).
+        let mut trusted_services = Vec::with_capacity(ts_definitions.len());
+        let mut oidc_services = Vec::new();
+        for definition in &ts_definitions {
+            let reusable = previous.and_then(|prev| {
+                prev.ts_definitions
+                    .iter()
+                    .find(|prev_def| prev_def.id() == definition.id())
+                    .filter(|prev_def| *prev_def == definition)
+                    .and_then(|_| {
+                        prev.trusted_services
+                            .iter()
+                            .find(|store| store.get_source_id() == definition.id())
+                            .cloned()
+                    })
+            });
+            match reusable {
+                Some(store) => {
+                    if let Some(prev) = previous {
+                        if let Some(oidc) = prev
+                            .oidc_services
+                            .iter()
+                            .find(|oidc| oidc.get_source_id() == definition.id())
+                        {
+                            oidc_services.push(oidc.clone());
+                        }
+                    }
+                    trusted_services.push(store);
+                }
+                None => {
+                    let (mut built, mut built_oidc) =
+                        build_services(std::slice::from_ref(definition), file_ts_dir, &|_id| {
+                            static_proxy(None)
+                        })?;
+                    trusted_services.append(&mut built);
+                    oidc_services.append(&mut built_oidc);
+                }
+            }
+        }
         Ok(PolicyState {
             policy,
             container: loaded.container().clone(),
             resolved_peers_by_node,
             trusted_services,
+            oidc_services,
             ts_definitions,
         })
     }
@@ -287,7 +335,8 @@ impl PolicyMgr {
         ts_mgr: Arc<TrustedServicesMgr>,
         file_ts_dir: PathBuf,
     ) -> Self {
-        ts_mgr.update_services(state.trusted_services.clone());
+        ts_mgr
+            .update_services_with_oidc(state.trusted_services.clone(), state.oidc_services.clone());
         PolicyMgr {
             state: ArcSwap::from_pointee(state),
             repo,
@@ -301,7 +350,8 @@ impl PolicyMgr {
     /// Swap in `state` and republish its trusted service stores, so the manager's stores
     /// always come from the policy that is currently live.
     fn publish(&self, state: PolicyState) {
-        self.ts_mgr.update_services(state.trusted_services.clone());
+        self.ts_mgr
+            .update_services_with_oidc(state.trusted_services.clone(), state.oidc_services.clone());
         self.state.store(Arc::new(state));
     }
 
@@ -567,6 +617,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ts_mgr.stale_sources_for_actor(&addr).len(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Per-service store reuse (PR #5 review): changing ONE trusted-service
+    /// declaration must rebuild only that store. Unchanged declarations — here
+    /// an OIDC store whose admitted cache would be emptied by a rebuild — keep
+    /// their live store and revision, so connected OIDC users are not pruned.
+    #[tokio::test]
+    async fn test_policy_update_reuses_unchanged_stores_per_service() {
+        use crate::test_helpers::{
+            TrustedServiceSpec, make_test_oidc_config, make_trusted_services_policy,
+        };
+
+        let dir = std::env::temp_dir().join("vs-pm-ts-per-svc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attrfile.json"),
+            r#"{"device.zpr.adapter.cn": {"alice": {"color": ["red"]}}}"#,
+        )
+        .unwrap();
+
+        let oidc_spec = || TrustedServiceSpec {
+            id: "google",
+            api: "oidc",
+            expiration_seconds: Some(300),
+            mappings: &["sub -> user.oidc-subject"],
+            identity: &["sub"],
+            oidc: Some(make_test_oidc_config()),
+        };
+        let file_spec = |secs: u32| TrustedServiceSpec {
+            id: "attrfile",
+            api: "file",
+            expiration_seconds: Some(secs),
+            mappings: &[],
+            identity: &[],
+            oidc: None,
+        };
+
+        let ts_mgr = Arc::new(TrustedServicesMgr::new());
+        let policy = make_trusted_services_policy(&[oidc_spec(), file_spec(3600)]);
+        let mgr = make_policy_mgr_with_ts(policy, ts_mgr.clone(), &dir).await;
+
+        // Catch an actor up with both stores' current revisions.
+        let addr: std::net::IpAddr = "fd5a:5052::a2".parse().unwrap();
+        for (source, revision) in ts_mgr.stale_sources_for_actor(&addr) {
+            ts_mgr.record_revision(&addr, &source, revision);
+        }
+        assert!(ts_mgr.stale_sources_for_actor(&addr).is_empty());
+
+        // Change only the FILE declaration: the oidc store must be carried
+        // over (same instance, same revision), only attrfile is stale.
+        let changed = make_trusted_services_policy(&[oidc_spec(), file_spec(7200)]);
+        mgr.update_policy_from_container_bytes(changed)
+            .await
+            .unwrap();
+        let stale: Vec<String> = ts_mgr
+            .stale_sources_for_actor(&addr)
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
+        assert_eq!(
+            stale,
+            vec!["attrfile".to_string()],
+            "only the changed declaration's store may be rebuilt"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -12,10 +12,14 @@ mod factory;
 mod file_attribute_store;
 mod manager;
 
+pub(crate) use attribute_mapper::{AttrHint, AttributeMapper};
+
 #[cfg(test)]
 mod test_support;
 
-pub use factory::{TrustedServiceDefinition, build_services, trusted_service_definitions};
+pub use factory::{
+    TS_API_OIDC, TrustedServiceDefinition, build_services, trusted_service_definitions,
+};
 pub use manager::TrustedServicesMgr;
 
 /// A revision no snapshot will ever carry (the counter starts at 1). Recording it for
@@ -27,7 +31,7 @@ pub const REVISION_NEVER: u64 = 0;
 static REVISION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Hand out the next process-wide trusted-service snapshot revision.
-fn next_revision() -> u64 {
+pub(crate) fn next_revision() -> u64 {
     REVISION_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -36,13 +40,19 @@ fn next_revision() -> u64 {
 /// attributes at refresh time -- producing the (key, value) pairs to send to trusted
 /// services. Attributes that are not single-valued cannot name an identity and are
 /// skipped.
+///
+/// `user.zpr.authority` is always included when the actor carries it, whether or
+/// not policy names it: identities such as an OIDC `sub` are unique only within
+/// the service that vouched for them, so sources need the authority pair to scope
+/// per-issuer identities to the issuing service (see
+/// `crate::oidc::OidcTrustedService::get_attributes_for_actor`).
 pub(crate) fn lookup_identities<'a>(
     lookup_keys: &[&str],
     attrs: impl Iterator<Item = &'a Attribute>,
 ) -> Vec<(String, String)> {
     let mut identities = Vec::new();
     for attr in attrs {
-        if lookup_keys.contains(&attr.get_key()) {
+        if lookup_keys.contains(&attr.get_key()) || attr.get_key() == key::USER_AUTHORITY {
             if let Ok(value) = attr.get_single_value() {
                 identities.push((attr.get_key().to_string(), value.to_string()));
             }
@@ -167,5 +177,37 @@ mod derive_tests {
             attr("bas", "user.dept", "engineering", 300),
         ];
         assert!(derive_user_authority("bas", &attrs).is_none());
+    }
+
+    /// `user.zpr.authority` is always part of the lookup-identity set when the
+    /// actor carries it (PR #5 review): it scopes per-issuer identities like an
+    /// OIDC `sub` to the service that vouched for them, so it must reach the
+    /// stores even though policy never declares it as an identity attribute.
+    #[test]
+    fn test_lookup_identities_includes_user_authority() {
+        let attrs = vec![
+            attr("google", key::USER_AUTHORITY, "google", 600),
+            attr("google", "user.oidc-subject", "s-123", 600),
+            attr("bas", "user.dept", "engineering", 600),
+        ];
+        let identities = lookup_identities(&["user.oidc-subject"], attrs.iter());
+        assert!(
+            identities.contains(&(key::USER_AUTHORITY.to_string(), "google".to_string())),
+            "the authority pair must be in the lookup set: {identities:?}"
+        );
+        assert!(identities.contains(&("user.oidc-subject".to_string(), "s-123".to_string())));
+        // Non-identity attributes still never leak into the lookup set.
+        assert!(!identities.iter().any(|(k, _)| k == "user.dept"));
+
+        // And it is not duplicated when policy also names it a lookup key.
+        let identities =
+            lookup_identities(&["user.oidc-subject", key::USER_AUTHORITY], attrs.iter());
+        assert_eq!(
+            identities
+                .iter()
+                .filter(|(k, _)| k == key::USER_AUTHORITY)
+                .count(),
+            1
+        );
     }
 }

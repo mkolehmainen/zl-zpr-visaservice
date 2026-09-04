@@ -17,8 +17,8 @@ use libeval::route::{LinkId, Route};
 
 use zpr::policy::v1 as capnp_policy;
 use zpr::policy_types::{
-    AttrExp, JoinPolicy, NetAddr, PFlags, Peering, Service, ServiceType, TrustedService,
-    parse_attribute_mapping,
+    AttrExp, JoinPolicy, NetAddr, OidcConfig, PFlags, Peering, Service, ServiceType,
+    TrustedService, parse_attribute_mapping,
 };
 use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Visa};
 use zpr::write_to::WriteTo;
@@ -224,15 +224,92 @@ pub fn make_trusted_service_policy_with_identity(
     mappings: &[&str],
     identity: &[&str],
 ) -> Vec<u8> {
-    let service = Service {
-        id: id.to_string(),
-        endpoints: Vec::new(),
-        kind: ServiceType::Trusted(api.to_string()),
-    };
+    make_trusted_service_policy_full(id, api, expiration_seconds, mappings, identity, None)
+}
+
+/// An [OidcConfig] with plausible Google-shaped values, seeded with the C2/C3
+/// fixture JWKS so a [crate::oidc::KeySource] built from it always has a key.
+pub fn make_test_oidc_config() -> OidcConfig {
+    OidcConfig {
+        issuer: "https://accounts.google.com".to_string(),
+        jwks_uri: String::new(),
+        client_id: "test-client-id.apps.googleusercontent.com".to_string(),
+        client_secret: None,
+        scopes: vec!["openid".to_string(), "email".to_string()],
+        allowed_domains: vec!["*".to_string()],
+        max_auth_age_seconds: 0,
+        allow_offline_access: false,
+        seed_jwks: include_str!("../tests/data/oidc-test-jwks.json").to_string(),
+        jwks_proxy_service: None,
+    }
+}
+
+/// Build a policy container declaring one `api = "oidc"` trusted service: the
+/// `ServiceType::Trusted("oidc")` service plus its `TrustedService` record carrying
+/// `oidc`. Same builder path as [make_trusted_service_policy_with_identity].
+pub fn make_oidc_policy(
+    id: &str,
+    expiration_seconds: u32,
+    mappings: &[&str],
+    identity: &[&str],
+    oidc: OidcConfig,
+) -> Vec<u8> {
+    make_trusted_service_policy_full(
+        id,
+        "oidc",
+        Some(expiration_seconds),
+        mappings,
+        identity,
+        Some(oidc),
+    )
+}
+
+/// The common builder behind the trusted-service policy helpers.
+fn make_trusted_service_policy_full(
+    id: &str,
+    api: &str,
+    expiration_seconds: Option<u32>,
+    mappings: &[&str],
+    identity: &[&str],
+    oidc: Option<OidcConfig>,
+) -> Vec<u8> {
+    make_trusted_services_policy(&[TrustedServiceSpec {
+        id,
+        api,
+        expiration_seconds,
+        mappings,
+        identity,
+        oidc,
+    }])
+}
+
+/// One trusted-service declaration for [make_trusted_services_policy].
+pub struct TrustedServiceSpec<'a> {
+    pub id: &'a str,
+    pub api: &'a str,
+    /// `None` gives the "service declared but no record" case.
+    pub expiration_seconds: Option<u32>,
+    pub mappings: &'a [&'a str],
+    pub identity: &'a [&'a str],
+    pub oidc: Option<OidcConfig>,
+}
+
+/// Build a policy container declaring several trusted services at once: one join
+/// policy providing every `ServiceType::Trusted(api)` service, plus a
+/// `TrustedService` record per spec carrying an `expiration_seconds`.
+pub fn make_trusted_services_policy(specs: &[TrustedServiceSpec]) -> Vec<u8> {
+    let services: Vec<Service> = specs
+        .iter()
+        .map(|spec| Service {
+            id: spec.id.to_string(),
+            endpoints: Vec::new(),
+            kind: ServiceType::Trusted(spec.api.to_string()),
+        })
+        .collect();
     let jp = JoinPolicy {
         conditions: Vec::new(),
         flags: PFlags::default(),
-        provides: Some(vec![service]),
+        provides: Some(services),
     };
 
     let mut msg = capnp::message::Builder::new_default();
@@ -243,18 +320,29 @@ pub fn make_trusted_service_policy_with_identity(
         policy_bldr.set_metadata("");
         jp.write_to(&mut policy_bldr.reborrow().init_join_policies(1).get(0));
 
-        if let Some(secs) = expiration_seconds {
-            let ts = TrustedService {
-                service_id: id.to_string(),
-                expiration_seconds: secs,
-                returns_attrs: mappings
-                    .iter()
-                    .map(|m| parse_attribute_mapping(m).unwrap())
-                    .collect(),
-                identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
-                oidc: None,
-            };
-            ts.write_to(&mut policy_bldr.reborrow().init_trusted_services(1).get(0));
+        let records: Vec<TrustedService> = specs
+            .iter()
+            .filter_map(|spec| {
+                spec.expiration_seconds.map(|secs| TrustedService {
+                    service_id: spec.id.to_string(),
+                    expiration_seconds: secs,
+                    returns_attrs: spec
+                        .mappings
+                        .iter()
+                        .map(|m| parse_attribute_mapping(m).unwrap())
+                        .collect(),
+                    identity_attrs: spec.identity.iter().map(|s| s.to_string()).collect(),
+                    oidc: spec.oidc.clone(),
+                })
+            })
+            .collect();
+        if !records.is_empty() {
+            let mut ts_bldr = policy_bldr
+                .reborrow()
+                .init_trusted_services(records.len() as u32);
+            for (i, record) in records.iter().enumerate() {
+                record.write_to(&mut ts_bldr.reborrow().get(i as u32));
+            }
         }
     }
     let mut bytes = Vec::new();
