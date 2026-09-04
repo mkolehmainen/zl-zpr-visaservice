@@ -258,8 +258,13 @@ mod tests {
 
     /// The `TrustedService` policy record an `api = "oidc"` declaration carries.
     fn make_record(mappings: &[&str]) -> TrustedService {
+        make_record_with_id("google", mappings)
+    }
+
+    /// As [make_record], for a service with the given id.
+    fn make_record_with_id(id: &str, mappings: &[&str]) -> TrustedService {
         TrustedService {
-            service_id: "google".to_string(),
+            service_id: id.to_string(),
             expiration_seconds: 300,
             returns_attrs: mappings
                 .iter()
@@ -272,7 +277,12 @@ mod tests {
 
     /// A store over the fixture OIDC config, seeded from policy (no network).
     fn make_store(mappings: &[&str]) -> OidcTrustedService {
-        let record = make_record(mappings);
+        make_store_with_id("google", mappings)
+    }
+
+    /// As [make_store], for a service with the given id.
+    fn make_store_with_id(id: &str, mappings: &[&str]) -> OidcTrustedService {
+        let record = make_record_with_id(id, mappings);
         let keys = Arc::new(
             KeySource::from_policy(record.oidc.as_ref().unwrap(), static_proxy(None)).unwrap(),
         );
@@ -299,6 +309,18 @@ mod tests {
 
     const MAPPINGS: &[&str] = &["sub -> user.oidc-subject", "email -> user.email"];
 
+    /// The lookup-identity set an actor authenticated by the "google" service
+    /// carries: the vouching `user.zpr.authority` pair plus the mapped sub.
+    fn google_identities(sub: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                libeval::attribute::key::USER_AUTHORITY.to_string(),
+                "google".to_string(),
+            ),
+            ("user.oidc-subject".to_string(), sub.to_string()),
+        ]
+    }
+
     /// admit -> lookup round-trips: the mapped claims come back for the
     /// `(mapped sub key, sub)` identity, stamped with the given expiry and the
     /// service's source id.
@@ -314,7 +336,7 @@ mod tests {
         assert!(!admitted.is_empty());
 
         let attrs = store
-            .get_attributes_for_actor(&[("user.oidc-subject".to_string(), "s-123".to_string())])
+            .get_attributes_for_actor(&google_identities("s-123"))
             .await
             .unwrap();
         let sub_attr = attrs
@@ -344,7 +366,7 @@ mod tests {
             .unwrap();
 
         let attrs = store
-            .get_attributes_for_actor(&[("user.oidc-subject".to_string(), "s-999".to_string())])
+            .get_attributes_for_actor(&google_identities("s-999"))
             .await
             .unwrap();
         assert!(attrs.is_empty());
@@ -368,7 +390,7 @@ mod tests {
         assert!(admitted.iter().all(|a| a.get_key() != "user.email"));
 
         let attrs = store
-            .get_attributes_for_actor(&[("user.oidc-subject".to_string(), "s-123".to_string())])
+            .get_attributes_for_actor(&google_identities("s-123"))
             .await
             .unwrap();
         assert!(attrs.iter().all(|a| a.get_key() != "user.email"));
@@ -388,7 +410,7 @@ mod tests {
         store.flush().await.unwrap();
 
         let attrs = store
-            .get_attributes_for_actor(&[("user.oidc-subject".to_string(), "s-123".to_string())])
+            .get_attributes_for_actor(&google_identities("s-123"))
             .await
             .unwrap();
         assert!(attrs.is_empty());
@@ -407,5 +429,69 @@ mod tests {
             )
             .unwrap();
         assert!(store.current_revision() > before);
+    }
+
+    /// Cross-issuer subject collision (PR #5 review): OIDC subjects are unique
+    /// per issuer only, so a lookup carrying an actor authority naming a
+    /// DIFFERENT service must not be served this store's cached claims, even
+    /// when the `(mapped sub key, sub)` pair matches an admitted record.
+    #[tokio::test]
+    async fn test_lookup_scoped_to_issuing_service_authority() {
+        let store = make_store(MAPPINGS);
+        let expires = SystemTime::now() + Duration::from_secs(300);
+        store
+            .admit(&make_token("s-123", Some("jane@example.com")), expires)
+            .unwrap();
+
+        // Actor authenticated by another provider that happens to have issued
+        // the same subject string: no attributes from this store.
+        let foreign = [
+            (
+                libeval::attribute::key::USER_AUTHORITY.to_string(),
+                "other-idp".to_string(),
+            ),
+            ("user.oidc-subject".to_string(), "s-123".to_string()),
+        ];
+        let attrs = store.get_attributes_for_actor(&foreign).await.unwrap();
+        assert!(
+            attrs.is_empty(),
+            "an actor vouched for by another service must not receive this store's cache"
+        );
+
+        // The actor this store admitted (authority == this service) is served.
+        let own = [
+            (
+                libeval::attribute::key::USER_AUTHORITY.to_string(),
+                "google".to_string(),
+            ),
+            ("user.oidc-subject".to_string(), "s-123".to_string()),
+        ];
+        let attrs = store.get_attributes_for_actor(&own).await.unwrap();
+        assert!(attrs.iter().any(|a| a.get_key() == "user.email"));
+    }
+
+    /// Admission purges expired records (PR #5 review): a subject that
+    /// disconnects and never returns must not stay cached forever — the next
+    /// admission sweeps it out, bounding the cache to subjects seen within one
+    /// expiration window.
+    #[test]
+    fn test_admit_purges_expired_entries() {
+        let store = make_store(MAPPINGS);
+        let past = SystemTime::now() - Duration::from_secs(1);
+        store
+            .admit(&make_token("s-gone", Some("gone@example.com")), past)
+            .unwrap();
+        assert_eq!(store.admitted.len(), 1);
+
+        let future = SystemTime::now() + Duration::from_secs(300);
+        store
+            .admit(&make_token("s-new", Some("new@example.com")), future)
+            .unwrap();
+        assert_eq!(
+            store.admitted.len(),
+            1,
+            "admission must sweep out expired records"
+        );
+        assert!(store.admitted.contains_key("s-new"));
     }
 }

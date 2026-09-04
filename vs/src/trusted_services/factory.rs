@@ -280,6 +280,36 @@ mod tests {
         );
     }
 
+    /// Two oidc declarations for the SAME issuer are ambiguous (PR #5 review):
+    /// which store validates a token would depend on unordered service
+    /// iteration, so the policy is rejected with an error naming both services
+    /// and the issuer — mirroring the compiler-side collision handling.
+    #[test]
+    fn test_duplicate_oidc_issuer_rejected() {
+        use crate::test_helpers::{TrustedServiceSpec, make_trusted_services_policy};
+
+        let spec = |id: &'static str| TrustedServiceSpec {
+            id,
+            api: "oidc",
+            expiration_seconds: Some(300),
+            mappings: &["sub -> user.oidc-subject"],
+            identity: &["sub"],
+            oidc: Some(make_test_oidc_config()), // same issuer both times
+        };
+        let policy = policy_from_container(make_trusted_services_policy(&[
+            spec("idp-a"),
+            spec("idp-b"),
+        ]));
+
+        let err = match trusted_service_definitions(&policy) {
+            Err(e) => e,
+            Ok(_) => panic!("duplicate oidc issuers must be rejected"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("idp-a") && msg.contains("idp-b"), "{msg}");
+        assert!(msg.contains("https://accounts.google.com"), "{msg}");
+    }
+
     /// `api = "oidc"` with no oidc record in the TrustedService is a policy error.
     #[test]
     fn test_oidc_definition_without_oidc_record_rejected() {

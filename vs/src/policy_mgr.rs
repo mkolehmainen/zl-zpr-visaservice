@@ -585,6 +585,72 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Per-service store reuse (PR #5 review): changing ONE trusted-service
+    /// declaration must rebuild only that store. Unchanged declarations — here
+    /// an OIDC store whose admitted cache would be emptied by a rebuild — keep
+    /// their live store and revision, so connected OIDC users are not pruned.
+    #[tokio::test]
+    async fn test_policy_update_reuses_unchanged_stores_per_service() {
+        use crate::test_helpers::{
+            TrustedServiceSpec, make_test_oidc_config, make_trusted_services_policy,
+        };
+
+        let dir = std::env::temp_dir().join("vs-pm-ts-per-svc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("attrfile.json"),
+            r#"{"device.zpr.adapter.cn": {"alice": {"color": ["red"]}}}"#,
+        )
+        .unwrap();
+
+        let oidc_spec = || TrustedServiceSpec {
+            id: "google",
+            api: "oidc",
+            expiration_seconds: Some(300),
+            mappings: &["sub -> user.oidc-subject"],
+            identity: &["sub"],
+            oidc: Some(make_test_oidc_config()),
+        };
+        let file_spec = |secs: u32| TrustedServiceSpec {
+            id: "attrfile",
+            api: "file",
+            expiration_seconds: Some(secs),
+            mappings: &[],
+            identity: &[],
+            oidc: None,
+        };
+
+        let ts_mgr = Arc::new(TrustedServicesMgr::new());
+        let policy = make_trusted_services_policy(&[oidc_spec(), file_spec(3600)]);
+        let mgr = make_policy_mgr_with_ts(policy, ts_mgr.clone(), &dir).await;
+
+        // Catch an actor up with both stores' current revisions.
+        let addr: std::net::IpAddr = "fd5a:5052::a2".parse().unwrap();
+        for (source, revision) in ts_mgr.stale_sources_for_actor(&addr) {
+            ts_mgr.record_revision(&addr, &source, revision);
+        }
+        assert!(ts_mgr.stale_sources_for_actor(&addr).is_empty());
+
+        // Change only the FILE declaration: the oidc store must be carried
+        // over (same instance, same revision), only attrfile is stale.
+        let changed = make_trusted_services_policy(&[oidc_spec(), file_spec(7200)]);
+        mgr.update_policy_from_container_bytes(changed)
+            .await
+            .unwrap();
+        let stale: Vec<String> = ts_mgr
+            .stale_sources_for_actor(&addr)
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
+        assert_eq!(
+            stale,
+            vec!["attrfile".to_string()],
+            "only the changed declaration's store may be rebuilt"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Build a Peering whose node_b substrate is an unresolvable hostname, so that
     /// resolving topology with a no-entry FakeResolver fails.
     fn make_peering_bad_host(node_a: IpAddr, node_b: IpAddr, link_id: &str) -> Peering {

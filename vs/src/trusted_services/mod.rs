@@ -172,4 +172,36 @@ mod derive_tests {
         ];
         assert!(derive_user_authority("bas", &attrs).is_none());
     }
+
+    /// `user.zpr.authority` is always part of the lookup-identity set when the
+    /// actor carries it (PR #5 review): it scopes per-issuer identities like an
+    /// OIDC `sub` to the service that vouched for them, so it must reach the
+    /// stores even though policy never declares it as an identity attribute.
+    #[test]
+    fn test_lookup_identities_includes_user_authority() {
+        let attrs = vec![
+            attr("google", key::USER_AUTHORITY, "google", 600),
+            attr("google", "user.oidc-subject", "s-123", 600),
+            attr("bas", "user.dept", "engineering", 600),
+        ];
+        let identities = lookup_identities(&["user.oidc-subject"], attrs.iter());
+        assert!(
+            identities.contains(&(key::USER_AUTHORITY.to_string(), "google".to_string())),
+            "the authority pair must be in the lookup set: {identities:?}"
+        );
+        assert!(identities.contains(&("user.oidc-subject".to_string(), "s-123".to_string())));
+        // Non-identity attributes still never leak into the lookup set.
+        assert!(!identities.iter().any(|(k, _)| k == "user.dept"));
+
+        // And it is not duplicated when policy also names it a lookup key.
+        let identities =
+            lookup_identities(&["user.oidc-subject", key::USER_AUTHORITY], attrs.iter());
+        assert_eq!(
+            identities
+                .iter()
+                .filter(|(k, _)| k == key::USER_AUTHORITY)
+                .count(),
+            1
+        );
+    }
 }

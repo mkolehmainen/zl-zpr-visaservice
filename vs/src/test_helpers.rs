@@ -273,15 +273,43 @@ fn make_trusted_service_policy_full(
     identity: &[&str],
     oidc: Option<OidcConfig>,
 ) -> Vec<u8> {
-    let service = Service {
-        id: id.to_string(),
-        endpoints: Vec::new(),
-        kind: ServiceType::Trusted(api.to_string()),
-    };
+    make_trusted_services_policy(&[TrustedServiceSpec {
+        id,
+        api,
+        expiration_seconds,
+        mappings,
+        identity,
+        oidc,
+    }])
+}
+
+/// One trusted-service declaration for [make_trusted_services_policy].
+pub struct TrustedServiceSpec<'a> {
+    pub id: &'a str,
+    pub api: &'a str,
+    /// `None` gives the "service declared but no record" case.
+    pub expiration_seconds: Option<u32>,
+    pub mappings: &'a [&'a str],
+    pub identity: &'a [&'a str],
+    pub oidc: Option<OidcConfig>,
+}
+
+/// Build a policy container declaring several trusted services at once: one join
+/// policy providing every `ServiceType::Trusted(api)` service, plus a
+/// `TrustedService` record per spec carrying an `expiration_seconds`.
+pub fn make_trusted_services_policy(specs: &[TrustedServiceSpec]) -> Vec<u8> {
+    let services: Vec<Service> = specs
+        .iter()
+        .map(|spec| Service {
+            id: spec.id.to_string(),
+            endpoints: Vec::new(),
+            kind: ServiceType::Trusted(spec.api.to_string()),
+        })
+        .collect();
     let jp = JoinPolicy {
         conditions: Vec::new(),
         flags: PFlags::default(),
-        provides: Some(vec![service]),
+        provides: Some(services),
     };
 
     let mut msg = capnp::message::Builder::new_default();
@@ -292,18 +320,29 @@ fn make_trusted_service_policy_full(
         policy_bldr.set_metadata("");
         jp.write_to(&mut policy_bldr.reborrow().init_join_policies(1).get(0));
 
-        if let Some(secs) = expiration_seconds {
-            let ts = TrustedService {
-                service_id: id.to_string(),
-                expiration_seconds: secs,
-                returns_attrs: mappings
-                    .iter()
-                    .map(|m| parse_attribute_mapping(m).unwrap())
-                    .collect(),
-                identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
-                oidc,
-            };
-            ts.write_to(&mut policy_bldr.reborrow().init_trusted_services(1).get(0));
+        let records: Vec<TrustedService> = specs
+            .iter()
+            .filter_map(|spec| {
+                spec.expiration_seconds.map(|secs| TrustedService {
+                    service_id: spec.id.to_string(),
+                    expiration_seconds: secs,
+                    returns_attrs: spec
+                        .mappings
+                        .iter()
+                        .map(|m| parse_attribute_mapping(m).unwrap())
+                        .collect(),
+                    identity_attrs: spec.identity.iter().map(|s| s.to_string()).collect(),
+                    oidc: spec.oidc.clone(),
+                })
+            })
+            .collect();
+        if !records.is_empty() {
+            let mut ts_bldr = policy_bldr
+                .reborrow()
+                .init_trusted_services(records.len() as u32);
+            for (i, record) in records.iter().enumerate() {
+                record.write_to(&mut ts_bldr.reborrow().get(i as u32));
+            }
         }
     }
     let mut bytes = Vec::new();
