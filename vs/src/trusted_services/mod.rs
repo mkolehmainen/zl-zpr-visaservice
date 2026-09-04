@@ -12,10 +12,14 @@ mod factory;
 mod file_attribute_store;
 mod manager;
 
+pub(crate) use attribute_mapper::{AttrHint, AttributeMapper};
+
 #[cfg(test)]
 mod test_support;
 
-pub use factory::{TrustedServiceDefinition, build_services, trusted_service_definitions};
+pub use factory::{
+    TS_API_OIDC, TrustedServiceDefinition, build_services, trusted_service_definitions,
+};
 pub use manager::TrustedServicesMgr;
 
 /// A revision no snapshot will ever carry (the counter starts at 1). Recording it for
@@ -27,7 +31,7 @@ pub const REVISION_NEVER: u64 = 0;
 static REVISION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Hand out the next process-wide trusted-service snapshot revision.
-fn next_revision() -> u64 {
+pub(crate) fn next_revision() -> u64 {
     REVISION_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 

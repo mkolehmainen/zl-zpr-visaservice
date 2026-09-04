@@ -7,6 +7,244 @@
 //! then serves those cached claims, so the normal ts_mgr union/conflict/refresh
 //! machinery applies unchanged.
 
+use async_trait::async_trait;
+use dashmap::DashMap;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
+
+use libeval::attribute::{Attribute, AttributeSource};
+use zpr::policy_types::{OidcConfig, TrustedService};
+
+use crate::error::ServiceError;
+use crate::trusted_services::{AttrHint, AttributeMapper, TrustedServiceInterface, next_revision};
+
+use super::jwks::KeySource;
+use super::validate::{IdpParams, ValidatedToken};
+
+/// The OIDC claim carrying the provider's stable subject identifier — the only
+/// identity claim this store admits and looks up under.
+const SUB_CLAIM: &str = "sub";
+
+/// An `api = "oidc"` trusted service: a claim cache keyed by the provider's
+/// `sub`, populated by [`OidcTrustedService::admit`] on the connect path and
+/// served through [`TrustedServiceInterface`].
+pub struct OidcTrustedService {
+    /// Trusted-service id (e.g. `"google"`); also the source id stamped on
+    /// every vended attribute, and thereby the derived `user.zpr.authority`.
+    id: String,
+    /// The pinned provider configuration from policy.
+    cfg: OidcConfig,
+    /// `returns_attributes` mapping from claim names to ZPR attribute keys.
+    mapper: AttributeMapper,
+    /// Cached signing keys for this provider (C3).
+    keys: Arc<KeySource>,
+    /// Admitted claims: `sub` -> (mapped attributes, record expiry).
+    admitted: DashMap<String, (Vec<Attribute>, SystemTime)>,
+    /// How long admitted attributes live, from the policy record.
+    expiration_seconds: u32,
+    /// Snapshot revision, from the process-wide trusted-service counter so the
+    /// ts_mgr staleness machinery treats this store like any other.
+    revision: AtomicU64,
+}
+
+impl OidcTrustedService {
+    /// Build the store from its policy record. The record must carry an
+    /// `oidc` config (the factory guarantees it; a missing one is a policy
+    /// error, not a panic).
+    pub fn new(record: &TrustedService, keys: Arc<KeySource>) -> Result<Self, ServiceError> {
+        let Some(cfg) = record.oidc.clone() else {
+            return Err(ServiceError::Param(format!(
+                "trusted service '{}': api 'oidc' requires an oidc config",
+                record.service_id
+            )));
+        };
+        Ok(OidcTrustedService {
+            id: record.service_id.clone(),
+            cfg,
+            mapper: AttributeMapper {
+                mappings: record.returns_attrs.clone(),
+            },
+            keys,
+            admitted: DashMap::new(),
+            expiration_seconds: record.expiration_seconds,
+            revision: AtomicU64::new(next_revision()),
+        })
+    }
+
+    /// The validator parameters for this provider (C2). `max_auth_age_seconds`
+    /// of 0 means no freshness requirement.
+    #[allow(dead_code)] // consumed by the C5 connect path
+    pub fn params(&self) -> IdpParams<'_> {
+        IdpParams {
+            issuer: &self.cfg.issuer,
+            client_id: &self.cfg.client_id,
+            allowed_domains: &self.cfg.allowed_domains,
+            max_auth_age: (self.cfg.max_auth_age_seconds > 0)
+                .then(|| Duration::from_secs(self.cfg.max_auth_age_seconds as u64)),
+            clock_skew: IdpParams::default_clock_skew(),
+        }
+    }
+
+    /// This provider's cached signing keys.
+    #[allow(dead_code)] // consumed by the C5 connect path
+    pub fn keys(&self) -> &KeySource {
+        &self.keys
+    }
+
+    /// How long admitted attributes live (`expiration_seconds` from policy).
+    #[allow(dead_code)] // consumed by the C5 connect path
+    pub fn lifetime(&self) -> Duration {
+        Duration::from_secs(self.expiration_seconds as u64)
+    }
+
+    /// The provider's issuer URL, for [`crate::trusted_services::TrustedServicesMgr`]
+    /// lookups by `iss`.
+    pub fn issuer(&self) -> &str {
+        &self.cfg.issuer
+    }
+
+    /// Map `token.raw_claims` through `returns_attributes`, stamp the given
+    /// expiry and this source, cache the result under `sub`, and bump the
+    /// revision. Returns the mapped attributes. Two claims mapping to the same
+    /// ZPR key with differing values fail closed, mirroring the
+    /// [`TrustedServiceInterface`] conflict contract.
+    pub fn admit(
+        &self,
+        token: &ValidatedToken,
+        expires: SystemTime,
+    ) -> Result<Vec<Attribute>, ServiceError> {
+        let src = AttributeSource::new(self.id.clone());
+        let mut mapped: BTreeMap<String, Attribute> = BTreeMap::new();
+        for (claim, value) in &token.raw_claims {
+            let Some((zpr_key, hint)) = self.mapper.map_attribute(claim) else {
+                continue; // unmapped claims can never become attributes
+            };
+            let values = claim_values(value);
+            let builder = src.builder(zpr_key.clone()).expires(expires);
+            let attr = match hint {
+                AttrHint::SingleValued => {
+                    let Some(first) = values.first() else {
+                        continue;
+                    };
+                    builder.value(first.clone())
+                }
+                AttrHint::MultiValued => builder.values(values),
+                // A tag is valueless: presence of the per-tag key is the tag.
+                AttrHint::Tag => builder.values(Vec::<String>::new()),
+            };
+            if let Some(existing) = mapped.get(&zpr_key) {
+                if existing.get_value() != attr.get_value() {
+                    // Claim names only, never values: claims are attacker-
+                    // influenced bytes and must not reach logs.
+                    return Err(ServiceError::Param(format!(
+                        "{}: two claims disagree on attribute '{zpr_key}'",
+                        self.id
+                    )));
+                }
+                continue;
+            }
+            mapped.insert(zpr_key, attr);
+        }
+
+        let attrs: Vec<Attribute> = mapped.into_values().collect();
+        self.admitted
+            .insert(token.sub.clone(), (attrs.clone(), expires));
+        self.revision.store(next_revision(), Ordering::SeqCst);
+        Ok(attrs)
+    }
+
+    /// The ZPR key the `sub` claim maps to — the identity key admitted actors
+    /// are looked up under. `None` when policy does not map `sub` at all (the
+    /// store then never matches an identity).
+    fn mapped_sub_key(&self) -> Option<String> {
+        self.mapper.map_attribute(SUB_CLAIM).map(|(key, _)| key)
+    }
+}
+
+// `expiration_seconds` lives on the policy record, not `OidcConfig`, so the
+// store keeps its own copy (see `lifetime`).
+
+#[async_trait]
+impl TrustedServiceInterface for OidcTrustedService {
+    /// Serve the cached claims of every admitted `sub` among `identities`
+    /// (matched under the mapped sub key). Expired records are dropped, not
+    /// served. Matching more than one admitted identity unions the results;
+    /// a same-key/different-value disagreement fails closed per the trait
+    /// contract.
+    async fn get_attributes_for_actor(
+        &self,
+        identities: &[(String, String)],
+    ) -> Result<Vec<Attribute>, ServiceError> {
+        let Some(sub_key) = self.mapped_sub_key() else {
+            return Ok(Vec::new());
+        };
+        let now = SystemTime::now();
+        let mut merged: BTreeMap<String, Attribute> = BTreeMap::new();
+        for (ident_key, ident_value) in identities {
+            if *ident_key != sub_key {
+                continue;
+            }
+            let Some(entry) = self.admitted.get(ident_value) else {
+                continue;
+            };
+            let (attrs, expires) = entry.value();
+            if *expires <= now {
+                drop(entry);
+                self.admitted
+                    .remove_if(ident_value, |_, (_, expiry)| *expiry <= now);
+                continue;
+            }
+            for attr in attrs {
+                match merged.get(attr.get_key()) {
+                    None => {
+                        merged.insert(attr.get_key().to_string(), attr.clone());
+                    }
+                    Some(first) if first.get_value() != attr.get_value() => {
+                        return Err(ServiceError::Param(format!(
+                            "{}: two admitted identities disagree on attribute '{}'",
+                            self.id,
+                            attr.get_key()
+                        )));
+                    }
+                    Some(_) => {} // same key, same values: one attribute
+                }
+            }
+        }
+        Ok(merged.into_values().collect())
+    }
+
+    /// Drop every admitted record. The next lookup finds nothing until the
+    /// connect path re-admits, which is the OIDC analogue of a data reload.
+    async fn flush(&self) -> Result<(), ServiceError> {
+        self.admitted.clear();
+        self.revision.store(next_revision(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn current_revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
+    fn get_source_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// A claim value as attribute value strings: a string is itself, a bool or
+/// number is its display form, an array is its (scalar) elements, and null /
+/// objects contribute nothing.
+fn claim_values(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Bool(b) => vec![b.to_string()],
+        serde_json::Value::Number(n) => vec![n.to_string()],
+        serde_json::Value::Array(items) => items.iter().flat_map(claim_values).collect(),
+        serde_json::Value::Null | serde_json::Value::Object(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,10 +351,7 @@ mod tests {
 
         // The admitted value under the wrong identity key is not an identity match.
         let attrs = store
-            .get_attributes_for_actor(&[(
-                "device.zpr.adapter.cn".to_string(),
-                "s-123".to_string(),
-            )])
+            .get_attributes_for_actor(&[("device.zpr.adapter.cn".to_string(), "s-123".to_string())])
             .await
             .unwrap();
         assert!(attrs.is_empty());

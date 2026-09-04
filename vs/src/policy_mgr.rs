@@ -28,6 +28,7 @@ use crate::db;
 use crate::error::{ResolverError, ServiceError, StoreError, TopologyError};
 use crate::loaded_policy::LoadedPolicy;
 use crate::logging::targets::MAIN;
+use crate::oidc::{OidcTrustedService, static_proxy};
 use crate::trusted_services::{
     TrustedServiceDefinition, TrustedServiceInterface, TrustedServicesMgr, build_services,
     trusted_service_definitions,
@@ -60,6 +61,9 @@ struct PolicyState {
     /// Attribute stores for the trusted services this policy declares. Republished to
     /// `ts_mgr` on every successful swap so the stores can never outlive their policy.
     trusted_services: Vec<Arc<dyn TrustedServiceInterface>>,
+    /// The typed OIDC subset of `trusted_services` (each store is in both), so the
+    /// manager can serve `oidc_service_for_issuer` lookups for the connect path.
+    oidc_services: Vec<Arc<OidcTrustedService>>,
     /// The declarations `trusted_services` was built from. Carried alongside the stores so
     /// the next policy can be compared against them and reuse the stores when unchanged.
     ts_definitions: Vec<TrustedServiceDefinition>,
@@ -262,19 +266,27 @@ impl PolicyMgr {
         let policy = loaded.policy();
         let resolved_peers_by_node = resolver.resolve_topology(&policy).await?;
         let ts_definitions = trusted_service_definitions(&policy)?;
-        let trusted_services = match previous {
+        let (trusted_services, oidc_services) = match previous {
             // Identical declarations mean the live stores are still correct.
             // Reusing them keeps their revisions, otherwise a policy install
             // makes every actor revision-stale against every source. Cached
             // attribute data now only moves on a TTL reload or an admin flush.
-            Some(prev) if prev.ts_definitions == ts_definitions => prev.trusted_services.clone(),
-            _ => build_services(&ts_definitions, file_ts_dir)?,
+            Some(prev) if prev.ts_definitions == ts_definitions => {
+                (prev.trusted_services.clone(), prev.oidc_services.clone())
+            }
+            // No proxy resolution yet: `build_state` has no actor-DB access, so a
+            // policy-named `jwks_proxy_service` resolves to "no proxy connected"
+            // and the key source serves its policy seed (C3 stale tolerance).
+            // Live proxy resolution and periodic refresh land with the connect
+            // path (C5).
+            _ => build_services(&ts_definitions, file_ts_dir, &|_id| static_proxy(None))?,
         };
         Ok(PolicyState {
             policy,
             container: loaded.container().clone(),
             resolved_peers_by_node,
             trusted_services,
+            oidc_services,
             ts_definitions,
         })
     }
@@ -287,7 +299,8 @@ impl PolicyMgr {
         ts_mgr: Arc<TrustedServicesMgr>,
         file_ts_dir: PathBuf,
     ) -> Self {
-        ts_mgr.update_services(state.trusted_services.clone());
+        ts_mgr
+            .update_services_with_oidc(state.trusted_services.clone(), state.oidc_services.clone());
         PolicyMgr {
             state: ArcSwap::from_pointee(state),
             repo,
@@ -301,7 +314,8 @@ impl PolicyMgr {
     /// Swap in `state` and republish its trusted service stores, so the manager's stores
     /// always come from the policy that is currently live.
     fn publish(&self, state: PolicyState) {
-        self.ts_mgr.update_services(state.trusted_services.clone());
+        self.ts_mgr
+            .update_services_with_oidc(state.trusted_services.clone(), state.oidc_services.clone());
         self.state.store(Arc::new(state));
     }
 

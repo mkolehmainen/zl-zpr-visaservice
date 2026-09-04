@@ -4,14 +4,14 @@ use zpr::policy_types::AttrMapping;
 
 /// Maps attributes returned by a trusted service into their ZPR representation.
 #[derive(Debug)]
-pub(super) struct AttributeMapper {
+pub(crate) struct AttributeMapper {
     // Linear scan. A trusted service returns a handful of attributes; index it
     // by service_attr_key if that ever stops being true.
-    pub(super) mappings: Vec<AttrMapping>,
+    pub(crate) mappings: Vec<AttrMapping>,
 }
 
 /// Describes how a mapped attribute value must be emitted.
-pub(super) enum AttrHint {
+pub(crate) enum AttrHint {
     /// Attribute is declared as single valued.
     SingleValued,
 
@@ -25,7 +25,7 @@ pub(super) enum AttrHint {
 
 impl AttributeMapper {
     /// Map a trusted-service attribute name into its ZPR name and value behavior.
-    pub(super) fn map_attribute(&self, ts_key: &str) -> Option<(String, AttrHint)> {
+    pub(crate) fn map_attribute(&self, ts_key: &str) -> Option<(String, AttrHint)> {
         // `AttrMapping::attr` already carries the decoded RHS spec, so `zpl_key`
         // handles the tag class translation ("#user.lazy" -> "user.zpr.tag.lazy").
         let attr = &self
