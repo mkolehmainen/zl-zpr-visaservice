@@ -9,9 +9,10 @@
 //! Proxy resolution is the caller's job (C4): when policy names a
 //! `jwks_proxy_service`, the caller resolves the providing actor with
 //! `ActorDb::get_zpr_addr_for_service` and the port from the policy
-//! `Service.endpoints` scope, building `http://[zpr-addr]:port`, and
-//! re-resolves on each refresh (providers come and go). This module only
-//! takes the resolved `Option<Url>`.
+//! `Service.endpoints` scope, building `http://[zpr-addr]:port`. Because
+//! providers come and go, the key source takes a [`ProxyResolver`]
+//! callback and re-invokes it on **every** refresh rather than pinning
+//! the address resolved at construction time.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -28,6 +29,24 @@ use super::OidcError;
 /// connect attempt hostage: on timeout the cached keys keep serving.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Hard cap on a JWKS response body. Real provider key sets are a few
+/// kilobytes; anything approaching this is hostile or broken, and reading
+/// it unbounded would let a compromised endpoint balloon memory.
+const MAX_JWKS_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Resolves the CONNECT proxy's *current* URL. Invoked on every refresh so
+/// a provider that disconnects and reconnects elsewhere is picked up; `None`
+/// means no provider for the policy-named proxy service is connected right
+/// now. Callers without a proxy requirement use [`static_proxy`]`(None)`.
+pub type ProxyResolver = Arc<dyn Fn() -> Option<Url> + Send + Sync>;
+
+/// A [`ProxyResolver`] that always yields the same answer — no proxy, or a
+/// fixed URL. For production proxied refresh, prefer a closure that
+/// re-resolves the providing actor each call.
+pub fn static_proxy(url: Option<Url>) -> ProxyResolver {
+    Arc::new(move || url.clone())
+}
+
 /// Cached signing keys for one provider. Seeded from policy; refreshed
 /// periodically and on unknown `kid`; never discarded on fetch failure
 /// (stale tolerance).
@@ -42,8 +61,9 @@ pub struct KeySource {
     /// The provider's pinned policy configuration (`jwks_uri` is what we
     /// fetch; nothing else from it is consulted here).
     cfg: OidcConfig,
-    /// CONNECT proxy for the fetch, when policy routes egress through one.
-    proxy: Option<Url>,
+    /// Yields the CONNECT proxy's current URL; called on every refresh so
+    /// the fetch follows the providing actor when it moves.
+    proxy: ProxyResolver,
     /// Extra TLS trust roots for the fetch client. Production always
     /// verifies against system roots only; tests inject their self-signed
     /// server certificate here.
@@ -55,8 +75,11 @@ impl KeySource {
     /// Build a key source from policy. Parses `seed_jwks`; fails with
     /// [`OidcError::NoKeys`] when the seed is empty and no fetch route
     /// exists (no `jwks_uri`, or policy demands a proxy that is not
-    /// resolved), because such a source could never produce a key.
-    pub fn from_policy(cfg: &OidcConfig, proxy: Option<Url>) -> Result<Self, OidcError> {
+    /// resolved), because such a source could never produce a key. When
+    /// policy names a proxy, `jwks_uri` must be `https://`: the CONNECT
+    /// proxy tunnels HTTPS only, so a plain-http URI would silently
+    /// bypass the policy-designated proxy and fetch in cleartext.
+    pub fn from_policy(cfg: &OidcConfig, proxy: ProxyResolver) -> Result<Self, OidcError> {
         let seed: JwkSet = if cfg.seed_jwks.trim().is_empty() {
             JwkSet { keys: Vec::new() }
         } else {
@@ -66,11 +89,20 @@ impl KeySource {
                 .map_err(|_| OidcError::Rejected("seed_jwks does not parse as a JWKS".into()))?
         };
 
+        let uri = cfg.jwks_uri.trim();
+        if cfg.jwks_proxy_service.is_some() && !uri.is_empty() && !uri.starts_with("https://") {
+            return Err(OidcError::Rejected(
+                "jwks_uri must be https:// when a jwks proxy is configured \
+                 (the CONNECT proxy tunnels HTTPS only; an http:// fetch \
+                 would bypass it in cleartext)"
+                    .into(),
+            ));
+        }
+
         if seed.keys.is_empty() {
             // No seed: the source is only viable if a refresh could succeed.
-            let no_uri = cfg.jwks_uri.trim().is_empty();
-            let proxy_required_but_missing = cfg.jwks_proxy_service.is_some() && proxy.is_none();
-            if no_uri || proxy_required_but_missing {
+            let proxy_required_but_missing = cfg.jwks_proxy_service.is_some() && proxy().is_none();
+            if uri.is_empty() || proxy_required_but_missing {
                 return Err(OidcError::NoKeys);
             }
         }
@@ -100,18 +132,31 @@ impl KeySource {
     /// Fetch `jwks_uri` and replace the cached set. On any failure the old
     /// keys keep serving (stale tolerance) and the error is returned. The
     /// response body is never logged and never echoed in errors.
+    ///
+    /// The proxy is re-resolved on every call (providers come and go);
+    /// redirects are never followed (a redirect off HTTPS would leak the
+    /// fetch, and a redirect anywhere else changes the pinned policy URL);
+    /// and the body is read under [`MAX_JWKS_BYTES`].
     pub async fn refresh(&self) -> Result<(), OidcError> {
         if self.cfg.jwks_uri.trim().is_empty() {
             return Err(OidcError::Rejected("no jwks_uri to refresh from".into()));
         }
-        if self.cfg.jwks_proxy_service.is_some() && self.proxy.is_none() {
+        // Re-resolve the proxy: the providing actor may have disconnected
+        // or reconnected at a new address since the last refresh.
+        let proxy_url = (self.proxy)();
+        if self.cfg.jwks_proxy_service.is_some() && proxy_url.is_none() {
             // Policy routes this fetch through a proxy and no provider is
             // connected right now; the seed/stale keys keep serving.
             return Err(OidcError::Rejected("proxy not reachable".into()));
         }
 
-        let mut builder = reqwest::Client::builder().timeout(FETCH_TIMEOUT);
-        if let Some(proxy_url) = &self.proxy {
+        let mut builder = reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            // Never follow redirects: the jwks_uri is pinned by policy, and
+            // a redirect could steer the fetch to a non-HTTPS URL (leaking
+            // it in plaintext, outside the CONNECT proxy when one is set).
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(proxy_url) = &proxy_url {
             // CONNECT tunnel: TLS runs end-to-end to the provider; the proxy
             // sees only `CONNECT host:port`, never the request.
             let proxy = reqwest::Proxy::https(proxy_url.clone())
@@ -126,23 +171,39 @@ impl KeySource {
             .build()
             .map_err(|e| OidcError::Rejected(format!("http client: {e}")))?;
 
-        let resp = client
+        let mut resp = client
             .get(&self.cfg.jwks_uri)
             .send()
             .await
             .map_err(|e| OidcError::Rejected(format!("JWKS fetch failed: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
+            // With redirects disabled a 3xx lands here too, which is the
+            // intended fate of any attempt to move the pinned jwks_uri.
             return Err(OidcError::Rejected(format!(
                 "JWKS fetch returned status {status}"
             )));
         }
 
+        // Read the body under an explicit cap: a hostile or broken provider
+        // must not be able to balloon memory with an unbounded response.
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| OidcError::Rejected(format!("JWKS fetch failed: {e}")))?
+        {
+            if body.len() + chunk.len() > MAX_JWKS_BYTES {
+                return Err(OidcError::Rejected(format!(
+                    "JWKS response too large (over {MAX_JWKS_BYTES} bytes)"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
         // Parse failures and an empty set are fetch failures, not
         // replacements — a provider serving garbage must not wipe the keys.
-        let fetched: JwkSet = resp
-            .json()
-            .await
+        let fetched: JwkSet = serde_json::from_slice(&body)
             .map_err(|_| OidcError::Rejected("fetched JWKS does not parse".into()))?;
         if fetched.keys.is_empty() {
             return Err(OidcError::Rejected("fetched JWKS is empty".into()));
@@ -224,6 +285,54 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         addr
+    }
+
+    /// TLS responder that answers every request with a 302 redirect to
+    /// `location`. Used to prove that a fetch is never allowed to follow a
+    /// redirect off HTTPS (which would leak the request in plaintext and,
+    /// when proxied, bypass the CONNECT proxy's policy routing).
+    async fn spawn_tls_redirect_server(location: String) -> (SocketAddr, reqwest::Certificate) {
+        let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let client_cert = reqwest::Certificate::from_pem(ck.cert.pem().as_bytes()).unwrap();
+        let chain = vec![ck.cert.der().clone()];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
+        );
+        let tls_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                let location = location.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match tls.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => head.push(byte[0]),
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        (addr, client_cert)
     }
 
     /// TLS JWKS responder for the CONNECT test. reqwest tunnels TLS
@@ -330,7 +439,7 @@ mod tests {
     async fn test_seed_serves_before_first_fetch() {
         // No server is started: the seed alone must serve.
         let c = cfg(seed_jwks_json(), "https://idp.invalid/jwks", None);
-        let ks = KeySource::from_policy(&c, None).unwrap();
+        let ks = KeySource::from_policy(&c, static_proxy(None)).unwrap();
         assert_eq!(kids(&ks.current()), vec!["k1".to_string()]);
     }
 
@@ -338,7 +447,7 @@ mod tests {
     async fn test_refresh_replaces_keys() {
         let addr = spawn_jwks_server(StatusCode::OK, k2_jwks_json()).await;
         let c = cfg(seed_jwks_json(), &format!("http://{addr}/jwks"), None);
-        let ks = KeySource::from_policy(&c, None).unwrap();
+        let ks = KeySource::from_policy(&c, static_proxy(None)).unwrap();
         ks.refresh().await.unwrap();
         let got = kids(&ks.current());
         assert!(got.contains(&"k2".to_string()), "{got:?}");
@@ -352,7 +461,7 @@ mod tests {
     async fn test_refresh_failure_keeps_stale_keys() {
         let addr = spawn_jwks_server(StatusCode::INTERNAL_SERVER_ERROR, String::new()).await;
         let c = cfg(seed_jwks_json(), &format!("http://{addr}/jwks"), None);
-        let ks = KeySource::from_policy(&c, None).unwrap();
+        let ks = KeySource::from_policy(&c, static_proxy(None)).unwrap();
         ks.refresh().await.unwrap_err();
         // Stale tolerance: the pre-failure keys keep serving.
         assert_eq!(kids(&ks.current()), vec!["k1".to_string()]);
@@ -368,7 +477,7 @@ mod tests {
             Some("egress-proxy"),
         );
         let proxy_url = reqwest::Url::parse(&format!("http://{proxy_addr}")).unwrap();
-        let mut ks = KeySource::from_policy(&c, Some(proxy_url)).unwrap();
+        let mut ks = KeySource::from_policy(&c, static_proxy(Some(proxy_url))).unwrap();
         // Trust the test server's self-signed cert; production uses system roots.
         ks.extra_roots.push(cert);
         ks.refresh().await.unwrap();
@@ -395,16 +504,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_proxy_with_http_jwks_uri_rejected() {
+        // Review fix (PR #4): the CONNECT proxy is HTTPS-only, so an
+        // `http://` jwks_uri would silently bypass the policy-designated
+        // proxy and fetch in plaintext. Policy that names a proxy must
+        // therefore carry an https jwks_uri; anything else fails at load.
+        let c = cfg(
+            seed_jwks_json(),
+            "http://idp.invalid/jwks",
+            Some("egress-proxy"),
+        );
+        let proxy_url = reqwest::Url::parse("http://127.0.0.1:3128").unwrap();
+        let err = KeySource::from_policy(&c, static_proxy(Some(proxy_url)))
+            .err()
+            .expect("http jwks_uri with a proxy configured must be rejected");
+        assert!(
+            matches!(&err, OidcError::Rejected(m) if m.contains("https")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redirect_off_https_is_refused() {
+        // A redirect from the https jwks_uri to a plain-http URL must not
+        // be followed: it would leak the fetch in plaintext (and, when
+        // proxied, step around the HTTPS-only CONNECT proxy). The stale
+        // keys keep serving.
+        let plain = spawn_jwks_server(StatusCode::OK, k2_jwks_json()).await;
+        let (redirector, cert) = spawn_tls_redirect_server(format!("http://{plain}/jwks")).await;
+        let c = cfg(
+            seed_jwks_json(),
+            &format!("https://127.0.0.1:{}/jwks", redirector.port()),
+            None,
+        );
+        let mut ks = KeySource::from_policy(&c, static_proxy(None)).unwrap();
+        ks.extra_roots.push(cert);
+        ks.refresh()
+            .await
+            .expect_err("redirect to non-HTTPS must fail the refresh");
+        // Stale tolerance: the seed keeps serving.
+        assert_eq!(kids(&ks.current()), vec!["k1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_re_resolves_proxy() {
+        // Review fix (PR #4): the proxy is re-resolved on every refresh, so
+        // when the providing actor moves, the next refresh follows it
+        // instead of hitting the stale address forever.
+        let (upstream, cert) = spawn_tls_jwks_server(k2_jwks_json()).await;
+
+        // A dead proxy address: bind and immediately drop the listener.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let slot: Arc<std::sync::Mutex<Option<reqwest::Url>>> = Arc::new(std::sync::Mutex::new(
+            Some(reqwest::Url::parse(&format!("http://{dead_addr}")).unwrap()),
+        ));
+        let resolver: ProxyResolver = {
+            let slot = slot.clone();
+            Arc::new(move || slot.lock().unwrap().clone())
+        };
+
+        let c = cfg(
+            seed_jwks_json(),
+            &format!("https://127.0.0.1:{}/jwks", upstream.port()),
+            Some("egress-proxy"),
+        );
+        let mut ks = KeySource::from_policy(&c, resolver).unwrap();
+        ks.extra_roots.push(cert);
+
+        // Old provider is gone: the refresh fails, stale keys keep serving.
+        ks.refresh()
+            .await
+            .expect_err("refresh through a dead proxy must fail");
+        assert_eq!(kids(&ks.current()), vec!["k1".to_string()]);
+
+        // A new provider connects at a different address; the next refresh
+        // must pick it up without rebuilding the KeySource.
+        let (new_proxy, mut lines) = spawn_connect_stub(upstream).await;
+        *slot.lock().unwrap() = Some(reqwest::Url::parse(&format!("http://{new_proxy}")).unwrap());
+        ks.refresh().await.unwrap();
+        assert!(kids(&ks.current()).contains(&"k2".to_string()));
+        let first = lines.try_recv().expect("new proxy must see the CONNECT");
+        assert!(first.starts_with("CONNECT "), "{first:?}");
+    }
+
+    #[tokio::test]
+    async fn test_oversized_jwks_rejected() {
+        // Review fix (PR #4): the response body is read under an explicit
+        // byte cap so a hostile or broken provider cannot balloon memory.
+        // The oversized body is a fetch failure; stale keys keep serving.
+        let mut v: serde_json::Value = serde_json::from_str(&k2_jwks_json()).unwrap();
+        v["pad"] = serde_json::json!(" ".repeat(2 * 1024 * 1024));
+        let addr = spawn_jwks_server(StatusCode::OK, v.to_string()).await;
+        let c = cfg(seed_jwks_json(), &format!("http://{addr}/jwks"), None);
+        let ks = KeySource::from_policy(&c, static_proxy(None)).unwrap();
+        let err = ks
+            .refresh()
+            .await
+            .expect_err("a multi-megabyte JWKS body must be rejected");
+        assert!(
+            matches!(&err, OidcError::Rejected(m) if m.contains("large")),
+            "{err}"
+        );
+        assert_eq!(kids(&ks.current()), vec!["k1".to_string()]);
+    }
+
+    #[tokio::test]
     async fn test_no_seed_no_route_is_nokeys() {
         // Policy demands a proxy, none is connected, and the seed is empty.
         let c = cfg("", "https://idp.invalid/jwks", Some("egress-proxy"));
-        let err = KeySource::from_policy(&c, None)
+        let err = KeySource::from_policy(&c, static_proxy(None))
             .err()
             .expect("empty seed with unreachable proxy must be NoKeys");
         assert!(matches!(err, OidcError::NoKeys), "{err}");
         // Likewise with no fetch route at all (empty jwks_uri, no proxy).
         let c2 = cfg("", "", None);
-        let err2 = KeySource::from_policy(&c2, None)
+        let err2 = KeySource::from_policy(&c2, static_proxy(None))
             .err()
             .expect("empty seed with no jwks_uri must be NoKeys");
         assert!(matches!(err2, OidcError::NoKeys), "{err2}");
