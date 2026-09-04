@@ -32,6 +32,10 @@ mod event_mgr;
 mod loaded_policy;
 mod logging;
 mod net_mgr;
+/// Offline OIDC id_token validation (consumed by the connect path in
+/// OIDC-C4/C5; until then only its own tests exercise it).
+#[allow(dead_code)]
+mod oidc;
 mod packet;
 mod policy_mgr;
 mod router;
