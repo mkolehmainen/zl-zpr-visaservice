@@ -27,8 +27,12 @@ pub const EVENT_QUEUE_DEPTH: usize = 1024;
 
 // We only load policy files built by this version or later.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 16;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 17;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 0;
+
+/// Retry hint (seconds) sent with `temporarilyUnavailable` when an OIDC
+/// provider has no signing keys at all yet (no seed, no successful fetch).
+pub const OIDC_NO_KEYS_RETRY_SECS: u32 = 30;
 
 /// Minimum policy compiler version this build will load.
 

@@ -1,0 +1,39 @@
+load zpt-test-oidc.bin2
+
+# APPROVE_CONNECTION 1: device-only (authd: CN + device authority). Approved,
+# with only device-namespace identity keys.
+connect --ac device.zpr.adapter.cn:dev1.zpr.org --ac device.zpr.authority:zpr-bootstrap
+
+# APPROVE_CONNECTION 2: user-only (authd: mapped sub, user authority, domain;
+# the claimed CN stays unauthenticated and must be scrubbed).
+connect --ac user.oidc-subject:s-123 --ac user.zpr.authority:google --ac user.domain:example.com --uc device.zpr.adapter.cn:dev1.zpr.org
+
+# APPROVE_CONNECTION 3: both namespaces authenticated.
+connect --ac device.zpr.adapter.cn:dev1.zpr.org --ac device.zpr.authority:zpr-bootstrap --ac user.oidc-subject:s-123 --ac user.zpr.authority:google --ac user.domain:example.com
+
+# Eval actors mirroring the three connect shapes.
+set devonly device.zpr.authority:zpr-bootstrap
+set devonly device.zpr.adapter.cn:dev1.zpr.org
+set useronly user.zpr.authority:google
+set useronly user.oidc-subject:s-123
+set useronly user.domain:example.com
+set both device.zpr.authority:zpr-bootstrap
+set both device.zpr.adapter.cn:dev1.zpr.org
+set both user.zpr.authority:google
+set both user.oidc-subject:s-123
+set both user.domain:example.com
+
+set webby zpr.services:Webby
+set devy zpr.services:Devy
+
+# eval 1: the domain rule (and the bare users rule) match a user login.
+eval TCP useronly > webby.80 [S]
+# eval 2: same for an actor that ALSO has a device identity.
+eval TCP both > webby.80 [S]
+# eval 3: device-only against Webby: neither the domain rule nor the bare
+# users rule matches (#144 fail-closed).
+eval TCP devonly > webby.80 [S]
+# eval 4: the device rule matches device-only (bare users rule does not).
+eval TCP devonly > devy.80 [S]
+# eval 5: both matches the device rule AND the bare users rule.
+eval TCP both > devy.80 [S]

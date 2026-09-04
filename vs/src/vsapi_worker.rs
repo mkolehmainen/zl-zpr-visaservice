@@ -1246,11 +1246,21 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             Err(e) => {
                 warn!(target: API, "connection authorization failed for node {:?}: {}", connect_via, e);
                 let mut err_builder = results.get().init_resp().init_error();
-                write_error(
-                    &mut err_builder,
-                    vsapi::ErrorCode::AuthError,
-                    format!("adapter authorization failed: {}", e).as_str(),
-                );
+                // An error the auth path already classified for the wire carries its
+                // exact code and retry hint (zipline#11, Contract 2); everything else
+                // stays a blanket authError. Neither branch echoes internal detail.
+                match e {
+                    ServiceError::ApiResponse(api) => {
+                        err_builder.set_code(api.code.into());
+                        err_builder.set_message(&api.message);
+                        err_builder.set_retry_in(api.retry_in);
+                    }
+                    _ => write_error(
+                        &mut err_builder,
+                        vsapi::ErrorCode::AuthError,
+                        format!("adapter authorization failed: {}", e).as_str(),
+                    ),
+                }
                 self.asm.counters.incr(CounterType::AuthorizeConnectFailed);
                 return Ok(());
             }

@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := zpt-test.bin2
+OBJS := zpt-test.bin2 zpt-test-oidc.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
