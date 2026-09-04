@@ -59,4 +59,69 @@ The `vs-admin` command line tool consumes this API.
 
 See [admin-http-api.txt](admin-http-api.txt) for full endpoint documentation.
 
+## JWKS CONNECT proxy (OIDC trusted services)
+
+An `api = "oidc"` trusted service periodically refreshes the provider's
+signing keys from its `jwks_uri`. The visa service typically has no direct
+internet route, so the fetch can be tunneled through an on-net HTTP
+**CONNECT forward proxy** — off-the-shelf software (squid, tinyproxy,
+anything that speaks `CONNECT`) fronted by a ZPR adapter. TLS runs
+end-to-end from the visa service to the JWKS host; the proxy sees only
+`CONNECT host:443` and ciphertext, so it can deny service but never forge
+keys. It must be a forward proxy, never a reverse proxy or anything that
+terminates TLS.
+
+### Declaring the proxy in ZPLC
+
+The proxy is an ordinary on-net service, named from the trusted-service
+declaration via its `service` key:
+
+```toml
+[trusted_services.google]
+api             = "oidc"
+issuer          = "https://accounts.google.com"
+jwks_uri        = "https://www.googleapis.com/oauth2/v3/certs"
+# ... client_id, allowed_domains, seed_jwks, etc.
+service         = "google-jwks-proxy"   # names the CONNECT proxy service
+
+[protocols.tcp]
+l4protocol = "TCP"
+port = 3128
+
+# The proxy itself: an ordinary on-net service. The compiler weaves the
+# visa-service access rule for it; no hand-written ZPL is needed.
+[services.google-jwks-proxy]
+protocol = "tcp"
+port = 3128
+provider = [["device.zpr.adapter.cn", "proxy1.zpr"]]
+```
+
+The adapter whose CN matches the `provider` attributes docks the proxy onto
+the ZPR network. Several trusted services may share one proxy.
+
+### What the visa service does with it
+
+On every refresh the visa service re-resolves the current provider of the
+named service (providers come and go; a proxy that reconnects at a new
+address is picked up on the next refresh), then issues
+`CONNECT <jwks-host>:443` through it and performs ordinary TLS with the
+JWKS host, verified against system roots.
+
+Rules enforced by the visa service:
+
+- **`jwks_uri` must be `https://` when a proxy is configured.** The
+  CONNECT proxy tunnels HTTPS only; a plain-`http://` URI would bypass the
+  policy-designated proxy and fetch in cleartext, so it is rejected at
+  policy load.
+- **Redirects are never followed.** The `jwks_uri` is pinned by policy; a
+  redirect (in particular off HTTPS) fails the refresh.
+- **Responses are capped at 1 MiB.** Real key sets are a few kilobytes;
+  an oversized body fails the refresh.
+- **Fetch failures never discard keys.** If the proxy is unreachable or
+  the fetch fails, the previously cached (or policy-seeded `seed_jwks`)
+  keys keep serving until a later refresh succeeds.
+
+Omitting `service` means the visa service fetches `jwks_uri` directly and
+therefore needs its own internet egress.
+
 

@@ -38,6 +38,7 @@ rand.workspace = true
 rcgen = "0.14.7"
 redis = { version = "1.0.3", features = ["tokio-comp", "aio", "connection-manager"] }
 regex = "1.12.2"
+reqwest = { workspace = true, features = ["json"] }
 rustls = "0.23.36"
 rustls-pemfile = "2"
 serde.workspace = true
