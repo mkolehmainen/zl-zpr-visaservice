@@ -149,6 +149,10 @@ pub struct CoreSection {
 
     /// Directory holding the `<service-id>.json` attribute files for `api=file` trusted services.
     pub file_ts_dir: Option<PathBuf>,
+
+    /// Period, in seconds, between JWKS refreshes for `api=oidc` trusted
+    /// services (OIDC C3). Consumed by the refresher wiring in C4/C5.
+    pub oidc_refresh_seconds: Option<u64>,
 }
 
 impl Default for VSConfig {
@@ -170,6 +174,7 @@ impl Default for CoreSection {
             identity: Some(String::new()),
             api_keys: Some(PathBuf::from(DEFAULT_API_KEYS_FILE)),
             file_ts_dir: Some(PathBuf::from(".")),
+            oidc_refresh_seconds: Some(3600),
         }
     }
 }

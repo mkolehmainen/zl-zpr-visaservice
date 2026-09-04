@@ -5,6 +5,168 @@
 //! failure (stale tolerance). Refresh optionally tunnels through a
 //! policy-designated CONNECT proxy so the visa service needs no direct
 //! internet route.
+//!
+//! Proxy resolution is the caller's job (C4): when policy names a
+//! `jwks_proxy_service`, the caller resolves the providing actor with
+//! `ActorDb::get_zpr_addr_for_service` and the port from the policy
+//! `Service.endpoints` scope, building `http://[zpr-addr]:port`, and
+//! re-resolves on each refresh (providers come and go). This module only
+//! takes the resolved `Option<Url>`.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+use arc_swap::ArcSwap;
+use jsonwebtoken::jwk::JwkSet;
+use reqwest::Url;
+use tokio::task::JoinHandle;
+use zpr::policy_types::OidcConfig;
+
+use super::OidcError;
+
+/// Hard cap on a single JWKS fetch. The refresh path must never hold a
+/// connect attempt hostage: on timeout the cached keys keep serving.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cached signing keys for one provider. Seeded from policy; refreshed
+/// periodically and on unknown `kid`; never discarded on fetch failure
+/// (stale tolerance).
+pub struct KeySource {
+    /// The live key set. Swapped atomically on a successful refresh only —
+    /// readers on the validation path never block and never see a partial
+    /// or emptied set.
+    keys: ArcSwap<JwkSet>,
+    /// When the last successful fetch happened (`None` = still on the seed).
+    /// Kept for operational visibility; consumed by C4/C5 wiring.
+    last_ok: Mutex<Option<SystemTime>>,
+    /// The provider's pinned policy configuration (`jwks_uri` is what we
+    /// fetch; nothing else from it is consulted here).
+    cfg: OidcConfig,
+    /// CONNECT proxy for the fetch, when policy routes egress through one.
+    proxy: Option<Url>,
+    /// Extra TLS trust roots for the fetch client. Production always
+    /// verifies against system roots only; tests inject their self-signed
+    /// server certificate here.
+    #[cfg(test)]
+    extra_roots: Vec<reqwest::Certificate>,
+}
+
+impl KeySource {
+    /// Build a key source from policy. Parses `seed_jwks`; fails with
+    /// [`OidcError::NoKeys`] when the seed is empty and no fetch route
+    /// exists (no `jwks_uri`, or policy demands a proxy that is not
+    /// resolved), because such a source could never produce a key.
+    pub fn from_policy(cfg: &OidcConfig, proxy: Option<Url>) -> Result<Self, OidcError> {
+        let seed: JwkSet = if cfg.seed_jwks.trim().is_empty() {
+            JwkSet { keys: Vec::new() }
+        } else {
+            // The seed comes from signed policy, not the network, but a
+            // typo'd seed must fail loudly at load time, not at first use.
+            serde_json::from_str(&cfg.seed_jwks)
+                .map_err(|_| OidcError::Rejected("seed_jwks does not parse as a JWKS".into()))?
+        };
+
+        if seed.keys.is_empty() {
+            // No seed: the source is only viable if a refresh could succeed.
+            let no_uri = cfg.jwks_uri.trim().is_empty();
+            let proxy_required_but_missing = cfg.jwks_proxy_service.is_some() && proxy.is_none();
+            if no_uri || proxy_required_but_missing {
+                return Err(OidcError::NoKeys);
+            }
+        }
+
+        Ok(KeySource {
+            keys: ArcSwap::from_pointee(seed),
+            last_ok: Mutex::new(None),
+            cfg: cfg.clone(),
+            proxy,
+            #[cfg(test)]
+            extra_roots: Vec::new(),
+        })
+    }
+
+    /// The current key set. Lock-free; safe to call on the hot path.
+    pub fn current(&self) -> Arc<JwkSet> {
+        self.keys.load_full()
+    }
+
+    /// When the last successful fetch happened (`None` = still serving the
+    /// policy seed). Consumed by C4/C5 wiring.
+    #[allow(dead_code)]
+    pub fn last_ok(&self) -> Option<SystemTime> {
+        *self.last_ok.lock().expect("last_ok lock poisoned")
+    }
+
+    /// Fetch `jwks_uri` and replace the cached set. On any failure the old
+    /// keys keep serving (stale tolerance) and the error is returned. The
+    /// response body is never logged and never echoed in errors.
+    pub async fn refresh(&self) -> Result<(), OidcError> {
+        if self.cfg.jwks_uri.trim().is_empty() {
+            return Err(OidcError::Rejected("no jwks_uri to refresh from".into()));
+        }
+        if self.cfg.jwks_proxy_service.is_some() && self.proxy.is_none() {
+            // Policy routes this fetch through a proxy and no provider is
+            // connected right now; the seed/stale keys keep serving.
+            return Err(OidcError::Rejected("proxy not reachable".into()));
+        }
+
+        let mut builder = reqwest::Client::builder().timeout(FETCH_TIMEOUT);
+        if let Some(proxy_url) = &self.proxy {
+            // CONNECT tunnel: TLS runs end-to-end to the provider; the proxy
+            // sees only `CONNECT host:port`, never the request.
+            let proxy = reqwest::Proxy::https(proxy_url.clone())
+                .map_err(|e| OidcError::Rejected(format!("bad proxy url: {e}")))?;
+            builder = builder.proxy(proxy);
+        }
+        #[cfg(test)]
+        for cert in &self.extra_roots {
+            builder = builder.add_root_certificate(cert.clone());
+        }
+        let client = builder
+            .build()
+            .map_err(|e| OidcError::Rejected(format!("http client: {e}")))?;
+
+        let resp = client
+            .get(&self.cfg.jwks_uri)
+            .send()
+            .await
+            .map_err(|e| OidcError::Rejected(format!("JWKS fetch failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(OidcError::Rejected(format!(
+                "JWKS fetch returned status {status}"
+            )));
+        }
+
+        // Parse failures and an empty set are fetch failures, not
+        // replacements — a provider serving garbage must not wipe the keys.
+        let fetched: JwkSet = resp
+            .json()
+            .await
+            .map_err(|_| OidcError::Rejected("fetched JWKS does not parse".into()))?;
+        if fetched.keys.is_empty() {
+            return Err(OidcError::Rejected("fetched JWKS is empty".into()));
+        }
+
+        self.keys.store(Arc::new(fetched));
+        *self.last_ok.lock().expect("last_ok lock poisoned") = Some(SystemTime::now());
+        Ok(())
+    }
+
+    /// Refresh every `period` in a background task. Failures are logged
+    /// (never the body) and the stale keys keep serving until the next tick.
+    #[allow(dead_code)] // consumed by C4/C5 wiring
+    pub fn spawn_refresher(self: Arc<Self>, period: Duration) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                if let Err(e) = self.refresh().await {
+                    tracing::warn!("periodic JWKS refresh failed: {e}");
+                }
+            }
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -236,11 +398,15 @@ mod tests {
     async fn test_no_seed_no_route_is_nokeys() {
         // Policy demands a proxy, none is connected, and the seed is empty.
         let c = cfg("", "https://idp.invalid/jwks", Some("egress-proxy"));
-        let err = KeySource::from_policy(&c, None).unwrap_err();
+        let err = KeySource::from_policy(&c, None)
+            .err()
+            .expect("empty seed with unreachable proxy must be NoKeys");
         assert!(matches!(err, OidcError::NoKeys), "{err}");
         // Likewise with no fetch route at all (empty jwks_uri, no proxy).
         let c2 = cfg("", "", None);
-        let err2 = KeySource::from_policy(&c2, None).unwrap_err();
+        let err2 = KeySource::from_policy(&c2, None)
+            .err()
+            .expect("empty seed with no jwks_uri must be NoKeys");
         assert!(matches!(err2, OidcError::NoKeys), "{err2}");
     }
 }
