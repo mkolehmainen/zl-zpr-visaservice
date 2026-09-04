@@ -219,7 +219,7 @@ pub fn validate_id_token(
 }
 
 #[cfg(test)]
-mod mint {
+pub(crate) mod mint {
     //! Test-only token minter for the fixture keypair.
     //!
     //! `vs/tests/data/oidc-test-rsa.pem` is a throwaway 2048-bit RSA key

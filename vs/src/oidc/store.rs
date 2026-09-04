@@ -105,6 +105,12 @@ impl OidcTrustedService {
         &self.cfg.issuer
     }
 
+    /// The trusted-service id (e.g. `"google"`): the value stamped into
+    /// `user.zpr.authority` by the connect path (C5).
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     /// Map `token.raw_claims` through `returns_attributes`, stamp the given
     /// expiry and this source, cache the result under `sub`, and bump the
     /// revision. Returns the mapped attributes. Two claims mapping to the same
@@ -163,8 +169,10 @@ impl OidcTrustedService {
 
     /// The ZPR key the `sub` claim maps to — the identity key admitted actors
     /// are looked up under. `None` when policy does not map `sub` at all (the
-    /// store then never matches an identity).
-    fn mapped_sub_key(&self) -> Option<String> {
+    /// store then never matches an identity). The connect path (C5) uses this
+    /// to push the mapped subject as the user identity anchor, so the
+    /// trusted-service lookup can find the admission it just cached.
+    pub(crate) fn mapped_sub_key(&self) -> Option<String> {
         self.mapper.map_attribute(SUB_CLAIM).map(|(key, _)| key)
     }
 }
