@@ -7,11 +7,14 @@
 //! keep from it".
 
 mod jwks;
+mod store;
 mod validate;
 
 // The re-exports are the module's public surface; nothing consumes them until
 // OIDC-C4/C5 wire validation into the connect path.
 #[allow(unused_imports)]
 pub use jwks::{KeySource, ProxyResolver, static_proxy};
+#[allow(unused_imports)]
+pub use store::OidcTrustedService;
 #[allow(unused_imports)]
 pub use validate::{IdpParams, OidcError, ValidatedToken, validate_id_token};

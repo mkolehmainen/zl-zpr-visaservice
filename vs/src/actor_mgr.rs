@@ -781,8 +781,31 @@ mod test {
             port_range: None,
         }];
 
-        let uri = uri_for_service(&ServiceType::Authentication, &addr, &endpoints).unwrap();
+        let uri =
+            uri_for_service(&ServiceType::Authentication, &addr, &endpoints, None).unwrap();
         assert_eq!(uri, "zpr-oauthrsa://[fd5a:5052::9]:4000");
+    }
+
+    /// The oidc arm: an `api = "oidc"` trusted service's URI is its issuer, straight
+    /// from the policy `OidcConfig` (no endpoints, no on-net address involved).
+    #[test]
+    fn test_uri_for_service_oidc_returns_issuer() {
+        let addr: IpAddr = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        let cfg = crate::test_helpers::make_test_oidc_config();
+
+        let uri = uri_for_service(
+            &ServiceType::Trusted("oidc".to_string()),
+            &addr,
+            &[],
+            Some(&cfg),
+        )
+        .unwrap();
+        assert_eq!(uri, "https://accounts.google.com");
+
+        // An oidc service without its config is an internal error, not a panic.
+        let err = uri_for_service(&ServiceType::Trusted("oidc".to_string()), &addr, &[], None)
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Internal(_)), "{err:?}");
     }
 
     #[test]
@@ -796,14 +819,14 @@ mod test {
         }];
 
         // Non-auth service types are not supported for auth service URIs.
-        let err = uri_for_service(&ServiceType::Regular, &addr, &endpoints).unwrap_err();
+        let err = uri_for_service(&ServiceType::Regular, &addr, &endpoints, None).unwrap_err();
         match err {
             ServiceError::Internal(_) => {}
             other => panic!("unexpected error: {:?}", other),
         }
 
         // Auth services must declare exactly one endpoint scope.
-        let err = uri_for_service(&ServiceType::Authentication, &addr, &[]).unwrap_err();
+        let err = uri_for_service(&ServiceType::Authentication, &addr, &[], None).unwrap_err();
         match err {
             ServiceError::Internal(_) => {}
             other => panic!("unexpected error: {:?}", other),
@@ -816,8 +839,13 @@ mod test {
             port_range: None,
         }];
         // Auth service scope must include a concrete port number.
-        let err = uri_for_service(&ServiceType::Authentication, &addr, &endpoints_missing_port)
-            .unwrap_err();
+        let err = uri_for_service(
+            &ServiceType::Authentication,
+            &addr,
+            &endpoints_missing_port,
+            None,
+        )
+        .unwrap_err();
         match err {
             ServiceError::Internal(_) => {}
             other => panic!("unexpected error: {:?}", other),
@@ -910,6 +938,49 @@ mod test {
 
         let services = mgr.get_auth_services_list(asm).await.unwrap();
         assert!(services.is_empty());
+    }
+
+    /// A policy declaring an `api = "oidc"` trusted service yields an off-net IdP
+    /// descriptor even though no actor provides the service: stype
+    /// `OidcAuthentication`, `service_uri` = issuer, `zpr_addr` = `::`, and the
+    /// `OidcClientConfig` carrying issuer/client_id/scopes.
+    #[tokio::test]
+    async fn test_auth_services_list_includes_oidc_descriptor() {
+        let mgr = make_mgr();
+
+        let oidc_cfg = crate::test_helpers::make_test_oidc_config();
+        let container_bytes = crate::test_helpers::make_oidc_policy(
+            "google",
+            300,
+            &["sub -> user.oidc-subject", "email -> user.email"],
+            &["sub"],
+            oidc_cfg.clone(),
+        );
+
+        let asm = new_assembly_for_tests(None).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(container_bytes)
+            .await
+            .unwrap();
+        let asm = Arc::new(asm);
+
+        let services = mgr.get_auth_services_list(asm).await.unwrap();
+        assert_eq!(services.len(), 1);
+        let sdesc = &services[0];
+        assert_eq!(sdesc.stype, zpr::vsapi_types::ServiceT::OidcAuthentication);
+        assert_eq!(sdesc.service_id, "google");
+        assert_eq!(sdesc.service_uri, oidc_cfg.issuer);
+        assert_eq!(
+            sdesc.zpr_addr,
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            "off-net services carry the unspecified address"
+        );
+        let client = sdesc.oidc.as_ref().expect("oidc client config");
+        assert_eq!(client.issuer, oidc_cfg.issuer);
+        assert_eq!(client.client_id, oidc_cfg.client_id);
+        assert_eq!(client.client_secret, oidc_cfg.client_secret);
+        assert_eq!(client.scopes, oidc_cfg.scopes);
+        assert_eq!(client.allow_offline_access, oidc_cfg.allow_offline_access);
     }
 
     #[tokio::test]

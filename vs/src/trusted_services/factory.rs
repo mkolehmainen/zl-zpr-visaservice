@@ -92,7 +92,8 @@ mod tests {
     use zpr::policy_types::PolicyContainerBytes;
 
     use crate::loaded_policy::LoadedPolicy;
-    use crate::test_helpers::make_trusted_service_policy;
+    use crate::oidc::static_proxy;
+    use crate::test_helpers::{make_oidc_policy, make_test_oidc_config, make_trusted_service_policy};
 
     /// Decode a test policy container into its policy representation.
     fn policy_from_container(container_bytes: Vec<u8>) -> Arc<Policy> {
@@ -109,7 +110,9 @@ mod tests {
         policy: &Policy,
         dir: &std::path::Path,
     ) -> Result<Vec<Arc<dyn TrustedServiceInterface>>, ServiceError> {
-        build_services(&trusted_service_definitions(policy)?, dir)
+        build_services(&trusted_service_definitions(policy)?, dir, &|_id| {
+            static_proxy(None)
+        })
     }
 
     /// A valid file declaration constructs a working mapped attribute store.
@@ -164,6 +167,79 @@ mod tests {
                 "expected failure for id={id} api={api} seconds={seconds:?}"
             );
         }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An `api = "oidc"` declaration builds an OIDC trusted-service store (today the
+    /// whole policy is rejected — the C4 acceptance case).
+    #[test]
+    fn test_oidc_definition_builds_oidc_store() {
+        let dir = std::env::temp_dir().join("vs-bsfp-oidc-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let policy = policy_from_container(make_oidc_policy(
+            "google",
+            300,
+            &["sub -> user.oidc-subject", "email -> user.email"],
+            &["sub"],
+            make_test_oidc_config(),
+        ));
+        let stores = build_from_policy(&policy, &dir).unwrap();
+
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].get_source_id(), "google");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two oidc declarations differing only in `OidcConfig.client_id` compare unequal,
+    /// so a policy install rebuilds the store (the definition carries the full record,
+    /// including its oidc config).
+    #[test]
+    fn test_oidc_definition_change_rebuilds_store() {
+        let make_defs = |client_id: &str| {
+            let mut cfg = make_test_oidc_config();
+            cfg.client_id = client_id.to_string();
+            let policy = policy_from_container(make_oidc_policy(
+                "google",
+                300,
+                &["sub -> user.oidc-subject"],
+                &["sub"],
+                cfg,
+            ));
+            trusted_service_definitions(&policy).unwrap()
+        };
+
+        let defs_a = make_defs("client-a.apps.googleusercontent.com");
+        let defs_a_again = make_defs("client-a.apps.googleusercontent.com");
+        let defs_b = make_defs("client-b.apps.googleusercontent.com");
+
+        assert_eq!(defs_a, defs_a_again, "identical declarations must compare equal");
+        assert_ne!(
+            defs_a, defs_b,
+            "an oidc config change must break definition equality"
+        );
+    }
+
+    /// `api = "oidc"` with no oidc record in the TrustedService is a policy error.
+    #[test]
+    fn test_oidc_definition_without_oidc_record_rejected() {
+        let dir = std::env::temp_dir().join("vs-bsfp-oidc-norec");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // make_trusted_service_policy writes a TrustedService record with oidc: None.
+        let policy = policy_from_container(make_trusted_service_policy(
+            "google",
+            "oidc",
+            Some(300),
+            &["sub -> user.oidc-subject"],
+        ));
+        let err = match build_from_policy(&policy, &dir) {
+            Err(e) => e,
+            Ok(_) => panic!("oidc service without an oidc record must be rejected"),
+        };
+        assert!(matches!(err, ServiceError::Param(_)), "{err:?}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

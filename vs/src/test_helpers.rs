@@ -17,8 +17,8 @@ use libeval::route::{LinkId, Route};
 
 use zpr::policy::v1 as capnp_policy;
 use zpr::policy_types::{
-    AttrExp, JoinPolicy, NetAddr, PFlags, Peering, Service, ServiceType, TrustedService,
-    parse_attribute_mapping,
+    AttrExp, JoinPolicy, NetAddr, OidcConfig, PFlags, Peering, Service, ServiceType,
+    TrustedService, parse_attribute_mapping,
 };
 use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Visa};
 use zpr::write_to::WriteTo;
@@ -224,6 +224,55 @@ pub fn make_trusted_service_policy_with_identity(
     mappings: &[&str],
     identity: &[&str],
 ) -> Vec<u8> {
+    make_trusted_service_policy_full(id, api, expiration_seconds, mappings, identity, None)
+}
+
+/// An [OidcConfig] with plausible Google-shaped values, seeded with the C2/C3
+/// fixture JWKS so a [crate::oidc::KeySource] built from it always has a key.
+pub fn make_test_oidc_config() -> OidcConfig {
+    OidcConfig {
+        issuer: "https://accounts.google.com".to_string(),
+        jwks_uri: String::new(),
+        client_id: "test-client-id.apps.googleusercontent.com".to_string(),
+        client_secret: None,
+        scopes: vec!["openid".to_string(), "email".to_string()],
+        allowed_domains: vec!["*".to_string()],
+        max_auth_age_seconds: 0,
+        allow_offline_access: false,
+        seed_jwks: include_str!("../tests/data/oidc-test-jwks.json").to_string(),
+        jwks_proxy_service: None,
+    }
+}
+
+/// Build a policy container declaring one `api = "oidc"` trusted service: the
+/// `ServiceType::Trusted("oidc")` service plus its `TrustedService` record carrying
+/// `oidc`. Same builder path as [make_trusted_service_policy_with_identity].
+pub fn make_oidc_policy(
+    id: &str,
+    expiration_seconds: u32,
+    mappings: &[&str],
+    identity: &[&str],
+    oidc: OidcConfig,
+) -> Vec<u8> {
+    make_trusted_service_policy_full(
+        id,
+        "oidc",
+        Some(expiration_seconds),
+        mappings,
+        identity,
+        Some(oidc),
+    )
+}
+
+/// The common builder behind the trusted-service policy helpers.
+fn make_trusted_service_policy_full(
+    id: &str,
+    api: &str,
+    expiration_seconds: Option<u32>,
+    mappings: &[&str],
+    identity: &[&str],
+    oidc: Option<OidcConfig>,
+) -> Vec<u8> {
     let service = Service {
         id: id.to_string(),
         endpoints: Vec::new(),
@@ -252,7 +301,7 @@ pub fn make_trusted_service_policy_with_identity(
                     .map(|m| parse_attribute_mapping(m).unwrap())
                     .collect(),
                 identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
-                oidc: None,
+                oidc,
             };
             ts.write_to(&mut policy_bldr.reborrow().init_trusted_services(1).get(0));
         }
