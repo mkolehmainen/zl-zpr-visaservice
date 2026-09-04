@@ -77,7 +77,9 @@ impl TrustedServicesMgr {
     }
 
     /// Atomically replace the entire trusted-service list. The typed OIDC list
-    /// is cleared; callers with OIDC stores use [Self::update_services_with_oidc].
+    /// is cleared. Production code publishes via [Self::update_services_with_oidc];
+    /// this shorthand serves the many tests that register plain stores.
+    #[cfg(test)]
     pub fn update_services(&self, services: Vec<Arc<dyn TrustedServiceInterface>>) {
         self.update_services_with_oidc(services, Vec::new());
     }
