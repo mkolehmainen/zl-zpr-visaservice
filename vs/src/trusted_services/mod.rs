@@ -40,13 +40,19 @@ pub(crate) fn next_revision() -> u64 {
 /// attributes at refresh time -- producing the (key, value) pairs to send to trusted
 /// services. Attributes that are not single-valued cannot name an identity and are
 /// skipped.
+///
+/// `user.zpr.authority` is always included when the actor carries it, whether or
+/// not policy names it: identities such as an OIDC `sub` are unique only within
+/// the service that vouched for them, so sources need the authority pair to scope
+/// per-issuer identities to the issuing service (see
+/// `crate::oidc::OidcTrustedService::get_attributes_for_actor`).
 pub(crate) fn lookup_identities<'a>(
     lookup_keys: &[&str],
     attrs: impl Iterator<Item = &'a Attribute>,
 ) -> Vec<(String, String)> {
     let mut identities = Vec::new();
     for attr in attrs {
-        if lookup_keys.contains(&attr.get_key()) {
+        if lookup_keys.contains(&attr.get_key()) || attr.get_key() == key::USER_AUTHORITY {
             if let Ok(value) = attr.get_single_value() {
                 identities.push((attr.get_key().to_string(), value.to_string()));
             }

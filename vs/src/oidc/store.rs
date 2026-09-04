@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use libeval::attribute::{Attribute, AttributeSource};
+use libeval::attribute::{Attribute, AttributeSource, key};
 use zpr::policy_types::{OidcConfig, TrustedService};
 
 use crate::error::ServiceError;
@@ -149,6 +149,12 @@ impl OidcTrustedService {
         }
 
         let attrs: Vec<Attribute> = mapped.into_values().collect();
+        // Opportunistic eviction: a subject that disconnects and never returns
+        // would otherwise stay cached forever (expiry is only checked on lookup
+        // of that exact subject). Sweeping on every admission bounds the cache
+        // to subjects admitted within one expiration window.
+        let now = SystemTime::now();
+        self.admitted.retain(|_, (_, expiry)| *expiry > now);
         self.admitted
             .insert(token.sub.clone(), (attrs.clone(), expires));
         self.revision.store(next_revision(), Ordering::SeqCst);
@@ -169,9 +175,15 @@ impl OidcTrustedService {
 #[async_trait]
 impl TrustedServiceInterface for OidcTrustedService {
     /// Serve the cached claims of every admitted `sub` among `identities`
-    /// (matched under the mapped sub key). Expired records are dropped, not
-    /// served. Matching more than one admitted identity unions the results;
-    /// a same-key/different-value disagreement fails closed per the trait
+    /// (matched under the mapped sub key). OIDC subjects are unique only
+    /// within their issuer, so the lookup set must also carry a
+    /// `user.zpr.authority` pair naming THIS service — the service that
+    /// validated the actor's token. Without it (or with another service's
+    /// authority) nothing is served: two providers mapping `sub` to the same
+    /// ZPR key must never serve each other's admitted actors, even for a
+    /// colliding subject string. Expired records are dropped, not served.
+    /// Matching more than one admitted identity unions the results; a
+    /// same-key/different-value disagreement fails closed per the trait
     /// contract.
     async fn get_attributes_for_actor(
         &self,
@@ -180,6 +192,14 @@ impl TrustedServiceInterface for OidcTrustedService {
         let Some(sub_key) = self.mapped_sub_key() else {
             return Ok(Vec::new());
         };
+        // Bind cached admissions to the issuing service: only an actor this
+        // service vouched for (authority == this service id) may match.
+        let vouched_here = identities
+            .iter()
+            .any(|(k, v)| k == key::USER_AUTHORITY && *v == self.id);
+        if !vouched_here {
+            return Ok(Vec::new());
+        }
         let now = SystemTime::now();
         let mut merged: BTreeMap<String, Attribute> = BTreeMap::new();
         for (ident_key, ident_value) in identities {

@@ -266,21 +266,57 @@ impl PolicyMgr {
         let policy = loaded.policy();
         let resolved_peers_by_node = resolver.resolve_topology(&policy).await?;
         let ts_definitions = trusted_service_definitions(&policy)?;
-        let (trusted_services, oidc_services) = match previous {
-            // Identical declarations mean the live stores are still correct.
-            // Reusing them keeps their revisions, otherwise a policy install
-            // makes every actor revision-stale against every source. Cached
-            // attribute data now only moves on a TTL reload or an admin flush.
-            Some(prev) if prev.ts_definitions == ts_definitions => {
-                (prev.trusted_services.clone(), prev.oidc_services.clone())
+        // Stores are matched per service definition: a declaration identical to
+        // the live one keeps its store (and revision, and any cached/admitted
+        // data — an OIDC store rebuilt with an empty admitted cache would strip
+        // connected users' attributes until reconnect), while changed or new
+        // declarations build fresh. Matching is keyed on the service id, never
+        // on definition-vector equality: `Policy::list_services` iterates a
+        // HashMap, so vector order is meaningless across installs.
+        //
+        // No proxy resolution yet for new stores: `build_state` has no actor-DB
+        // access, so a policy-named `jwks_proxy_service` resolves to "no proxy
+        // connected" and the key source serves its policy seed (C3 stale
+        // tolerance). Live proxy resolution and periodic refresh land with the
+        // connect path (C5).
+        let mut trusted_services = Vec::with_capacity(ts_definitions.len());
+        let mut oidc_services = Vec::new();
+        for definition in &ts_definitions {
+            let reusable = previous.and_then(|prev| {
+                prev.ts_definitions
+                    .iter()
+                    .find(|prev_def| prev_def.id() == definition.id())
+                    .filter(|prev_def| *prev_def == definition)
+                    .and_then(|_| {
+                        prev.trusted_services
+                            .iter()
+                            .find(|store| store.get_source_id() == definition.id())
+                            .cloned()
+                    })
+            });
+            match reusable {
+                Some(store) => {
+                    if let Some(prev) = previous {
+                        if let Some(oidc) = prev
+                            .oidc_services
+                            .iter()
+                            .find(|oidc| oidc.get_source_id() == definition.id())
+                        {
+                            oidc_services.push(oidc.clone());
+                        }
+                    }
+                    trusted_services.push(store);
+                }
+                None => {
+                    let (mut built, mut built_oidc) =
+                        build_services(std::slice::from_ref(definition), file_ts_dir, &|_id| {
+                            static_proxy(None)
+                        })?;
+                    trusted_services.append(&mut built);
+                    oidc_services.append(&mut built_oidc);
+                }
             }
-            // No proxy resolution yet: `build_state` has no actor-DB access, so a
-            // policy-named `jwks_proxy_service` resolves to "no proxy connected"
-            // and the key source serves its policy seed (C3 stale tolerance).
-            // Live proxy resolution and periodic refresh land with the connect
-            // path (C5).
-            _ => build_services(&ts_definitions, file_ts_dir, &|_id| static_proxy(None))?,
-        };
+        }
         Ok(PolicyState {
             policy,
             container: loaded.container().clone(),

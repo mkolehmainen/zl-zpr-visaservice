@@ -32,11 +32,27 @@ pub struct TrustedServiceDefinition {
     record: TrustedService,
 }
 
+impl TrustedServiceDefinition {
+    /// The declared trusted-service id (also the store's source id), the key
+    /// unchanged declarations are matched under across policy installs.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// Validate and extract the trusted services a policy declares.
+///
+/// Two `api = "oidc"` declarations sharing an issuer are rejected: token
+/// validation resolves the provider by its `iss` claim, so a duplicate issuer
+/// would make which client configuration checks a token depend on unordered
+/// service iteration. The error names both services and the issuer, mirroring
+/// the compiler-side collision diagnostics.
 pub fn trusted_service_definitions(
     policy: &Policy,
 ) -> Result<Vec<TrustedServiceDefinition>, ServiceError> {
     let mut definitions = Vec::new();
+    let mut issuer_owners: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for service in policy.list_services() {
         let ServiceType::Trusted(api) = &service.kind else {
@@ -61,11 +77,28 @@ pub fn trusted_service_definitions(
                 service.id
             )));
         };
-        if api == TS_API_OIDC && trusted_service.oidc.is_none() {
-            return Err(ServiceError::Param(format!(
-                "trusted service '{}': api 'oidc' requires an oidc config in the policy record",
-                service.id
-            )));
+        if api == TS_API_OIDC {
+            let Some(cfg) = &trusted_service.oidc else {
+                return Err(ServiceError::Param(format!(
+                    "trusted service '{}': api 'oidc' requires an oidc config in the policy record",
+                    service.id
+                )));
+            };
+            if let Some(other) = issuer_owners.insert(cfg.issuer.clone(), service.id.clone()) {
+                // Sort the pair: list_services iterates a HashMap, and the
+                // diagnostic must not depend on its order.
+                let (first, second) = if other <= service.id {
+                    (other, service.id.clone())
+                } else {
+                    (service.id.clone(), other)
+                };
+                return Err(ServiceError::Param(format!(
+                    "trusted services '{first}' and '{second}' both declare oidc issuer \
+                     '{}': issuers must be unique so a token's iss claim selects exactly \
+                     one provider",
+                    cfg.issuer
+                )));
+            }
         }
 
         definitions.push(TrustedServiceDefinition {
