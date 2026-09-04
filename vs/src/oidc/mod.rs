@@ -6,9 +6,12 @@
 //! module only answers "is this token valid for that provider, and what do we
 //! keep from it".
 
+mod jwks;
 mod validate;
 
-// The re-export is the module's public surface; nothing consumes it until
+// The re-exports are the module's public surface; nothing consumes them until
 // OIDC-C4/C5 wire validation into the connect path.
+#[allow(unused_imports)]
+pub use jwks::KeySource;
 #[allow(unused_imports)]
 pub use validate::{IdpParams, OidcError, ValidatedToken, validate_id_token};
