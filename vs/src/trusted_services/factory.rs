@@ -38,6 +38,13 @@ impl TrustedServiceDefinition {
     pub fn id(&self) -> &str {
         &self.id
     }
+
+    /// The pinned `OidcConfig` for an `api = "oidc"` declaration, `None`
+    /// otherwise. `PolicyMgr::build_state` reads `jwks_proxy_service` from it
+    /// to build the ActorDb-backed proxy resolver (zipline#19).
+    pub fn oidc_config(&self) -> Option<&zpr::policy_types::OidcConfig> {
+        self.record.oidc.as_ref()
+    }
 }
 
 /// Validate and extract the trusted services a policy declares.
@@ -119,10 +126,10 @@ pub fn trusted_service_definitions(
 /// Returns the full `dyn` store list plus its typed OIDC subset (each OIDC
 /// store appears in both), so `TrustedServicesMgr` can serve
 /// `oidc_service_for_issuer` lookups for the connect path.
-pub fn build_services(
+pub async fn build_services(
     definitions: &[TrustedServiceDefinition],
     file_ts_dir: &Path,
-    proxy_for: &dyn Fn(&str) -> ProxyResolver,
+    proxy_for: &(dyn Fn(&str) -> ProxyResolver + Sync),
 ) -> Result<
     (
         Vec<Arc<dyn TrustedServiceInterface>>,
@@ -143,8 +150,9 @@ pub fn build_services(
                         definition.id
                     )));
                 };
-                let keys =
-                    KeySource::from_policy(cfg, proxy_for(&definition.id)).map_err(|error| {
+                let keys = KeySource::from_policy(cfg, proxy_for(&definition.id))
+                    .await
+                    .map_err(|error| {
                         ServiceError::TrustedServiceInit(format!(
                             "TS '{}' failed to build JWKS key source: {error}",
                             definition.id
@@ -193,13 +201,14 @@ mod tests {
 
     /// Validate and build in one step, as `PolicyMgr` does for a brand-new policy.
     /// Yields only the `dyn` list; the typed OIDC subset is manager plumbing.
-    fn build_from_policy(
+    async fn build_from_policy(
         policy: &Policy,
         dir: &std::path::Path,
     ) -> Result<Vec<Arc<dyn TrustedServiceInterface>>, ServiceError> {
         build_services(&trusted_service_definitions(policy)?, dir, &|_id| {
             static_proxy(None)
         })
+        .await
         .map(|(services, _oidc)| services)
     }
 
@@ -220,7 +229,7 @@ mod tests {
             Some(3600),
             &["color -> user.color"],
         ));
-        let stores = build_from_policy(&policy, &dir).unwrap();
+        let stores = build_from_policy(&policy, &dir).await.unwrap();
 
         assert_eq!(stores.len(), 1);
         assert_eq!(stores[0].get_source_id(), "attrfile");
@@ -236,8 +245,8 @@ mod tests {
     }
 
     /// Invalid or unsupported declarations reject the policy atomically.
-    #[test]
-    fn test_build_services_from_policy_rejects_bad_declarations() {
+    #[tokio::test]
+    async fn test_build_services_from_policy_rejects_bad_declarations() {
         let dir = std::env::temp_dir().join("vs-bsfp-bad");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -251,7 +260,7 @@ mod tests {
         for (id, api, seconds) in cases {
             let policy = policy_from_container(make_trusted_service_policy(id, api, seconds, &[]));
             assert!(
-                build_from_policy(&policy, &dir).is_err(),
+                build_from_policy(&policy, &dir).await.is_err(),
                 "expected failure for id={id} api={api} seconds={seconds:?}"
             );
         }
@@ -261,8 +270,8 @@ mod tests {
 
     /// An `api = "oidc"` declaration builds an OIDC trusted-service store (today the
     /// whole policy is rejected — the C4 acceptance case).
-    #[test]
-    fn test_oidc_definition_builds_oidc_store() {
+    #[tokio::test]
+    async fn test_oidc_definition_builds_oidc_store() {
         let dir = std::env::temp_dir().join("vs-bsfp-oidc-ok");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -273,7 +282,7 @@ mod tests {
             &["sub"],
             make_test_oidc_config(),
         ));
-        let stores = build_from_policy(&policy, &dir).unwrap();
+        let stores = build_from_policy(&policy, &dir).await.unwrap();
 
         assert_eq!(stores.len(), 1);
         assert_eq!(stores[0].get_source_id(), "google");
@@ -344,8 +353,8 @@ mod tests {
     }
 
     /// `api = "oidc"` with no oidc record in the TrustedService is a policy error.
-    #[test]
-    fn test_oidc_definition_without_oidc_record_rejected() {
+    #[tokio::test]
+    async fn test_oidc_definition_without_oidc_record_rejected() {
         let dir = std::env::temp_dir().join("vs-bsfp-oidc-norec");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -356,7 +365,7 @@ mod tests {
             Some(300),
             &["sub -> user.oidc-subject"],
         ));
-        let err = match build_from_policy(&policy, &dir) {
+        let err = match build_from_policy(&policy, &dir).await {
             Err(e) => e,
             Ok(_) => panic!("oidc service without an oidc record must be rejected"),
         };

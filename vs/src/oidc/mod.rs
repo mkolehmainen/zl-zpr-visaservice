@@ -12,8 +12,10 @@ mod validate;
 
 // The re-exports are the module's public surface; nothing consumes them until
 // OIDC-C4/C5 wire validation into the connect path.
+#[cfg(test)]
+pub(crate) use jwks::test_support;
 #[allow(unused_imports)]
-pub use jwks::{KeySource, ProxyResolver, static_proxy};
+pub use jwks::{KeySource, ProxyFuture, ProxyResolver, static_proxy};
 #[allow(unused_imports)]
 pub use store::OidcTrustedService;
 #[allow(unused_imports)]
