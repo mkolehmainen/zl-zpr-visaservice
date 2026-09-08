@@ -29,6 +29,15 @@ use super::OidcError;
 /// connect attempt hostage: on timeout the cached keys keep serving.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Minimum spacing between *credential-triggered* JWKS fetches
+/// ([`KeySource::refresh_coalesced`]). The `kid` that triggers such a fetch
+/// comes from an unverified JWT header, so without a cooldown any adapter
+/// could make the visa service hammer the identity provider with one
+/// outbound fetch (and up to [`FETCH_TIMEOUT`]) per bogus token. Providers
+/// rotate keys rarely; 30 s bounds the flood while keeping post-rotation
+/// recovery prompt. Matches `config::OIDC_NO_KEYS_RETRY_SECS`.
+const REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// Hard cap on a JWKS response body. Real provider key sets are a few
 /// kilobytes; anything approaching this is hostile or broken, and reading
 /// it unbounded would let a compromised endpoint balloon memory.
@@ -64,6 +73,13 @@ pub struct KeySource {
     /// Yields the CONNECT proxy's current URL; called on every refresh so
     /// the fetch follows the providing actor when it moves.
     proxy: ProxyResolver,
+    /// Serializes credential-triggered refreshes so concurrent requests
+    /// coalesce onto one in-flight fetch ([`Self::refresh_coalesced`]).
+    refresh_gate: tokio::sync::Mutex<()>,
+    /// When the last credential-triggered refresh *attempt* started (success
+    /// or failure), enforcing [`REFRESH_COOLDOWN`]. Distinct from `last_ok`,
+    /// which records successes only.
+    last_attempt: Mutex<Option<SystemTime>>,
     /// Extra TLS trust roots for the fetch client. Production always
     /// verifies against system roots only; tests inject their self-signed
     /// server certificate here.
@@ -112,6 +128,8 @@ impl KeySource {
             last_ok: Mutex::new(None),
             cfg: cfg.clone(),
             proxy,
+            refresh_gate: tokio::sync::Mutex::new(()),
+            last_attempt: Mutex::new(None),
             #[cfg(test)]
             extra_roots: Vec::new(),
         })
@@ -214,9 +232,65 @@ impl KeySource {
         Ok(())
     }
 
+    /// Credential-triggered refresh: coalesced and rate-limited.
+    ///
+    /// The connect path calls this when an id_token names an unknown `kid` or
+    /// the cache has no keys yet. Both triggers derive from *unverified*
+    /// attacker-suppliable input, so unlike [`Self::refresh`] this entry
+    /// point:
+    ///
+    /// - **single-flights**: concurrent callers share one in-flight fetch
+    ///   (a caller that waited out someone else's successful fetch returns
+    ///   `Ok` without fetching again), and
+    /// - **rate-limits**: an attempt within [`REFRESH_COOLDOWN`] of the
+    ///   previous one is refused without touching the network, so a flood of
+    ///   bogus tokens cannot make the visa service hammer the provider.
+    ///
+    /// The periodic refresher keeps using [`Self::refresh`] directly — it is
+    /// not attacker-triggerable and must not be starved by the cooldown.
+    pub async fn refresh_coalesced(&self) -> Result<(), OidcError> {
+        let entered = SystemTime::now();
+        let _gate = self.refresh_gate.lock().await;
+
+        // Single-flight: a fetch that succeeded while we waited on the gate
+        // already delivered the keys we came for — share it, don't re-fetch.
+        if self.last_ok().is_some_and(|ok| ok >= entered) {
+            return Ok(());
+        }
+
+        // Cooldown: refuse without touching the network when the previous
+        // attempt (success or failure) is too recent. This also covers the
+        // waiter whose leader's fetch just *failed* — retrying immediately
+        // would only double the hammering the leader already took the error
+        // for.
+        let previous_attempt = *self
+            .last_attempt
+            .lock()
+            .expect("last_attempt lock poisoned");
+        if let Some(attempt) = previous_attempt {
+            let since = SystemTime::now()
+                .duration_since(attempt)
+                .unwrap_or(Duration::ZERO);
+            if since < REFRESH_COOLDOWN {
+                return Err(OidcError::Rejected(
+                    "JWKS refresh in cooldown; cached keys keep serving".into(),
+                ));
+            }
+        }
+
+        *self
+            .last_attempt
+            .lock()
+            .expect("last_attempt lock poisoned") = Some(SystemTime::now());
+        self.refresh().await
+    }
+
     /// Refresh every `period` in a background task. Failures are logged
     /// (never the body) and the stale keys keep serving until the next tick.
-    #[allow(dead_code)] // consumed by C4/C5 wiring
+    /// Deliberately bypasses the [`Self::refresh_coalesced`] cooldown: the
+    /// periodic tick is operator-configured (`oidc_refresh_seconds`), not
+    /// attacker-triggerable.
+    #[allow(dead_code)] // wiring lands with the proxy-resolver follow-up to zipline#11 (PR #6 review)
     pub fn spawn_refresher(self: Arc<Self>, period: Duration) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -609,6 +683,102 @@ mod tests {
             "{err}"
         );
         assert_eq!(kids(&ks.current()), vec!["k1".to_string()]);
+    }
+
+    /// Counting JWKS responder: like [spawn_jwks_server] but records how many
+    /// requests it served and holds each response for `delay` (so concurrent
+    /// callers demonstrably overlap).
+    async fn spawn_counting_jwks_server(
+        body: String,
+        delay: Duration,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = count.clone();
+        let app = axum::Router::new().route(
+            "/jwks",
+            axum::routing::get(move || {
+                let body = body.clone();
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    body
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, count)
+    }
+
+    #[tokio::test]
+    async fn test_coalesced_refresh_single_flight() {
+        // Review fix (PR #6): the `kid` that triggers a connect-path refresh
+        // comes from an unverified JWT header, so a flood of bogus kids must
+        // not fan out into a fetch per request. Concurrent coalesced
+        // refreshes share one in-flight fetch.
+        let (addr, count) =
+            spawn_counting_jwks_server(k2_jwks_json(), Duration::from_millis(300)).await;
+        let c = cfg(seed_jwks_json(), &format!("http://{addr}/jwks"), None);
+        let ks = Arc::new(KeySource::from_policy(&c, static_proxy(None)).unwrap());
+
+        let tasks: Vec<_> = (0..5)
+            .map(|_| {
+                let ks = ks.clone();
+                tokio::spawn(async move { ks.refresh_coalesced().await })
+            })
+            .collect();
+        for t in tasks {
+            t.await
+                .unwrap()
+                .expect("every coalesced caller shares the successful fetch");
+        }
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "five concurrent refreshes must produce exactly one fetch"
+        );
+        assert!(kids(&ks.current()).contains(&"k2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_coalesced_refresh_cooldown_blocks_repeat() {
+        // Review fix (PR #6): sequential attacker-triggered refreshes are
+        // rate-limited per provider — a second coalesced refresh inside the
+        // cooldown window never reaches the network.
+        let (addr, count) = spawn_counting_jwks_server(k2_jwks_json(), Duration::ZERO).await;
+        let c = cfg(seed_jwks_json(), &format!("http://{addr}/jwks"), None);
+        let ks = KeySource::from_policy(&c, static_proxy(None)).unwrap();
+
+        ks.refresh_coalesced().await.unwrap();
+        let err = ks
+            .refresh_coalesced()
+            .await
+            .expect_err("a repeat refresh inside the cooldown must be refused");
+        assert!(
+            matches!(&err, OidcError::Rejected(m) if m.contains("cooldown")),
+            "{err}"
+        );
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the cooldown-blocked refresh must not fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plain_refresh_bypasses_cooldown() {
+        // The raw `refresh()` entry point (periodic refresher, tests) is not
+        // attacker-triggerable and deliberately ignores the cooldown.
+        let (addr, count) = spawn_counting_jwks_server(k2_jwks_json(), Duration::ZERO).await;
+        let c = cfg(seed_jwks_json(), &format!("http://{addr}/jwks"), None);
+        let ks = KeySource::from_policy(&c, static_proxy(None)).unwrap();
+
+        ks.refresh_coalesced().await.unwrap();
+        ks.refresh().await.unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

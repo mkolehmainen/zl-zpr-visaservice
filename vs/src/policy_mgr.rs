@@ -118,6 +118,44 @@ impl PolicySnapshot {
             .unwrap_or_default()
     }
 
+    /// The attribute stores for the trusted services this snapshot's policy
+    /// declares. Connect-path authorization queries these — not the live
+    /// `ts_mgr` list — so an in-flight authentication is pinned to one
+    /// coherent policy/store pair (PR #6 review).
+    pub fn trusted_services(&self) -> &[Arc<dyn TrustedServiceInterface>] {
+        &self.0.trusted_services
+    }
+
+    /// The OIDC trusted service pinned to `issuer` in this snapshot, when its
+    /// policy declares one. The connect path resolves an incoming token's
+    /// provider through the snapshot rather than the live manager so
+    /// validation and authorization cannot straddle a policy update
+    /// (PR #6 review).
+    pub fn oidc_service_for_issuer(&self, issuer: &str) -> Option<Arc<OidcTrustedService>> {
+        self.0
+            .oidc_services
+            .iter()
+            .find(|service| service.issuer() == issuer)
+            .cloned()
+    }
+
+    /// Build a snapshot directly from a policy and its stores, for unit tests
+    /// that drive `authorize_connection` without a full policy install.
+    #[cfg(test)]
+    pub fn for_tests(
+        policy: Arc<Policy>,
+        trusted_services: Vec<Arc<dyn TrustedServiceInterface>>,
+    ) -> Self {
+        PolicySnapshot(Arc::new(PolicyState {
+            policy,
+            container: PolicyContainerBytes::from(Vec::new()),
+            resolved_peers_by_node: HashMap::new(),
+            trusted_services,
+            oidc_services: Vec::new(),
+            ts_definitions: Vec::new(),
+        }))
+    }
+
     /// Dispatches to [Policy::describe_link] on the captured policy.
     ///
     /// ## Errors
@@ -277,8 +315,13 @@ impl PolicyMgr {
         // No proxy resolution yet for new stores: `build_state` has no actor-DB
         // access, so a policy-named `jwks_proxy_service` resolves to "no proxy
         // connected" and the key source serves its policy seed (C3 stale
-        // tolerance). Live proxy resolution and periodic refresh land with the
-        // connect path (C5).
+        // tolerance). The connect path (C5) refreshes on demand — coalesced and
+        // rate-limited — which covers providers with direct egress; wiring an
+        // actor-backed proxy resolver (ActorDb lookup of the providing actor,
+        // per the master plan's C3 "Proxy resolution" paragraph) needs plumbing
+        // this module does not have and is tracked as a follow-up to zipline#11
+        // (PR #6 review, finding 2). Until then a proxied provider's refresh
+        // fails "proxy not reachable" and its policy seed keeps serving.
         let mut trusted_services = Vec::with_capacity(ts_definitions.len());
         let mut oidc_services = Vec::new();
         for definition in &ts_definitions {

@@ -109,20 +109,23 @@ impl TrustedServicesMgr {
             .cloned()
     }
 
-    /// Query every trusted service concurrently for an actor's attributes.
+    /// Query every given trusted service concurrently for an actor's attributes.
     ///
     /// `identities` is the actor's lookup-identity (key, value) set; see
-    /// [TrustedServiceInterface::get_attributes_for_actor].
+    /// [TrustedServiceInterface::get_attributes_for_actor]. Takes an explicit
+    /// store list — the connect path passes the stores captured in a
+    /// [crate::policy_mgr::PolicySnapshot] rather than this manager's live
+    /// list, pinning the whole authentication to one policy revision
+    /// (PR #6 review).
     ///
     /// Each result is paired with the service's source id so the caller can attribute
     /// it (e.g. to derive `user.zpr.authority` from the vending source) without
     /// trusting the source string stamped on the returned attributes themselves.
-    pub async fn get_attributes_for_actor(
-        &self,
+    pub async fn get_attributes_for_actor_from(
+        services: &[Arc<dyn TrustedServiceInterface>],
         identities: &[(String, String)],
     ) -> Vec<(String, Result<Vec<Attribute>, ServiceError>)> {
-        let snapshot = self.services.load_full();
-        let futures = snapshot.iter().map(|service| {
+        let futures = services.iter().map(|service| {
             let service = service.clone();
             async move {
                 (
