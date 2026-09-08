@@ -203,6 +203,22 @@ impl EvalContext {
         authenticated_claims: Option<&[Attribute]>,
         unauthenticated_claims: Option<&[Attribute]>,
     ) -> Result<Actor, EvalError> {
+        self.approve_connection_detailed(authenticated_claims, unauthenticated_claims)
+            .map(|(actor, _)| actor)
+    }
+
+    /// As [EvalContext::approve_connection], additionally reporting whether any join
+    /// policy matched the claims. A non-node with no matching join policy is still
+    /// approved -- with its unauthenticated claims scrubbed -- because a device-only
+    /// adapter may stay connected without a join policy (#227). Callers that must
+    /// refuse such a connection anyway (the visa service's `policyDenied` for OIDC
+    /// user logins, zipline#11) branch on the returned flag rather than this crate
+    /// guessing their policy.
+    pub fn approve_connection_detailed(
+        &self,
+        authenticated_claims: Option<&[Attribute]>,
+        unauthenticated_claims: Option<&[Attribute]>,
+    ) -> Result<(Actor, bool), EvalError> {
         if authenticated_claims.is_none() {
             return Err(EvalError::AttributeMissing(
                 "no authenticated claims provided".into(),
@@ -340,7 +356,7 @@ impl EvalContext {
             }
         }
 
-        Ok(actor)
+        Ok((actor, matched_join_policy))
     }
 
     /// Similar to [EvalContext::approve_connection] except this assumes that the passed actor

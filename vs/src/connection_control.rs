@@ -25,19 +25,24 @@ use std::usize;
 use tracing::{debug, error, info, warn};
 
 use libeval::actor::{Actor, Role};
-use libeval::attribute::{Attribute, key};
+use libeval::attribute::{Attribute, AttributeSource, key};
 use libeval::eval::EvalContext;
 use libeval::policy::Policy;
 
 use zpr::vsapi::v1 as vsapi;
-use zpr::vsapi_types::{AuthBlob, ChallengeAlg, Claim, ConnectRequest, PublicKey, SelfSignedBlob};
+use zpr::vsapi_types::{
+    ApiResponseError, AuthBlob, ChallengeAlg, Claim, ConnectRequest, ErrorCode, OidcBlob,
+    PublicKey, SelfSignedBlob,
+};
 
 use crate::assembly::Assembly;
 use crate::auth;
 use crate::config;
 use crate::error::ServiceError;
 use crate::logging::targets::CC;
-use crate::trusted_services::{derive_user_authority, lookup_identities};
+use crate::oidc::{OidcError, validate_id_token};
+use crate::policy_mgr::PolicySnapshot;
+use crate::trusted_services::{TrustedServicesMgr, derive_user_authority, lookup_identities};
 
 // TODO: move to libeval
 const CLASS_DEVICE: &str = "device";
@@ -51,8 +56,6 @@ const ATTR_KEY_VS_IDENT: &str = "zpr.vs.bootstrap.ident";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Namespace {
     Device,
-    // Constructed first by the C5 OIDC arm (zipline#11); part of the C1 contract shape.
-    #[allow(dead_code)]
     User,
 }
 
@@ -275,6 +278,12 @@ impl ConnectionControl {
             None => warn!(target: CC, "adapter via {connect_via} sent no usable A2A DH public key"),
         }
 
+        // One coherent policy view for the whole operation: blob validation,
+        // trusted-service lookups, and authorization all read this snapshot,
+        // so a concurrent policy update cannot validate a credential under
+        // one revision and authorize it under another (PR #6 review).
+        let psnap = asm.policy_mgr.get_current_snapshot();
+
         // Validate every presented blob (spec: presented-and-invalid fails the whole
         // connection; absent is not a failure). Each arm authenticates one identity
         // namespace and yields its authenticated claims; the first error aborts, and
@@ -290,7 +299,11 @@ impl ConnectionControl {
                                 .expires_in(config::DEFAULT_AUTH_EXPIRATION)
                                 .value(key::AUTHORITY_METHOD_BOOTSTRAP),
                         ];
-                        authd.extend(self.authenticate_ss_blob(&asm, ssb, &scrubbed_claims)?);
+                        authd.extend(self.authenticate_ss_blob(
+                            psnap.policy(),
+                            ssb,
+                            &scrubbed_claims,
+                        )?);
                         BlobOutcome {
                             authd,
                             namespace: Namespace::Device,
@@ -302,10 +315,9 @@ impl ConnectionControl {
                         "external auth not yet supported".into(),
                     ));
                 }
-                // Replaced with real OIDC validation in C5 (zipline#11).
-                AuthBlob::Oidc(_) => {
-                    return Err(ServiceError::Internal("OIDC not yet supported".into()));
-                }
+                // A user login: validate the id_token offline against the declared
+                // provider and stamp the user authority (zipline#11, C5).
+                AuthBlob::Oidc(oidc_blob) => self.authenticate_oidc_blob(&psnap, oidc_blob).await?,
             };
             if seen_namespaces.contains(&outcome.namespace) {
                 return Err(ServiceError::Param(format!(
@@ -317,17 +329,20 @@ impl ConnectionControl {
             authd_claims.extend(outcome.authd);
         }
 
-        // Every presented blob validated -- now run through policy.
-        let policy = asm.policy_mgr.get_current();
+        // Every presented blob validated -- now run through policy. A validated
+        // user (OIDC) blob makes "no join policy matched" a refusal (policyDenied)
+        // rather than the #227 device-only fallthrough.
+        let user_login_presented = seen_namespaces.contains(&Namespace::User);
         let endpoint_cn = authd_or_claimed_cn(&authd_claims, &scrubbed_claims);
         let mut actor = self
             .authorize_connection(
                 asm,
-                &policy,
+                &psnap,
                 &endpoint_cn,
                 scrubbed_claims,
                 authd_claims,
                 req.dock_interface,
+                user_login_presented,
             )
             .await?;
 
@@ -392,11 +407,19 @@ impl ConnectionControl {
             authd_claims.push(Attribute::builder(claim.key).value(claim.value));
         }
 
-        let policy = asm.policy_mgr.get_current();
+        let psnap = asm.policy_mgr.get_current_snapshot();
 
         // Ok checks out -- now run through policy.
         let vs_actor = self
-            .authorize_connection(asm, &policy, &config::VS_CN, Vec::new(), authd_claims, 0)
+            .authorize_connection(
+                asm,
+                &psnap,
+                &config::VS_CN,
+                Vec::new(),
+                authd_claims,
+                0,
+                false,
+            )
             .await?;
 
         // authorize_connection no longer stamps a blanket authority, so the
@@ -412,7 +435,7 @@ impl ConnectionControl {
     /// actually happened (authorize_connection never promotes it).
     fn authenticate_ss_blob(
         &self,
-        asm: &Arc<Assembly>,
+        policy: &Policy,
         ssb: &SelfSignedBlob,
         unauthd_claims: &[Attribute],
     ) -> Result<Vec<Attribute>, ServiceError> {
@@ -439,7 +462,6 @@ impl ConnectionControl {
             }
         }
 
-        let policy = asm.policy_mgr.get_current();
         let pubkey = policy.get_bootstrap_key_by_cn(&ssb.cn).ok_or_else(|| {
             ServiceError::AuthenticationFailed(format!("no key found in policy for cn {}", ssb.cn))
         })?;
@@ -454,6 +476,124 @@ impl ConnectionControl {
         // The RSA blob signature verified against the bootstrap key policy binds to
         // this CN, so the CN is authenticated.
         Ok(vec![Attribute::builder(key::CN).value(&ssb.cn)])
+    }
+
+    /// Verify one OIDC auth blob (zipline#11, C5): resolve the declared provider by
+    /// the blob's issuer (a selector, not a trust input -- client_id and
+    /// allowed_domains always come from policy), validate the `id_token` offline
+    /// against the provider's cached JWKS, admit the mapped claims into the
+    /// provider's store, and yield the user-namespace outcome.
+    ///
+    /// The outcome carries the namespaced user authority plus the mapped subject:
+    /// the authority names the vouching service and the subject anchors the
+    /// trusted-service lookup in [Self::authorize_connection] that serves the
+    /// remaining mapped claims (C4). Token claims are never pushed directly.
+    ///
+    /// Failures are classified per the Contract 2 error table and returned as
+    /// [ServiceError::ApiResponse] so the real code and retry hint reach the wire.
+    /// Wire messages stay generic -- no claim values, no issuer echo, no
+    /// validation internals -- so error responses cannot become a claim-probing
+    /// oracle; the classified detail (claim names only, never values) goes to the
+    /// log.
+    async fn authenticate_oidc_blob(
+        &self,
+        psnap: &PolicySnapshot,
+        blob: &OidcBlob,
+    ) -> Result<BlobOutcome, ServiceError> {
+        // Resolve the provider from the pinned snapshot, not the live ts_mgr
+        // list, so validation cannot straddle a concurrent policy update
+        // relative to the authorization step (PR #6 review).
+        let Some(svc) = psnap.oidc_service_for_issuer(&blob.issuer) else {
+            // The blob's issuer is attacker-supplied bytes: neither logged nor echoed.
+            warn!(target: CC, "OIDC blob names an issuer with no declared trusted service");
+            return Err(ApiResponseError::new_code_msg(
+                ErrorCode::ParamError,
+                "no identity provider declared for issuer",
+            )
+            .into());
+        };
+
+        let now = SystemTime::now();
+        let mut result = validate_id_token(
+            &blob.id_token,
+            &svc.keys().current(),
+            &svc.params(),
+            &blob.nonce,
+            now,
+        );
+        if matches!(
+            result,
+            Err(OidcError::UnknownKid(_)) | Err(OidcError::NoKeys)
+        ) {
+            // Two cache states are recoverable by fetching (C3): UnknownKid
+            // (the provider rotated its signing keys) and NoKeys (policy
+            // shipped an empty seed_jwks, so the very first login finds an
+            // empty cache). Refresh once and retry once. Both triggers derive
+            // from unverified input, so the refresh is coalesced and
+            // rate-limited (see [KeySource::refresh_coalesced]); a failed or
+            // cooldown-refused refresh keeps the cached keys serving and the
+            // retry then fails the same way and is classified below.
+            if let Err(e) = svc.keys().refresh_coalesced().await {
+                warn!(target: CC, "JWKS refresh after validation failure failed for provider '{}': {e}", svc.id());
+            }
+            result = validate_id_token(
+                &blob.id_token,
+                &svc.keys().current(),
+                &svc.params(),
+                &blob.nonce,
+                now,
+            );
+        }
+        let token = match result {
+            Ok(token) => token,
+            Err(err) => {
+                // The OidcError detail carries claim names, never values (C2), so
+                // it is safe to log -- but not to send.
+                info!(target: CC, "OIDC token rejected for provider '{}': {err}", svc.id());
+                let api = match err {
+                    OidcError::NoKeys => ApiResponseError::new(
+                        ErrorCode::TemporarilyUnavailable,
+                        "identity provider keys unavailable",
+                        config::OIDC_NO_KEYS_RETRY_SECS,
+                    ),
+                    // UnknownKid after the one refresh+retry is a signature-class
+                    // failure (Contract 2).
+                    OidcError::Signature(_) | OidcError::UnknownKid(_) => {
+                        ApiResponseError::new_code_msg(
+                            ErrorCode::InvalidSignature,
+                            "token validation failed",
+                        )
+                    }
+                    OidcError::Rejected(_) => ApiResponseError::new_code_msg(
+                        ErrorCode::AuthError,
+                        "authentication rejected",
+                    ),
+                };
+                return Err(api.into());
+            }
+        };
+
+        // The credential lifetime anchors on the authentication moment
+        // (`auth_time`, or `iat` when absent); the token's `exp` was reject-only
+        // during validation and plays no part here (Contract 7).
+        let expires = token.auth_time + svc.lifetime();
+        let mapped = svc.admit(&token, expires)?;
+
+        let src = AttributeSource::new(svc.id());
+        let mut authd = vec![
+            src.builder(key::USER_AUTHORITY)
+                .expires(expires)
+                .value(svc.id()),
+        ];
+        if let Some(sub_key) = svc.mapped_sub_key()
+            && let Some(sub_attr) = mapped.into_iter().find(|a| a.get_key() == sub_key)
+        {
+            authd.push(sub_attr);
+        }
+        Ok(BlobOutcome {
+            authd,
+            namespace: Namespace::User,
+        })
     }
 
     /// Preform authentication of an adapter or a node, then run through policy.
@@ -471,19 +611,21 @@ impl ConnectionControl {
         //
         // Note that (b) is also needed for the AC type auth.
 
+        // One coherent policy view for validation and authorization (PR #6 review).
+        let psnap = asm.policy_mgr.get_current_snapshot();
         let mut authd_claims = authd_claims;
-        authd_claims.extend(self.authenticate_ss_blob(&asm, ssb, &unauthd_claims)?);
+        authd_claims.extend(self.authenticate_ss_blob(psnap.policy(), ssb, &unauthd_claims)?);
 
         // Ok checks out -- now run through policy.
-        let policy = asm.policy_mgr.get_current();
         let mut actor = self
             .authorize_connection(
                 asm,
-                &policy,
+                &psnap,
                 &ssb.cn,
                 unauthd_claims,
                 authd_claims,
                 dock_interface,
+                false,
             )
             .await?;
 
@@ -524,14 +666,20 @@ impl ConnectionControl {
     /// (blob arm) that verified the entity owns stamping the namespaced authority
     /// (e.g. [key::DEVICE_AUTHORITY] on the RSA bootstrap path). Whichever
     /// namespaced authorities are present are registered as identity attributes.
+    ///
+    /// `user_login_presented` says the connect carried a (validated) OIDC blob:
+    /// such a connection is refused with `policyDenied` when no join policy
+    /// matches, unlike the device-only case which may stay connected without one
+    /// (#227) -- see [EvalContext::approve_connection_detailed].
     async fn authorize_connection(
         &self,
         asm: Arc<Assembly>,
-        current_policy: &Arc<Policy>,
+        psnap: &PolicySnapshot,
         endpoint_cn: &str,
         unauthd_claims: Vec<Attribute>,
         mut authd_claims: Vec<Attribute>,
         _dock_interface: u8,
+        user_login_presented: bool,
     ) -> Result<Actor, ServiceError> {
         // TODO: Check with our revocation tables.
         info!(target: CC, "authorize_connection - TODO: check revocation table");
@@ -542,6 +690,7 @@ impl ConnectionControl {
         // Classification is the caller's job: a path that verified the CN (e.g. an RSA
         // blob signature) pushes it into `authd_claims` itself, and a path that only
         // received a claimed CN leaves it unauthenticated. `endpoint_cn` is log-only.
+        let current_policy = psnap.policy();
         authd_claims.push(
             Attribute::builder(key::CONFIG_ID)
                 .value(format!("{}", current_policy.get_version().unwrap_or(0))),
@@ -563,7 +712,15 @@ impl ConnectionControl {
         // satisfied by a missing key. Refuse the connection rather than authorize
         // against a partial claim set. Note this means a trusted-service outage blocks
         // new connections.
-        for (source_id, ts_results) in asm.ts_mgr.get_attributes_for_actor(&identities).await {
+        // Query the snapshot's stores, not the live ts_mgr list, so the
+        // attributes feeding this join decision come from the same policy
+        // revision the decision is evaluated under (PR #6 review). The
+        // stores are shared Arcs, so an unchanged store carries the same
+        // cached/admitted data either way.
+        for (source_id, ts_results) in
+            TrustedServicesMgr::get_attributes_for_actor_from(psnap.trusted_services(), &identities)
+                .await
+        {
             match ts_results {
                 Ok(ts_attrs) => {
                     // A source that vends `user.*` attributes is the authority asserting
@@ -586,19 +743,33 @@ impl ConnectionControl {
             }
         }
 
-        let ectx = EvalContext::new(current_policy.clone());
+        let ectx = EvalContext::new(psnap.policy_arc());
 
         // TODO: Need to go in to eval and fix the approve_connection logic w/respect to the ROLE claim.
         // We won't know a priori if this is a node or adapter. Though sometimes we do know it's a node.
         // Anyway, best to let VS sort it out and do not do it in libeval.
-        let mut authd_actor =
-            match ectx.approve_connection(Some(&authd_claims), Some(&unauthd_claims)) {
-                Ok(actor) => actor,
+        let (mut authd_actor, matched_join_policy) =
+            match ectx.approve_connection_detailed(Some(&authd_claims), Some(&unauthd_claims)) {
+                Ok(approved) => approved,
                 Err(e) => {
                     info!(target: CC, "connection not approved for cn {}: {}", endpoint_cn, e);
                     return Err(e.into());
                 }
             };
+
+        // A valid user login that policy does not admit is refused outright with
+        // `policyDenied` (Contract 2): authentication succeeded, so this is not a
+        // credential oracle, and unlike the device-only #227 case there is nothing
+        // a join-policy-less user session may do. The message stays generic --
+        // which policies exist is not the caller's to learn.
+        if user_login_presented && !matched_join_policy {
+            info!(target: CC, "user login for {endpoint_cn} matched no join policy");
+            return Err(ApiResponseError::new_code_msg(
+                ErrorCode::PolicyDenied,
+                "no join policy admits this connection",
+            )
+            .into());
+        }
 
         // The blob arms own the authority: register whichever namespaced authority
         // attributes the authentication path stamped as identity attributes, rather
@@ -1091,20 +1262,41 @@ mod tests {
     /// A trusted-service lookup failure must reject the connection rather than
     /// authorize against a partial claim set -- a join policy can be satisfied by a
     /// missing key, so falling through would let an outage approve an actor.
+    /// Drives `authorize_connection` with a snapshot carrying the failing store:
+    /// the connect path reads the snapshot's stores, not the live ts_mgr list
+    /// (PR #6 review), so that is the seam an outage flows through.
     #[tokio::test]
     async fn authorize_connection_rejects_on_trusted_service_failure() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let authd = vec![Attribute::builder(key::CN).value(config::VS_CN)];
 
-        // Baseline: with no trusted services configured this same call succeeds, so the
-        // rejection below is caused by the failure and not by the surrounding setup.
-        cc.authenticate_visa_service(asm.clone(), Vec::new())
-            .await
-            .expect("should authorize with no trusted services");
+        // Baseline: the same call with no trusted services succeeds, so the
+        // rejection below is caused by the failure and not the setup.
+        cc.authorize_connection(
+            asm.clone(),
+            &snap(policy.clone(), Vec::new()),
+            config::VS_CN,
+            Vec::new(),
+            authd.clone(),
+            0,
+            false,
+        )
+        .await
+        .expect("should authorize with no trusted services");
 
-        asm.ts_mgr
-            .update_services(vec![Arc::new(FailingTrustedService)]);
-        let result = cc.authenticate_visa_service(asm, Vec::new()).await;
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, vec![Arc::new(FailingTrustedService)]),
+                config::VS_CN,
+                Vec::new(),
+                authd,
+                0,
+                false,
+            )
+            .await;
         assert!(matches!(
             result,
             Err(ServiceError::AttributesIndeterminate(_))
@@ -1603,6 +1795,16 @@ mod tests {
         svc
     }
 
+    /// A [PolicySnapshot] over `policy` carrying `services` as its stores, for
+    /// driving `authorize_connection` directly (it reads the snapshot's stores,
+    /// not the live ts_mgr list — PR #6 review).
+    fn snap(
+        policy: Arc<Policy>,
+        services: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>>,
+    ) -> PolicySnapshot {
+        PolicySnapshot::for_tests(policy, services)
+    }
+
     /// Decode a test policy container into its policy representation.
     fn policy_from_container(container_bytes: Vec<u8>) -> Arc<Policy> {
         crate::loaded_policy::LoadedPolicy::from_container(
@@ -1647,11 +1849,12 @@ mod tests {
         let actor = cc
             .authorize_connection(
                 asm.clone(),
-                &policy,
+                &snap(policy, vec![svc.clone()]),
                 "privileged.zpr.org",
                 unauthd,
                 authd,
                 0,
+                false,
             )
             .await
             .expect("user-only connection should authorize");
@@ -1694,11 +1897,12 @@ mod tests {
         let actor = cc
             .authorize_connection(
                 asm.clone(),
-                &policy,
+                &snap(policy, vec![svc.clone()]),
                 "device-1.zpr.org",
                 Vec::new(),
                 authd,
                 0,
+                false,
             )
             .await
             .expect("device connection should authorize");
@@ -1777,12 +1981,20 @@ mod tests {
             Some(3600),
             &["dept -> user.dept"],
         ));
-        asm.ts_mgr
-            .update_services(vec![named_ts("bas", &[("user.dept", "engineering")])]);
+        let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> =
+            vec![named_ts("bas", &[("user.dept", "engineering")])];
 
         let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
         let actor = cc
-            .authorize_connection(asm, &policy, "device-1.zpr.org", Vec::new(), authd, 0)
+            .authorize_connection(
+                asm,
+                &snap(policy, stores),
+                "device-1.zpr.org",
+                Vec::new(),
+                authd,
+                0,
+                false,
+            )
             .await
             .expect("connection should authorize");
 
@@ -1817,12 +2029,20 @@ mod tests {
             Some(3600),
             &["location -> device.zpr.location"],
         ));
-        asm.ts_mgr
-            .update_services(vec![named_ts("bas", &[("device.zpr.location", "hq")])]);
+        let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> =
+            vec![named_ts("bas", &[("device.zpr.location", "hq")])];
 
         let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
         let actor = cc
-            .authorize_connection(asm, &policy, "device-1.zpr.org", Vec::new(), authd, 0)
+            .authorize_connection(
+                asm,
+                &snap(policy, stores),
+                "device-1.zpr.org",
+                Vec::new(),
+                authd,
+                0,
+                false,
+            )
             .await
             .expect("connection should authorize");
 
@@ -1845,14 +2065,22 @@ mod tests {
             Some(3600),
             &["dept -> user.dept"],
         ));
-        asm.ts_mgr.update_services(vec![
+        let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> = vec![
             named_ts("bas", &[("user.dept", "engineering")]),
             named_ts("inventory", &[("device.zpr.location", "hq")]),
-        ]);
+        ];
 
         let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
         let actor = cc
-            .authorize_connection(asm, &policy, "device-1.zpr.org", Vec::new(), authd, 0)
+            .authorize_connection(
+                asm,
+                &snap(policy, stores),
+                "device-1.zpr.org",
+                Vec::new(),
+                authd,
+                0,
+                false,
+            )
             .await
             .expect("connection should authorize");
 
@@ -1934,8 +2162,9 @@ mod tests {
         })
     }
 
-    /// A syntactically-present OIDC blob; its contents never matter in C1 because the
-    /// arm is a stub that rejects.
+    /// A syntactically-present OIDC blob naming an issuer no trusted service
+    /// declares. Under C5 this is a real validation failure (paramError), which
+    /// keeps this fixture useful for the fail-closed property below.
     fn oidc_stub_blob() -> AuthBlob {
         AuthBlob::Oidc(zpr::vsapi_types::OidcBlob {
             issuer: "https://issuer.example".to_string(),
@@ -1962,8 +2191,8 @@ mod tests {
     }
 
     /// Presented-and-invalid fails closed: a connection carrying a VALID SS blob plus
-    /// an (unsupported) OIDC blob fails as a whole -- the valid device authentication
-    /// does not rescue it -- and no actor is persisted.
+    /// an OIDC blob naming an undeclared issuer fails as a whole -- the valid device
+    /// authentication does not rescue it -- and no actor is persisted.
     #[tokio::test]
     async fn test_two_blobs_ss_and_oidc_stub_fails_whole_connection() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
@@ -1982,8 +2211,14 @@ mod tests {
             .await;
 
         match result {
-            Err(ServiceError::Internal(msg)) => assert_eq!(msg, "OIDC not yet supported"),
-            other => panic!("expected Internal error, got {:?}", other),
+            Err(ServiceError::ApiResponse(api)) => {
+                assert!(
+                    matches!(api.code, zpr::vsapi_types::ErrorCode::ParamError),
+                    "expected paramError for undeclared issuer, got {:?}",
+                    api.code
+                )
+            }
+            other => panic!("expected ApiResponse error, got {:?}", other),
         }
         // The failed connection must not leave an actor behind.
         assert!(
@@ -2053,7 +2288,15 @@ mod tests {
         let unauthd = vec![Attribute::builder(key::CN).value("some-device.zpr")];
 
         let actor = cc
-            .authorize_connection(asm, &policy, "some-device.zpr", unauthd, authd, 0)
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "some-device.zpr",
+                unauthd,
+                authd,
+                0,
+                false,
+            )
             .await
             .expect("user-only connection should authorize");
 
@@ -2091,7 +2334,15 @@ mod tests {
         let unauthd = vec![Attribute::builder(key::CN).value("server1.zpr")];
 
         let actor = cc
-            .authorize_connection(asm, &policy, "server1.zpr", unauthd, authd, 0)
+            .authorize_connection(
+                asm,
+                &snap(policy, vec![svc.clone()]),
+                "server1.zpr",
+                unauthd,
+                authd,
+                0,
+                false,
+            )
             .await
             .expect("user-only connection should authorize");
 
@@ -2107,6 +2358,520 @@ mod tests {
         assert!(
             actor.get_attribute("device.role").is_none(),
             "actor must not inherit the claimed device's attributes"
+        );
+    }
+
+    // ---- OIDC blob on the connect path (zipline#11, C5) ----
+
+    use crate::oidc::mint::{TEST_KID, test_rsa_pem, token as mint_token};
+    use crate::test_helpers::{make_oidc_connect_policy, make_test_oidc_config};
+    use serde_json::json;
+    use zpr::policy_types::OidcConfig;
+    use zpr::vsapi_types::{ApiResponseError, ErrorCode, OidcBlob};
+
+    /// Issuer/client of the fixture config ([make_test_oidc_config]).
+    const OIDC_ISSUER: &str = "https://accounts.google.com";
+    const OIDC_CLIENT_ID: &str = "test-client-id.apps.googleusercontent.com";
+    /// The nonce the connect request binds its token to.
+    const OIDC_NONCE: &str = "test-nonce-1";
+    /// The subject minted into the test tokens.
+    const OIDC_SUB: &str = "test-sub-12345";
+    /// The claim -> ZPR attribute mappings the C5 test policies declare.
+    const OIDC_MAPPINGS: &[&str] = &[
+        "sub -> user.oidc-subject",
+        "email -> user.email",
+        "hd -> user.domain",
+    ];
+    /// `expiration_seconds` in the C5 test policies (12 h).
+    const OIDC_LIFETIME_SECS: u32 = 43200;
+
+    /// Unix seconds for "now" (the JWT library validates `exp` against real time).
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A fully valid claim set for the fixture provider; tests override fields.
+    fn oidc_base_claims() -> serde_json::Value {
+        json!({
+            "iss": OIDC_ISSUER,
+            "aud": OIDC_CLIENT_ID,
+            "sub": OIDC_SUB,
+            "exp": unix_now() + 3600,
+            "iat": unix_now(),
+            "nonce": OIDC_NONCE,
+            "hd": "example.com",
+            "email": "jane@example.com",
+            "email_verified": true,
+        })
+    }
+
+    /// Sign `claims` with the fixture RSA key under the standard kid.
+    fn mint_signed(claims: serde_json::Value) -> String {
+        let signing_key = jwt::EncodingKey::from_rsa_pem(test_rsa_pem()).unwrap();
+        mint_token(claims, TEST_KID, jwt::Algorithm::RS256, &signing_key)
+    }
+
+    /// An OIDC auth blob for the fixture issuer carrying `id_token`.
+    fn oidc_blob(id_token: String) -> AuthBlob {
+        AuthBlob::Oidc(OidcBlob {
+            issuer: OIDC_ISSUER.to_string(),
+            id_token,
+            nonce: OIDC_NONCE.to_string(),
+        })
+    }
+
+    /// Install the standard C5 OIDC policy (no bootstrap keys, join-any) on `asm`.
+    async fn install_oidc_policy(asm: &Arc<Assembly>, oidc: OidcConfig) {
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                OIDC_MAPPINGS,
+                &["sub"],
+                oidc,
+                &[],
+                &[],
+            ))
+            .await
+            .expect("test policy should install");
+    }
+
+    /// Unwrap a connect failure into its wire-classified [ApiResponseError].
+    fn expect_api_response(result: Result<Actor, ServiceError>) -> ApiResponseError {
+        match result {
+            Err(ServiceError::ApiResponse(api)) => api,
+            other => panic!("expected ApiResponse error, got {:?}", other),
+        }
+    }
+
+    /// A valid OIDC-only connect stamps `user.zpr.authority = ["google"]`, the mapped
+    /// claims arrive through the trusted-service lookup, the identity keys are the
+    /// mapped sub then the user authority (after the VS ident JWT), and nothing in the
+    /// device namespace is asserted.
+    #[tokio::test]
+    async fn test_oidc_only_connect_yields_user_authority_and_claims() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(vec![oidc_blob(mint_signed(oidc_base_claims()))], "some.cn");
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("valid OIDC connect should authorize");
+
+        assert_eq!(
+            actor
+                .get_attribute(key::USER_AUTHORITY)
+                .expect("user authority must be stamped")
+                .get_value(),
+            &vec!["google".to_string()]
+        );
+        assert_eq!(
+            actor
+                .get_attribute("user.oidc-subject")
+                .expect("mapped sub must be present")
+                .get_single_value()
+                .unwrap(),
+            OIDC_SUB
+        );
+        assert_eq!(
+            actor
+                .get_attribute("user.email")
+                .expect("mapped email must be present")
+                .get_single_value()
+                .unwrap(),
+            "jane@example.com"
+        );
+        assert_eq!(
+            actor
+                .get_attribute("user.domain")
+                .expect("mapped hd must be present")
+                .get_single_value()
+                .unwrap(),
+            "example.com"
+        );
+        // lookup_identity_keys order (mapped sub) then the namespaced authority;
+        // the VS ident JWT is prepended at order 0 by the connect path.
+        let ikeys: Vec<&str> = actor.identity_keys_iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            ikeys,
+            vec![ATTR_KEY_VS_IDENT, "user.oidc-subject", key::USER_AUTHORITY]
+        );
+        // No device identity was authenticated.
+        assert!(actor.get_attribute(key::DEVICE_AUTHORITY).is_none());
+        assert!(actor.get_attribute(key::CN).is_none());
+        assert!(
+            actor
+                .attrs_iter()
+                .all(|a| !a.get_key().starts_with("device.")),
+            "no device.* attribute may be asserted by a user-only login"
+        );
+    }
+
+    /// SS + OIDC in one connect: both namespaced authorities are stamped and both are
+    /// registered as identity keys.
+    #[tokio::test]
+    async fn test_ss_plus_oidc_connect_yields_both_authorities() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                OIDC_MAPPINGS,
+                &["sub"],
+                make_test_oidc_config(),
+                &[(cn, &pubkey_der)],
+                &[],
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(
+            vec![
+                make_valid_ss_blob(&privkey, cn),
+                oidc_blob(mint_signed(oidc_base_claims())),
+            ],
+            cn,
+        );
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("SS+OIDC connect should authorize");
+
+        assert_eq!(
+            actor
+                .get_attribute(key::DEVICE_AUTHORITY)
+                .expect("device authority must be stamped")
+                .get_value(),
+            &vec![key::AUTHORITY_METHOD_BOOTSTRAP.to_string()]
+        );
+        assert_eq!(
+            actor
+                .get_attribute(key::USER_AUTHORITY)
+                .expect("user authority must be stamped")
+                .get_value(),
+            &vec!["google".to_string()]
+        );
+        assert!(
+            actor
+                .identity_keys_iter()
+                .any(|k| k == key::DEVICE_AUTHORITY),
+            "device authority must be an identity key"
+        );
+        assert!(
+            actor.identity_keys_iter().any(|k| k == key::USER_AUTHORITY),
+            "user authority must be an identity key"
+        );
+    }
+
+    /// A nonce mismatch fails the whole connection with `invalidSignature`, even when a
+    /// valid SS blob is also presented, and no actor is persisted (fail closed).
+    #[tokio::test]
+    async fn test_oidc_wrong_nonce_fails_whole_connection_invalid_signature() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                OIDC_MAPPINGS,
+                &["sub"],
+                make_test_oidc_config(),
+                &[(cn, &pubkey_der)],
+                &[],
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let mut claims = oidc_base_claims();
+        claims["nonce"] = json!("some-other-nonce");
+        let req = make_connect_request(
+            vec![
+                make_valid_ss_blob(&privkey, cn),
+                oidc_blob(mint_signed(claims)),
+            ],
+            cn,
+        );
+
+        let result = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+
+        let api = expect_api_response(result);
+        assert!(
+            matches!(api.code, ErrorCode::InvalidSignature),
+            "expected invalidSignature, got {:?}",
+            api.code
+        );
+        assert!(
+            asm.actor_mgr.get_actor_by_cn(cn).await.unwrap().is_none(),
+            "no actor may be persisted for a failed multi-blob connection"
+        );
+    }
+
+    /// A consumer account (no `hd` claim) against a domain-restricted provider is
+    /// rejected with `authError`.
+    #[tokio::test]
+    async fn test_oidc_consumer_account_no_hd_rejected_auth_error() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let restricted = OidcConfig {
+            allowed_domains: vec!["example.com".to_string()],
+            ..make_test_oidc_config()
+        };
+        install_oidc_policy(&asm, restricted).await;
+        let cc = make_cc("test-vs");
+        let mut claims = oidc_base_claims();
+        claims.as_object_mut().unwrap().remove("hd");
+        let req = make_connect_request(vec![oidc_blob(mint_signed(claims))], "some.cn");
+
+        let result = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+
+        let api = expect_api_response(result);
+        assert!(
+            matches!(api.code, ErrorCode::AuthError),
+            "expected authError, got {:?}",
+            api.code
+        );
+    }
+
+    /// A blob naming an issuer with no declared trusted service is a `paramError`,
+    /// and the error does not echo the attacker-supplied issuer string.
+    #[tokio::test]
+    async fn test_oidc_unknown_issuer_param_error() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        let unknown_issuer = "https://idp.attacker.example";
+        let req = make_connect_request(
+            vec![AuthBlob::Oidc(OidcBlob {
+                issuer: unknown_issuer.to_string(),
+                id_token: mint_signed(oidc_base_claims()),
+                nonce: OIDC_NONCE.to_string(),
+            })],
+            "some.cn",
+        );
+
+        let result = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+
+        let api = expect_api_response(result);
+        assert!(
+            matches!(api.code, ErrorCode::ParamError),
+            "expected paramError, got {:?}",
+            api.code
+        );
+        assert!(
+            !api.message.contains(unknown_issuer),
+            "error must not echo the blob's issuer: {}",
+            api.message
+        );
+    }
+
+    /// With no keys at all (empty seed, fetch never succeeded) the failure is
+    /// `temporarilyUnavailable` with a non-zero retry hint.
+    #[tokio::test]
+    async fn test_oidc_no_keys_temporarily_unavailable() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        // Empty seed; a jwks_uri exists (so the key source is viable) but the
+        // endpoint only serves errors, so the on-demand priming refresh fails
+        // and the current key set stays empty.
+        let addr = spawn_jwks_http_server(500, String::new()).await;
+        let keyless = OidcConfig {
+            seed_jwks: String::new(),
+            jwks_uri: format!("http://{addr}/jwks"),
+            ..make_test_oidc_config()
+        };
+        install_oidc_policy(&asm, keyless).await;
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(vec![oidc_blob(mint_signed(oidc_base_claims()))], "some.cn");
+
+        let result = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+
+        let api = expect_api_response(result);
+        assert!(
+            matches!(api.code, ErrorCode::TemporarilyUnavailable),
+            "expected temporarilyUnavailable, got {:?}",
+            api.code
+        );
+        assert_eq!(api.retry_in, config::OIDC_NO_KEYS_RETRY_SECS);
+    }
+
+    /// Plain-HTTP responder answering `status`/`body` on `/jwks` (connect-path
+    /// twin of the jwks.rs test server).
+    async fn spawn_jwks_http_server(status: u16, body: String) -> std::net::SocketAddr {
+        let status = axum::http::StatusCode::from_u16(status).unwrap();
+        let app = axum::Router::new().route(
+            "/jwks",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { (status, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// Review fix (PR #6): a provider with an empty `seed_jwks` but a usable
+    /// `jwks_uri` acquires its first key set on demand — the NoKeys outcome
+    /// triggers the same one-refresh-and-retry as UnknownKid, so the first
+    /// valid login primes the cache instead of every login failing
+    /// `temporarilyUnavailable` forever.
+    #[tokio::test]
+    async fn test_oidc_empty_seed_primes_keys_from_jwks_uri() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let jwks_body = include_str!("../tests/data/oidc-test-jwks.json").to_string();
+        let addr = spawn_jwks_http_server(200, jwks_body).await;
+        let empty_seed = OidcConfig {
+            seed_jwks: String::new(),
+            jwks_uri: format!("http://{addr}/jwks"),
+            ..make_test_oidc_config()
+        };
+        install_oidc_policy(&asm, empty_seed).await;
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(vec![oidc_blob(mint_signed(oidc_base_claims()))], "some.cn");
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("first login must prime the empty JWKS cache and authorize");
+
+        assert_eq!(
+            actor
+                .get_attribute(key::USER_AUTHORITY)
+                .expect("user authority must be stamped")
+                .get_value(),
+            &vec!["google".to_string()]
+        );
+    }
+
+    /// A fully valid login that no join policy admits is refused with `policyDenied`
+    /// — unlike the device-only case (#227), which may stay connected without one.
+    #[tokio::test]
+    async fn test_valid_login_no_join_policy_is_policy_denied() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        // The only join policy requires a domain this login does not have.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                OIDC_MAPPINGS,
+                &["sub"],
+                make_test_oidc_config(),
+                &[],
+                &[("user.domain", "blocked.example")],
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(vec![oidc_blob(mint_signed(oidc_base_claims()))], "some.cn");
+
+        let result = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+
+        let api = expect_api_response(result);
+        assert!(
+            matches!(api.code, ErrorCode::PolicyDenied),
+            "expected policyDenied, got {:?}",
+            api.code
+        );
+    }
+
+    /// Review fix (PR #6): OIDC validation and authorization must run under one
+    /// policy. The provider store is resolved from the same [PolicySnapshot]
+    /// that later authorizes the connection, so a concurrent policy update
+    /// cannot validate a token under one revision's provider config and
+    /// authorize the mapped claims under another. This exercises the seam: a
+    /// snapshot taken before an update keeps resolving its own revision's
+    /// provider even after ts_mgr has been swapped to a policy without one.
+    #[tokio::test]
+    async fn test_oidc_validation_pinned_to_policy_snapshot() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        let pinned = asm.policy_mgr.get_current_snapshot();
+
+        // A concurrent policy update removes the provider entirely; the
+        // manager's live list no longer knows the issuer.
+        let (_, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_bootstrap_key(
+                "other.zpr",
+                &pubkey_der,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            asm.ts_mgr.oidc_service_for_issuer(OIDC_ISSUER).is_none(),
+            "precondition: the live trusted-service list must have dropped the provider"
+        );
+
+        // An in-flight authentication that captured `pinned` before the update
+        // still validates against that snapshot's provider (and would then
+        // authorize under the same snapshot's policy).
+        let AuthBlob::Oidc(blob) = oidc_blob(mint_signed(oidc_base_claims())) else {
+            unreachable!()
+        };
+        let outcome = cc
+            .authenticate_oidc_blob(&pinned, &blob)
+            .await
+            .expect("the pinned snapshot's provider must keep serving the in-flight connect");
+        assert!(
+            outcome
+                .authd
+                .iter()
+                .any(|a| a.get_key() == key::USER_AUTHORITY),
+            "outcome must carry the user authority from the pinned provider"
+        );
+    }
+
+    /// `user.zpr.authority` expires at `auth_time + expiration_seconds`, anchored to
+    /// the authentication moment — not at the token's `exp`, which is reject-only.
+    #[tokio::test]
+    async fn test_user_authority_expiry_is_auth_time_plus_lifetime() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        // Authenticated an hour ago; policy lifetime is 12 h, so the authority must
+        // expire ~11 h from now regardless of the token's 1 h `exp`.
+        let auth_time = unix_now() - 3600;
+        let mut claims = oidc_base_claims();
+        claims["auth_time"] = json!(auth_time);
+        let req = make_connect_request(vec![oidc_blob(mint_signed(claims))], "some.cn");
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("valid OIDC connect should authorize");
+
+        let expires = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .expect("user authority must be stamped")
+            .get_expires();
+        let expected =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(auth_time + OIDC_LIFETIME_SECS as u64);
+        let drift = expires
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            drift < Duration::from_secs(30),
+            "authority expiry must be auth_time + lifetime (drift {}s)",
+            drift.as_secs()
         );
     }
 }

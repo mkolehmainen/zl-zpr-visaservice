@@ -264,6 +264,82 @@ pub fn make_oidc_policy(
     )
 }
 
+/// As [make_oidc_policy], but with full control over the connect-path shape
+/// (zipline#11 C5 tests): `bootstrap` adds policy bootstrap keys (CN, RSA
+/// public key DER) so an SS blob can validate alongside the OIDC blob, and
+/// `join_conditions` puts `(key, value)` match conditions on the single join
+/// policy providing the trusted service — conditions the actor does not meet
+/// give the "valid login, no join policy matched" case.
+pub fn make_oidc_connect_policy(
+    id: &str,
+    expiration_seconds: u32,
+    mappings: &[&str],
+    identity: &[&str],
+    oidc: OidcConfig,
+    bootstrap: &[(&str, &[u8])],
+    join_conditions: &[(&str, &str)],
+) -> Vec<u8> {
+    let jp = JoinPolicy {
+        conditions: join_conditions
+            .iter()
+            .map(|(k, v)| {
+                zpr::policy_types::Attribute::tuple(*k)
+                    .value(*v)
+                    .build()
+                    .unwrap()
+            })
+            .collect(),
+        flags: PFlags::default(),
+        provides: Some(vec![Service {
+            id: id.to_string(),
+            endpoints: Vec::new(),
+            kind: ServiceType::Trusted("oidc".to_string()),
+        }]),
+    };
+    let record = TrustedService {
+        service_id: id.to_string(),
+        expiration_seconds,
+        returns_attrs: mappings
+            .iter()
+            .map(|m| parse_attribute_mapping(m).unwrap())
+            .collect(),
+        identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
+        oidc: Some(oidc),
+    };
+
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
+        policy_bldr.set_created("2024-01-01T00:00:00Z");
+        policy_bldr.set_version(1);
+        policy_bldr.set_metadata("");
+        if !bootstrap.is_empty() {
+            let mut keys = policy_bldr.reborrow().init_keys(bootstrap.len() as u32);
+            for (i, (cn, der)) in bootstrap.iter().enumerate() {
+                let mut key_bldr = keys.reborrow().get(i as u32);
+                key_bldr.set_id(cn);
+                key_bldr.set_key_type(capnp_policy::KeyMaterialT::RsaPub);
+                key_bldr
+                    .reborrow()
+                    .init_key_allows(1)
+                    .set(0, capnp_policy::KeyAllowance::Bootstrap);
+                key_bldr.set_key_data(der);
+            }
+        }
+        jp.write_to(&mut policy_bldr.reborrow().init_join_policies(1).get(0));
+        let mut ts_bldr = policy_bldr.reborrow().init_trusted_services(1);
+        record.write_to(&mut ts_bldr.reborrow().get(0));
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+    make_container_bytes(
+        crate::config::POLICY_MIN_COMPILER_MAJOR,
+        crate::config::POLICY_MIN_COMPILER_MINOR,
+        crate::config::POLICY_MIN_COMPILER_PATCH,
+        &bytes,
+    )
+}
+
 /// The common builder behind the trusted-service policy helpers.
 fn make_trusted_service_policy_full(
     id: &str,
