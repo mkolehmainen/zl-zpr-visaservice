@@ -155,7 +155,11 @@ pub struct CoreSection {
     pub file_ts_dir: Option<PathBuf>,
 
     /// Period, in seconds, between JWKS refreshes for `api=oidc` trusted
-    /// services (OIDC C3). Consumed by the refresher wiring in C4/C5.
+    /// services. Unset or 0 disables the periodic refresher — the policy
+    /// manager warns per provider, and key rotation is then picked up only
+    /// by connect-path misses (zipline#19). There is deliberately no
+    /// visa-service default: the compiler-emitted `OidcConfig` carries no
+    /// refresh interval today, so any period is an explicit operator choice.
     pub oidc_refresh_seconds: Option<u64>,
 }
 
@@ -178,7 +182,7 @@ impl Default for CoreSection {
             identity: Some(String::new()),
             api_keys: Some(PathBuf::from(DEFAULT_API_KEYS_FILE)),
             file_ts_dir: Some(PathBuf::from(".")),
-            oidc_refresh_seconds: Some(3600),
+            oidc_refresh_seconds: None,
         }
     }
 }
