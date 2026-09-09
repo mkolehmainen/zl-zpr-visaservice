@@ -30,6 +30,15 @@ pub struct TrustedServiceDefinition {
     id: String,
     api: String,
     record: TrustedService,
+    /// The single-scope port pinned by the policy declaration of the regular
+    /// service this OIDC config names as `jwks_proxy_service`; `None` for
+    /// non-OIDC definitions, direct-egress providers, or a proxy declaration
+    /// the resolver could never use (missing, or not exactly one single-port
+    /// scope). Captured into the definition — not recomputed at build time —
+    /// so it participates in equality: a policy update that changes only the
+    /// proxy service's declaration breaks reuse and rebuilds the store, whose
+    /// resolver pins this port (PR #7 review, P1).
+    jwks_proxy_port: Option<u16>,
 }
 
 impl TrustedServiceDefinition {
@@ -45,6 +54,28 @@ impl TrustedServiceDefinition {
     pub fn oidc_config(&self) -> Option<&zpr::policy_types::OidcConfig> {
         self.record.oidc.as_ref()
     }
+
+    /// The proxy port captured from the policy's `jwks_proxy_service`
+    /// declaration (see the field doc). `PolicyMgr::build_state` hands this
+    /// to the proxy resolver so resolver and equality key can never disagree.
+    pub fn jwks_proxy_port(&self) -> Option<u16> {
+        self.jwks_proxy_port
+    }
+}
+
+/// The port the ActorDb-backed JWKS proxy resolver would dial for
+/// `service_id`: the policy must declare it with exactly one single-port
+/// endpoint scope (the same shape `uri_for_service` enforces for on-net auth
+/// services); anything else yields `None`.
+fn jwks_proxy_port_from_policy(policy: &Policy, service_id: &str) -> Option<u16> {
+    policy
+        .list_services()
+        .into_iter()
+        .find(|service| service.id == service_id)
+        .and_then(|service| match service.endpoints.as_slice() {
+            [scope] => scope.port,
+            _ => None,
+        })
 }
 
 /// Validate and extract the trusted services a policy declares.
@@ -108,10 +139,17 @@ pub fn trusted_service_definitions(
             }
         }
 
+        let jwks_proxy_port = trusted_service
+            .oidc
+            .as_ref()
+            .and_then(|cfg| cfg.jwks_proxy_service.as_deref())
+            .and_then(|proxy_id| jwks_proxy_port_from_policy(policy, proxy_id));
+
         definitions.push(TrustedServiceDefinition {
             id: service.id.clone(),
             api: api.clone(),
             record: trusted_service.clone(),
+            jwks_proxy_port,
         });
     }
 

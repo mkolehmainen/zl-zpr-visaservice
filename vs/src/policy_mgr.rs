@@ -30,7 +30,7 @@ use crate::db;
 use crate::error::{ResolverError, ServiceError, StoreError, TopologyError};
 use crate::loaded_policy::LoadedPolicy;
 use crate::logging::targets::MAIN;
-use crate::oidc::{OidcTrustedService, ProxyFuture, ProxyResolver};
+use crate::oidc::{KeySource, OidcTrustedService, ProxyFuture, ProxyResolver};
 use crate::trusted_services::{
     TrustedServiceDefinition, TrustedServiceInterface, TrustedServicesMgr, build_services,
     trusted_service_definitions,
@@ -87,6 +87,70 @@ impl Drop for PolicyState {
         {
             handle.abort();
         }
+    }
+}
+
+/// A fully validated policy state that has not yet taken over refresher
+/// ownership (PR #7 review). [`PolicyMgr::build_state`] produces one without
+/// touching the live state or spawning any task, so dropping a candidate on a
+/// later failure (e.g. the DB write) is completely side-effect free: live
+/// refreshers keep running under their current owner and nothing was spawned
+/// for the rejected policy. [`Self::commit`] is the infallible ownership
+/// step, run only once every fallible step has succeeded.
+struct CandidateState {
+    state: PolicyState,
+    /// Service ids of reused OIDC stores whose running refresher must move
+    /// over from the previous state at commit.
+    carried_over: Vec<String>,
+    /// Freshly built OIDC stores' key sources, awaiting a refresher spawn at
+    /// commit (when a refresh period is configured).
+    to_spawn: Vec<(String, Arc<KeySource>)>,
+}
+
+impl CandidateState {
+    /// Take ownership of the refresher tasks and return the finished state:
+    /// carried-over handles move out of `previous` (the same live state the
+    /// candidate was built against), and each newly built store spawns its
+    /// refresher — or warns once when the period is disabled. Infallible by
+    /// design; callers run it only after construction and persistence have
+    /// both succeeded.
+    fn commit(self, previous: Option<&PolicyState>, oidc_refresh: Option<Duration>) -> PolicyState {
+        let mut handles: HashMap<String, JoinHandle<()>> = HashMap::new();
+        if let Some(prev) = previous {
+            let mut prev_handles = prev
+                .oidc_refreshers
+                .lock()
+                .expect("oidc_refreshers lock poisoned");
+            for id in &self.carried_over {
+                if let Some(handle) = prev_handles.remove(id) {
+                    handles.insert(id.clone(), handle);
+                }
+            }
+        }
+        for (id, keys) in self.to_spawn {
+            match oidc_refresh {
+                Some(period) => {
+                    handles.insert(id, keys.spawn_refresher(period));
+                }
+                None => {
+                    // Operator decision on zipline#19: 0/absent means
+                    // disabled, loudly — key rotation is then picked up only
+                    // by connect-path misses.
+                    warn!(
+                        target: MAIN,
+                        "periodic JWKS refresh disabled (oidc_refresh_seconds is 0 \
+                         or unset): provider '{id}' will refresh keys only on \
+                         connect-path misses"
+                    );
+                }
+            }
+        }
+        *self
+            .state
+            .oidc_refreshers
+            .lock()
+            .expect("oidc_refreshers lock poisoned") = handles;
+        self.state
     }
 }
 
@@ -275,17 +339,12 @@ impl PolicyMgr {
 
         // Resolve topology before persisting so a policy that cannot initialize is never
         // stored as the current policy. build_state borrows `loaded`, leaving it
-        // available for the post-resolution persist below.
-        let state = Self::build_state(
-            &resolver,
-            &loaded,
-            &file_ts_dir,
-            &actor_repo,
-            oidc_refresh,
-            None,
-        )
-        .await?;
+        // available for the post-resolution persist below. Refreshers are spawned
+        // by commit only after the persist succeeds, so a failed write leaves no task.
+        let candidate =
+            Self::build_state(&resolver, &loaded, &file_ts_dir, &actor_repo, None).await?;
         repo.set_current_policy(&loaded, false).await?;
+        let state = candidate.commit(None, oidc_refresh);
 
         debug!(target: MAIN, "policy manager initialized successfully");
         Ok(Self::from_state(
@@ -330,15 +389,9 @@ impl PolicyMgr {
         let resolver = PolicyResolver::new(resolver);
         // A trusted service the policy declares but that cannot be configured (e.g. its
         // attribute file is missing) fails startup; the error names the service and file.
-        let state = Self::build_state(
-            &resolver,
-            &loaded,
-            &file_ts_dir,
-            &actor_repo,
-            oidc_refresh,
-            None,
-        )
-        .await?;
+        let candidate =
+            Self::build_state(&resolver, &loaded, &file_ts_dir, &actor_repo, None).await?;
+        let state = candidate.commit(None, oidc_refresh);
 
         debug!(target: MAIN, "policy manager initialized successfully");
         Ok(Self::from_state(
@@ -369,22 +422,24 @@ impl PolicyMgr {
     /// Build the atomically-swapped policy state after resolving all policy topology.
     ///
     /// Intentionally performs only validation/state construction: it does not write the
-    /// DB or store into `self.state`. This keeps failed DNS/topology resolution from
-    /// leaking partial policy state. Borrows `loaded` (cloning only the `Arc<Policy>`
+    /// DB, store into `self.state`, spawn refresher tasks, or mutate the live state.
+    /// This keeps failed DNS/topology/store resolution from leaking partial policy
+    /// state — a candidate that is dropped on a later failure has no side effects to
+    /// undo (PR #7 review). Borrows `loaded` (cloning only the `Arc<Policy>`
     /// and the `Bytes`-backed container — both refcount bumps) so the caller can still
     /// persist it after resolution succeeds.
     ///
     /// `previous` is the currently live state, when there is one, and is used only to
-    /// carry unchanged trusted-service stores forward (and their running
-    /// periodic refreshers with them).
+    /// carry unchanged trusted-service stores forward. Refresher ownership transfer
+    /// and fresh spawns are deferred to [`CandidateState::commit`], which the caller
+    /// runs only after every remaining fallible step (DB write) has succeeded.
     async fn build_state(
         resolver: &PolicyResolver,
         loaded: &LoadedPolicy,
         file_ts_dir: &Path,
         actor_repo: &Arc<db::ActorRepo>,
-        oidc_refresh: Option<Duration>,
         previous: Option<&PolicyState>,
-    ) -> Result<PolicyState, ServiceError> {
+    ) -> Result<CandidateState, ServiceError> {
         let policy = loaded.policy();
         let resolved_peers_by_node = resolver.resolve_topology(&policy).await?;
         let ts_definitions = trusted_service_definitions(&policy)?;
@@ -394,7 +449,11 @@ impl PolicyMgr {
         // connected users' attributes until reconnect), while changed or new
         // declarations build fresh. Matching is keyed on the service id, never
         // on definition-vector equality: `Policy::list_services` iterates a
-        // HashMap, so vector order is meaningless across installs.
+        // HashMap, so vector order is meaningless across installs. The
+        // definition's equality key includes the proxy port captured from the
+        // `jwks_proxy_service` declaration, so a policy that changes only the
+        // proxy service rebuilds the OIDC store whose resolver pinned that
+        // port (PR #7 review, P1).
         //
         // A new OIDC store whose policy names a `jwks_proxy_service` gets an
         // ActorDb-backed proxy resolver (zipline#19): every refresh re-resolves
@@ -405,7 +464,8 @@ impl PolicyMgr {
         // tolerance) until one connects.
         let mut trusted_services = Vec::with_capacity(ts_definitions.len());
         let mut oidc_services = Vec::new();
-        let mut oidc_refreshers: HashMap<String, JoinHandle<()>> = HashMap::new();
+        let mut carried_over = Vec::new();
+        let mut to_spawn = Vec::new();
         for definition in &ts_definitions {
             let reusable = previous.and_then(|prev| {
                 prev.ts_definitions
@@ -427,17 +487,12 @@ impl PolicyMgr {
                             .iter()
                             .find(|oidc| oidc.get_source_id() == definition.id())
                         {
-                            // The store moves to the new state unchanged, so its
-                            // running refresher moves with it rather than being
-                            // aborted and respawned.
-                            if let Some(handle) = prev
-                                .oidc_refreshers
-                                .lock()
-                                .expect("oidc_refreshers lock poisoned")
-                                .remove(definition.id())
-                            {
-                                oidc_refreshers.insert(definition.id().to_string(), handle);
-                            }
+                            // The store moves to the new state unchanged, and
+                            // its running refresher will move with it — but
+                            // only at commit time, so a candidate that fails
+                            // later never strips the live state's handle
+                            // (PR #7 review, P2).
+                            carried_over.push(definition.id().to_string());
                             oidc_services.push(oidc.clone());
                         }
                     }
@@ -448,48 +503,37 @@ impl PolicyMgr {
                         build_services(std::slice::from_ref(definition), file_ts_dir, &|_id| {
                             proxy_resolver_for(
                                 actor_repo.clone(),
-                                &policy,
                                 definition
                                     .oidc_config()
                                     .and_then(|cfg| cfg.jwks_proxy_service.as_deref()),
+                                definition.jwks_proxy_port(),
                             )
                         })
                         .await?;
+                    // Refresher spawning is deferred to commit: a definition
+                    // that fails AFTER this store built must not leave a task
+                    // fetching a rejected policy's JWKS endpoint (PR #7
+                    // review, P2).
                     for store in &built_oidc {
-                        match oidc_refresh {
-                            Some(period) => {
-                                oidc_refreshers.insert(
-                                    store.get_source_id().to_string(),
-                                    store.keys_arc().spawn_refresher(period),
-                                );
-                            }
-                            None => {
-                                // Operator decision on zipline#19: 0/absent
-                                // means disabled, loudly — key rotation is then
-                                // picked up only by connect-path misses.
-                                warn!(
-                                    target: MAIN,
-                                    "periodic JWKS refresh disabled (oidc_refresh_seconds is 0 \
-                                     or unset): provider '{}' will refresh keys only on \
-                                     connect-path misses",
-                                    store.get_source_id()
-                                );
-                            }
-                        }
+                        to_spawn.push((store.get_source_id().to_string(), store.keys_arc()));
                     }
                     trusted_services.append(&mut built);
                     oidc_services.extend(built_oidc);
                 }
             }
         }
-        Ok(PolicyState {
-            policy,
-            container: loaded.container().clone(),
-            resolved_peers_by_node,
-            trusted_services,
-            oidc_services,
-            ts_definitions,
-            oidc_refreshers: std::sync::Mutex::new(oidc_refreshers),
+        Ok(CandidateState {
+            state: PolicyState {
+                policy,
+                container: loaded.container().clone(),
+                resolved_peers_by_node,
+                trusted_services,
+                oidc_services,
+                ts_definitions,
+                oidc_refreshers: std::sync::Mutex::new(HashMap::new()),
+            },
+            carried_over,
+            to_spawn,
         })
     }
 
@@ -552,20 +596,23 @@ impl PolicyMgr {
         // the current policy, container, and topology untouched. The new policy,
         // container, and links swap in together as one PolicyState. The live state is
         // passed in so trusted-service stores whose declaration did not change are
-        // carried over rather than rebuilt with a fresh revision.
+        // carried over rather than rebuilt with a fresh revision. build_state never
+        // mutates the live state and never spawns: refresher ownership is transferred
+        // and new refreshers spawned only by commit, after the DB write below has
+        // succeeded, so a failed update leaves the live refresher set exactly as it
+        // was and a rejected policy leaves no task behind (PR #7 review).
         let previous = self.state.load_full();
-        let state = Self::build_state(
+        let candidate = Self::build_state(
             &self.resolver,
             &loaded,
             &self.file_ts_dir,
             &self.actor_repo,
-            self.oidc_refresh,
             Some(&previous),
         )
         .await?;
         self.repo.set_current_policy(&loaded, false).await?;
 
-        self.publish(state);
+        self.publish(candidate.commit(Some(&previous), self.oidc_refresh));
         Ok(vinst)
     }
 
@@ -661,17 +708,19 @@ impl PolicyResolver {
 /// egress) yields a resolver that always answers "no proxy". Otherwise each
 /// invocation — one per refresh, per the C3 re-resolution guardrail — looks up
 /// the actor currently providing that service in the actor database and pairs
-/// its ZPR address with the port pinned by the policy `Service.endpoints`
-/// scope (the same exactly-one-scope-with-port shape `uri_for_service`
-/// enforces for on-net auth services). No connected provider, a missing or
-/// port-less service declaration, or a DB error all resolve to `None`: the
-/// refresh then fails "proxy not reachable" and the seed/last-good keys keep
-/// serving. The port is pinned from the policy that declared the store —
-/// a policy changing it rebuilds the store (definition equality breaks).
+/// its ZPR address with `port`, the port pinned by the policy
+/// `Service.endpoints` scope (the same exactly-one-scope-with-port shape
+/// `uri_for_service` enforces for on-net auth services), pre-captured into the
+/// [TrustedServiceDefinition] so it also participates in store-reuse equality
+/// (PR #7 review, P1). No connected provider, a missing or port-less service
+/// declaration, or a DB error all resolve to `None`: the refresh then fails
+/// "proxy not reachable" and the seed/last-good keys keep serving. A policy
+/// changing the proxy declaration rebuilds the store (definition equality
+/// breaks), so the resolver never outlives the port it pinned.
 fn proxy_resolver_for(
     actor_repo: Arc<db::ActorRepo>,
-    policy: &Policy,
     proxy_service: Option<&str>,
+    port: Option<u16>,
 ) -> ProxyResolver {
     let Some(service_id) = proxy_service else {
         // Direct egress: no proxy, ever.
@@ -682,14 +731,6 @@ fn proxy_resolver_for(
     // The proxy's port comes from the policy service declaration; a
     // declaration this resolver could never complete is warned about once at
     // build time instead of failing every refresh mysteriously.
-    let port = policy
-        .list_services()
-        .into_iter()
-        .find(|service| service.id == service_id)
-        .and_then(|service| match service.endpoints.as_slice() {
-            [scope] => scope.port,
-            _ => None,
-        });
     if port.is_none() {
         warn!(
             target: MAIN,
@@ -1262,6 +1303,214 @@ mod tests {
             "the replaced store's refresher must be aborted"
         );
         assert!(!rebuilt.is_finished());
+    }
+
+    /// PR #7 review (P1): a policy update that changes ONLY the declaration of
+    /// the regular service named by `jwks_proxy_service` (here: its port) must
+    /// REBUILD the OIDC store — the existing store's resolver captured the old
+    /// proxy port, so reusing it would keep dialing the obsolete endpoint. The
+    /// rebuilt store's next refresh must dial the NEW proxy endpoint.
+    #[tokio::test]
+    async fn test_proxy_service_change_rebuilds_oidc_store() {
+        use crate::oidc::test_support::{
+            k2_jwks_json, kids, seed_jwks_json, spawn_connect_stub, spawn_tls_jwks_server,
+        };
+        use crate::test_helpers::{make_oidc_policy_with_proxy_service, make_test_oidc_config};
+
+        let (upstream, cert) = spawn_tls_jwks_server(k2_jwks_json()).await;
+        let (old_proxy, mut old_lines) = spawn_connect_stub(upstream).await;
+        let (new_proxy, mut new_lines) = spawn_connect_stub(upstream).await;
+
+        let mut oidc = make_test_oidc_config();
+        oidc.seed_jwks = seed_jwks_json().to_string();
+        oidc.jwks_uri = format!("https://127.0.0.1:{}/jwks", upstream.port());
+        oidc.jwks_proxy_service = Some("egress-proxy".to_string());
+
+        let (mgr, actor_repo) = make_policy_mgr_with_actors(
+            make_oidc_policy_with_proxy_service(
+                "google",
+                oidc.clone(),
+                "egress-proxy",
+                old_proxy.port(),
+            ),
+            None,
+        )
+        .await;
+        connect_provider(&actor_repo, &old_proxy.ip().to_string(), "egress-proxy").await;
+
+        let old_store = mgr
+            .get_current_snapshot()
+            .oidc_service_for_issuer("https://accounts.google.com")
+            .unwrap();
+
+        // The update changes ONLY the proxy service's port; the OIDC trusted
+        // service declaration itself is byte-identical, so definition equality
+        // alone would (wrongly) reuse the old store.
+        mgr.update_policy_from_container_bytes(make_oidc_policy_with_proxy_service(
+            "google",
+            oidc,
+            "egress-proxy",
+            new_proxy.port(),
+        ))
+        .await
+        .unwrap();
+
+        let store = mgr
+            .get_current_snapshot()
+            .oidc_service_for_issuer("https://accounts.google.com")
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&old_store, &store),
+            "changing the proxy service declaration must rebuild the OIDC store"
+        );
+        store.keys().add_extra_root(cert);
+        store.keys().refresh().await.unwrap();
+        assert!(kids(&store.keys().current()).contains(&"k2".to_string()));
+        let line = new_lines
+            .try_recv()
+            .expect("refresh after the update must dial the NEW proxy endpoint");
+        assert!(line.starts_with("CONNECT "), "{line:?}");
+        assert!(
+            old_lines.try_recv().is_err(),
+            "the OLD proxy endpoint must not be dialed after the update"
+        );
+    }
+
+    /// PR #7 review (P2): a FAILED update must leave the live state's
+    /// refresher ownership exactly as it was, even when the failing candidate
+    /// reused the OIDC store. Repeats the failing update because definition
+    /// order comes from a HashMap: the bug only bit when the OIDC definition
+    /// was processed (and its live handle stolen) before the file store failed.
+    #[tokio::test]
+    async fn test_failed_update_keeps_live_refresher_after_reuse() {
+        use crate::test_helpers::{
+            TrustedServiceSpec, make_test_oidc_config, make_trusted_services_policy,
+        };
+
+        let oidc_spec = || TrustedServiceSpec {
+            id: "google",
+            api: "oidc",
+            expiration_seconds: Some(300),
+            mappings: &["sub -> user.oidc-subject"],
+            identity: &["sub"],
+            oidc: Some(make_test_oidc_config()),
+        };
+
+        let (mgr, _actor_repo) = make_policy_mgr_with_actors(
+            make_trusted_services_policy(&[oidc_spec()]),
+            Some(std::time::Duration::from_secs(3600)),
+        )
+        .await;
+        let original = mgr
+            .get_current_snapshot()
+            .oidc_refresher_abort_handle("google")
+            .expect("refresher must be spawned with a period configured");
+
+        // Same OIDC declaration (reused) plus a file store whose attribute
+        // file does not exist: every one of these updates must fail...
+        let bad = || {
+            make_trusted_services_policy(&[
+                oidc_spec(),
+                TrustedServiceSpec {
+                    id: "nosuchfile",
+                    api: "file",
+                    expiration_seconds: Some(3600),
+                    mappings: &[],
+                    identity: &[],
+                    oidc: None,
+                },
+            ])
+        };
+        for _ in 0..10 {
+            assert!(mgr.update_policy_from_container_bytes(bad()).await.is_err());
+            // ...and leave the live refresher owned by the live state, alive.
+            let live = mgr
+                .get_current_snapshot()
+                .oidc_refresher_abort_handle("google")
+                .expect("a failed update must not strip the live state's refresher");
+            assert_eq!(
+                original.id(),
+                live.id(),
+                "the live refresher must be the original task, untouched"
+            );
+            assert!(
+                !original.is_finished(),
+                "the live refresher must stay alive"
+            );
+        }
+    }
+
+    /// PR #7 review (P2): a REJECTED policy must never leave a refresher
+    /// running. If a freshly built OIDC store spawned its refresher during
+    /// construction and a later definition then failed, the task was detached
+    /// and kept fetching the rejected policy's JWKS endpoint forever. Spawning
+    /// is deferred to the commit step, so a failed build spawns nothing.
+    /// Repeats the attempt because definition order comes from a HashMap.
+    #[tokio::test]
+    async fn test_rejected_policy_never_leaves_refresher_running() {
+        use crate::test_helpers::{
+            TrustedServiceSpec, make_test_oidc_config, make_trusted_services_policy,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A counting endpoint: any connection to it can only come from a
+        // leaked refresher, since nothing else in this test fetches.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        {
+            let hits = hits.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((_sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    hits.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+
+        // Live manager with a fast refresh period and no OIDC store.
+        let (mgr, _actor_repo) = make_policy_mgr_with_actors(
+            policy_no_topology(),
+            Some(std::time::Duration::from_millis(10)),
+        )
+        .await;
+
+        // Every update declares a NEW OIDC store pointed at the counting
+        // endpoint plus a file store whose attribute file is missing, so the
+        // whole policy is rejected after the OIDC store built successfully.
+        let mut oidc = make_test_oidc_config();
+        oidc.jwks_uri = format!("http://{addr}/jwks");
+        for _ in 0..10 {
+            let bad = make_trusted_services_policy(&[
+                TrustedServiceSpec {
+                    id: "google",
+                    api: "oidc",
+                    expiration_seconds: Some(300),
+                    mappings: &["sub -> user.oidc-subject"],
+                    identity: &["sub"],
+                    oidc: Some(oidc.clone()),
+                },
+                TrustedServiceSpec {
+                    id: "nosuchfile",
+                    api: "file",
+                    expiration_seconds: Some(3600),
+                    mappings: &[],
+                    identity: &[],
+                    oidc: None,
+                },
+            ]);
+            assert!(mgr.update_policy_from_container_bytes(bad).await.is_err());
+        }
+
+        // Give any leaked 10ms-period refresher ample time to tick.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a rejected policy's JWKS endpoint must never be fetched"
+        );
     }
 
     /// Build a Peering whose node_b substrate is an unresolvable hostname, so that
