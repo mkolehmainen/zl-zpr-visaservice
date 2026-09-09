@@ -17,7 +17,7 @@ use libeval::route::{LinkId, Route};
 
 use zpr::policy::v1 as capnp_policy;
 use zpr::policy_types::{
-    AttrExp, JoinPolicy, NetAddr, OidcConfig, PFlags, Peering, Service, ServiceType,
+    AttrExp, JoinPolicy, NetAddr, OidcConfig, PFlags, Peering, Scope, Service, ServiceType,
     TrustedService, parse_attribute_mapping,
 };
 use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, PacketDesc, TcpUdpPep, Visa};
@@ -420,6 +420,67 @@ pub fn make_trusted_services_policy(specs: &[TrustedServiceSpec]) -> Vec<u8> {
                 record.write_to(&mut ts_bldr.reborrow().get(i as u32));
             }
         }
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+    make_container_bytes(
+        crate::config::POLICY_MIN_COMPILER_MAJOR,
+        crate::config::POLICY_MIN_COMPILER_MINOR,
+        crate::config::POLICY_MIN_COMPILER_PATCH,
+        &bytes,
+    )
+}
+
+/// Build a policy container declaring one `api = "oidc"` trusted service whose
+/// join policy also carries a jwks-proxy service: the OIDC service (endpoints
+/// empty, as compiled policy has for an off-net provider) plus a
+/// `ServiceType::Regular` proxy service with a single port scope — the shape
+/// the ActorDb-backed proxy resolver reads its port from.
+pub fn make_oidc_policy_with_proxy_service(
+    id: &str,
+    oidc: OidcConfig,
+    proxy_service_id: &str,
+    proxy_port: u16,
+) -> Vec<u8> {
+    let services = vec![
+        Service {
+            id: id.to_string(),
+            endpoints: Vec::new(),
+            kind: ServiceType::Trusted("oidc".to_string()),
+        },
+        Service {
+            id: proxy_service_id.to_string(),
+            endpoints: vec![Scope {
+                protocol: 6, // TCP
+                flag: None,
+                port: Some(proxy_port),
+                port_range: None,
+            }],
+            kind: ServiceType::Regular,
+        },
+    ];
+    let jp = JoinPolicy {
+        conditions: Vec::new(),
+        flags: PFlags::default(),
+        provides: Some(services),
+    };
+    let record = TrustedService {
+        service_id: id.to_string(),
+        expiration_seconds: 300,
+        returns_attrs: vec![parse_attribute_mapping("sub -> user.oidc-subject").unwrap()],
+        identity_attrs: vec!["sub".to_string()],
+        oidc: Some(oidc),
+    };
+
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
+        policy_bldr.set_created("2024-01-01T00:00:00Z");
+        policy_bldr.set_version(1);
+        policy_bldr.set_metadata("");
+        jp.write_to(&mut policy_bldr.reborrow().init_join_policies(1).get(0));
+        let mut ts_bldr = policy_bldr.reborrow().init_trusted_services(1);
+        record.write_to(&mut ts_bldr.reborrow().get(0));
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &msg).unwrap();

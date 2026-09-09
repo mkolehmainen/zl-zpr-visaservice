@@ -147,6 +147,8 @@ pub mod tests {
                 Arc::new(FakeResolver::ip_only()),
                 ts_mgr.clone(),
                 PathBuf::from("."),
+                Arc::new(ActorRepo::new(db_handle.clone())),
+                None,
             )
             .await
             .expect("failed to initialize PolicyMgr"),

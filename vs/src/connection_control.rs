@@ -1060,6 +1060,8 @@ mod tests {
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
             PathBuf::from("."),
+            Arc::new(crate::db::ActorRepo::new(asm.state_db.clone())),
+            None,
         )
         .await
         .unwrap();

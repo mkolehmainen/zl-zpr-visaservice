@@ -255,8 +255,21 @@ async fn main() -> std::process::ExitCode {
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
 
+    // JWKS refresh period for OIDC trusted services: 0 or unset disables the
+    // periodic refresher (the policy manager warns per provider; connect-path
+    // on-demand refresh still works).
+    let oidc_refresh = cfg
+        .core
+        .oidc_refresh_seconds
+        .filter(|&secs| secs > 0)
+        .map(std::time::Duration::from_secs);
+
     // Initialize the policy manager either from provided policy-container or from database.
     let policy_mgr = {
+        // The policy manager gets its own ActorRepo handle over the shared DB:
+        // the JWKS proxy resolver looks up the actor providing a policy-named
+        // proxy service on every refresh.
+        let actor_repo = Arc::new(db::ActorRepo::new(db_handle.clone()));
         let policy_mgr_res = match initial_policy_bytes {
             Some(p) => {
                 PolicyMgr::new_with_initial_policy(
@@ -265,6 +278,8 @@ async fn main() -> std::process::ExitCode {
                     Arc::new(SystemResolver),
                     ts_mgr.clone(),
                     file_ts_dir,
+                    actor_repo,
+                    oidc_refresh,
                 )
                 .await
             }
@@ -274,6 +289,8 @@ async fn main() -> std::process::ExitCode {
                     Arc::new(SystemResolver),
                     ts_mgr.clone(),
                     file_ts_dir,
+                    actor_repo,
+                    oidc_refresh,
                 )
                 .await
             }

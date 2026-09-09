@@ -93,6 +93,13 @@ impl OidcTrustedService {
         &self.keys
     }
 
+    /// The shared handle to this provider's key source, for callers that
+    /// need to hold it beyond the store borrow (the periodic refresher task,
+    /// zipline#19).
+    pub fn keys_arc(&self) -> Arc<KeySource> {
+        self.keys.clone()
+    }
+
     /// How long admitted attributes live (`expiration_seconds` from policy).
     #[allow(dead_code)] // consumed by the C5 connect path
     pub fn lifetime(&self) -> Duration {
@@ -304,15 +311,17 @@ mod tests {
     }
 
     /// A store over the fixture OIDC config, seeded from policy (no network).
-    fn make_store(mappings: &[&str]) -> OidcTrustedService {
-        make_store_with_id("google", mappings)
+    async fn make_store(mappings: &[&str]) -> OidcTrustedService {
+        make_store_with_id("google", mappings).await
     }
 
     /// As [make_store], for a service with the given id.
-    fn make_store_with_id(id: &str, mappings: &[&str]) -> OidcTrustedService {
+    async fn make_store_with_id(id: &str, mappings: &[&str]) -> OidcTrustedService {
         let record = make_record_with_id(id, mappings);
         let keys = Arc::new(
-            KeySource::from_policy(record.oidc.as_ref().unwrap(), static_proxy(None)).unwrap(),
+            KeySource::from_policy(record.oidc.as_ref().unwrap(), static_proxy(None))
+                .await
+                .unwrap(),
         );
         OidcTrustedService::new(&record, keys).unwrap()
     }
@@ -354,7 +363,7 @@ mod tests {
     /// service's source id.
     #[tokio::test]
     async fn test_admit_then_lookup_by_sub() {
-        let store = make_store(MAPPINGS);
+        let store = make_store(MAPPINGS).await;
         assert_eq!(store.get_source_id(), "google");
         let expires = SystemTime::now() + Duration::from_secs(300);
 
@@ -387,7 +396,7 @@ mod tests {
     /// non-sub identity key never matches either.
     #[tokio::test]
     async fn test_lookup_unknown_sub_is_empty() {
-        let store = make_store(MAPPINGS);
+        let store = make_store(MAPPINGS).await;
         let expires = SystemTime::now() + Duration::from_secs(300);
         store
             .admit(&make_token("s-123", Some("jane@example.com")), expires)
@@ -411,7 +420,7 @@ mod tests {
     /// raw_claims by the validator) must never produce a `user.email` attribute.
     #[tokio::test]
     async fn test_email_not_mapped_when_unverified() {
-        let store = make_store(MAPPINGS);
+        let store = make_store(MAPPINGS).await;
         let expires = SystemTime::now() + Duration::from_secs(300);
 
         let admitted = store.admit(&make_token("s-123", None), expires).unwrap();
@@ -429,7 +438,7 @@ mod tests {
     /// flush drops every admitted record: the next lookup finds nothing.
     #[tokio::test]
     async fn test_flush_clears_admitted() {
-        let store = make_store(MAPPINGS);
+        let store = make_store(MAPPINGS).await;
         let expires = SystemTime::now() + Duration::from_secs(300);
         store
             .admit(&make_token("s-123", Some("jane@example.com")), expires)
@@ -448,7 +457,7 @@ mod tests {
     /// machinery sees actors as stale against the new snapshot.
     #[tokio::test]
     async fn test_admit_bumps_revision() {
-        let store = make_store(MAPPINGS);
+        let store = make_store(MAPPINGS).await;
         let before = store.current_revision();
         store
             .admit(
@@ -465,7 +474,7 @@ mod tests {
     /// when the `(mapped sub key, sub)` pair matches an admitted record.
     #[tokio::test]
     async fn test_lookup_scoped_to_issuing_service_authority() {
-        let store = make_store(MAPPINGS);
+        let store = make_store(MAPPINGS).await;
         let expires = SystemTime::now() + Duration::from_secs(300);
         store
             .admit(&make_token("s-123", Some("jane@example.com")), expires)
@@ -502,9 +511,9 @@ mod tests {
     /// disconnects and never returns must not stay cached forever — the next
     /// admission sweeps it out, bounding the cache to subjects seen within one
     /// expiration window.
-    #[test]
-    fn test_admit_purges_expired_entries() {
-        let store = make_store(MAPPINGS);
+    #[tokio::test]
+    async fn test_admit_purges_expired_entries() {
+        let store = make_store(MAPPINGS).await;
         let past = SystemTime::now() - Duration::from_secs(1);
         store
             .admit(&make_token("s-gone", Some("gone@example.com")), past)

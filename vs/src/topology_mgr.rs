@@ -642,7 +642,7 @@ mod tests {
 
     /// Create a PolicyMgr over the given db preloaded with the given policy bytes.
     async fn make_policy_mgr_from_bytes(db: Arc<FakeDb>, pol_bytes: Vec<u8>) -> PolicyMgr {
-        let repo = PolicyRepo::new(db);
+        let repo = PolicyRepo::new(db.clone());
         PolicyMgr::new_with_initial_policy(
             make_container_bytes(
                 config::POLICY_MIN_COMPILER_MAJOR,
@@ -654,6 +654,8 @@ mod tests {
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
             PathBuf::from("."),
+            Arc::new(crate::db::ActorRepo::new(db)),
+            None,
         )
         .await
         .unwrap()
