@@ -676,7 +676,7 @@ mod test {
     use crate::db::{ActorRepo, FakeDb, NodeRepo};
     use crate::test_helpers::{
         make_actor_defexp, make_actor_with_services_defexp, make_adapter_actor_defexp,
-        make_container_bytes, make_node_actor_defexp,
+        make_container_bytes, make_node_actor_defexp, make_oidc_only_adapter_defexp,
     };
 
     use bytes::Bytes;
@@ -1048,6 +1048,45 @@ mod test {
             .unwrap();
         assert_eq!(cns.len(), 1);
         assert_eq!(cns[0], "adapter-cn-1");
+    }
+
+    /// F2 (zipline#29 / zipline#30, A1 gate): a CN-less adapter (OIDC-only connect)
+    /// connected to a node must still be represented in
+    /// `get_adapter_cns_connected_to_node`. Today the method ends in
+    /// `.filter_map(|actor| actor.get_cn()...)`, so the adapter is silently dropped
+    /// from `NodeRecordBrief.adapters` — an omission path independent of F1's
+    /// `list_actor_cns` drop. Fix lands in zipline#31 (A2), which removes the
+    /// #[ignore].
+    #[tokio::test]
+    #[ignore = "known defect F2, zipline#29; fix lands in zipline#31"]
+    async fn test_get_adapter_cns_includes_cn_less_adapter() {
+        let mgr = make_mgr();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::60", "node-cn-f2", "[fd5a:5052::160]:1234");
+        let cn_less_adapter = make_oidc_only_adapter_defexp("fd5a:5052::61");
+        let normal_adapter = make_adapter_actor_defexp("fd5a:5052::62", "adapter-cn-f2");
+        let node_addr: IpAddr = "fd5a:5052::60".parse().unwrap();
+
+        mgr.add_node(&node_actor, false).await.unwrap();
+        mgr.add_adapter_via_node(&cn_less_adapter, &node_addr)
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&normal_adapter, &node_addr)
+            .await
+            .unwrap();
+
+        let cns = mgr
+            .get_adapter_cns_connected_to_node(&node_addr)
+            .await
+            .unwrap();
+        // Both connected adapters must be represented; the CN-less one must not be
+        // filter_map'd away. (What its entry should say is A2's design call — the
+        // pinned contract here is presence.)
+        assert_eq!(
+            cns.len(),
+            2,
+            "CN-less adapter was dropped from get_adapter_cns_connected_to_node: {cns:?}"
+        );
     }
 
     #[tokio::test]

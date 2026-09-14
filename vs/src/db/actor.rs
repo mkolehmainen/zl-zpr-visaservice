@@ -643,7 +643,10 @@ mod test {
     use super::*;
     use crate::db::DbConnection;
     use crate::db::db_fake::FakeDb;
-    use crate::test_helpers::{make_actor_defexp, make_actor_with_services_defexp};
+    use crate::test_helpers::{
+        make_actor_defexp, make_actor_with_services_defexp, make_adapter_actor_defexp,
+        make_oidc_only_adapter_defexp,
+    };
     use libeval::attribute::{ROLE_ADAPTER, ROLE_NODE, key};
 
     #[tokio::test]
@@ -1009,5 +1012,149 @@ mod test {
         let loaded = repo.get_actor_by_zpr_addr(&addr).await.unwrap();
         let cn_via_actor = loaded.get_cn().unwrap();
         assert_eq!(cn_direct, cn_via_actor);
+    }
+
+    // ------------------------------------------------------------------
+    // zipline#29 / zipline#30 (A1 gate): CN-keyed actor-surface defects.
+    // These tests pin the CORRECT behaviour; they fail against today's code.
+    // The fix lands in zipline#31 (A2), which removes the #[ignore]s.
+    // ------------------------------------------------------------------
+
+    /// F1 (zipline#29): a CN-less actor (real OIDC-only connect case) must still be
+    /// represented in `list_actor_cns`. Today `list_actor_cns` HGETs the `cn`
+    /// attribute, warns "missing CN attribute for actor at key = ..." and `continue`s,
+    /// so the actor silently vanishes from the admin listing even though it is in the
+    /// DB and in its role set.
+    #[tokio::test]
+    #[ignore = "known defect F1, zipline#29; fix lands in zipline#31"]
+    async fn test_list_actor_cns_includes_cn_less_actor() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+
+        let cn_less = make_oidc_only_adapter_defexp("fd5a:5052::71");
+        let normal = make_adapter_actor_defexp("fd5a:5052::72", "adapter-with-cn");
+
+        repo.add_actor(&cn_less).await.unwrap();
+        repo.add_actor(&normal).await.unwrap();
+
+        let cns = repo.list_actor_cns(None).await.unwrap();
+        // Both connected actors must be represented — the CN-less one must not be
+        // skipped. (What its entry should *say* — empty CN, address, or a synthetic
+        // name — is A2's design call; the pinned contract here is presence.)
+        assert_eq!(
+            cns.len(),
+            2,
+            "CN-less actor was dropped from list_actor_cns: {cns:?}"
+        );
+    }
+
+    /// F3 (zipline#29): two actors at different addresses sharing one CN must remain
+    /// distinct, and BOTH must stay resolvable through the CN-keyed surface. Today
+    /// `cn_idx` is a `DashMap<String, IpAddr>` written with `insert`, so the second
+    /// connect overwrites the first, and `clean_up` removes the CN entry
+    /// unconditionally, so either actor's disconnect orphans the survivor.
+    ///
+    /// The pin deliberately does NOT assert which single actor `get_actor_by_cn`
+    /// returns while both are connected — a first-write-wins index would satisfy
+    /// that just as vacuously as today's last-write-wins. Instead it asserts the
+    /// invariant any correct fix must uphold with the API that exists today:
+    /// whichever colliding actor disconnects, the OTHER remains resolvable by CN.
+    /// Scenario 1 removes the later writer, scenario 2 the earlier writer; no
+    /// single-slot index (first- or last-write-wins, with or without value-guarded
+    /// removal) can pass both, while a multimap/rebuilt index passes trivially.
+    /// Whether zipline#31 also adds a list-all-matches API is that issue's call.
+    #[tokio::test]
+    #[ignore = "known defect F3, zipline#29; fix lands in zipline#31"]
+    async fn test_shared_cn_actors_remain_distinct() {
+        let addr_a: IpAddr = "fd5a:5052::81".parse().unwrap();
+        let addr_b: IpAddr = "fd5a:5052::82".parse().unwrap();
+
+        // --- Scenario 1: later writer (actor_b) disconnects; actor_a must survive.
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
+        let actor_a = make_adapter_actor_defexp("fd5a:5052::81", "shared-cn");
+        let actor_b = make_adapter_actor_defexp("fd5a:5052::82", "shared-cn");
+        repo.add_actor(&actor_a).await.unwrap();
+        repo.add_actor(&actor_b).await.unwrap();
+
+        // Both actors are connected: both listed, and each is a distinct record
+        // in the store, reachable by its own address with the shared CN.
+        let cns = repo.list_actor_cns(None).await.unwrap();
+        assert_eq!(cns.len(), 2, "expected two entries, got {cns:?}");
+        for addr in [&addr_a, &addr_b] {
+            let loaded = repo.get_actor_by_zpr_addr(addr).await.unwrap();
+            assert_eq!(loaded.get_cn(), Some("shared-cn"));
+        }
+        // CN lookup must reach a live actor even mid-collision (sanity, not the pin).
+        let resolved = repo.get_actor_by_cn("shared-cn").await.unwrap();
+        let resolved_addr = *resolved.get_zpr_addr().unwrap();
+        assert!(
+            resolved_addr == addr_a || resolved_addr == addr_b,
+            "resolved to neither actor: {resolved_addr}"
+        );
+
+        repo.rm_actor_by_zpr_addr(&addr_b).await.unwrap();
+        let survivor = repo.get_actor_by_cn("shared-cn").await.expect(
+            "actor_a became unreachable by CN after the colliding actor_b \
+             disconnected (single-slot cn_idx lost or displaced its mapping)",
+        );
+        assert_eq!(
+            *survivor.get_zpr_addr().unwrap(),
+            addr_a,
+            "CN lookup resolved to the removed actor instead of the survivor"
+        );
+
+        // --- Scenario 2: earlier writer (actor_a) disconnects; actor_b must survive.
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
+        let actor_a = make_adapter_actor_defexp("fd5a:5052::81", "shared-cn");
+        let actor_b = make_adapter_actor_defexp("fd5a:5052::82", "shared-cn");
+        repo.add_actor(&actor_a).await.unwrap();
+        repo.add_actor(&actor_b).await.unwrap();
+
+        repo.rm_actor_by_zpr_addr(&addr_a).await.unwrap();
+        let survivor = repo.get_actor_by_cn("shared-cn").await.expect(
+            "actor_b became unreachable by CN after the colliding actor_a \
+             disconnected (single-slot cn_idx lost or displaced its mapping)",
+        );
+        assert_eq!(
+            *survivor.get_zpr_addr().unwrap(),
+            addr_b,
+            "CN lookup resolved to the removed actor instead of the survivor"
+        );
+    }
+
+    /// F4 (zipline#29): `cn_idx` is populated only by `add_actor` -> `add_to_cache`
+    /// and is never rebuilt from the backing store. A fresh `ActorRepo` over an
+    /// already-populated `Arc<dyn DbConnection>` (what a VS restart against persisted
+    /// state produces) therefore LISTS the actor but 404s it on `get_actor_by_cn`.
+    ///
+    /// NOTE: this test PASSES while the bug exists — it documents today's broken
+    /// behaviour so A2 cannot regress silently. When zipline#31 removes or rebuilds
+    /// `cn_idx`, the `NotFound` assertion below inverts and this test is rewritten
+    /// there to assert successful lookup.
+    #[tokio::test]
+    async fn test_fresh_repo_forgets_cn_index_documents_defect() {
+        let db: Arc<FakeDb> = Arc::new(FakeDb::new());
+
+        // Repo #1 populates the store; its in-memory cn_idx knows the actor.
+        let repo1 = ActorRepo::new(db.clone());
+        let actor = make_adapter_actor_defexp("fd5a:5052::91", "persisted-cn");
+        repo1.add_actor(&actor).await.unwrap();
+        assert!(repo1.get_actor_by_cn("persisted-cn").await.is_ok());
+
+        // Repo #2 over the SAME backing store: an ActorRepo that never saw
+        // add_actor for this actor — the restart-against-persisted-state case.
+        let repo2 = ActorRepo::new(db);
+
+        // The actor is visible to the lister (it reads the store)...
+        let cns = repo2.list_actor_cns(None).await.unwrap();
+        assert_eq!(cns, vec!["persisted-cn".to_string()]);
+
+        // ...but CN-keyed lookup fails: cn_idx was never rebuilt. This is the
+        // DEFECT, deliberately asserted as today's behaviour (see note above).
+        let err = repo2.get_actor_by_cn("persisted-cn").await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotFound(_)),
+            "unexpected error kind: {err:?}"
+        );
     }
 }
