@@ -1049,45 +1049,76 @@ mod test {
     }
 
     /// F3 (zipline#29): two actors at different addresses sharing one CN must remain
-    /// distinct. Today `cn_idx` is a `DashMap<String, IpAddr>` written with `insert`,
-    /// so the second connect overwrites the first: `list_actor_cns` shows the name
-    /// twice (it walks addresses) while `get_actor_by_cn` resolves both to whichever
-    /// connected last. Post-fix contract (pinned here): two distinct entries, each
-    /// resolving to its own address.
+    /// distinct, and BOTH must stay resolvable through the CN-keyed surface. Today
+    /// `cn_idx` is a `DashMap<String, IpAddr>` written with `insert`, so the second
+    /// connect overwrites the first, and `clean_up` removes the CN entry
+    /// unconditionally, so either actor's disconnect orphans the survivor.
+    ///
+    /// The pin deliberately does NOT assert which single actor `get_actor_by_cn`
+    /// returns while both are connected — a first-write-wins index would satisfy
+    /// that just as vacuously as today's last-write-wins. Instead it asserts the
+    /// invariant any correct fix must uphold with the API that exists today:
+    /// whichever colliding actor disconnects, the OTHER remains resolvable by CN.
+    /// Scenario 1 removes the later writer, scenario 2 the earlier writer; no
+    /// single-slot index (first- or last-write-wins, with or without value-guarded
+    /// removal) can pass both, while a multimap/rebuilt index passes trivially.
+    /// Whether zipline#31 also adds a list-all-matches API is that issue's call.
     #[tokio::test]
     #[ignore = "known defect F3, zipline#29; fix lands in zipline#31"]
     async fn test_shared_cn_actors_remain_distinct() {
-        let db = Arc::new(FakeDb::new());
-        let repo = ActorRepo::new(db);
-
         let addr_a: IpAddr = "fd5a:5052::81".parse().unwrap();
         let addr_b: IpAddr = "fd5a:5052::82".parse().unwrap();
+
+        // --- Scenario 1: later writer (actor_b) disconnects; actor_a must survive.
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
         let actor_a = make_adapter_actor_defexp("fd5a:5052::81", "shared-cn");
         let actor_b = make_adapter_actor_defexp("fd5a:5052::82", "shared-cn");
-
         repo.add_actor(&actor_a).await.unwrap();
         repo.add_actor(&actor_b).await.unwrap();
 
-        // Both actors are connected and must both be listed.
+        // Both actors are connected: both listed, and each is a distinct record
+        // in the store, reachable by its own address with the shared CN.
         let cns = repo.list_actor_cns(None).await.unwrap();
         assert_eq!(cns.len(), 2, "expected two entries, got {cns:?}");
-
-        // Each actor must be resolvable to its own address. Today the last writer
-        // wins in cn_idx, so the lookup returns addr_b's actor for both — actor_a
-        // has become unreachable by CN (the collision this test pins).
+        for addr in [&addr_a, &addr_b] {
+            let loaded = repo.get_actor_by_zpr_addr(addr).await.unwrap();
+            assert_eq!(loaded.get_cn(), Some("shared-cn"));
+        }
+        // CN lookup must reach a live actor even mid-collision (sanity, not the pin).
         let resolved = repo.get_actor_by_cn("shared-cn").await.unwrap();
-        let resolved_addr = resolved.get_zpr_addr().unwrap();
+        let resolved_addr = *resolved.get_zpr_addr().unwrap();
         assert!(
-            *resolved_addr == addr_a || *resolved_addr == addr_b,
+            resolved_addr == addr_a || resolved_addr == addr_b,
             "resolved to neither actor: {resolved_addr}"
         );
-        // The post-fix surface must let a caller reach BOTH actors. With today's
-        // single-slot index that is impossible, which is exactly the defect: assert
-        // that actor_a did not silently vanish from CN-keyed lookup.
+
+        repo.rm_actor_by_zpr_addr(&addr_b).await.unwrap();
+        let survivor = repo.get_actor_by_cn("shared-cn").await.expect(
+            "actor_a became unreachable by CN after the colliding actor_b \
+             disconnected (single-slot cn_idx lost or displaced its mapping)",
+        );
         assert_eq!(
-            *resolved_addr, addr_a,
-            "actor at {addr_a} was displaced from CN lookup by the later connect at {addr_b} \
-             (cn_idx last-writer-wins collision)"
+            *survivor.get_zpr_addr().unwrap(),
+            addr_a,
+            "CN lookup resolved to the removed actor instead of the survivor"
+        );
+
+        // --- Scenario 2: earlier writer (actor_a) disconnects; actor_b must survive.
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
+        let actor_a = make_adapter_actor_defexp("fd5a:5052::81", "shared-cn");
+        let actor_b = make_adapter_actor_defexp("fd5a:5052::82", "shared-cn");
+        repo.add_actor(&actor_a).await.unwrap();
+        repo.add_actor(&actor_b).await.unwrap();
+
+        repo.rm_actor_by_zpr_addr(&addr_a).await.unwrap();
+        let survivor = repo.get_actor_by_cn("shared-cn").await.expect(
+            "actor_b became unreachable by CN after the colliding actor_a \
+             disconnected (single-slot cn_idx lost or displaced its mapping)",
+        );
+        assert_eq!(
+            *survivor.get_zpr_addr().unwrap(),
+            addr_b,
+            "CN lookup resolved to the removed actor instead of the survivor"
         );
     }
 
