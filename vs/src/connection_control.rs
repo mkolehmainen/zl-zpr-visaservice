@@ -2891,4 +2891,168 @@ mod tests {
             drift.as_secs()
         );
     }
+
+    // ---- user.zpr.authority displacement by a decorating file store (zipline#24) ----
+
+    /// A trusted service with a configurable source id that vends a fixed attribute
+    /// set only when one of the lookup-identity values matches `known_value` --
+    /// standing in for a file store holding a user record keyed on the mapped OIDC
+    /// subject (zipline#24).
+    struct KeyedNamedTrustedService {
+        source_id: String,
+        /// Identity value that owns `vends`.
+        known_value: String,
+        /// (ZPR attribute key, value) pairs vended when `known_value` matches.
+        vends: Vec<(String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services::TrustedServiceInterface for KeyedNamedTrustedService {
+        async fn get_attributes_for_actor(
+            &self,
+            identities: &[(String, String)],
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            if identities.iter().any(|(_, v)| *v == self.known_value) {
+                return Ok(self
+                    .vends
+                    .iter()
+                    .map(|(k, v)| {
+                        libeval::attribute::AttributeSource::new(self.source_id.clone())
+                            .builder(k)
+                            .expires_in(Duration::from_secs(600))
+                            .value(v)
+                    })
+                    .collect());
+            }
+            Ok(Vec::new())
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        // Never flushed in these tests.
+        fn current_revision(&self) -> u64 {
+            1
+        }
+
+        fn get_source_id(&self) -> &str {
+            &self.source_id
+        }
+    }
+
+    /// zipline#24 (V1 gate, connect path): a valid OIDC login through `google` must
+    /// leave `user.zpr.authority == "google"` on the actor even when a second,
+    /// decorating trusted service (`happyfile`, a file store vending the tag
+    /// `user.zpr.tag.lazy` for the mapped subject) also answers the connect-time
+    /// lookup.
+    ///
+    /// Today this FAILS: `happyfile`'s tag is a `user.*` key, so
+    /// `derive_user_authority` mints `user.zpr.authority = happyfile` for it, that
+    /// derived claim is pushed into `authd_claims` AFTER the OIDC arm's stamped
+    /// `google`, and `approve_connection_detailed` commits claims with `add_attribute`
+    /// in slice order -- last writer wins, so the actor ends up with `"happyfile"`.
+    ///
+    /// The store order handed to [PolicySnapshot::for_tests] is pinned explicitly
+    /// (google's OIDC store first, happyfile second): production order is
+    /// `policy.list_services()` -- a HashMap iteration upstream, stable per policy
+    /// build but not sorted -- so the displacement direction must not be left to
+    /// accident in this test.
+    #[tokio::test]
+    #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
+    async fn test_oidc_connect_with_decorating_file_store_keeps_google_authority_zipline24() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        // Install a `google` OIDC policy mapping `sub -> user.sub` so the minted blob
+        // validates and its subject is admitted into the provider store.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                &["sub -> user.sub"],
+                &["sub"],
+                make_test_oidc_config(),
+                &[],
+                &[],
+            ))
+            .await
+            .expect("test policy should install");
+        let cc = make_cc("test-vs");
+        let pinned = asm.policy_mgr.get_current_snapshot();
+        let google_store = pinned
+            .oidc_service_for_issuer(OIDC_ISSUER)
+            .expect("installed policy must declare the google provider");
+
+        // The OIDC arm validates the token and stamps `user.zpr.authority = google`
+        // plus the mapped subject -- exactly what authenticate_adapter_or_node feeds
+        // into authorize_connection for a user-only login.
+        let AuthBlob::Oidc(blob) = oidc_blob(mint_signed(oidc_base_claims())) else {
+            unreachable!()
+        };
+        let outcome = cc
+            .authenticate_oidc_blob(&pinned, &blob)
+            .await
+            .expect("minted token must validate");
+        let authd = outcome.authd;
+
+        // Authorization policy declares BOTH trusted services, so `user.sub` is a
+        // lookup-identity key and the join policy (no conditions) admits the login.
+        let policy = policy_from_container(crate::test_helpers::make_trusted_services_policy(&[
+            crate::test_helpers::TrustedServiceSpec {
+                id: "google",
+                api: "oidc",
+                expiration_seconds: Some(3600),
+                mappings: &["sub -> user.sub"],
+                identity: &["sub"],
+                oidc: Some(make_test_oidc_config()),
+            },
+            crate::test_helpers::TrustedServiceSpec {
+                id: "happyfile",
+                api: "file",
+                expiration_seconds: Some(3600),
+                mappings: &["lazy -> #user.lazy"],
+                identity: &[],
+                oidc: None,
+            },
+        ]));
+        // happyfile's file-store mapping `lazy -> #user.lazy` produces the ZPR key
+        // `user.zpr.tag.lazy` (attribute_mapper.rs), vended for the admitted subject.
+        let happyfile = Arc::new(KeyedNamedTrustedService {
+            source_id: "happyfile".to_string(),
+            known_value: OIDC_SUB.to_string(),
+            vends: vec![("user.zpr.tag.lazy".to_string(), String::new())],
+        });
+        // Store order PINNED: google first, happyfile second, so happyfile's derived
+        // authority is pushed after google's stamped one and wins the last-writer race.
+        let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> =
+            vec![google_store, happyfile];
+
+        let actor = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, stores),
+                "user-only",
+                Vec::new(),
+                authd,
+                0,
+                true,
+            )
+            .await
+            .expect("user login with matching join policy should authorize");
+
+        // The decoration arrived...
+        assert!(
+            actor.get_attribute("user.zpr.tag.lazy").is_some(),
+            "happyfile's tag must reach the actor"
+        );
+        // ...but the authenticator's authority must survive it. FAILS today with
+        // "happyfile" (zipline#24); fixed by zipline#25/#26.
+        assert_eq!(
+            actor
+                .get_attribute(key::USER_AUTHORITY)
+                .expect("user authority must be present")
+                .get_value(),
+            &vec!["google".to_string()],
+            "the OIDC authenticator's authority must not be displaced by a decorating store"
+        );
+    }
 }

@@ -168,6 +168,30 @@ mod derive_tests {
         assert!(derive_user_authority("bas", &[]).is_none());
     }
 
+    /// Characterization of the zipline#24 defect mechanism: [derive_user_authority]
+    /// derives `user.zpr.authority = <source id>` for ANY source vending a `user.*`
+    /// attribute — here `happyfile` vending only the tag `user.zpr.tag.lazy` — with
+    /// no regard for an authority already asserted by another source (e.g. the OIDC
+    /// arm's `user.zpr.authority = google`). The two-argument signature cannot even
+    /// see a competing authority, so on the connect and refresh paths the derived
+    /// value silently overwrites the authenticator's (last writer wins in
+    /// `Actor::attrs`). This test PASSES today and documents that behaviour.
+    ///
+    /// The fix (zipline#25, plan task V2) changes the signature to
+    /// `derive_user_authority(source_id, ts_attrs, existing_authority: Option<&str>)`:
+    /// return `None` when `existing_authority == Some(other)` for `other != source_id`,
+    /// and still derive when it is `Some(source_id)` so expiry re-stamps. That change
+    /// rewrites this test into an assertion of the new behaviour.
+    #[test]
+    fn test_derive_user_authority_displaces_competing_authority_zipline24() {
+        let attrs = vec![attr("happyfile", "user.zpr.tag.lazy", "", 600)];
+        let authority = derive_user_authority("happyfile", &attrs)
+            .expect("a lone user.* tag derives an authority today");
+        assert_eq!(authority.get_key(), key::USER_AUTHORITY);
+        assert_eq!(authority.get_value(), ["happyfile".to_string()]);
+        assert_eq!(authority.get_source(), "happyfile");
+    }
+
     /// A source that vends `user.zpr.authority` itself asserts the authority
     /// directly; nothing is derived on top of it.
     #[test]
