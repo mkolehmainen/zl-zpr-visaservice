@@ -45,7 +45,9 @@ Common Types
 |                 |                                                          |
 | NamedListEntry  | { "id": string }                                         |
 |                 |                                                          |
-| CnEntry         | { "cn": string }                                         |
+| ActorEntry      | { "zpr_addr": string, "cn": string | null }              |
+|                 |   zpr_addr identifies the actor; cn is a display label   |
+|                 |   that may be absent.                                    |
 |                 |                                                          |
 | PolicyBundle    | { "config_id": number, "version": string,                |
 |                 |   "format": string, "container": string }                |
@@ -67,7 +69,8 @@ Common Types
 |                 |   "ingress_key": string, "egress_key": string }          |
 |                 |   keys are base64-encoded (and encrypted) byte strings.  |
 |                 |                                                          |
-| ActorDescriptor | { "cn": string, "created": number, "ident": string,      |
+| ActorDescriptor | { "cn": string | null, "created": number,                |
+|                 |   "ident": string,                                       |
 |                 |   "node": boolean, "zpr_addr": string,                   |
 |                 |   "attrs": ApiAttribute[],                               |
 |                 |   "auth_exp": number | null,                             |
@@ -83,6 +86,7 @@ Common Types
 |                 |   "approved_vreqs": number, "denied_vreqs": number,      |
 |                 |   "last_vreq": number | null,                            |
 |                 |   "adapters": string[], "links": string[],               |
+|                 |   (adapters and links are ZPR address strings)           |
 |                 |   "visas": number[], "visas_enqueued": number[],         |
 |                 |   "pending_revocation": number,                          |
 |                 |   "vss_port": number | null }                            |
@@ -138,46 +142,50 @@ Endpoints
 GET /admin/actors
 -----------------
   Summary
-    Returns a list of actor common names.
+    Returns a list of connected actors: ZPR address plus optional CN.
   Query
     role: node | adapter (optional; invalid value => 400)
   Request
     (none)
   Response
-    200: CnEntry[]
+    200: ActorEntry[]
     400: invalid role query value
     403: permission denied (empty list)
     500: empty list
 
-GET /admin/actors/{cn}
-----------------------
+GET /admin/actors/{zpr_addr}
+----------------------------
   Summary
-    Returns details for a specific actor.
+    Returns details for the actor at the given ZPR address.
   Request
     (none)
   Response
     200: ActorDescriptor
+    400: malformed ZPR address
     403: permission denied
     404: not found
     500: server error
   Notes
     created is currently 0 (actor create time not tracked yet).
     node_details is populated for node actors and null for adapters.
-    Note that passed {cn} must be url path encoded.
+    cn is null for actors without a CN (e.g. an OIDC-only connect).
 
-DELETE /admin/actors/{cn}
--------------------------
+DELETE /admin/actors/{zpr_addr}
+-------------------------------
   Summary
-    Revokes an actor. Placeholder: returns a fixed response.
+    Kicks the actor's live session (its credential is untouched;
+    credential revocation is /admin/authrevoke). Placeholder: the
+    address is validated but the response is fixed.
   Request
     (none)
   Response
     200: Revokes
-  Notes
-    Note that passed {cn} must be url path encoded.
+    400: malformed ZPR address
+    403: permission denied
+    404: not found
 
-GET /admin/actors/{cn}/visas
-----------------------------
+GET /admin/actors/{zpr_addr}/visas
+----------------------------------
   Summary
     Returns the IDs of all visas whose five-tuple has this actor's ZPR
     address as either the source or destination.
@@ -185,29 +193,28 @@ GET /admin/actors/{cn}/visas
     (none)
   Response
     200: ListEntry[]
+    400: malformed ZPR address (empty list)
     403: permission denied (empty list)
-    404: actor not found, or actor has no ZPR address (empty list)
+    404: actor not found (empty list)
     500: server error (empty list)
   Notes
-    Note that passed {cn} must be url path encoded.
     Currently scans every visa (O(n)); an index is pending a visa_mgr
     rework. No pagination support yet.
 
-GET /admin/nodes/{cn}/visas
----------------------------
+GET /admin/nodes/{zpr_addr}/visas
+---------------------------------
   Summary
     Returns the IDs of the visas currently installed on the given node.
   Request
     (none)
   Response
     200: ListEntry[]
-    400: actor is not a node (empty list)
+    400: malformed ZPR address, or actor is not a node (empty list)
     403: permission denied (empty list)
-    404: actor not found, or actor has no ZPR address (empty list)
+    404: actor not found (empty list)
     500: server error (empty list)
   Notes
-    {cn} must resolve to a node actor; non-node actors return 400.
-    Note that passed {cn} must be url path encoded.
+    {zpr_addr} must resolve to a node actor; non-node actors return 400.
 
 GET /admin/services
 -------------------
