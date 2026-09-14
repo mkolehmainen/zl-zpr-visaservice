@@ -3034,7 +3034,6 @@ mod tests {
                 Vec::new(),
                 authd,
                 0,
-                true,
             )
             .await
             .expect("user login with matching join policy should authorize");
