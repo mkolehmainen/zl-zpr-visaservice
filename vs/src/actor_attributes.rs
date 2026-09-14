@@ -743,4 +743,217 @@ mod tests {
             "the derived authority must not outlive the user record it vouches for"
         );
     }
+
+    // ---- user.zpr.authority displacement on the refresh path (zipline#24) ----
+
+    /// An OIDC-shaped fake (`google`): enforces the real store's `vouched_here` gate
+    /// (vs/src/oidc/store.rs) -- it vends its user record ONLY when the lookup set
+    /// carries `("user.zpr.authority", "google")`; with a competing authority (or
+    /// none) it answers with an empty, successful result, exactly like
+    /// [crate::oidc::OidcTrustedService::get_attributes_for_actor].
+    struct VouchedOidcFake;
+
+    const GOOGLE: &str = "google";
+    const USER_SUB_KEY: &str = "user.sub";
+    const USER_SUB_VALUE: &str = "google-sub-12345";
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services::TrustedServiceInterface for VouchedOidcFake {
+        async fn get_attributes_for_actor(
+            &self,
+            identities: &[(String, String)],
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            let vouched_here = identities
+                .iter()
+                .any(|(k, v)| k == key::USER_AUTHORITY && v == GOOGLE);
+            if !vouched_here {
+                return Ok(Vec::new());
+            }
+            Ok(vec![
+                AttributeSource::new(GOOGLE)
+                    .builder(USER_SUB_KEY)
+                    .expires_in(Duration::from_secs(600))
+                    .value(USER_SUB_VALUE),
+            ])
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        // Never flushed in these tests.
+        fn current_revision(&self) -> u64 {
+            1
+        }
+
+        fn get_source_id(&self) -> &str {
+            GOOGLE
+        }
+    }
+
+    /// A file-store-shaped fake (`happyfile`): vends the tag `user.zpr.tag.lazy`
+    /// whenever the lookup set carries the known `user.sub` value, like a
+    /// [crate::trusted_services] file store whose `lazy -> #user.lazy` mapping is
+    /// keyed on the mapped OIDC subject (zipline#24).
+    struct HappyfileFake;
+
+    const HAPPYFILE: &str = "happyfile";
+    const LAZY_TAG_KEY: &str = "user.zpr.tag.lazy";
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services::TrustedServiceInterface for HappyfileFake {
+        async fn get_attributes_for_actor(
+            &self,
+            identities: &[(String, String)],
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            if identities
+                .iter()
+                .any(|(k, v)| k == USER_SUB_KEY && v == USER_SUB_VALUE)
+            {
+                return Ok(vec![
+                    AttributeSource::new(HAPPYFILE)
+                        .builder(LAZY_TAG_KEY)
+                        .expires_in(Duration::from_secs(600))
+                        .values(Vec::<String>::new()),
+                ]);
+            }
+            Ok(Vec::new())
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        // Never flushed in these tests.
+        fn current_revision(&self) -> u64 {
+            1
+        }
+
+        fn get_source_id(&self) -> &str {
+            HAPPYFILE
+        }
+    }
+
+    /// An actor as the connect path leaves a decorated OIDC login:
+    /// `user.zpr.authority = google` and `user.sub` from the authenticator, the
+    /// `user.zpr.tag.lazy` tag from the decorating file store, plus a ZPR address.
+    /// `authority_value`/`authority_source` parameterize the displaced-state variant.
+    fn post_connect_actor(authority_value: &str, authority_source: &str, tag_secs: i64) -> Actor {
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(Attribute::builder(key::ZPR_ADDR).value(TEST_ADDR))
+            .unwrap();
+        actor
+            .add_attribute(
+                AttributeSource::new(authority_source)
+                    .builder(key::USER_AUTHORITY)
+                    .expires_in(Duration::from_secs(600))
+                    .value(authority_value),
+            )
+            .unwrap();
+        actor
+            .add_attribute(
+                AttributeSource::new(GOOGLE)
+                    .builder(USER_SUB_KEY)
+                    .expires_in(Duration::from_secs(600))
+                    .value(USER_SUB_VALUE),
+            )
+            .unwrap();
+        let tag_expires = if tag_secs < 0 {
+            SystemTime::now() - Duration::from_secs(tag_secs.unsigned_abs())
+        } else {
+            SystemTime::now() + Duration::from_secs(tag_secs as u64)
+        };
+        actor
+            .add_attribute(
+                AttributeSource::new(HAPPYFILE)
+                    .builder(LAZY_TAG_KEY)
+                    .expires(tag_expires)
+                    .values(Vec::<String>::new()),
+            )
+            .unwrap();
+        actor
+    }
+
+    /// zipline#24 (V1 gate, refresh path, symptom 1 of 2): a TTL refresh that touches
+    /// ONLY the decorating file store must not displace the authenticator's
+    /// `user.zpr.authority`. The actor starts as the connect path leaves it
+    /// (authority = google, `user.sub`, the happyfile tag); only the tag is expired
+    /// and only `happyfile` is registered, so exactly one source refreshes -- the
+    /// order-nondeterministic multi-source case is deliberately avoided so the RED
+    /// is deterministic.
+    ///
+    /// Today this FAILS: the re-vended tag is a `user.*` key, so
+    /// [derive_user_authority] mints `user.zpr.authority = happyfile` on the refresh
+    /// (vs/src/actor_attributes.rs) and `add_attribute` overwrites google's stamp.
+    #[tokio::test]
+    #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
+    async fn test_refresh_of_decorating_store_keeps_google_authority_zipline24() {
+        let mgr = TrustedServicesMgr::new();
+        mgr.update_services(vec![Arc::new(HappyfileFake)]);
+        // Authority and user.sub are fresh; only happyfile's tag has expired.
+        let mut actor = post_connect_actor(GOOGLE, GOOGLE, -1);
+
+        let outcome = refresh_expired_attributes(&mgr, &[USER_SUB_KEY], &mut actor).await;
+        assert!(outcome.changed);
+
+        // The tag was refreshed...
+        assert!(
+            !actor.get_attribute(LAZY_TAG_KEY).unwrap().is_expired(),
+            "happyfile must re-vend the tag"
+        );
+        // ...and the authenticator's authority must survive it. FAILS today with
+        // "happyfile" (zipline#24); fixed by zipline#25/#26.
+        assert_eq!(
+            actor
+                .get_attribute(key::USER_AUTHORITY)
+                .expect("user authority must be present")
+                .get_value(),
+            [GOOGLE.to_string()],
+            "a decorating store's refresh must not displace the authenticator's authority"
+        );
+    }
+
+    /// zipline#24 (V1 gate, refresh path, symptom 2 of 2): once the authority has
+    /// been displaced to `happyfile` (the state symptom 1 proves), the actor's
+    /// attributes unravel across refreshes. The OIDC store's `vouched_here` gate
+    /// answers the displaced-authority lookup with an empty result, the
+    /// revision-stale refresh prunes `user.sub` as no-longer-vended, and on the next
+    /// pass the file store's lookup (keyed on the now-missing `user.sub`) finds
+    /// nothing, so `user.zpr.tag.lazy` disappears too -- the actor loses `lazy`
+    /// mid-session.
+    ///
+    /// The actor starts in the displaced state rather than re-deriving it here:
+    /// starting from `google` would need both sources refreshed in one pass, whose
+    /// order is a HashSet iteration and would make the RED nondeterministic.
+    #[tokio::test]
+    #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
+    async fn test_refresh_after_displacement_loses_user_record_and_tag_zipline24() {
+        let mgr = TrustedServicesMgr::new();
+        mgr.update_services(vec![Arc::new(VouchedOidcFake), Arc::new(HappyfileFake)]);
+        // The displaced state: authority = happyfile, google's user.sub, the tag.
+        let mut actor = post_connect_actor(HAPPYFILE, HAPPYFILE, 600);
+
+        // Both sources are revision-stale (no recorded revisions), so both refresh.
+        // google's vouched_here gate sees authority=happyfile -> empty result ->
+        // the revision refresh prunes user.sub as no-longer-vended.
+        let outcome = refresh_expired_attributes(&mgr, &[USER_SUB_KEY], &mut actor).await;
+        assert!(outcome.indeterminate.is_empty());
+        assert!(
+            actor.get_attribute(USER_SUB_KEY).is_some(),
+            "the authenticated user.sub must survive a refresh (zipline#24: pruned \
+             because the displaced authority fails google's vouched_here gate)"
+        );
+
+        // Revisions deliberately NOT committed: both sources stay stale, as the
+        // request path leaves them after a failed persist. The next pass computes
+        // its lookup set without user.sub, so happyfile finds nothing and the tag
+        // (and its derived authority) are pruned as no-longer-vended.
+        let _ = refresh_expired_attributes(&mgr, &[USER_SUB_KEY], &mut actor).await;
+        assert!(
+            actor.get_attribute(LAZY_TAG_KEY).is_some(),
+            "the file store's tag must survive refreshes (zipline#24: lost once the \
+             pruned user.sub can no longer key the happyfile lookup)"
+        );
+    }
 }
