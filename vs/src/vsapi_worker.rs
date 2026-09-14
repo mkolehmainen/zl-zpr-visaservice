@@ -1026,8 +1026,9 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // TODO: This is a hack: the visa service "actor" needs to know what node it's adapter is docked to.
         //       Ideally we would query our adapter directly.
         {
+            let vs_zpr_addr = self.asm.config.get_vs_addr();
             if let Ok(maybe_visa_service_actor) =
-                self.asm.actor_mgr.get_actor_by_cn(config::VS_CN).await
+                self.asm.actor_mgr.get_actor_by_zpr_addr(&vs_zpr_addr).await
             {
                 if let Some(visa_service_actor) = maybe_visa_service_actor {
                     if self
