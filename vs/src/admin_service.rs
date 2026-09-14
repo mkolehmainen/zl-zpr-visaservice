@@ -2,6 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::{
@@ -48,7 +49,7 @@ use crate::visa_mgr::VisaMgr;
 use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 
 use admin_api_types::{
-    ActorDescriptor, ApiAttribute, ApiKeyFormat, ApiKeySet, CnEntry, ConnectionType, DenyRecord,
+    ActorDescriptor, ActorEntry, ApiAttribute, ApiKeyFormat, ApiKeySet, ConnectionType, DenyRecord,
     ListEntry, NamedListEntry, NetworkDetails, NodeConnection, NodeRecordBrief, Revokes,
     ServiceDescriptor, Stats, VisaDescriptor,
 };
@@ -515,14 +516,15 @@ async fn revoke_visa(EPath(id): EPath<u64>) -> impl IntoResponse {
     (StatusCode::OK, Json(r)).into_response()
 }
 
-/// Returns a list of connected CN values in CnEntry structs or empty list.
+/// Returns the connected actors as ActorEntry structs (ZPR address plus optional
+/// CN display label) or an empty list.
 async fn get_actors(
     Extension(perm): Extension<Permission>,
     State(state): State<SharedState>,
     Query(q): Query<RoleFilter>,
-) -> (StatusCode, Json<Vec<CnEntry>>) {
+) -> (StatusCode, Json<Vec<ActorEntry>>) {
     if !perm.can_read() {
-        return (StatusCode::FORBIDDEN, Json(Vec::<CnEntry>::new()));
+        return (StatusCode::FORBIDDEN, Json(Vec::<ActorEntry>::new()));
     }
     debug!(target: ADMIN, "GET /admin/actors {:?}", q);
     let db_filter = match q.role {
@@ -532,17 +534,23 @@ async fn get_actors(
     };
 
     let rstate = state.read().await;
-    match rstate.asm.actor_mgr.list_actor_cns(db_filter).await {
+    match rstate.asm.actor_mgr.list_actors(db_filter).await {
         Err(e) => {
             error!(target: ADMIN, "error listing connected actors: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(Vec::<CnEntry>::new()),
+                Json(Vec::<ActorEntry>::new()),
             )
         }
-        Ok(cns) => {
-            let cn_list: Vec<CnEntry> = cns.into_iter().map(|cn| CnEntry { cn }).collect();
-            (StatusCode::OK, Json(cn_list))
+        Ok(actors) => {
+            let entries: Vec<ActorEntry> = actors
+                .into_iter()
+                .map(|(addr, cn)| ActorEntry {
+                    zpr_addr: addr.to_string(),
+                    cn,
+                })
+                .collect();
+            (StatusCode::OK, Json(entries))
         }
     }
 }
@@ -550,9 +558,9 @@ async fn get_actors(
 async fn get_actor(
     State(state): State<SharedState>,
     Extension(perm): Extension<Permission>,
-    EPath(cn): EPath<String>,
+    EPath(addr): EPath<String>,
 ) -> Result<Json<ActorDescriptor>, StatusCode> {
-    debug!(target: ADMIN, "GET /admin/actor/{}", cn);
+    debug!(target: ADMIN, "GET /admin/actors/{}", addr);
     let rstate = state.read().await;
     let asm = rstate.asm.clone();
     drop(rstate);
@@ -561,7 +569,10 @@ async fn get_actor(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    match asm.actor_mgr.get_actor_by_cn(&cn).await {
+    // The path segment is a ZPR address; a malformed one is a bad request, not a miss.
+    let zpr_addr = IpAddr::from_str(&addr).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    match asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await {
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         Ok(opt_a) => match opt_a {
             None => Err(StatusCode::NOT_FOUND),
@@ -592,12 +603,14 @@ async fn get_actor(
                 let auth_exp = actor.get_authentication_expiration();
 
                 let node_details = match is_node {
-                    true => Some(build_node_record_brief(&asm, actor).await?),
+                    true => Some(build_node_record_brief(&asm, &actor).await?),
                     false => None,
                 };
 
                 let descriptor = ActorDescriptor {
-                    cn: cn.clone(),
+                    // The path no longer carries a name: the CN comes from the
+                    // actor record itself, and may legitimately be absent.
+                    cn: actor.get_cn().map(str::to_string),
                     ctime: SystemTime::UNIX_EPOCH, // TODO: Not tracked yet
                     ident,
                     node: is_node,
@@ -614,7 +627,7 @@ async fn get_actor(
 
 async fn build_node_record_brief(
     asm: &Assembly,
-    actor: libeval::actor::Actor,
+    actor: &libeval::actor::Actor,
 ) -> Result<NodeRecordBrief, StatusCode> {
     let counters = asm.counters.clone();
     let actor_mgr = asm.actor_mgr.clone();
@@ -644,19 +657,17 @@ async fn build_node_record_brief(
         .unwrap_or(0);
     let last_vreq = counters.get_last_request_time(zpr_addr);
     let adapters = actor_mgr
-        .get_adapter_cns_connected_to_node(zpr_addr)
+        .get_adapters_connected_to_node(zpr_addr)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut links: Vec<String> = Vec::new();
-    for peer_addr in topo_mgr.get_peers(zpr_addr) {
-        match actor_mgr.get_cn_by_zpr_addr(&peer_addr).await {
-            Ok(cn) => links.push(cn),
-            Err(e) => {
-                warn!(target: ADMIN, "error {} getting CN for peer with addr {}", e, peer_addr);
-                links.push(format!("cn_missing:{}", peer_addr))
-            }
-        }
-    }
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect();
+    let links: Vec<String> = topo_mgr
+        .get_peers(zpr_addr)
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect();
     let visas = visa_mgr
         .get_installed_visa_ids_for_node(zpr_addr)
         .await
@@ -696,30 +707,51 @@ async fn build_node_record_brief(
     })
 }
 
-async fn revoke_actor(EPath(cn): EPath<String>) -> impl IntoResponse {
-    debug!(target: ADMIN, "DELETE /admin/actors/{}", cn);
+/// DELETE /admin/actors/{addr} -- kicks the actor's live session (its credential
+/// is untouched; credential revocation is /admin/authrevoke). Placeholder: the
+/// address is validated (400 malformed, 404 unknown) but the response is fixed.
+async fn revoke_actor(
+    State(state): State<SharedState>,
+    Extension(perm): Extension<Permission>,
+    EPath(addr): EPath<String>,
+) -> Result<Json<Revokes>, StatusCode> {
+    if !perm.can_write() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    debug!(target: ADMIN, "DELETE /admin/actors/{}", addr);
+
+    let zpr_addr = IpAddr::from_str(&addr).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let rstate = state.read().await;
+    match rstate.asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await {
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Ok(Some(_)) => {}
+    }
+
     let r = Revokes {
         id: "i".to_string(),
         revoked: vec![0, 1, 2],
     };
-
-    (StatusCode::OK, Json(r)).into_response()
+    Ok(Json(r))
 }
 
-/// Resolve a CN to its ZPR address and a cloned (Arc-backed) visa manager, releasing the state
-/// read-lock before returning so callers can do longer work without blocking writers. When
-/// `require_node` is set, non-node actors are rejected with `BAD_REQUEST`. On any failure the
-/// appropriate `StatusCode` is returned for the caller to surface.
+/// Parse and resolve a ZPR-address path segment, returning the address and a cloned
+/// (Arc-backed) visa manager, releasing the state read-lock before returning so callers
+/// can do longer work without blocking writers. A malformed address is `BAD_REQUEST`;
+/// an unknown one is `NOT_FOUND`. When `require_node` is set, non-node actors are
+/// rejected with `BAD_REQUEST`.
 async fn resolve_actor_addr(
     state: &SharedState,
-    cn: &str,
+    addr: &str,
     require_node: bool,
 ) -> Result<(IpAddr, VisaMgr), StatusCode> {
+    let zpr_addr = IpAddr::from_str(addr).map_err(|_| StatusCode::BAD_REQUEST)?;
+
     let rstate = state.read().await;
 
-    let actor = match rstate.asm.actor_mgr.get_actor_by_cn(cn).await {
+    let actor = match rstate.asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await {
         Err(e) => {
-            error!(target: ADMIN, "error getting actor with cn {}: {}", cn, e);
+            error!(target: ADMIN, "error getting actor at {}: {}", zpr_addr, e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
         Ok(None) => return Err(StatusCode::NOT_FOUND),
@@ -727,33 +759,25 @@ async fn resolve_actor_addr(
     };
 
     if require_node && !actor.is_node() {
-        warn!(target: ADMIN, "actor {} is not a node", cn);
+        warn!(target: ADMIN, "actor at {} is not a node", zpr_addr);
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let actor_addr = match actor.get_zpr_addr() {
-        None => {
-            warn!(target: ADMIN, "actor {} has no ZPR address", cn);
-            return Err(StatusCode::NOT_FOUND);
-        }
-        Some(addr) => *addr,
-    };
-
-    Ok((actor_addr, rstate.asm.visa_mgr.clone()))
+    Ok((zpr_addr, rstate.asm.visa_mgr.clone()))
 }
 
 /// List of visa IDs
 async fn get_related_visas(
     Extension(perm): Extension<Permission>,
     State(state): State<SharedState>,
-    EPath(cn): EPath<String>,
+    EPath(addr): EPath<String>,
 ) -> (StatusCode, Json<Vec<ListEntry>>) {
     if !perm.can_read() {
         return (StatusCode::FORBIDDEN, Json(Vec::<ListEntry>::new()));
     }
-    debug!(target: ADMIN, "GET /admin/actors/{}/visas", cn);
+    debug!(target: ADMIN, "GET /admin/actors/{}/visas", addr);
 
-    let (actor_addr, visa_mgr) = match resolve_actor_addr(&state, &cn, false).await {
+    let (actor_addr, visa_mgr) = match resolve_actor_addr(&state, &addr, false).await {
         Ok(pair) => pair,
         Err(code) => return (code, Json(Vec::<ListEntry>::new())),
     };
@@ -777,14 +801,14 @@ async fn get_related_visas(
 async fn get_visas_on_node(
     Extension(perm): Extension<Permission>,
     State(state): State<SharedState>,
-    EPath(cn): EPath<String>,
+    EPath(addr): EPath<String>,
 ) -> (StatusCode, Json<Vec<ListEntry>>) {
     if !perm.can_read() {
         return (StatusCode::FORBIDDEN, Json(Vec::<ListEntry>::new()));
     }
-    debug!(target: ADMIN, "GET /admin/nodes/{}/visas", cn);
+    debug!(target: ADMIN, "GET /admin/nodes/{}/visas", addr);
 
-    let (actor_addr, visa_mgr) = match resolve_actor_addr(&state, &cn, true).await {
+    let (actor_addr, visa_mgr) = match resolve_actor_addr(&state, &addr, true).await {
         Ok(pair) => pair,
         Err(code) => return (code, Json(Vec::<ListEntry>::new())),
     };
@@ -1723,7 +1747,7 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
 
-        let actors: Vec<CnEntry> = serde_json::from_slice(&body).unwrap();
+        let actors: Vec<ActorEntry> = serde_json::from_slice(&body).unwrap();
         assert!(actors.is_empty());
     }
 
@@ -1751,9 +1775,10 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
 
-        let actors: Vec<CnEntry> = serde_json::from_slice(&body).unwrap();
+        let actors: Vec<ActorEntry> = serde_json::from_slice(&body).unwrap();
         assert_eq!(actors.len(), 1);
-        assert_eq!(actors[0].cn, "node-1");
+        assert_eq!(actors[0].zpr_addr, "fd5a:5052::10");
+        assert_eq!(actors[0].cn, Some("node-1".to_string()));
     }
 
     /// F1 endpoint view (zipline#29 / zipline#30, A1 gate): `GET /admin/actors` must
@@ -1844,16 +1869,16 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
 
-        let mut actors: Vec<CnEntry> = serde_json::from_slice(&body).unwrap();
+        let mut actors: Vec<ActorEntry> = serde_json::from_slice(&body).unwrap();
         assert_eq!(actors.len(), 3);
-        actors.sort_by(|a, b| a.cn.cmp(&b.cn));
-        let actor_cns: Vec<String> = actors.into_iter().map(|a| a.cn).collect();
+        actors.sort_by(|a, b| a.zpr_addr.cmp(&b.zpr_addr));
+        let actor_addrs: Vec<String> = actors.into_iter().map(|a| a.zpr_addr).collect();
         assert_eq!(
-            actor_cns,
+            actor_addrs,
             vec![
-                "node-1".to_string(),
-                "node-2".to_string(),
-                "node-3".to_string()
+                "fd5a:5052::11".to_string(),
+                "fd5a:5052::12".to_string(),
+                "fd5a:5052::13".to_string()
             ]
         );
     }
@@ -1894,9 +1919,10 @@ mod tests {
             .await
             .unwrap()
             .to_bytes();
-        let actors_nodes: Vec<CnEntry> = serde_json::from_slice(&body_nodes).unwrap();
+        let actors_nodes: Vec<ActorEntry> = serde_json::from_slice(&body_nodes).unwrap();
         assert_eq!(actors_nodes.len(), 1);
-        assert_eq!(actors_nodes[0].cn, "node-1");
+        assert_eq!(actors_nodes[0].zpr_addr, "fd5a:5052::20");
+        assert_eq!(actors_nodes[0].cn, Some("node-1".to_string()));
 
         let response_adapters = app
             .oneshot(
@@ -1917,9 +1943,10 @@ mod tests {
             .await
             .unwrap()
             .to_bytes();
-        let actors_adapters: Vec<CnEntry> = serde_json::from_slice(&body_adapters).unwrap();
+        let actors_adapters: Vec<ActorEntry> = serde_json::from_slice(&body_adapters).unwrap();
         assert_eq!(actors_adapters.len(), 1);
-        assert_eq!(actors_adapters[0].cn, "adapter-1");
+        assert_eq!(actors_adapters[0].zpr_addr, "fd5a:5052::21");
+        assert_eq!(actors_adapters[0].cn, Some("adapter-1".to_string()));
     }
 
     #[tokio::test]
@@ -2298,7 +2325,7 @@ mod tests {
         );
     }
 
-    /// GET /admin/nodes/{cn}/visas for a node with no installed visas returns OK
+    /// GET /admin/nodes/{addr}/visas for a node with no installed visas returns OK
     /// with an empty list.
     #[tokio::test]
     async fn test_get_visas_on_node_empty_ok() {
@@ -2313,7 +2340,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/admin/nodes/node-1/visas")
+                    .uri("/admin/nodes/fd5a:5052::30/visas")
                     .header("X-API-Key", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -2327,7 +2354,7 @@ mod tests {
         assert!(visas.is_empty());
     }
 
-    /// GET /admin/nodes/{cn}/visas for a non-node actor is rejected with BAD_REQUEST.
+    /// GET /admin/nodes/{addr}/visas for a non-node actor is rejected with BAD_REQUEST.
     #[tokio::test]
     async fn test_get_visas_on_node_non_node_bad_request() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
@@ -2346,7 +2373,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/admin/nodes/adapter-1/visas")
+                    .uri("/admin/nodes/fd5a:5052::32/visas")
                     .header("X-API-Key", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -2356,9 +2383,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// GET /admin/nodes/{cn}/visas for an unknown CN returns NOT_FOUND.
+    /// GET /admin/nodes/{addr}/visas for an unknown address returns NOT_FOUND.
     #[tokio::test]
-    async fn test_get_visas_on_node_unknown_cn_not_found() {
+    async fn test_get_visas_on_node_unknown_addr_not_found() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_r_key(&asm);
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
@@ -2367,7 +2394,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/admin/nodes/does-not-exist/visas")
+                    .uri("/admin/nodes/fd5a:5052::999/visas")
                     .header("X-API-Key", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -2377,10 +2404,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// GET /admin/actors/{cn}/visas for an unknown CN returns NOT_FOUND (exercises
-    /// the shared resolve_actor_addr helper with require_node = false).
+    /// GET /admin/actors/{addr}/visas for an unknown address returns NOT_FOUND
+    /// (exercises the shared resolve_actor_addr helper with require_node = false).
     #[tokio::test]
-    async fn test_get_related_visas_unknown_cn_not_found() {
+    async fn test_get_related_visas_unknown_addr_not_found() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_r_key(&asm);
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
@@ -2389,7 +2416,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/admin/actors/does-not-exist/visas")
+                    .uri("/admin/actors/fd5a:5052::999/visas")
                     .header("X-API-Key", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -2493,6 +2520,212 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         // Nothing was invalidated, so nothing needs revalidating.
         assert!(event_rx.try_recv().is_err());
+    }
+
+    /// GET /admin/actors/{addr} returns the actor's descriptor, keyed on the
+    /// address, with the CN read from the actor record (not echoed from the path).
+    #[tokio::test]
+    async fn test_get_actor_detail_ok() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::40", "node-detail", "[fd5a:5052::140]:1234");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/actors/fd5a:5052::40")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let descriptor: ActorDescriptor = serde_json::from_slice(&body).unwrap();
+        assert_eq!(descriptor.zpr_addr, "fd5a:5052::40");
+        assert_eq!(descriptor.cn, Some("node-detail".to_string()));
+        assert!(descriptor.node);
+        assert!(
+            descriptor.node_details.is_some(),
+            "node actors carry node_details"
+        );
+    }
+
+    /// A CN-less actor (OIDC-only connect) is fetchable by address and its
+    /// descriptor carries a null cn -- the acceptance case for the re-key.
+    #[tokio::test]
+    async fn test_get_actor_detail_cn_less_ok() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::41", "node-x", "[fd5a:5052::141]:1234");
+        let cn_less = make_oidc_only_adapter_defexp("fd5a:5052::42");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&cn_less, node.get_zpr_addr().unwrap())
+            .await
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/actors/fd5a:5052::42")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let descriptor: ActorDescriptor = serde_json::from_slice(&body).unwrap();
+        assert_eq!(descriptor.zpr_addr, "fd5a:5052::42");
+        assert_eq!(descriptor.cn, None, "CN-less actor must carry a null cn");
+        assert!(!descriptor.node);
+        assert!(descriptor.node_details.is_none());
+    }
+
+    /// A CN-less adapter appears in its node's NodeRecordBrief.adapters, listed by
+    /// ZPR address (acceptance: the F2 fix as seen through the detail endpoint).
+    #[tokio::test]
+    async fn test_get_actor_detail_node_brief_lists_cn_less_adapter() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::43", "node-brief", "[fd5a:5052::143]:1234");
+        let cn_less = make_oidc_only_adapter_defexp("fd5a:5052::44");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&cn_less, node.get_zpr_addr().unwrap())
+            .await
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/actors/fd5a:5052::43")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let descriptor: ActorDescriptor = serde_json::from_slice(&body).unwrap();
+        let brief = descriptor.node_details.expect("node carries node_details");
+        assert_eq!(
+            brief.adapters,
+            vec!["fd5a:5052::44".to_string()],
+            "the CN-less adapter must appear in NodeRecordBrief.adapters by address"
+        );
+    }
+
+    /// GET /admin/actors/{addr}: a malformed address is a 400 (new behaviour --
+    /// a CN path accepted any string) and an unknown one is a 404.
+    #[tokio::test]
+    async fn test_get_actor_detail_malformed_400_unknown_404() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        for (path, expected) in [
+            ("/admin/actors/not-an-address", StatusCode::BAD_REQUEST),
+            ("/admin/actors/fd5a:5052::999", StatusCode::NOT_FOUND),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header("X-API-Key", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "for {path}");
+        }
+    }
+
+    /// DELETE /admin/actors/{addr}: 200 with the placeholder Revokes body for a
+    /// known actor, 400 for a malformed address, 404 for an unknown one.
+    #[tokio::test]
+    async fn test_revoke_actor_ok_and_errors() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_rw_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::45", "node-rvk", "[fd5a:5052::145]:1234");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        for (path, expected) in [
+            ("/admin/actors/fd5a:5052::45", StatusCode::OK),
+            ("/admin/actors/not-an-address", StatusCode::BAD_REQUEST),
+            ("/admin/actors/fd5a:5052::999", StatusCode::NOT_FOUND),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(path)
+                        .header("X-API-Key", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "for {path}");
+            if expected == StatusCode::OK {
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let _revokes: Revokes = serde_json::from_slice(&body).unwrap();
+            }
+        }
+    }
+
+    /// The visa endpoints share resolve_actor_addr: a malformed address is a 400
+    /// on both /admin/actors/{addr}/visas and /admin/nodes/{addr}/visas.
+    #[tokio::test]
+    async fn test_visa_endpoints_malformed_address_bad_request() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        for path in [
+            "/admin/actors/not-an-address/visas",
+            "/admin/nodes/not-an-address/visas",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header("X-API-Key", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "for {path}");
+        }
     }
 
     /// A read-only key may not flush a trusted service.
