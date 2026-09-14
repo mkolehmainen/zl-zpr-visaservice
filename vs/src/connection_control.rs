@@ -337,10 +337,7 @@ impl ConnectionControl {
             authd_claims.extend(outcome.authd);
         }
 
-        // Every presented blob validated -- now run through policy. A validated
-        // user (OIDC) blob makes "no join policy matched" a refusal (policyDenied)
-        // rather than the #227 device-only fallthrough.
-        let user_login_presented = seen_namespaces.contains(&Namespace::User);
+        // Every presented blob validated -- now run through policy.
         let endpoint_cn = authd_or_claimed_cn(&authd_claims, &scrubbed_claims);
         let mut actor = self
             .authorize_connection(
@@ -350,7 +347,6 @@ impl ConnectionControl {
                 scrubbed_claims,
                 authd_claims,
                 req.dock_interface,
-                user_login_presented,
             )
             .await?;
 
@@ -419,15 +415,7 @@ impl ConnectionControl {
 
         // Ok checks out -- now run through policy.
         let vs_actor = self
-            .authorize_connection(
-                asm,
-                &psnap,
-                &config::VS_CN,
-                Vec::new(),
-                authd_claims,
-                0,
-                false,
-            )
+            .authorize_connection(asm, &psnap, &config::VS_CN, Vec::new(), authd_claims, 0)
             .await?;
 
         // authorize_connection no longer stamps a blanket authority, so the
@@ -633,7 +621,6 @@ impl ConnectionControl {
                 unauthd_claims,
                 authd_claims,
                 dock_interface,
-                false,
             )
             .await?;
 
@@ -675,10 +662,10 @@ impl ConnectionControl {
     /// (e.g. [key::DEVICE_AUTHORITY] on the RSA bootstrap path). Whichever
     /// namespaced authorities are present are registered as identity attributes.
     ///
-    /// `user_login_presented` says the connect carried a (validated) OIDC blob:
-    /// such a connection is refused with `policyDenied` when no join policy
-    /// matches, unlike the device-only case which may stay connected without one
-    /// (#227) -- see [EvalContext::approve_connection_detailed].
+    /// An authenticated endpoint that matches no join policy is still authorized --
+    /// it just gets no role and no services, so no communication policy admits it
+    /// anywhere (#227). This holds for user (OIDC) logins too; see
+    /// [EvalContext::approve_connection].
     async fn authorize_connection(
         &self,
         asm: Arc<Assembly>,
@@ -687,7 +674,6 @@ impl ConnectionControl {
         unauthd_claims: Vec<Attribute>,
         mut authd_claims: Vec<Attribute>,
         _dock_interface: u8,
-        user_login_presented: bool,
     ) -> Result<Actor, ServiceError> {
         // TODO: Check with our revocation tables.
         info!(target: CC, "authorize_connection - TODO: check revocation table");
@@ -756,28 +742,14 @@ impl ConnectionControl {
         // TODO: Need to go in to eval and fix the approve_connection logic w/respect to the ROLE claim.
         // We won't know a priori if this is a node or adapter. Though sometimes we do know it's a node.
         // Anyway, best to let VS sort it out and do not do it in libeval.
-        let (mut authd_actor, matched_join_policy) =
-            match ectx.approve_connection_detailed(Some(&authd_claims), Some(&unauthd_claims)) {
+        let mut authd_actor =
+            match ectx.approve_connection(Some(&authd_claims), Some(&unauthd_claims)) {
                 Ok(approved) => approved,
                 Err(e) => {
                     info!(target: CC, "connection not approved for cn {}: {}", endpoint_cn, e);
                     return Err(e.into());
                 }
             };
-
-        // A valid user login that policy does not admit is refused outright with
-        // `policyDenied` (Contract 2): authentication succeeded, so this is not a
-        // credential oracle, and unlike the device-only #227 case there is nothing
-        // a join-policy-less user session may do. The message stays generic --
-        // which policies exist is not the caller's to learn.
-        if user_login_presented && !matched_join_policy {
-            info!(target: CC, "user login for {endpoint_cn} matched no join policy");
-            return Err(ApiResponseError::new_code_msg(
-                ErrorCode::PolicyDenied,
-                "no join policy admits this connection",
-            )
-            .into());
-        }
 
         // The blob arms own the authority: register whichever namespaced authority
         // attributes the authentication path stamped as identity attributes, rather
@@ -1291,7 +1263,6 @@ mod tests {
             Vec::new(),
             authd.clone(),
             0,
-            false,
         )
         .await
         .expect("should authorize with no trusted services");
@@ -1304,7 +1275,6 @@ mod tests {
                 Vec::new(),
                 authd,
                 0,
-                false,
             )
             .await;
         assert!(matches!(
@@ -1864,7 +1834,6 @@ mod tests {
                 unauthd,
                 authd,
                 0,
-                false,
             )
             .await
             .expect("user-only connection should authorize");
@@ -1912,7 +1881,6 @@ mod tests {
                 Vec::new(),
                 authd,
                 0,
-                false,
             )
             .await
             .expect("device connection should authorize");
@@ -2003,7 +1971,6 @@ mod tests {
                 Vec::new(),
                 authd,
                 0,
-                false,
             )
             .await
             .expect("connection should authorize");
@@ -2051,7 +2018,6 @@ mod tests {
                 Vec::new(),
                 authd,
                 0,
-                false,
             )
             .await
             .expect("connection should authorize");
@@ -2089,7 +2055,6 @@ mod tests {
                 Vec::new(),
                 authd,
                 0,
-                false,
             )
             .await
             .expect("connection should authorize");
@@ -2305,7 +2270,6 @@ mod tests {
                 unauthd,
                 authd,
                 0,
-                false,
             )
             .await
             .expect("user-only connection should authorize");
@@ -2351,7 +2315,6 @@ mod tests {
                 unauthd,
                 authd,
                 0,
-                false,
             )
             .await
             .expect("user-only connection should authorize");
@@ -2801,10 +2764,14 @@ mod tests {
         );
     }
 
-    /// A fully valid login that no join policy admits is refused with `policyDenied`
-    /// — unlike the device-only case (#227), which may stay connected without one.
+    /// A fully valid user login that no join policy admits still connects: a join
+    /// policy grants a role and services, and an actor without one simply has
+    /// neither -- exactly the device-only #227 case. Refusing the connection was
+    /// the wrong lever ("only admit logins vouched by service X" is a policy
+    /// feature ZPL cannot yet express), so authentication alone admits the
+    /// endpoint and communication policy decides what it may reach.
     #[tokio::test]
-    async fn test_valid_login_no_join_policy_is_policy_denied() {
+    async fn test_valid_login_no_join_policy_connects() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         // The only join policy requires a domain this login does not have.
         asm.policy_mgr
@@ -2822,15 +2789,23 @@ mod tests {
         let cc = make_cc("test-vs");
         let req = make_connect_request(vec![oidc_blob(mint_signed(oidc_base_claims()))], "some.cn");
 
-        let result = cc
+        let actor = cc
             .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
-            .await;
+            .await
+            .expect("a validated login must connect without a matching join policy");
 
-        let api = expect_api_response(result);
+        // Authenticated, so the user identity is on the actor ...
+        assert_eq!(
+            actor
+                .get_attribute(key::USER_AUTHORITY)
+                .expect("user authority must be stamped")
+                .get_value(),
+            &vec!["google".to_string()]
+        );
+        // ... but no join policy matched, so it provides no services.
         assert!(
-            matches!(api.code, ErrorCode::PolicyDenied),
-            "expected policyDenied, got {:?}",
-            api.code
+            actor.get_attribute(key::SERVICES).is_none(),
+            "no join policy matched, so the actor must provide no services"
         );
     }
 
