@@ -95,16 +95,16 @@ impl Executor {
 
     pub fn do_cmd_actors(
         &self,
-        cn: Option<String>,
+        addr: Option<String>,
         revoke: bool,
         nodes: bool,
         visas: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        match cn {
-            Some(cn) => match (revoke, visas) {
-                (true, _) => self.revoke_actor(&cn)?,
-                (_, true) => self.get_related_visas(&cn)?,
-                _ => self.get_actor(&cn)?,
+        match addr {
+            Some(addr) => match (revoke, visas) {
+                (true, _) => self.revoke_actor(&addr)?,
+                (_, true) => self.get_related_visas(&addr)?,
+                _ => self.get_actor(&addr)?,
             },
             None => self.get_actors(nodes)?,
         }
@@ -232,24 +232,24 @@ impl Executor {
         self.print_json(&actors)
     }
 
-    fn get_actor(&self, cn: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let actor = self.vs_cli.get_actor(cn)?;
+    fn get_actor(&self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let actor = self.vs_cli.get_actor(addr)?;
         self.print_json(&actor)
     }
 
-    fn revoke_actor(&self, cn: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let revoke = self.vs_cli.revoke_actor(cn)?;
+    fn revoke_actor(&self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let revoke = self.vs_cli.revoke_actor(addr)?;
         self.print_json(&revoke)
     }
 
-    fn get_related_visas(&self, cn: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let entries = self.vs_cli.get_related_visas(cn)?;
+    fn get_related_visas(&self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let entries = self.vs_cli.get_related_visas(addr)?;
         self.print_json(&entries)
     }
 
-    /// Prints the IDs of the visas currently installed on the node with the given CN.
-    fn get_visas_on_node(&self, cn: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let entries = self.vs_cli.get_visas_on_node(cn)?;
+    /// Prints the IDs of the visas currently installed on the node at the given ZPR address.
+    fn get_visas_on_node(&self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let entries = self.vs_cli.get_visas_on_node(addr)?;
         self.print_json(&entries)
     }
 

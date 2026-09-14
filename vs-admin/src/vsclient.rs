@@ -7,7 +7,7 @@ use reqwest::tls::Certificate;
 use zpr::policy_types::PolicyBundle;
 
 use admin_api_types::{
-    ActorDescriptor, AuthRevokeDescriptor, CnEntry, DenyRecord, ListEntry, NamedListEntry,
+    ActorDescriptor, ActorEntry, AuthRevokeDescriptor, DenyRecord, ListEntry, NamedListEntry,
     NetworkDetails, Revokes, ServiceDescriptor, Stats, VisaDescriptor,
 };
 
@@ -169,24 +169,24 @@ impl VsClient {
 
     /// `GET <api_url>/admin/actors[?role=node|adapter]`
     ///
-    /// Returns a list of CN values.
-    pub fn get_actors(&self, filter: RoleFilter) -> Result<Vec<CnEntry>, VsaError> {
+    /// Returns a list of actor entries: ZPR address plus optional CN display label.
+    pub fn get_actors(&self, filter: RoleFilter) -> Result<Vec<ActorEntry>, VsaError> {
         let query = match filter {
             RoleFilter::NodesOnly => "?role=node",
             RoleFilter::AdaptersOnly => "?role=adapter",
             RoleFilter::All => "",
         };
-        let entry_vec = self.request_get_list_entries::<CnEntry>(&format!(
+        let entry_vec = self.request_get_list_entries::<ActorEntry>(&format!(
             "{}/admin/actors{}",
             self.api_url, query
         ))?;
         Ok(entry_vec)
     }
 
-    /// `GET <api_url>/admin/actors/<cn>`
-    pub fn get_actor(&self, cn: &str) -> Result<ActorDescriptor, VsaError> {
+    /// `GET <api_url>/admin/actors/<zpr_addr>`
+    pub fn get_actor(&self, addr: &str) -> Result<ActorDescriptor, VsaError> {
         let mut requrl = reqwest::Url::parse(&format!("{}/admin/actors", self.api_url))?;
-        requrl.path_segments_mut().unwrap().push(cn);
+        requrl.path_segments_mut().unwrap().push(addr);
         let resp = self.ht_get(requrl.as_str())?;
         let entry: ActorDescriptor = resp.json()?;
         Ok(entry)
@@ -277,19 +277,19 @@ impl VsClient {
         Ok(revoke)
     }
 
-    /// `DELETE <api_url>/admin/actors/<cn>`
-    pub fn revoke_actor(&self, cn: &str) -> Result<Revokes, VsaError> {
+    /// `DELETE <api_url>/admin/actors/<zpr_addr>`
+    pub fn revoke_actor(&self, addr: &str) -> Result<Revokes, VsaError> {
         let mut requrl = reqwest::Url::parse(&format!("{}/admin/actors", self.api_url))?;
-        requrl.path_segments_mut().unwrap().push(cn);
+        requrl.path_segments_mut().unwrap().push(addr);
         let resp = self.ht_delete(requrl.as_str())?;
         let revoke: Revokes = resp.json()?;
         Ok(revoke)
     }
 
-    /// `GET <api_url>/admin/actors/<cn>/visas`
-    pub fn get_related_visas(&self, cn: &str) -> Result<Vec<ListEntry>, VsaError> {
+    /// `GET <api_url>/admin/actors/<zpr_addr>/visas`
+    pub fn get_related_visas(&self, addr: &str) -> Result<Vec<ListEntry>, VsaError> {
         let mut requrl = reqwest::Url::parse(&format!("{}/admin/actors", self.api_url))?;
-        requrl.path_segments_mut().unwrap().push(cn).push("visas");
+        requrl.path_segments_mut().unwrap().push(addr).push("visas");
         let entry_vec = self.request_get_list_entries::<ListEntry>(requrl.as_str())?;
         Ok(entry_vec)
     }
@@ -344,12 +344,12 @@ impl VsClient {
         Ok(entry)
     }
 
-    /// `GET <api_url>/admin/nodes/<cn>/visas`
+    /// `GET <api_url>/admin/nodes/<zpr_addr>/visas`
     ///
     /// Returns the IDs of the visas currently installed on the given node.
-    pub fn get_visas_on_node(&self, cn: &str) -> Result<Vec<ListEntry>, VsaError> {
+    pub fn get_visas_on_node(&self, addr: &str) -> Result<Vec<ListEntry>, VsaError> {
         let mut requrl = reqwest::Url::parse(&format!("{}/admin/nodes", self.api_url))?;
-        requrl.path_segments_mut().unwrap().push(cn).push("visas");
+        requrl.path_segments_mut().unwrap().push(addr).push("visas");
         let entry_vec = self.request_get_list_entries::<ListEntry>(requrl.as_str())?;
         Ok(entry_vec)
     }

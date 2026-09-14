@@ -11,7 +11,6 @@
 //! - nodes                        - set of IP addresses  of all connected nodes.
 //! - adapters                     - set of IP addresses  of all connected adapters.
 
-use dashmap::DashMap;
 use libeval::actor::Actor;
 use libeval::attribute::Attribute;
 use libeval::attribute::key;
@@ -38,8 +37,6 @@ pub enum Role {
 
 pub struct ActorRepo {
     db: Arc<dyn DbConnection>,
-
-    cn_idx: DashMap<String, IpAddr>, // CN -> ZPR_ADDRESS
 }
 
 /// Location of a service in the ZPRnet.
@@ -57,14 +54,11 @@ impl ServiceEntry {
 
 impl ActorRepo {
     pub fn new(db_handle: Arc<dyn DbConnection>) -> Self {
-        ActorRepo {
-            db: db_handle,
-            cn_idx: DashMap::new(),
-        }
+        ActorRepo { db: db_handle }
     }
 
     /// Undo all the redis additions performed by `add_actor`.
-    async fn clean_up(&self, zpraddr: &IpAddr, cn: Option<&str>) -> Result<(), StoreError> {
+    async fn clean_up(&self, zpraddr: &IpAddr) -> Result<(), StoreError> {
         //let mut vk_conn = self.db.conn.clone();
 
         let zpraddr_str = zpraddr.to_string();
@@ -111,24 +105,17 @@ impl ActorRepo {
             }
             self.db.del(&services_key).await?;
         }
-
-        if let Some(cn_val) = cn {
-            self.cn_idx.remove(cn_val);
-        }
         Ok(())
     }
 
     pub async fn add_actor(&self, actor: &Actor) -> Result<(), StoreError> {
         match self.try_add_actor(actor).await {
-            Ok(_) => {
-                self.add_to_cache(actor);
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(e) => {
                 // Attempt to clean up after ourselves...
                 warn!(target: DB, "add_actor failed, attempting cleanup");
                 if let Some(zpraddr) = actor.get_zpr_addr() {
-                    match self.clean_up(zpraddr, actor.get_cn()).await {
+                    match self.clean_up(zpraddr).await {
                         Ok(_) => (),
                         Err(cleanup_err) => {
                             error!(target: DB, "actor insert failed and so did clean up for addr={}: {}", zpraddr, cleanup_err);
@@ -138,37 +125,6 @@ impl ActorRepo {
                 Err(e)
             }
         }
-    }
-
-    /// List the ZPR addresses of all connected actors.
-    pub async fn list_zpr_addrs(&self) -> Result<Vec<IpAddr>, StoreError> {
-        let mut addrs = Vec::new();
-
-        let node_addr_strs: HashSet<String> = self.db.smembers(KEY_NODES).await?;
-        for addr_str in node_addr_strs {
-            let addr: IpAddr = match addr_str.parse() {
-                Ok(addr) => addr,
-                Err(err) => {
-                    warn!(target: DB, "invalid zpr address in set {}: {} ({})", KEY_NODES, addr_str, err);
-                    continue;
-                }
-            };
-            addrs.push(addr);
-        }
-
-        let adapter_addr_strs: HashSet<String> = self.db.smembers(KEY_ADAPTERS).await?;
-        for addr_str in adapter_addr_strs {
-            let addr: IpAddr = match addr_str.parse() {
-                Ok(addr) => addr,
-                Err(err) => {
-                    warn!(target: DB, "invalid zpr address in set {}: {} ({})", KEY_ADAPTERS, addr_str, err);
-                    continue;
-                }
-            };
-            addrs.push(addr);
-        }
-
-        Ok(addrs)
     }
 
     /// Update existing actor data. The passed actor is authoritative: attributes it no
@@ -277,15 +233,6 @@ impl ActorRepo {
 
         debug!(target: DB, "update actor in DB: addr={zpraddr} cn={:?} node?={}", actor.get_cn(), actor.is_node());
         Ok(())
-    }
-
-    /// Update our in-memory cache when we add an actor.
-    pub fn add_to_cache(&self, actor: &Actor) {
-        if let Some(cn_val) = actor.get_cn() {
-            if let Some(zpr_addr) = actor.get_zpr_addr() {
-                self.cn_idx.insert(cn_val.to_string(), zpr_addr.clone());
-            }
-        }
     }
 
     /// Get a list of all the connected services -- what they are called and where
@@ -403,7 +350,7 @@ impl ActorRepo {
             }
         };
 
-        self.clean_up(&zpraddr, actor.get_cn()).await?;
+        self.clean_up(&zpraddr).await?;
 
         let zpraddr_str = zpraddr.to_string();
         let base_key = actor_key_for(&zpraddr);
@@ -480,22 +427,7 @@ impl ActorRepo {
 
     /// Remove actor from the state database, including all services.
     pub async fn rm_actor_by_zpr_addr(&self, zpra: &std::net::IpAddr) -> Result<(), StoreError> {
-        let opt_cn = match self.get_actor_attrs(zpra, &[key::CN]).await {
-            Ok(attr_list) => {
-                if attr_list.is_empty() {
-                    None
-                } else {
-                    if let Ok(cn_val) = attr_list[0].get_single_value() {
-                        Some(cn_val.to_string())
-                    } else {
-                        None
-                    }
-                }
-            }
-            Err(_) => None,
-        };
-
-        self.clean_up(zpra, opt_cn.as_deref()).await?;
+        self.clean_up(zpra).await?;
         debug!(target: DB, "removed actor from DB: addr={zpra}");
         Ok(())
     }
@@ -538,48 +470,18 @@ impl ActorRepo {
         Ok(actor)
     }
 
-    /// Returns only the CN for the actor at the given ZPR address, without loading the full actor.
+    /// List all connected actors, optionally filtered by role, keyed on the ZPR
+    /// address. Each entry carries the actor's CN when it has one -- the CN is a
+    /// display label that may be absent (e.g. an OIDC-only connect), never a key.
     ///
-    /// Returns `StoreError::NotFound` if no actor exists for the address or the actor has no CN attribute.
-    pub async fn get_cn_by_zpr_addr(&self, zpra: &IpAddr) -> Result<String, StoreError> {
-        let base_key = actor_key_for(zpra);
-        let exists: bool = self.db.exists(&base_key).await?;
-        if !exists {
-            return Err(StoreError::NotFound(format!("actor not found: {}", zpra)));
-        }
-        let mut attrs = self.get_actor_attrs(zpra, &[key::CN]).await?;
-        if attrs.is_empty() {
-            return Err(StoreError::NotFound(format!("actor at {} has no CN", zpra)));
-        }
-        let cn_attr = attrs.remove(0);
-        match cn_attr.get_single_value() {
-            Ok(cn_val) => Ok(cn_val.to_string()),
-            Err(_) => Ok(cn_attr.get_value_as_string()),
-        }
-    }
+    /// Walks the "nodes" and "adapters" role sets.
+    pub async fn list_actors(
+        &self,
+        by_role: Option<Role>,
+    ) -> Result<Vec<(IpAddr, Option<String>)>, StoreError> {
+        let mut actors = Vec::new();
 
-    /// Look up actor by CN attribute. Uses our cache.
-    ///
-    /// ## Errors
-    // - Returns `StoreError::NotFound` if no actor found for the given CN.
-    pub async fn get_actor_by_cn(&self, cn: &str) -> Result<Actor, StoreError> {
-        let actor_addr = match self.cn_idx.get(cn) {
-            Some(addr) => addr.clone(),
-            None => {
-                return Err(StoreError::NotFound(format!(
-                    "actor not found for CN: {}",
-                    cn
-                )));
-            }
-        };
-        self.get_actor_by_zpr_addr(&actor_addr).await
-    }
-
-    /// This uses our "nodes" and "adapters" sets to list the CN values of all connected actors.
-    pub async fn list_actor_cns(&self, by_roles: Option<Role>) -> Result<Vec<String>, StoreError> {
-        let mut cns = Vec::new();
-
-        let set_keys = match by_roles {
+        let set_keys = match by_role {
             Some(Role::Node) => vec![KEY_NODES.to_string()],
             Some(Role::Adapter) => vec![KEY_ADAPTERS.to_string()],
             None => vec![KEY_NODES.to_string(), KEY_ADAPTERS.to_string()],
@@ -598,19 +500,35 @@ impl ActorRepo {
                 };
                 let a_key = attrs_key_for(&addr);
 
-                // Pull the CN attribute out of the actor hash (which is JSON Attribute)
-                if let Some(cn_attr_json) = self.db.hget(&a_key, key::CN).await? {
-                    let cn_attr: Attribute = serde_json::from_str(&cn_attr_json)?;
-                    match cn_attr.get_single_value() {
-                        Ok(cn_val) => cns.push(cn_val.to_string()),
-                        Err(_) => cns.push(cn_attr.get_value_as_string()),
+                // Pull the CN attribute out of the actor hash (JSON Attribute) as a
+                // display label; a missing CN is a normal state, not an anomaly. A CN
+                // that fails to load or decode degrades to no-CN rather than an error:
+                // the ZPR address (the key) is what matters -- startup address
+                // reservation walks this list, and one bad label must not discard
+                // every other actor's address.
+                let cn = match self.db.hget(&a_key, key::CN).await {
+                    Ok(Some(cn_attr_json)) => {
+                        match serde_json::from_str::<Attribute>(&cn_attr_json) {
+                            Ok(cn_attr) => match cn_attr.get_single_value() {
+                                Ok(cn_val) => Some(cn_val.to_string()),
+                                Err(_) => Some(cn_attr.get_value_as_string()),
+                            },
+                            Err(err) => {
+                                warn!(target: DB, "malformed CN attribute for actor {addr}, listing it without a CN: {err}");
+                                None
+                            }
+                        }
                     }
-                } else {
-                    warn!(target: DB, "missing CN attribute for actor at key = {a_key}");
-                }
+                    Ok(None) => None,
+                    Err(err) => {
+                        warn!(target: DB, "could not load CN attribute for actor {addr}, listing it without a CN: {err}");
+                        None
+                    }
+                };
+                actors.push((addr, cn));
             }
         }
-        Ok(cns)
+        Ok(actors)
     }
 }
 
@@ -721,7 +639,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_actor_cns_with_role_filter() {
+    async fn test_list_actors_with_role_filter() {
         let db = Arc::new(FakeDb::new());
         let repo = ActorRepo::new(db);
 
@@ -737,18 +655,61 @@ mod test {
         repo.add_actor(&node_actor).await.unwrap();
         repo.add_actor(&adapter_actor).await.unwrap();
 
-        let mut all_cns = repo.list_actor_cns(None).await.unwrap();
-        all_cns.sort();
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let adapter_addr: IpAddr = "fd5a:5052::20".parse().unwrap();
+
+        let mut all_actors = repo.list_actors(None).await.unwrap();
+        all_actors.sort();
         assert_eq!(
-            all_cns,
-            vec!["adapter-cn".to_string(), "node-cn".to_string()]
+            all_actors,
+            vec![
+                (node_addr, Some("node-cn".to_string())),
+                (adapter_addr, Some("adapter-cn".to_string())),
+            ]
         );
 
-        let node_cns = repo.list_actor_cns(Some(Role::Node)).await.unwrap();
-        assert_eq!(node_cns, vec!["node-cn".to_string()]);
+        let node_actors = repo.list_actors(Some(Role::Node)).await.unwrap();
+        assert_eq!(node_actors, vec![(node_addr, Some("node-cn".to_string()))]);
 
-        let adapter_cns = repo.list_actor_cns(Some(Role::Adapter)).await.unwrap();
-        assert_eq!(adapter_cns, vec!["adapter-cn".to_string()]);
+        let adapter_actors = repo.list_actors(Some(Role::Adapter)).await.unwrap();
+        assert_eq!(
+            adapter_actors,
+            vec![(adapter_addr, Some("adapter-cn".to_string()))]
+        );
+    }
+
+    /// Startup address reservation walks `list_actors` (vs/src/main.rs
+    /// `synchronize_state`), so one actor whose persisted CN attribute is
+    /// malformed JSON must not error out the whole listing -- that would leave
+    /// every other persisted ZPR address unreserved and re-assignable. The bad
+    /// entry stays in the list with its address (the key) and no CN (a display
+    /// label). Codex review on zipline#31.
+    #[tokio::test]
+    async fn test_list_actors_survives_malformed_cn_attribute() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db.clone());
+
+        repo.add_actor(&make_adapter_actor_defexp("fd5a:5052::41", "good-cn"))
+            .await
+            .unwrap();
+        repo.add_actor(&make_adapter_actor_defexp("fd5a:5052::42", "bad-cn"))
+            .await
+            .unwrap();
+
+        // Corrupt one actor's persisted CN attribute JSON in place.
+        let bad_addr: IpAddr = "fd5a:5052::42".parse().unwrap();
+        db.hset(&attrs_key_for(&bad_addr), key::CN, "{not json")
+            .await
+            .unwrap();
+
+        let mut actors = repo.list_actors(None).await.unwrap();
+        actors.sort();
+
+        let good_addr: IpAddr = "fd5a:5052::41".parse().unwrap();
+        assert_eq!(
+            actors,
+            vec![(good_addr, Some("good-cn".to_string())), (bad_addr, None)]
+        );
     }
 
     #[tokio::test]
@@ -876,42 +837,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_get_actor_by_cn_not_found() {
-        let db = Arc::new(FakeDb::new());
-        let repo = ActorRepo::new(db);
-
-        let err = repo.get_actor_by_cn("missing-cn").await.unwrap_err();
-        match err {
-            StoreError::NotFound(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_actor_by_cn_and_rm_clears_cache() {
-        let db = Arc::new(FakeDb::new());
-        let repo = ActorRepo::new(db);
-        let actor = make_actor_with_services_defexp(
-            ROLE_NODE,
-            "fd5a:5052::50",
-            &["svc:one"],
-            "actor-cache",
-        );
-        let zpr_addr: IpAddr = "fd5a:5052::50".parse().unwrap();
-
-        repo.add_actor(&actor).await.unwrap();
-        let loaded = repo.get_actor_by_cn("actor-cache").await.unwrap();
-        assert_eq!(loaded.get_zpr_addr(), Some(&zpr_addr));
-
-        repo.rm_actor_by_zpr_addr(&zpr_addr).await.unwrap();
-        let err = repo.get_actor_by_cn("actor-cache").await.unwrap_err();
-        match err {
-            StoreError::NotFound(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn test_list_services_for_actor_only_returns_actor_services() {
         let db = Arc::new(FakeDb::new());
         let repo = ActorRepo::new(db);
@@ -944,32 +869,6 @@ mod test {
         assert_eq!(adapter_services, vec!["svc:three".to_string()]);
     }
 
-    #[tokio::test]
-    async fn test_get_cn_by_zpr_addr_returns_cn() {
-        let db = Arc::new(FakeDb::new());
-        let repo = ActorRepo::new(db);
-        let actor = make_actor_defexp(&[
-            (key::ROLE, ROLE_NODE),
-            (key::CN, "my-node"),
-            (key::ZPR_ADDR, "fd5a:5052::10"),
-        ]);
-        repo.add_actor(&actor).await.unwrap();
-
-        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
-        let cn = repo.get_cn_by_zpr_addr(&addr).await.unwrap();
-        assert_eq!(cn, "my-node");
-    }
-
-    #[tokio::test]
-    async fn test_get_cn_by_zpr_addr_not_found() {
-        let db = Arc::new(FakeDb::new());
-        let repo = ActorRepo::new(db);
-
-        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
-        let err = repo.get_cn_by_zpr_addr(&addr).await.unwrap_err();
-        assert!(matches!(err, StoreError::NotFound(_)));
-    }
-
     /// update_actor is authoritative: an attribute dropped from the actor is dropped from
     /// the store, so a later load does not resurrect it. (An attribute refresh can remove
     /// attributes -- e.g. a trusted service no longer vends one.)
@@ -995,39 +894,21 @@ mod test {
         assert_eq!(loaded.get_cn(), Some("drop-node"));
     }
 
-    #[tokio::test]
-    async fn test_get_cn_by_zpr_addr_matches_get_actor_get_cn() {
-        //  Both get_cn_by_zpr_addr and get_actor_by_zpr_addr().get_cn() must return the same CN.
-        let db = Arc::new(FakeDb::new());
-        let repo = ActorRepo::new(db);
-        let actor = make_actor_defexp(&[
-            (key::ROLE, ROLE_NODE),
-            (key::CN, "roundtrip-node"),
-            (key::ZPR_ADDR, "fd5a:5052::10"),
-        ]);
-        repo.add_actor(&actor).await.unwrap();
-
-        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
-        let cn_direct = repo.get_cn_by_zpr_addr(&addr).await.unwrap();
-        let loaded = repo.get_actor_by_zpr_addr(&addr).await.unwrap();
-        let cn_via_actor = loaded.get_cn().unwrap();
-        assert_eq!(cn_direct, cn_via_actor);
-    }
-
     // ------------------------------------------------------------------
     // zipline#29 / zipline#30 (A1 gate): CN-keyed actor-surface defects.
-    // These tests pin the CORRECT behaviour; they fail against today's code.
-    // The fix lands in zipline#31 (A2), which removes the #[ignore]s.
+    // A1 pinned these as #[ignore]d failing tests against the CN-keyed code;
+    // zipline#31 (A2) re-keys the surface onto the ZPR address and turns them
+    // green (F4's assertion is inverted -- it documented the defect).
     // ------------------------------------------------------------------
 
     /// F1 (zipline#29): a CN-less actor (real OIDC-only connect case) must still be
-    /// represented in `list_actor_cns`. Today `list_actor_cns` HGETs the `cn`
-    /// attribute, warns "missing CN attribute for actor at key = ..." and `continue`s,
-    /// so the actor silently vanishes from the admin listing even though it is in the
-    /// DB and in its role set.
+    /// represented in the actor listing. The pre-A2 `list_actor_cns` HGET'd the `cn`
+    /// attribute, warned "missing CN attribute for actor at key = ..." and
+    /// `continue`d, so the actor silently vanished from the admin listing even
+    /// though it was in the DB and in its role set. Re-keyed onto `list_actors` by
+    /// zipline#31 (A2): the actor appears as `(addr, None)`.
     #[tokio::test]
-    #[ignore = "known defect F1, zipline#29; fix lands in zipline#31"]
-    async fn test_list_actor_cns_includes_cn_less_actor() {
+    async fn test_list_actors_includes_cn_less_actor() {
         let db = Arc::new(FakeDb::new());
         let repo = ActorRepo::new(db);
 
@@ -1037,34 +918,35 @@ mod test {
         repo.add_actor(&cn_less).await.unwrap();
         repo.add_actor(&normal).await.unwrap();
 
-        let cns = repo.list_actor_cns(None).await.unwrap();
-        // Both connected actors must be represented — the CN-less one must not be
-        // skipped. (What its entry should *say* — empty CN, address, or a synthetic
-        // name — is A2's design call; the pinned contract here is presence.)
+        // Both connected actors must be represented -- the CN-less one must not be
+        // skipped; it is listed by its address with no CN label.
+        let mut actors = repo.list_actors(None).await.unwrap();
+        actors.sort();
         assert_eq!(
-            cns.len(),
-            2,
-            "CN-less actor was dropped from list_actor_cns: {cns:?}"
+            actors,
+            vec![
+                ("fd5a:5052::71".parse().unwrap(), None),
+                (
+                    "fd5a:5052::72".parse().unwrap(),
+                    Some("adapter-with-cn".to_string())
+                ),
+            ],
+            "CN-less actor must appear as (addr, None)"
         );
     }
 
     /// F3 (zipline#29): two actors at different addresses sharing one CN must remain
-    /// distinct, and BOTH must stay resolvable through the CN-keyed surface. Today
-    /// `cn_idx` is a `DashMap<String, IpAddr>` written with `insert`, so the second
-    /// connect overwrites the first, and `clean_up` removes the CN entry
-    /// unconditionally, so either actor's disconnect orphans the survivor.
+    /// distinct, and BOTH must stay resolvable. Pre-A2 the CN-keyed `cn_idx` was a
+    /// single-slot `DashMap<String, IpAddr>` written with `insert`, so the second
+    /// connect overwrote the first, and `clean_up` removed the CN entry
+    /// unconditionally, so either actor's disconnect orphaned the survivor.
     ///
-    /// The pin deliberately does NOT assert which single actor `get_actor_by_cn`
-    /// returns while both are connected — a first-write-wins index would satisfy
-    /// that just as vacuously as today's last-write-wins. Instead it asserts the
-    /// invariant any correct fix must uphold with the API that exists today:
-    /// whichever colliding actor disconnects, the OTHER remains resolvable by CN.
-    /// Scenario 1 removes the later writer, scenario 2 the earlier writer; no
-    /// single-slot index (first- or last-write-wins, with or without value-guarded
-    /// removal) can pass both, while a multimap/rebuilt index passes trivially.
-    /// Whether zipline#31 also adds a list-all-matches API is that issue's call.
+    /// Re-keyed by zipline#31 (A2): the ZPR address identifies the actor, so the
+    /// two same-CN actors are two `list_actors` entries, each resolving through
+    /// `get_actor_by_zpr_addr`, and whichever colliding actor disconnects, the
+    /// OTHER remains fully resolvable. Scenario 1 removes the later writer,
+    /// scenario 2 the earlier writer.
     #[tokio::test]
-    #[ignore = "known defect F3, zipline#29; fix lands in zipline#31"]
     async fn test_shared_cn_actors_remain_distinct() {
         let addr_a: IpAddr = "fd5a:5052::81".parse().unwrap();
         let addr_b: IpAddr = "fd5a:5052::82".parse().unwrap();
@@ -1076,31 +958,34 @@ mod test {
         repo.add_actor(&actor_a).await.unwrap();
         repo.add_actor(&actor_b).await.unwrap();
 
-        // Both actors are connected: both listed, and each is a distinct record
-        // in the store, reachable by its own address with the shared CN.
-        let cns = repo.list_actor_cns(None).await.unwrap();
-        assert_eq!(cns.len(), 2, "expected two entries, got {cns:?}");
+        // Both actors are connected: two distinct entries carrying the shared CN,
+        // each reachable by its own address.
+        let mut actors = repo.list_actors(None).await.unwrap();
+        actors.sort();
+        assert_eq!(
+            actors,
+            vec![
+                (addr_a, Some("shared-cn".to_string())),
+                (addr_b, Some("shared-cn".to_string())),
+            ],
+            "expected two distinct entries for the shared CN"
+        );
         for addr in [&addr_a, &addr_b] {
             let loaded = repo.get_actor_by_zpr_addr(addr).await.unwrap();
             assert_eq!(loaded.get_cn(), Some("shared-cn"));
+            assert_eq!(loaded.get_zpr_addr(), Some(addr));
         }
-        // CN lookup must reach a live actor even mid-collision (sanity, not the pin).
-        let resolved = repo.get_actor_by_cn("shared-cn").await.unwrap();
-        let resolved_addr = *resolved.get_zpr_addr().unwrap();
-        assert!(
-            resolved_addr == addr_a || resolved_addr == addr_b,
-            "resolved to neither actor: {resolved_addr}"
-        );
 
         repo.rm_actor_by_zpr_addr(&addr_b).await.unwrap();
-        let survivor = repo.get_actor_by_cn("shared-cn").await.expect(
-            "actor_a became unreachable by CN after the colliding actor_b \
-             disconnected (single-slot cn_idx lost or displaced its mapping)",
-        );
+        let survivor = repo
+            .get_actor_by_zpr_addr(&addr_a)
+            .await
+            .expect("actor_a must stay resolvable after the colliding actor_b disconnected");
+        assert_eq!(*survivor.get_zpr_addr().unwrap(), addr_a);
         assert_eq!(
-            *survivor.get_zpr_addr().unwrap(),
-            addr_a,
-            "CN lookup resolved to the removed actor instead of the survivor"
+            repo.list_actors(None).await.unwrap(),
+            vec![(addr_a, Some("shared-cn".to_string()))],
+            "only the survivor may remain listed"
         );
 
         // --- Scenario 2: earlier writer (actor_a) disconnects; actor_b must survive.
@@ -1111,50 +996,54 @@ mod test {
         repo.add_actor(&actor_b).await.unwrap();
 
         repo.rm_actor_by_zpr_addr(&addr_a).await.unwrap();
-        let survivor = repo.get_actor_by_cn("shared-cn").await.expect(
-            "actor_b became unreachable by CN after the colliding actor_a \
-             disconnected (single-slot cn_idx lost or displaced its mapping)",
-        );
+        let survivor = repo
+            .get_actor_by_zpr_addr(&addr_b)
+            .await
+            .expect("actor_b must stay resolvable after the colliding actor_a disconnected");
+        assert_eq!(*survivor.get_zpr_addr().unwrap(), addr_b);
         assert_eq!(
-            *survivor.get_zpr_addr().unwrap(),
-            addr_b,
-            "CN lookup resolved to the removed actor instead of the survivor"
+            repo.list_actors(None).await.unwrap(),
+            vec![(addr_b, Some("shared-cn".to_string()))],
+            "only the survivor may remain listed"
         );
     }
 
-    /// F4 (zipline#29): `cn_idx` is populated only by `add_actor` -> `add_to_cache`
-    /// and is never rebuilt from the backing store. A fresh `ActorRepo` over an
-    /// already-populated `Arc<dyn DbConnection>` (what a VS restart against persisted
-    /// state produces) therefore LISTS the actor but 404s it on `get_actor_by_cn`.
+    /// F4 (zipline#29): a fresh `ActorRepo` over an already-populated
+    /// `Arc<dyn DbConnection>` (what a VS restart against persisted state produces)
+    /// must be able to fetch every actor it lists. Pre-A2 an in-process `cn_idx`
+    /// was populated only by `add_actor` and never rebuilt from the backing store,
+    /// so a fresh repo LISTED the actor but 404'd its CN lookup. zipline#31 (A2)
+    /// deletes the index -- `ActorRepo` is stateless over the DB -- so this cannot
+    /// regress by construction.
     ///
-    /// NOTE: this test PASSES while the bug exists — it documents today's broken
-    /// behaviour so A2 cannot regress silently. When zipline#31 removes or rebuilds
-    /// `cn_idx`, the `NotFound` assertion below inverts and this test is rewritten
-    /// there to assert successful lookup.
+    /// (Inverts A1's `test_fresh_repo_forgets_cn_index_documents_defect`, which
+    /// deliberately asserted the broken behaviour so it could not regress silently.)
     #[tokio::test]
-    async fn test_fresh_repo_forgets_cn_index_documents_defect() {
+    async fn test_fresh_repo_resolves_persisted_actor() {
         let db: Arc<FakeDb> = Arc::new(FakeDb::new());
 
-        // Repo #1 populates the store; its in-memory cn_idx knows the actor.
+        // Repo #1 populates the store.
         let repo1 = ActorRepo::new(db.clone());
         let actor = make_adapter_actor_defexp("fd5a:5052::91", "persisted-cn");
         repo1.add_actor(&actor).await.unwrap();
-        assert!(repo1.get_actor_by_cn("persisted-cn").await.is_ok());
 
         // Repo #2 over the SAME backing store: an ActorRepo that never saw
-        // add_actor for this actor — the restart-against-persisted-state case.
+        // add_actor for this actor -- the restart-against-persisted-state case.
         let repo2 = ActorRepo::new(db);
 
-        // The actor is visible to the lister (it reads the store)...
-        let cns = repo2.list_actor_cns(None).await.unwrap();
-        assert_eq!(cns, vec!["persisted-cn".to_string()]);
+        // The actor is visible to the lister...
+        let addr: IpAddr = "fd5a:5052::91".parse().unwrap();
+        let actors = repo2.list_actors(None).await.unwrap();
+        assert_eq!(actors, vec![(addr, Some("persisted-cn".to_string()))]);
 
-        // ...but CN-keyed lookup fails: cn_idx was never rebuilt. This is the
-        // DEFECT, deliberately asserted as today's behaviour (see note above).
-        let err = repo2.get_actor_by_cn("persisted-cn").await.unwrap_err();
-        assert!(
-            matches!(err, StoreError::NotFound(_)),
-            "unexpected error kind: {err:?}"
-        );
+        // ...and every listed actor is fetchable: no in-process index remains to
+        // go stale.
+        for (listed_addr, _cn) in &actors {
+            let loaded = repo2
+                .get_actor_by_zpr_addr(listed_addr)
+                .await
+                .expect("a fresh repo must fetch every actor it lists");
+            assert_eq!(loaded.get_zpr_addr(), Some(listed_addr));
+        }
     }
 }

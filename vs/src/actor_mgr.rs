@@ -287,28 +287,12 @@ impl ActorMgr {
         }
     }
 
-    /// Returns only the CN for the actor at the given ZPR address, without loading the full actor.
-    pub async fn get_cn_by_zpr_addr(&self, zpra: &IpAddr) -> Result<String, ServiceError> {
-        match self.actor_db.get_cn_by_zpr_addr(zpra).await {
-            Ok(cn) => Ok(cn),
-            Err(e) => Err(ServiceError::from(e)),
-        }
-    }
-
     /// Returns actors public key or None if no key is stored for it.
     pub async fn get_a2a_dh_pubkey_by_zpr_addr(
         &self,
         zpra: &IpAddr,
     ) -> Result<Option<PublicKey>, ServiceError> {
         Ok(self.actor_db.get_a2a_dh_pubkey_by_zpr_addr(zpra).await?)
-    }
-
-    pub async fn get_actor_by_cn(&self, cn: &str) -> Result<Option<Actor>, ServiceError> {
-        match self.actor_db.get_actor_by_cn(cn).await {
-            Ok(actor) => Ok(Some(actor)),
-            Err(StoreError::NotFound(_)) => Ok(None),
-            Err(e) => Err(ServiceError::from(e)),
-        }
     }
 
     /// Remove actor state from the database. If removing a node, also call [ActorMgr::remove_node].
@@ -384,26 +368,6 @@ impl ActorMgr {
                 None
             }
         }
-    }
-
-    pub async fn get_adapter_cns_connected_to_node(
-        &self,
-        node_addr: &IpAddr,
-    ) -> Result<Vec<String>, ServiceError> {
-        let adapter_zpr_addrs = self.get_adapters_connected_to_node(node_addr).await?;
-
-        Ok(futures::future::join_all(
-            adapter_zpr_addrs
-                .iter()
-                .map(|addr| self.get_actor_by_zpr_addr(addr)),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .filter_map(|actor| actor.get_cn().map(|cn| cn.to_string()))
-        .collect())
     }
 
     /// Get the list of authentication services: connected on-net actor-authentication
@@ -488,13 +452,15 @@ impl ActorMgr {
         Ok(services)
     }
 
-    /// Get the list of connectioned actor CN values, optionally filtered by role.
-    pub async fn list_actor_cns(
+    /// List the connected actors, optionally filtered by role. Each entry is the
+    /// actor's ZPR address (the key) plus its CN when it has one (a display label
+    /// that may be absent).
+    pub async fn list_actors(
         &self,
         by_role: Option<db::Role>,
-    ) -> Result<Vec<String>, ServiceError> {
-        let cns = self.actor_db.list_actor_cns(by_role).await?;
-        Ok(cns)
+    ) -> Result<Vec<(IpAddr, Option<String>)>, ServiceError> {
+        let actors = self.actor_db.list_actors(by_role).await?;
+        Ok(actors)
     }
 
     /// Get the service details for the named service.
@@ -559,11 +525,6 @@ impl ActorMgr {
 
     pub async fn list_node_addrs(&self) -> Result<Vec<IpAddr>, ServiceError> {
         let addrs = self.node_db.list_node_addrs().await?;
-        Ok(addrs)
-    }
-
-    pub async fn list_zpr_addrs(&self) -> Result<Vec<IpAddr>, ServiceError> {
-        let addrs = self.actor_db.list_zpr_addrs().await?;
         Ok(addrs)
     }
 
@@ -1030,7 +991,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_get_adapter_cns_connected_to_node_single_adapter() {
+    async fn test_get_adapters_connected_to_node_single_adapter() {
         let mgr = make_mgr();
         let node_actor =
             make_node_actor_defexp("fd5a:5052::20", "node-cn-1", "[fd5a:5052::120]:1234");
@@ -1042,24 +1003,23 @@ mod test {
             .await
             .unwrap();
 
-        let cns = mgr
-            .get_adapter_cns_connected_to_node(&node_addr)
+        let addrs = mgr
+            .get_adapters_connected_to_node(&node_addr)
             .await
             .unwrap();
-        assert_eq!(cns.len(), 1);
-        assert_eq!(cns[0], "adapter-cn-1");
+        assert_eq!(addrs, vec!["fd5a:5052::21".parse::<IpAddr>().unwrap()]);
     }
 
     /// F2 (zipline#29 / zipline#30, A1 gate): a CN-less adapter (OIDC-only connect)
-    /// connected to a node must still be represented in
-    /// `get_adapter_cns_connected_to_node`. Today the method ends in
-    /// `.filter_map(|actor| actor.get_cn()...)`, so the adapter is silently dropped
-    /// from `NodeRecordBrief.adapters` — an omission path independent of F1's
-    /// `list_actor_cns` drop. Fix lands in zipline#31 (A2), which removes the
-    /// #[ignore].
+    /// connected to a node must still be represented in the node's adapter list.
+    /// Pre-A2, `get_adapter_cns_connected_to_node` ended in
+    /// `.filter_map(|actor| actor.get_cn()...)`, so the adapter was silently
+    /// dropped from `NodeRecordBrief.adapters` -- an omission path independent of
+    /// F1's `list_actor_cns` drop. zipline#31 (A2) deletes that CN-mapping wrapper:
+    /// the address list from `get_adapters_connected_to_node` is the surface, and
+    /// it cannot drop a CN-less adapter.
     #[tokio::test]
-    #[ignore = "known defect F2, zipline#29; fix lands in zipline#31"]
-    async fn test_get_adapter_cns_includes_cn_less_adapter() {
+    async fn test_get_adapters_includes_cn_less_adapter() {
         let mgr = make_mgr();
         let node_actor =
             make_node_actor_defexp("fd5a:5052::60", "node-cn-f2", "[fd5a:5052::160]:1234");
@@ -1075,22 +1035,25 @@ mod test {
             .await
             .unwrap();
 
-        let cns = mgr
-            .get_adapter_cns_connected_to_node(&node_addr)
+        // Both connected adapters must be represented by address; the CN-less one
+        // must not be filter_map'd away.
+        let mut addrs = mgr
+            .get_adapters_connected_to_node(&node_addr)
             .await
             .unwrap();
-        // Both connected adapters must be represented; the CN-less one must not be
-        // filter_map'd away. (What its entry should say is A2's design call — the
-        // pinned contract here is presence.)
+        addrs.sort();
         assert_eq!(
-            cns.len(),
-            2,
-            "CN-less adapter was dropped from get_adapter_cns_connected_to_node: {cns:?}"
+            addrs,
+            vec![
+                "fd5a:5052::61".parse::<IpAddr>().unwrap(),
+                "fd5a:5052::62".parse::<IpAddr>().unwrap(),
+            ],
+            "CN-less adapter was dropped from the node's adapter list"
         );
     }
 
     #[tokio::test]
-    async fn test_get_adapter_cns_connected_to_node_multiple_adapters() {
+    async fn test_get_adapters_connected_to_node_multiple_adapters() {
         let mgr = make_mgr();
         let node_actor =
             make_node_actor_defexp("fd5a:5052::20", "node-cn", "[fd5a:5052::120]:1234");
@@ -1110,17 +1073,23 @@ mod test {
             .await
             .unwrap();
 
-        let mut cns = mgr
-            .get_adapter_cns_connected_to_node(&node_addr)
+        let mut addrs = mgr
+            .get_adapters_connected_to_node(&node_addr)
             .await
             .unwrap();
-        cns.sort();
-        assert_eq!(cns.len(), 3);
-        assert_eq!(cns, vec!["adapter-1", "adapter-2", "adapter-3"]);
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec![
+                "fd5a:5052::21".parse::<IpAddr>().unwrap(),
+                "fd5a:5052::22".parse::<IpAddr>().unwrap(),
+                "fd5a:5052::23".parse::<IpAddr>().unwrap(),
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn test_get_adapter_cns_connected_to_node_no_adapters() {
+    async fn test_get_adapters_connected_to_node_no_adapters() {
         let mgr = make_mgr();
         let node_actor =
             make_node_actor_defexp("fd5a:5052::20", "node-cn", "[fd5a:5052::120]:1234");
@@ -1128,15 +1097,15 @@ mod test {
 
         mgr.add_node(&node_actor, false).await.unwrap();
 
-        let cns = mgr
-            .get_adapter_cns_connected_to_node(&node_addr)
+        let addrs = mgr
+            .get_adapters_connected_to_node(&node_addr)
             .await
             .unwrap();
-        assert!(cns.is_empty());
+        assert!(addrs.is_empty());
     }
 
     #[tokio::test]
-    async fn test_get_adapter_cns_connected_to_node_only_returns_own_adapters() {
+    async fn test_get_adapters_connected_to_node_only_returns_own_adapters() {
         // Two nodes, each with their own adapters — verify no cross-contamination.
         let mgr = make_mgr();
         let node_a = make_node_actor_defexp("fd5a:5052::20", "node-a", "[fd5a:5052::120]:1234");
@@ -1156,24 +1125,26 @@ mod test {
             .await
             .unwrap();
 
-        let cns_a = mgr
-            .get_adapter_cns_connected_to_node(&node_a_addr)
+        let addrs_a = mgr
+            .get_adapters_connected_to_node(&node_a_addr)
             .await
             .unwrap();
-        assert_eq!(cns_a.len(), 1);
-        assert_eq!(cns_a[0], "adapter-for-a");
+        assert_eq!(addrs_a, vec!["fd5a:5052::22".parse::<IpAddr>().unwrap()]);
 
-        let cns_b = mgr
-            .get_adapter_cns_connected_to_node(&node_b_addr)
+        let addrs_b = mgr
+            .get_adapters_connected_to_node(&node_b_addr)
             .await
             .unwrap();
-        assert_eq!(cns_b.len(), 1);
-        assert_eq!(cns_b[0], "adapter-for-b");
+        assert_eq!(addrs_b, vec!["fd5a:5052::23".parse::<IpAddr>().unwrap()]);
     }
 
     #[tokio::test]
-    async fn test_get_adapter_cns_connected_to_node_after_removal() {
-        // Add two adapters, remove one, verify only the remaining CN is returned.
+    async fn test_get_adapters_connected_to_node_after_removal() {
+        // The adapter list is the node_db connections view: removing the actor
+        // record alone does not scrub the node's connections set (only the node's
+        // own removal or reconnect does), so the address remains listed. This
+        // documents the surviving API's semantics -- the old CN-mapping wrapper
+        // hid the stale entry only as a side effect of its CN filter.
         let mgr = make_mgr();
         let node_actor =
             make_node_actor_defexp("fd5a:5052::20", "node-cn-rm", "[fd5a:5052::120]:1234");
@@ -1191,40 +1162,51 @@ mod test {
             .unwrap();
 
         // Sanity: both present before removal.
-        let mut cns = mgr
-            .get_adapter_cns_connected_to_node(&node_addr)
+        let mut addrs = mgr
+            .get_adapters_connected_to_node(&node_addr)
             .await
             .unwrap();
-        cns.sort();
-        assert_eq!(cns.len(), 2);
+        addrs.sort();
+        assert_eq!(addrs.len(), 2);
 
-        // Remove the actor record for adapter2.
+        // Remove the actor record for adapter2; the connections set is untouched.
         mgr.remove_actor_by_zpr_addr(&remove_addr).await.unwrap();
 
-        // The node_db still has the ZPR address in its connected-adapters list,
-        // but the actor lookup will return None — the function should gracefully
-        // skip it via .flatten().
-        let cns = mgr
-            .get_adapter_cns_connected_to_node(&node_addr)
+        let mut addrs = mgr
+            .get_adapters_connected_to_node(&node_addr)
             .await
             .unwrap();
-        assert_eq!(cns.len(), 1);
-        assert_eq!(cns[0], "keep-me");
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec![
+                "fd5a:5052::21".parse::<IpAddr>().unwrap(),
+                "fd5a:5052::22".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        // The removed adapter's actor record is gone even though its address is
+        // still in the node's connections set.
+        assert!(
+            mgr.get_actor_by_zpr_addr(&remove_addr)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
-    async fn test_get_adapter_cns_connected_to_node_unknown_node() {
+    async fn test_get_adapters_connected_to_node_unknown_node() {
         // Querying a node address that was never added should return an empty vec
         // (or an error, depending on the NodeRepo implementation).
         let mgr = make_mgr();
         let unknown_addr: IpAddr = "fd5a:5052::99".parse().unwrap();
 
-        let result = mgr.get_adapter_cns_connected_to_node(&unknown_addr).await;
+        let result = mgr.get_adapters_connected_to_node(&unknown_addr).await;
         // With FakeDb this likely returns Ok(vec![]).
         // If the implementation errors on unknown nodes, adjust to unwrap_err().
         match result {
-            Ok(cns) => assert!(cns.is_empty()),
-            Err(_) => {} // Also acceptable — unknown node is not in DB.
+            Ok(addrs) => assert!(addrs.is_empty()),
+            Err(_) => {} // Also acceptable -- unknown node is not in DB.
         }
     }
 

@@ -63,8 +63,8 @@ pub enum SubCmd {
         // TODO decide if it should be visas --revoke --id ID or if revoke should also take a u64 and be visas --revoke ID
         #[arg(long, short = 'r', requires = "id")]
         revoke: bool,
-        /// List the visas currently installed on the node with the given CN
-        #[arg(long, short = 'n', value_name = "CN", conflicts_with_all = ["id", "revoke"])]
+        /// List the visas currently installed on the node with the given ZPR address
+        #[arg(long, short = 'n', value_name = "ZPR_ADDR", conflicts_with_all = ["id", "revoke"])]
         on_node: Option<String>,
         /// Show the recent visa denies, most recent first
         #[arg(long, conflicts_with_all = ["id", "revoke", "on_node"])]
@@ -77,21 +77,21 @@ pub enum SubCmd {
         limit: Option<usize>,
     },
 
-    /// Commands related to actors, provide no additional arguments to see list of CNs of all actors
+    /// Commands related to actors, provide no additional arguments to see list of all actors (ZPR address plus optional CN)
     #[command()]
     Actors {
-        /// See more information on a specific actor
-        #[arg(long, short = 'c', conflicts_with = "nodes")]
-        cn: Option<String>,
-        /// Remove the actor with a given CN in the VS, along with any associated visas. If revoke is supplied, cn must be as well
+        /// See more information on the actor at a specific ZPR address
+        #[arg(long, short = 'a', value_name = "ZPR_ADDR", conflicts_with = "nodes")]
+        addr: Option<String>,
+        /// Remove the actor at a given ZPR address in the VS, along with any associated visas. If revoke is supplied, addr must be as well
         // TODO decide if it should be visas --revoke --id ID or if revoke should also take a u64 and be visas --revoke ID
-        #[arg(long, short = 'r', requires = "cn", conflicts_with_all = ["nodes", "visas"])]
+        #[arg(long, short = 'r', requires = "addr", conflicts_with_all = ["nodes", "visas"])]
         revoke: bool,
-        /// See list of CNs of all actors that are nodes
-        #[arg(long, short = 'n', conflicts_with_all = ["cn", "revoke", "visas"])]
+        /// See list of all actors that are nodes
+        #[arg(long, short = 'n', conflicts_with_all = ["addr", "revoke", "visas"])]
         nodes: bool,
-        /// Provide visas related to the actor with a given CN. If visas is supplied, cn must be as well
-        #[arg(long, short = 'v', requires = "cn", conflicts_with_all = ["revoke", "nodes"])]
+        /// Provide visas related to the actor at a given ZPR address. If visas is supplied, addr must be as well
+        #[arg(long, short = 'v', requires = "addr", conflicts_with_all = ["revoke", "nodes"])]
         visas: bool,
     },
 

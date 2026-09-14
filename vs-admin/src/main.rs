@@ -7,25 +7,13 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use clap::{Args, Parser};
+use clap::Parser;
 use colored::Colorize;
 use reqwest;
 use reqwest::tls::Certificate;
 
 use crate::executor::Executor;
 use crate::main_args::{Cmd, SubCmd};
-
-#[derive(Args)]
-#[group(required = true, multiple = false)]
-struct RevokeArg {
-    /// Revoke a visa ID
-    #[arg(long)]
-    visa_id: Option<u64>,
-
-    /// Revoke access to a given adapter CN
-    #[arg(long)]
-    actor_cn: Option<String>,
-}
 
 fn resolve_api_key(args: &Cmd) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(key) = &args.api_key {
@@ -79,11 +67,11 @@ fn main() {
         }) => exec.do_cmd_visas(id, revoke, on_node, denies, last, limit),
 
         Some(SubCmd::Actors {
-            cn,
+            addr,
             revoke,
             nodes,
             visas,
-        }) => exec.do_cmd_actors(cn, revoke, nodes, visas),
+        }) => exec.do_cmd_actors(addr, revoke, nodes, visas),
 
         Some(SubCmd::Services { id, flush }) => exec.do_cmd_services(id, flush),
         // Some(SubCmd::Install {

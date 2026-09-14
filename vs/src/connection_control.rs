@@ -2207,7 +2207,7 @@ mod tests {
         }
         // The failed connection must not leave an actor behind.
         assert!(
-            asm.actor_mgr.get_actor_by_cn(cn).await.unwrap().is_none(),
+            asm.actor_mgr.list_actors(None).await.unwrap().is_empty(),
             "no actor may be persisted for a failed multi-blob connection"
         );
     }
@@ -2627,7 +2627,7 @@ mod tests {
             api.code
         );
         assert!(
-            asm.actor_mgr.get_actor_by_cn(cn).await.unwrap().is_none(),
+            asm.actor_mgr.list_actors(None).await.unwrap().is_empty(),
             "no actor may be persisted for a failed multi-blob connection"
         );
     }
