@@ -123,7 +123,7 @@ func expiredActors(actors []dataplane.ActorDescriptor) []string {
 	var expired []string
 	for _, actor := range actors {
 		if ActorAuthState(actor) == AuthExpired {
-			expired = append(expired, actor.CName)
+			expired = append(expired, actorLabel(actor))
 		}
 	}
 
@@ -133,7 +133,10 @@ func expiredActors(actors []dataplane.ActorDescriptor) []string {
 func undescribedActors(actors []dataplane.ActorDescriptor) int {
 	count := 0
 	for _, actor := range actors {
-		if actor.ZprAddress == "" {
+		// The degraded stub used to be recognisable by its empty address; the
+		// address-keyed fallback always carries one, so FetchActors marks the
+		// stub explicitly instead.
+		if actor.Undescribed {
 			count++
 		}
 	}
@@ -144,7 +147,7 @@ func undescribedActors(actors []dataplane.ActorDescriptor) int {
 func absentServices(services []dataplane.ServiceDescriptor, actors []dataplane.ActorDescriptor) []string {
 	var absent []string
 	for _, service := range services {
-		if _, ok := actorByCN(actors, service.ActorCN); !ok {
+		if _, ok := actorByAddr(actors, service.ZprAddress); !ok {
 			absent = append(absent, service.ServiceName)
 		}
 	}

@@ -76,11 +76,11 @@ func ActorNodes(vp viewport.Model, actors []dataplane.ActorDescriptor, selectedI
 	case !actor.Node:
 		t.Row("not a node", "", "")
 	case actor.NodeDetails == nil:
-		t.Row(actor.CName, actor.ZprAddress, "not tracked yet")
+		t.Row(actorLabel(actor), actor.ZprAddress, "not tracked yet")
 	case actor.NodeDetails.InSync:
-		t.Row(actor.CName, actor.ZprAddress, "in sync")
+		t.Row(actorLabel(actor), actor.ZprAddress, "in sync")
 	default:
-		t.Row(actor.CName, actor.ZprAddress, "out of sync")
+		t.Row(actorLabel(actor), actor.ZprAddress, "out of sync")
 	}
 
 	content += lipgloss.NewStyle().PaddingTop(1).Render(t.Render())

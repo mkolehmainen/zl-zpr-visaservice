@@ -259,11 +259,11 @@ func TestActorDetailsOverflowKeepsFooterAndWarning(t *testing.T) {
 // TestActorServicesOfferedEndpoints checks the Endpoints column renders, other
 // actors' services are excluded, and filtering keeps FetchServices' name order.
 func TestActorServicesOfferedEndpoints(t *testing.T) {
-	actors := []dataplane.ActorDescriptor{{CName: "adapter-a"}}
+	actors := []dataplane.ActorDescriptor{{CName: "adapter-a", ZprAddress: "fd5a:5052:90de::10"}}
 	services := []dataplane.ServiceDescriptor{
-		{ServiceName: "alpha", ActorCN: "adapter-a", Endpoints: "TCP/80"},
-		{ServiceName: "other", ActorCN: "adapter-b", Endpoints: "TCP/22"},
-		{ServiceName: "zebra", ActorCN: "adapter-a", Endpoints: "UDP/53"},
+		{ServiceName: "alpha", ActorCN: "adapter-a", ZprAddress: "fd5a:5052:90de::10", Endpoints: "TCP/80"},
+		{ServiceName: "other", ActorCN: "adapter-b", ZprAddress: "fd5a:5052:90de::11", Endpoints: "TCP/22"},
+		{ServiceName: "zebra", ActorCN: "adapter-a", ZprAddress: "fd5a:5052:90de::10", Endpoints: "UDP/53"},
 	}
 
 	out := ansi.Strip(ActorServicesOffered(80, 20, actors, 0, services, nil, nil, nil))
@@ -287,11 +287,11 @@ func TestActorServicesOfferedEndpoints(t *testing.T) {
 // share: alpha and beta answer on the same actor address and are told apart by
 // port alone, alpha also answers on a dock address, and quiet gets nothing.
 func offeredFixture() ([]dataplane.ActorDescriptor, []dataplane.ServiceDescriptor, []dataplane.VisaDescriptor) {
-	actors := []dataplane.ActorDescriptor{{CName: "alpha-cn"}}
+	actors := []dataplane.ActorDescriptor{{CName: "alpha-cn", ZprAddress: "fd5a:5052:90de::30"}}
 	services := []dataplane.ServiceDescriptor{
 		{ServiceName: "alpha", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::30", DockZprAddress: "fd5a:5052:90de::99", Endpoints: "TCP/443"},
 		{ServiceName: "beta", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::30", Endpoints: "TCP/9000"},
-		{ServiceName: "quiet", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::31", Endpoints: "TCP/8080"},
+		{ServiceName: "quiet", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::30", Endpoints: "TCP/8080"},
 	}
 	visas := []dataplane.VisaDescriptor{
 		// Forward and reverse halves of one flow towards alpha.
@@ -299,7 +299,7 @@ func offeredFixture() ([]dataplane.ActorDescriptor, []dataplane.ServiceDescripto
 		{ID: 2, Direction: "reverse", Proto: "TCP", SourceAddr: strPtr("fd5a:5052:90de::30"), DestAddr: strPtr("fd5a:5052:90de::40"), SourcePort: intPtr(443), DestPort: intPtr(0)},
 		// Towards alpha on its dock address.
 		{ID: 3, Direction: "forward", Proto: "TCP", SourceAddr: strPtr("fd5a:5052:90de::40"), DestAddr: strPtr("fd5a:5052:90de::99"), SourcePort: intPtr(0), DestPort: intPtr(443)},
-		// Nobody's service.
+		// Nobody's service: port 22 is not a declared endpoint on ::30.
 		{ID: 4, Direction: "forward", Proto: "TCP", SourceAddr: strPtr("fd5a:5052:90de::31"), DestAddr: strPtr("fd5a:5052:90de::40"), SourcePort: intPtr(0), DestPort: intPtr(22)},
 		// Same address as alpha, beta's port.
 		{ID: 5, Direction: "forward", Proto: "TCP", SourceAddr: strPtr("fd5a:5052:90de::40"), DestAddr: strPtr("fd5a:5052:90de::30"), SourcePort: intPtr(0), DestPort: intPtr(9000)},
@@ -340,7 +340,7 @@ func TestActorServicesOfferedVisaCounts(t *testing.T) {
 	if got := rowCell(t, out, "beta"); got != "1" {
 		t.Errorf("beta count = %q, want 1:\n%s", got, out)
 	}
-	// ::31 only ever appears as a forward source, and ::40 is nobody's service.
+	// No visa names port 8080, quiet's only declared endpoint.
 	if got := rowCell(t, out, "quiet"); got != "0" {
 		t.Errorf("quiet count = %q, want 0:\n%s", got, out)
 	}

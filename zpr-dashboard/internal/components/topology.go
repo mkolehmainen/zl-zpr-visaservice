@@ -95,12 +95,12 @@ func topologyLinkCells(link dataplane.NodeConnection, actors []dataplane.ActorDe
 	return node, actor, substrate
 }
 
-// topologyActorName is the CN of the actor at addr, or a dash when no actor
-// claims that address.
+// topologyActorName labels the actor at addr — its CN, or the address itself
+// when the actor has no CN — and a dash when no actor claims the address.
 func topologyActorName(addr string, actors []dataplane.ActorDescriptor, width int) string {
-	// A miss yields the zero descriptor, whose empty CN becomes the dash.
+	// A miss yields the zero descriptor, whose empty label becomes the dash.
 	actor, _ := actorByAddr(actors, addr)
-	return ansi.Truncate(orDash(actor.CName), width, "...")
+	return ansi.Truncate(orDash(actorLabel(actor)), width, "...")
 }
 
 // linkStatus renders a ctype with the colour the CLI uses: up green,

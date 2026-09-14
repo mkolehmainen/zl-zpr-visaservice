@@ -13,7 +13,7 @@ import (
 // viewport at a narrow and a wide terminal, and that the narrow rendering still
 // shows an unbroken Visas header on Services Offered.
 func TestActorsPageFitsViewport(t *testing.T) {
-	actors := []dataplane.ActorDescriptor{{CName: "alpha-cn"}}
+	actors := []dataplane.ActorDescriptor{{CName: "alpha-cn", ZprAddress: "fd5a:5052:90de::30"}}
 	services := []dataplane.ServiceDescriptor{
 		{ServiceName: "alpha", ActorCN: "alpha-cn", ZprAddress: "fd5a:5052:90de::30", Endpoints: "TCP/80"},
 	}

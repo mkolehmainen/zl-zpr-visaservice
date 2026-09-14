@@ -10,9 +10,9 @@ import (
 	"neboagency.com/zpr-dashborad/internal/styles"
 )
 
-// Not implemented (DELETE /admin/actors/{cn} exists but revokes nothing):
+// Not implemented (DELETE /admin/actors/{addr} exists but revokes nothing):
 //
-//	DELETE /admin/actors/{cn}
+//	DELETE /admin/actors/{addr}
 //
 //	Request Parameters:
 //	  revoke_visas boolean (optional, default false)
@@ -48,7 +48,7 @@ func ActorRevokeModal(width, height int, actor dataplane.ActorDescriptor, visas 
 		lipgloss.NewStyle().Foreground(styles.ColorRed).Bold(true).Render("  ⚠  Revoke Actor Authorization"),
 		dim.Render("     Immediately invalidate this actor's trust"),
 		dim.Render(strings.Repeat("─", 56-2)),
-		field("Actor", value.Render(orDash(actor.CName))),
+		field("Actor", value.Render(orDash(actorLabel(actor)))),
 		field("Address", value.Render(orDash(actor.ZprAddress))),
 		field("Trust", lipgloss.NewStyle().Foreground(authStateColor(state)).Render(authStateName(state))),
 		field("Visas", actorModalVisas(visas)),

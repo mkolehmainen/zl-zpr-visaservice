@@ -248,7 +248,7 @@ type actorSnapshotMsg struct {
 }
 
 type actorVisasMsg struct {
-	cn    string
+	addr  string
 	visas []dataplane.VisaDescriptor
 	err   error
 }
@@ -276,24 +276,27 @@ func fetchActorsSnapshotCmd() tea.Cmd {
 	}
 }
 
-func fetchActorVisasCmd(cn string) tea.Cmd {
+func fetchActorVisasCmd(addr string) tea.Cmd {
 	return func() tea.Msg {
 		client, err := dataplane.Shared()
 		if err != nil {
-			return actorVisasMsg{cn: cn, err: err}
+			return actorVisasMsg{addr: addr, err: err}
 		}
 
-		visas, err := client.FetchActorVisas(context.Background(), cn)
-		return actorVisasMsg{cn: cn, visas: visas, err: err}
+		visas, err := client.FetchActorVisas(context.Background(), addr)
+		return actorVisasMsg{addr: addr, visas: visas, err: err}
 	}
 }
 
-func (m Model) selectedActorCN() (string, bool) {
+// selectedActorAddr is the ZPR address of the selected actor — the actor's
+// identity on the admin API. The CN cannot key the selection: it may be absent,
+// so several CN-less actors would alias to "".
+func (m Model) selectedActorAddr() (string, bool) {
 	idx := m.state.actor.selectedIndex
 	if idx < 0 || idx >= len(m.state.actor.actors) {
 		return "", false
 	}
-	return m.state.actor.actors[idx].CName, true
+	return m.state.actor.actors[idx].ZprAddress, true
 }
 
 type Model struct {
@@ -452,8 +455,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state.actor.visas = nil
 				m.state.actor.visaCountHistory = nil
 				m.viewport.SetContent(m.Content())
-				if cn, ok := m.selectedActorCN(); ok {
-					return m, fetchActorVisasCmd(cn)
+				if addr, ok := m.selectedActorAddr(); ok {
+					return m, fetchActorVisasCmd(addr)
 				}
 				return m, nil
 			}
@@ -481,8 +484,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state.actor.visas = nil
 				m.state.actor.visaCountHistory = nil
 				m.viewport.SetContent(m.Content())
-				if cn, ok := m.selectedActorCN(); ok {
-					return m, fetchActorVisasCmd(cn)
+				if addr, ok := m.selectedActorAddr(); ok {
+					return m, fetchActorVisasCmd(addr)
 				}
 				return m, nil
 			}
@@ -541,18 +544,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Keep the last good topology when only the network fetch failed,
 		// and vice versa.
 		if msg.actorErr == nil {
-			prevCN, hadPrev := m.selectedActorCN()
+			prevAddr, hadPrev := m.selectedActorAddr()
 			m.state.actor.actors = msg.actors
 			// Sort here, not in the view: selectedIndex and the revoke target
 			// index into this slice.
 			slices.SortFunc(m.state.actor.actors, func(a, b dataplane.ActorDescriptor) int {
-				return cmp.Compare(a.CName, b.CName)
+				return cmp.Compare(a.ZprAddress, b.ZprAddress)
 			})
-			// The selection follows the CN, not the row number: an actor that
-			// joins and sorts earlier would otherwise shift the details pane
-			// and the revoke target onto a different actor.
+			// The selection follows the ZPR address, not the row number: an
+			// actor that joins and sorts earlier would otherwise shift the
+			// details pane and the revoke target onto a different actor. The
+			// address is the identity — a CN can be absent, and re-anchoring
+			// on it would alias every CN-less actor to "".
 			idx := slices.IndexFunc(m.state.actor.actors, func(a dataplane.ActorDescriptor) bool {
-				return a.CName == prevCN
+				return a.ZprAddress == prevAddr
 			})
 			switch {
 			case hadPrev && idx >= 0:
@@ -571,8 +576,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state.actor.selectedIndex = max(0, len(m.state.actor.actors)-1)
 				}
 			}
-			if cn, ok := m.selectedActorCN(); ok {
-				visasCmd = fetchActorVisasCmd(cn)
+			if addr, ok := m.selectedActorAddr(); ok {
+				visasCmd = fetchActorVisasCmd(addr)
 			}
 		}
 		if msg.networkErr == nil {
@@ -584,7 +589,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, visasCmd
 
 	case actorVisasMsg:
-		if cn, ok := m.selectedActorCN(); ok && cn == msg.cn {
+		// Deliver only the selected actor's response, keyed on the address:
+		// keyed on the CN, two CN-less actors would accept each other's lists.
+		if addr, ok := m.selectedActorAddr(); ok && addr == msg.addr {
 			m.state.actor.visasFetchErr = msg.err
 			if msg.err == nil {
 				// FetchActorVisas returns them sorted by visa ID descending.

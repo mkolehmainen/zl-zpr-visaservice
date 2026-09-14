@@ -11,13 +11,13 @@ import (
 // TestGetActorSortsAttrs checks attributes come back sorted by key, so views
 // can render them without sorting on every frame.
 func TestGetActorSortsAttrs(t *testing.T) {
-	c := testClient(t, `{"cn":"adapter-a","attrs":[
+	c := testClient(t, `{"zpr_addr":"fd5a:5052::10","cn":"adapter-a","attrs":[
 		{"key":"user.hair_color","value":["brown"]},
 		{"key":"zpr.role","value":["adapter"]},
 		{"key":"org.team","value":["infra"]}
 	]}`)
 
-	actor, err := c.GetActor(context.Background(), "adapter-a")
+	actor, err := c.GetActor(context.Background(), "fd5a:5052::10")
 	if err != nil {
 		t.Fatalf("GetActor: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestFetchActorVisasSortsByIDDesc(t *testing.T) {
 
 	c := &Client{baseURL: srv.URL, http: srv.Client()}
 
-	visas, err := c.FetchActorVisas(context.Background(), "adapter-a")
+	visas, err := c.FetchActorVisas(context.Background(), "fd5a:5052::10")
 	if err != nil {
 		t.Fatalf("FetchActorVisas: %v", err)
 	}

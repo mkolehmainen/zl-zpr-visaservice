@@ -8,20 +8,19 @@ import (
 	"neboagency.com/zpr-dashborad/internal/timefmt"
 )
 
-// actorDock resolves the CN of the dock an actor connects through, from its
-// zpr.connect_via address. Falls back to the raw address when no actor matches
-// it, and to "" when the attribute (or its value) is absent.
-// ponytail: linear scan, build an addr→CN map if the actor count gets large.
+// actorDock labels the dock an actor connects through, from its
+// zpr.connect_via address: the dock's CN when it has one, the raw address
+// otherwise (whether or not an actor claims it), and "" when the attribute
+// (or its value) is absent.
+// ponytail: linear scan, build an addr→label map if the actor count gets large.
 func actorDock(actors []dataplane.ActorDescriptor, actor dataplane.ActorDescriptor) string {
 	via := actor.Attr("zpr.connect_via")
 	if len(via) == 0 || via[0] == "" {
 		return ""
 	}
 
-	for _, candidate := range actors {
-		if candidate.ZprAddress == via[0] && candidate.CName != "" {
-			return candidate.CName
-		}
+	if dock, ok := actorByAddr(actors, via[0]); ok {
+		return actorLabel(dock)
 	}
 
 	return via[0]

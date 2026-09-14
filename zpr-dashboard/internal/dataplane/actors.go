@@ -7,18 +7,16 @@ import (
 	"net/http"
 )
 
-// Returned result, see how we extract json values from it
-type CnEntry struct {
-	CName       string `json:"cn"`
-	CTime       string `json:"ctime"`
-	Ident       string `json:"ident"`
-	Node        string `json:"node"`
-	ZprAddress  string `json:"zpr_addr"`
-	NodeDetails string `json:"node_details"`
+// ActorEntry is one row of the GET /admin/actors listing. The ZPR address
+// identifies the actor; the CN is a display label that may be absent
+// (decoded as "" when the wire carries null).
+type ActorEntry struct {
+	ZprAddress string `json:"zpr_addr"`
+	CName      string `json:"cn"`
 }
 
 // List all actors
-func (c *Client) ListActors(ctx context.Context) ([]CnEntry, error) {
+func (c *Client) ListActors(ctx context.Context) ([]ActorEntry, error) {
 	path := "/admin/actors"
 
 	resp, err := c.Get(ctx, path)
@@ -31,7 +29,7 @@ func (c *Client) ListActors(ctx context.Context) ([]CnEntry, error) {
 		return nil, fmt.Errorf("List actors: %s", resp.Status)
 	}
 
-	var entries []CnEntry
+	var entries []ActorEntry
 	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
 		return nil, fmt.Errorf("Decode actors: %w", err)
 	}
@@ -47,10 +45,10 @@ func (c *Client) FetchActors(ctx context.Context) ([]ActorDescriptor, error) {
 
 	var actors []ActorDescriptor
 	for _, entry := range entries {
-		actor, err := c.GetActor(ctx, entry.CName)
+		actor, err := c.GetActor(ctx, entry.ZprAddress)
 		if err != nil {
-			// keep an actor we can name but not describe
-			actors = append(actors, ActorDescriptor{CName: entry.CName})
+			// keep an actor we can address but not describe
+			actors = append(actors, ActorDescriptor{ZprAddress: entry.ZprAddress, CName: entry.CName, Undescribed: true})
 			continue
 		}
 

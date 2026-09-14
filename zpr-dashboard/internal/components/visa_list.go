@@ -211,12 +211,11 @@ func visaRowStyle(widths []int, selectedIndex, rows, warnCol int, warn func(row 
 		return s
 	}
 }
-func visaSubject(visa dataplane.VisaDescriptor, actors []dataplane.ActorDescriptor) string {
-	if actor, ok := actorByAddr(actors, visa.RequestingNode); ok {
-		return actor.CName
-	}
 
-	return orDash(visa.RequestingNode)
+// visaSubject labels the requesting node: its CN when known, its address
+// otherwise.
+func visaSubject(visa dataplane.VisaDescriptor, actors []dataplane.ActorDescriptor) string {
+	return endpointLabel(visa.RequestingNode, actors)
 }
 
 func actorByAddr(actors []dataplane.ActorDescriptor, addr string) (dataplane.ActorDescriptor, bool) {

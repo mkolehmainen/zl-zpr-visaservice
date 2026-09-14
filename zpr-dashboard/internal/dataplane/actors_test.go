@@ -92,6 +92,9 @@ func TestFetchActorsJoinsOnAddress(t *testing.T) {
 	if actors[1].CName != "node-a" || actors[1].Ident != "certified" {
 		t.Errorf("actor 1 = %+v, want node-a's full descriptor", actors[1])
 	}
+	if actors[0].Undescribed || actors[1].Undescribed {
+		t.Error("described actors must not be marked Undescribed")
+	}
 
 	for _, want := range []string{"/admin/actors/fd5a:5052::1", "/admin/actors/fd5a:5052::2"} {
 		found := false
@@ -134,6 +137,11 @@ func TestFetchActorsDegradedFallbackKeepsAddress(t *testing.T) {
 	}
 	if actors[1].ZprAddress != "fd5a:5052::2" || actors[1].CName != "node-a" {
 		t.Errorf("degraded actor 1 = %+v, want address plus CN", actors[1])
+	}
+	for i, a := range actors {
+		if !a.Undescribed {
+			t.Errorf("degraded actor %d not marked Undescribed — the cannot-be-described alert keys on it", i)
+		}
 	}
 }
 
