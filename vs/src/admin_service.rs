@@ -1147,7 +1147,8 @@ mod tests {
     use crate::admin_apikeys::{ApiKeyRecord, KeyStatus};
     use crate::assembly::tests::{new_assembly_for_tests, new_assembly_with_event_rx};
     use crate::test_helpers::{
-        make_adapter_actor_defexp, make_node_actor_defexp, make_peering, policy_with_peerings,
+        make_adapter_actor_defexp, make_node_actor_defexp, make_oidc_only_adapter_defexp,
+        make_peering, policy_with_peerings,
     };
     use zpr::policy_types::AttrExp;
 
@@ -1753,6 +1754,54 @@ mod tests {
         let actors: Vec<CnEntry> = serde_json::from_slice(&body).unwrap();
         assert_eq!(actors.len(), 1);
         assert_eq!(actors[0].cn, "node-1");
+    }
+
+    /// F1 endpoint view (zipline#29 / zipline#30, A1 gate): `GET /admin/actors` must
+    /// represent a CN-less actor (OIDC-only connect). This encodes the reported
+    /// symptom directly: an OIDC-only actor connects and no dashboard row appears.
+    /// Today `list_actor_cns` skips the actor (warn + continue on the missing `cn`
+    /// attribute), so the endpoint returns only the CN-bearing actor. Fix lands in
+    /// zipline#31 (A2), which removes the #[ignore].
+    #[tokio::test]
+    #[ignore = "known defect F1 (endpoint), zipline#29; fix lands in zipline#31"]
+    async fn test_admin_actors_lists_cn_less_actor() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::30", "node-f1", "[fd5a:5052::130]:1234");
+        let cn_less_adapter = make_oidc_only_adapter_defexp("fd5a:5052::31");
+        asm.actor_mgr.add_node(&node_actor, false).await.unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&cn_less_adapter, node_actor.get_zpr_addr().unwrap())
+            .await
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/actors")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let actors: Vec<CnEntry> = serde_json::from_slice(&body).unwrap();
+        // Both connected actors must have an entry; the CN-less adapter must not be
+        // omitted from the admin listing. (What its `cn` field should carry is A2's
+        // design call — the pinned contract here is presence.)
+        assert_eq!(
+            actors.len(),
+            2,
+            "CN-less actor omitted from GET /admin/actors: {actors:?}"
+        );
     }
 
     #[tokio::test]
