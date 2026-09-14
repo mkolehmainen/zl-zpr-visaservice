@@ -554,8 +554,11 @@ async fn synchronize_state(actor_mgr: &ActorMgr, net_mgr: &NetMgr) -> Result<(),
     actor_mgr.refresh_state().await?;
 
     // Grab all the adapter addresses we have handed out already so that we do not try
-    // to hand out the same address to a new adapter.
-    for (zpr_addr, _cn) in actor_mgr.list_actors(None).await.unwrap_or_default() {
+    // to hand out the same address to a new adapter. A bad per-actor record does not
+    // error the listing (`list_actors` degrades it to an address with no CN), so an
+    // Err here is a real DB failure: propagate it rather than silently reserving
+    // nothing and letting the allocator hand out occupied addresses.
+    for (zpr_addr, _cn) in actor_mgr.list_actors(None).await? {
         if net_mgr.is_managed_address(&zpr_addr) {
             net_mgr.take_zpr_addr(&zpr_addr)?;
         }

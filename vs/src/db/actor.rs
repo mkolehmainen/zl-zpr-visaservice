@@ -501,16 +501,29 @@ impl ActorRepo {
                 let a_key = attrs_key_for(&addr);
 
                 // Pull the CN attribute out of the actor hash (JSON Attribute) as a
-                // display label; a missing CN is a normal state, not an anomaly.
-                let cn = match self.db.hget(&a_key, key::CN).await? {
-                    Some(cn_attr_json) => {
-                        let cn_attr: Attribute = serde_json::from_str(&cn_attr_json)?;
-                        match cn_attr.get_single_value() {
-                            Ok(cn_val) => Some(cn_val.to_string()),
-                            Err(_) => Some(cn_attr.get_value_as_string()),
+                // display label; a missing CN is a normal state, not an anomaly. A CN
+                // that fails to load or decode degrades to no-CN rather than an error:
+                // the ZPR address (the key) is what matters -- startup address
+                // reservation walks this list, and one bad label must not discard
+                // every other actor's address.
+                let cn = match self.db.hget(&a_key, key::CN).await {
+                    Ok(Some(cn_attr_json)) => {
+                        match serde_json::from_str::<Attribute>(&cn_attr_json) {
+                            Ok(cn_attr) => match cn_attr.get_single_value() {
+                                Ok(cn_val) => Some(cn_val.to_string()),
+                                Err(_) => Some(cn_attr.get_value_as_string()),
+                            },
+                            Err(err) => {
+                                warn!(target: DB, "malformed CN attribute for actor {addr}, listing it without a CN: {err}");
+                                None
+                            }
                         }
                     }
-                    None => None,
+                    Ok(None) => None,
+                    Err(err) => {
+                        warn!(target: DB, "could not load CN attribute for actor {addr}, listing it without a CN: {err}");
+                        None
+                    }
                 };
                 actors.push((addr, cn));
             }
@@ -662,6 +675,40 @@ mod test {
         assert_eq!(
             adapter_actors,
             vec![(adapter_addr, Some("adapter-cn".to_string()))]
+        );
+    }
+
+    /// Startup address reservation walks `list_actors` (vs/src/main.rs
+    /// `synchronize_state`), so one actor whose persisted CN attribute is
+    /// malformed JSON must not error out the whole listing -- that would leave
+    /// every other persisted ZPR address unreserved and re-assignable. The bad
+    /// entry stays in the list with its address (the key) and no CN (a display
+    /// label). Codex review on zipline#31.
+    #[tokio::test]
+    async fn test_list_actors_survives_malformed_cn_attribute() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db.clone());
+
+        repo.add_actor(&make_adapter_actor_defexp("fd5a:5052::41", "good-cn"))
+            .await
+            .unwrap();
+        repo.add_actor(&make_adapter_actor_defexp("fd5a:5052::42", "bad-cn"))
+            .await
+            .unwrap();
+
+        // Corrupt one actor's persisted CN attribute JSON in place.
+        let bad_addr: IpAddr = "fd5a:5052::42".parse().unwrap();
+        db.hset(&attrs_key_for(&bad_addr), key::CN, "{not json")
+            .await
+            .unwrap();
+
+        let mut actors = repo.list_actors(None).await.unwrap();
+        actors.sort();
+
+        let good_addr: IpAddr = "fd5a:5052::41".parse().unwrap();
+        assert_eq!(
+            actors,
+            vec![(good_addr, Some("good-cn".to_string())), (bad_addr, None)]
         );
     }
 
