@@ -75,10 +75,24 @@ const USER_NAMESPACE_PREFIX: &str = "user.";
 ///
 /// Returns None when the service vended no `user.*` attributes (a device with no user
 /// record in any trusted service must still not match a bare `allow users ...` rule —
-/// the fail-closed property of #144 survives), and when the service explicitly vended
+/// the fail-closed property of #144 survives), when the service explicitly vended
 /// `user.zpr.authority` itself (it is asserting the authority directly; nothing to
-/// derive).
-pub(crate) fn derive_user_authority(source_id: &str, ts_attrs: &[Attribute]) -> Option<Attribute> {
+/// derive), and when `existing_authority` names a DIFFERENT source (zipline#25): the
+/// service that verified the credential owns `user.zpr.authority`, so a service that
+/// merely decorates an already-identified actor with extra attributes never displaces
+/// it. The `!=` is load-bearing — when the existing authority IS this source,
+/// derivation still proceeds, which is how the authenticating service re-stamps the
+/// authority's expiry against its own current user record on every refresh.
+pub(crate) fn derive_user_authority(
+    source_id: &str,
+    ts_attrs: &[Attribute],
+    existing_authority: Option<&str>,
+) -> Option<Attribute> {
+    if let Some(existing) = existing_authority {
+        if existing != source_id {
+            return None;
+        }
+    }
     if ts_attrs.iter().any(|a| a.get_key() == key::USER_AUTHORITY) {
         return None;
     }
@@ -145,7 +159,7 @@ mod derive_tests {
             attr("bas", "user.dept", "engineering", 300),
             attr("bas", "device.zpr.location", "hq", 60),
         ];
-        let authority = derive_user_authority("bas", &attrs).expect("authority expected");
+        let authority = derive_user_authority("bas", &attrs, None).expect("authority expected");
         assert_eq!(authority.get_key(), key::USER_AUTHORITY);
         assert_eq!(authority.get_value(), ["bas".to_string()]);
         assert_eq!(authority.get_source(), "bas");
@@ -164,32 +178,60 @@ mod derive_tests {
     #[test]
     fn test_derive_user_authority_none_without_user_attrs() {
         let device_only = vec![attr("bas", "device.zpr.location", "hq", 600)];
-        assert!(derive_user_authority("bas", &device_only).is_none());
-        assert!(derive_user_authority("bas", &[]).is_none());
+        assert!(derive_user_authority("bas", &device_only, None).is_none());
+        assert!(derive_user_authority("bas", &[], None).is_none());
     }
 
-    /// Characterization of the zipline#24 defect mechanism: [derive_user_authority]
-    /// derives `user.zpr.authority = <source id>` for ANY source vending a `user.*`
-    /// attribute — here `happyfile` vending only the tag `user.zpr.tag.lazy` — with
-    /// no regard for an authority already asserted by another source (e.g. the OIDC
-    /// arm's `user.zpr.authority = google`). The two-argument signature cannot even
-    /// see a competing authority, so on the connect and refresh paths the derived
-    /// value silently overwrites the authenticator's (last writer wins in
-    /// `Actor::attrs`). This test PASSES today and documents that behaviour.
-    ///
-    /// The fix (zipline#25, plan task V2) changes the signature to
-    /// `derive_user_authority(source_id, ts_attrs, existing_authority: Option<&str>)`:
-    /// return `None` when `existing_authority == Some(other)` for `other != source_id`,
-    /// and still derive when it is `Some(source_id)` so expiry re-stamps. That change
-    /// rewrites this test into an assertion of the new behaviour.
+    /// Guard against the zipline#24 defect: the service that verified the
+    /// credential owns `user.zpr.authority`. A source vending only decorating
+    /// `user.*` attributes — here `happyfile` vending the tag `user.zpr.tag.lazy`
+    /// — must NOT displace an authority already asserted by another source (the
+    /// OIDC arm's `user.zpr.authority = google`): with a competing
+    /// `existing_authority` the derivation returns `None` (zipline#25, plan
+    /// task V2). Before that fix this test asserted the opposite — the derived
+    /// value silently overwrote the authenticator's, last writer wins in
+    /// `Actor::attrs` — which was the #24 characterization.
     #[test]
     fn test_derive_user_authority_displaces_competing_authority_zipline24() {
         let attrs = vec![attr("happyfile", "user.zpr.tag.lazy", "", 600)];
-        let authority = derive_user_authority("happyfile", &attrs)
-            .expect("a lone user.* tag derives an authority today");
+        assert!(
+            derive_user_authority("happyfile", &attrs, Some("google")).is_none(),
+            "a decorating source must not displace the authenticator's authority"
+        );
+    }
+
+    /// The `!=` in the competing-authority guard is load-bearing: when the
+    /// existing authority IS this source, derivation still proceeds so the
+    /// authenticating service re-stamps the authority's expiry against its own
+    /// current user record on every refresh (#324 — the authority must not
+    /// outlive the record it vouches for). Blocking on `Some(_)` unconditionally
+    /// would freeze the expiry and let the authority lapse mid-session.
+    #[test]
+    fn test_derive_user_authority_restamps_own_authority() {
+        let attrs = vec![
+            attr("google", "user.oidc-subject", "s-123", 600),
+            attr("google", "user.dept", "engineering", 300),
+        ];
+        let authority = derive_user_authority("google", &attrs, Some("google"))
+            .expect("the authenticating source must re-derive its own authority");
         assert_eq!(authority.get_key(), key::USER_AUTHORITY);
-        assert_eq!(authority.get_value(), ["happyfile".to_string()]);
-        assert_eq!(authority.get_source(), "happyfile");
+        assert_eq!(authority.get_value(), ["google".to_string()]);
+        assert_eq!(authority.get_source(), "google");
+        assert_eq!(
+            authority.get_expires(),
+            attrs[1].get_expires(),
+            "expiry must be recomputed from the current ts_attrs on each pass"
+        );
+    }
+
+    /// With no existing authority the derivation behaves exactly as today —
+    /// the single-file-store case (#144 / #324) must not regress.
+    #[test]
+    fn test_derive_user_authority_without_existing_authority() {
+        let attrs = vec![attr("bas", "user.dept", "engineering", 300)];
+        let authority = derive_user_authority("bas", &attrs, None).expect("authority expected");
+        assert_eq!(authority.get_value(), ["bas".to_string()]);
+        assert_eq!(authority.get_expires(), attrs[0].get_expires());
     }
 
     /// A source that vends `user.zpr.authority` itself asserts the authority
@@ -200,7 +242,7 @@ mod derive_tests {
             attr("bas", key::USER_AUTHORITY, "custom-authority", 600),
             attr("bas", "user.dept", "engineering", 300),
         ];
-        assert!(derive_user_authority("bas", &attrs).is_none());
+        assert!(derive_user_authority("bas", &attrs, None).is_none());
     }
 
     /// `user.zpr.authority` is always part of the lookup-identity set when the

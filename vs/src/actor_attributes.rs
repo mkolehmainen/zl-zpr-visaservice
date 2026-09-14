@@ -163,7 +163,10 @@ async fn refresh_expired_attributes(
                     // attribute the source stopped vending).
                     let ts_attrs = {
                         let mut ts_attrs = ts_attrs;
-                        if let Some(authority) = derive_user_authority(source, &ts_attrs) {
+                        // `existing_authority` is deliberately `None` here: threading
+                        // the actor's real authority through is the behavioural wiring
+                        // of zipline#26 (V3); `None` preserves today's behaviour.
+                        if let Some(authority) = derive_user_authority(source, &ts_attrs, None) {
                             ts_attrs.push(authority);
                         }
                         ts_attrs
