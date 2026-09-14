@@ -95,12 +95,14 @@ pub struct Revokes {
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Eq)]
 pub struct ActorDescriptor {
-    pub cn: String,
+    /// Display label; may be absent (e.g. an OIDC-only connect). Never an identity.
+    pub cn: Option<String>,
     #[serde(rename = "created")]
     #[serde_as(as = "TimestampSeconds<i64>")]
     pub ctime: SystemTime,
     pub ident: String,
     pub node: bool,
+    /// The ZPR address: the identity of an actor on the admin API.
     pub zpr_addr: String,
     pub attrs: Vec<ApiAttribute>,
     #[serde_as(as = "Option<TimestampSeconds<i64>>")]
@@ -108,15 +110,18 @@ pub struct ActorDescriptor {
     pub node_details: Option<NodeRecordBrief>,
 }
 
+// Wire-side actor identity is the ZPR address, not the CN: CNs may be shared or
+// absent, so keying equality/order on them would collapse CN-less actors into one
+// equivalence class.
 impl PartialEq for ActorDescriptor {
     fn eq(&self, other: &Self) -> bool {
-        self.cn == other.cn
+        self.zpr_addr == other.zpr_addr
     }
 }
 
 impl Ord for ActorDescriptor {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.cn.cmp(&other.cn)
+        self.zpr_addr.cmp(&other.zpr_addr)
     }
 }
 
@@ -184,9 +189,9 @@ pub struct NodeRecordBrief {
     // Time of last visa request, None if there was no request
     #[serde_as(as = "Option<TimestampSeconds<i64>>")]
     pub last_vreq: Option<SystemTime>,
-    // CNs of all adapters connected to the node
+    // ZPR addresses of all adapters connected to the node
     pub adapters: Vec<String>,
-    // CNs of all other nodes connected to the node
+    // ZPR addresses of all other nodes connected to the node
     pub links: Vec<String>,
     // IDs of all visas installed on the node
     pub visas: Vec<u64>,
@@ -204,10 +209,12 @@ pub struct AuthRevokeDescriptor {
     pub cn: String,
 }
 
-/// Simple struct with a "cn" field.
+/// One actor in the `GET /admin/actors` listing. The ZPR address identifies the
+/// actor; the CN is a display label that may be absent.
 #[derive(Serialize, Deserialize, Debug)]
-pub struct CnEntry {
-    pub cn: String,
+pub struct ActorEntry {
+    pub zpr_addr: String,
+    pub cn: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -472,7 +479,7 @@ mod tests {
     #[test]
     fn actor_descriptor_serializes_timestamps_as_integer_seconds() {
         let ad = ActorDescriptor {
-            cn: "test.cn".to_string(),
+            cn: Some("test.cn".to_string()),
             ctime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5000),
             ident: "ident".to_string(),
             node: false,
@@ -490,7 +497,7 @@ mod tests {
     #[test]
     fn actor_descriptor_none_auth_exp_serializes_as_null() {
         let ad = ActorDescriptor {
-            cn: "test.cn".to_string(),
+            cn: Some("test.cn".to_string()),
             ctime: SystemTime::UNIX_EPOCH,
             ident: "ident".to_string(),
             node: false,
