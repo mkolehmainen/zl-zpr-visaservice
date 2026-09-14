@@ -890,7 +890,6 @@ mod tests {
     /// [derive_user_authority] mints `user.zpr.authority = happyfile` on the refresh
     /// (vs/src/actor_attributes.rs) and `add_attribute` overwrites google's stamp.
     #[tokio::test]
-    #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
     async fn test_refresh_of_decorating_store_keeps_google_authority_zipline24() {
         let mgr = TrustedServicesMgr::new();
         mgr.update_services(vec![Arc::new(HappyfileFake)]);
@@ -937,7 +936,6 @@ mod tests {
     /// Today this FAILS at the tag-loss check below: pass 1 displaces the
     /// authority to `happyfile`, pass 2 prunes `user.sub`, pass 3 prunes the tag.
     #[tokio::test]
-    #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
     async fn test_refresh_after_displacement_loses_user_record_and_tag_zipline24() {
         let mgr = TrustedServicesMgr::new();
         mgr.update_services(vec![Arc::new(VouchedOidcFake), Arc::new(HappyfileFake)]);

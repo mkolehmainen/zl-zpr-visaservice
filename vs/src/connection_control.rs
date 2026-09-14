@@ -2962,7 +2962,6 @@ mod tests {
     /// build but not sorted -- so the displacement direction must not be left to
     /// accident in this test.
     #[tokio::test]
-    #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
     async fn test_oidc_connect_with_decorating_file_store_keeps_google_authority_zipline24() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         // Install a `google` OIDC policy mapping `sub -> user.sub` so the minted blob
