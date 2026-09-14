@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use libeval::actor::Actor;
-use libeval::attribute::Attribute;
+use libeval::attribute::{Attribute, key};
 
 use tracing::{debug, warn};
 
@@ -163,10 +163,17 @@ async fn refresh_expired_attributes(
                     // attribute the source stopped vending).
                     let ts_attrs = {
                         let mut ts_attrs = ts_attrs;
-                        // `existing_authority` is deliberately `None` here: threading
-                        // the actor's real authority through is the behavioural wiring
-                        // of zipline#26 (V3); `None` preserves today's behaviour.
-                        if let Some(authority) = derive_user_authority(source, &ts_attrs, None) {
+                        // The actor's current authority gates derivation (zipline#26):
+                        // a decorating source never displaces the authenticator's
+                        // stamp, while the authenticating source itself re-stamps
+                        // expiry on its own refresh (same-source arm in
+                        // [derive_user_authority]).
+                        let existing_authority: Option<String> = actor
+                            .get_attribute(key::USER_AUTHORITY)
+                            .and_then(|a| a.get_value().first().cloned());
+                        if let Some(authority) =
+                            derive_user_authority(source, &ts_attrs, existing_authority.as_deref())
+                        {
                             ts_attrs.push(authority);
                         }
                         ts_attrs
