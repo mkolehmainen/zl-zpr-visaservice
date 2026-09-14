@@ -914,46 +914,71 @@ mod tests {
         );
     }
 
-    /// zipline#24 (V1 gate, refresh path, symptom 2 of 2): once the authority has
-    /// been displaced to `happyfile` (the state symptom 1 proves), the actor's
-    /// attributes unravel across refreshes. The OIDC store's `vouched_here` gate
+    /// zipline#24 (V1 gate, refresh path, symptom 2 of 2): after the decorating
+    /// store's refresh displaces the authority (symptom 1), the actor's attributes
+    /// unravel across the following refreshes: the OIDC store's `vouched_here` gate
     /// answers the displaced-authority lookup with an empty result, the
-    /// revision-stale refresh prunes `user.sub` as no-longer-vended, and on the next
-    /// pass the file store's lookup (keyed on the now-missing `user.sub`) finds
-    /// nothing, so `user.zpr.tag.lazy` disappears too -- the actor loses `lazy`
-    /// mid-session.
+    /// revision-stale refresh prunes `user.sub` as no-longer-vended, and the next
+    /// file-store lookup (keyed on the now-missing `user.sub`) finds nothing, so
+    /// `user.zpr.tag.lazy` disappears too -- the actor loses `lazy` mid-session.
     ///
-    /// The actor starts in the displaced state rather than re-deriving it here:
-    /// starting from `google` would need both sources refreshed in one pass, whose
-    /// order is a HashSet iteration and would make the RED nondeterministic.
+    /// The displaced state is DERIVED here by the same single-source refresh
+    /// symptom 1 uses (google's revision pre-committed, only happyfile's tag
+    /// expired), and each later pass is kept single-source by re-staling one
+    /// revision at a time -- a two-source pass iterates a HashSet, whose order
+    /// would make the RED nondeterministic. Deriving the state, rather than
+    /// starting from a pre-displaced fixture, is what lets the #25/#26 fix turn
+    /// this test green: with pass 1 no longer displacing, google keeps vouching
+    /// for `user.sub` in pass 2 and happyfile re-vends the tag in pass 3.
+    ///
+    /// Today this FAILS at the tag-loss check below: pass 1 displaces the
+    /// authority to `happyfile`, pass 2 prunes `user.sub`, pass 3 prunes the tag.
     #[tokio::test]
     #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
     async fn test_refresh_after_displacement_loses_user_record_and_tag_zipline24() {
         let mgr = TrustedServicesMgr::new();
         mgr.update_services(vec![Arc::new(VouchedOidcFake), Arc::new(HappyfileFake)]);
-        // The displaced state: authority = happyfile, google's user.sub, the tag.
-        let mut actor = post_connect_actor(HAPPYFILE, HAPPYFILE, 600);
+        // As the connect path leaves it: authority = google, fresh user.sub, and
+        // the happyfile tag expired so pass 1 touches only the decorating store.
+        let mut actor = post_connect_actor(GOOGLE, GOOGLE, -1);
 
-        // Both sources are revision-stale (no recorded revisions), so both refresh.
-        // google's vouched_here gate sees authority=happyfile -> empty result ->
-        // the revision refresh prunes user.sub as no-longer-vended.
+        // Pass 1 (the symptom-1 refresh): google's revision is pre-committed, so
+        // only happyfile refreshes. Today its re-vended tag makes
+        // [derive_user_authority] mint `user.zpr.authority = happyfile` over
+        // google's stamp; under the #25/#26 fix the authority stays google.
+        // Deliberately not asserted either way -- this test's claim is the
+        // downstream cascade, asserted at the end.
+        mgr.record_revision(&test_addr(), GOOGLE, 1);
         let outcome = refresh_expired_attributes(&mgr, &[USER_SUB_KEY], &mut actor).await;
         assert!(outcome.indeterminate.is_empty());
-        assert!(
-            actor.get_attribute(USER_SUB_KEY).is_some(),
-            "the authenticated user.sub must survive a refresh (zipline#24: pruned \
-             because the displaced authority fails google's vouched_here gate)"
-        );
+        outcome.commit_revisions(&mgr, &test_addr());
 
-        // Revisions deliberately NOT committed: both sources stay stale, as the
-        // request path leaves them after a failed persist. The next pass computes
-        // its lookup set without user.sub, so happyfile finds nothing and the tag
-        // (and its derived authority) are pruned as no-longer-vended.
+        // Pass 2: re-stale ONLY google (happyfile was committed above and its tag
+        // is fresh). Displaced, google's vouched_here gate sees
+        // authority=happyfile -> empty result -> the revision refresh prunes
+        // user.sub as no-longer-vended. Fixed, the authority is still google, so
+        // user.sub is re-vouched and kept.
+        mgr.record_revision(&test_addr(), GOOGLE, REVISION_NEVER);
+        let outcome = refresh_expired_attributes(&mgr, &[USER_SUB_KEY], &mut actor).await;
+        assert!(outcome.indeterminate.is_empty());
+        outcome.commit_revisions(&mgr, &test_addr());
+
+        // Pass 3: re-stale ONLY happyfile. Displaced, its lookup is keyed on the
+        // now-pruned user.sub, finds nothing, and the tag (and its derived
+        // authority) are pruned as no-longer-vended.
+        mgr.record_revision(&test_addr(), HAPPYFILE, REVISION_NEVER);
         let _ = refresh_expired_attributes(&mgr, &[USER_SUB_KEY], &mut actor).await;
+
         assert!(
             actor.get_attribute(LAZY_TAG_KEY).is_some(),
-            "the file store's tag must survive refreshes (zipline#24: lost once the \
-             pruned user.sub can no longer key the happyfile lookup)"
+            "the file store's tag must survive refreshes (zipline#24: the displaced \
+             authority fails google's vouched_here gate, user.sub is pruned, and the \
+             next happyfile lookup finds nothing to key the tag)"
+        );
+        assert!(
+            actor.get_attribute(USER_SUB_KEY).is_some(),
+            "the authenticated user.sub must survive refreshes (zipline#24: pruned \
+             because the displaced authority fails google's vouched_here gate)"
         );
     }
 }
