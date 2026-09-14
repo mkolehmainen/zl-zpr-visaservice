@@ -265,7 +265,15 @@ impl ConnectionControl {
             ));
         }
 
-        check_required_claims(&req.claims, &[key::CN])?;
+        // Only a device (self-signed) blob carries a CN, so only a connect that
+        // presents one is required to claim it. A user-only login (OIDC blob, no
+        // bootstrap key) has no device identity at all and the node sends no CN
+        // claim for it; demanding one here would make user-only connects impossible.
+        // The claim is unauthenticated either way -- it is the validated blob, not
+        // the claim, that authenticates the CN.
+        if req.blobs.iter().any(|blob| matches!(blob, AuthBlob::SS(_))) {
+            check_required_claims(&req.claims, &[key::CN])?;
+        }
 
         let scrubbed_claims = scrub_adapter_claims(req.claims)?;
 
@@ -2511,6 +2519,38 @@ mod tests {
                 .attrs_iter()
                 .all(|a| !a.get_key().starts_with("device.")),
             "no device.* attribute may be asserted by a user-only login"
+        );
+    }
+
+    /// Regression (one-node-oidc-test.sh): a user-only adapter presents no device
+    /// blob, and the node therefore sends **no** `device.zpr.adapter.cn` claim at all
+    /// (zl-zpr-core adapter/ph/src/visa_mgmt.rs only emits the CN claim from a
+    /// self-signed blob). The connect entry point must not demand that claim; the
+    /// other OIDC-only tests all go through `make_connect_request`, which always
+    /// supplies a CN, so they never exercised the real wire shape.
+    #[tokio::test]
+    async fn test_oidc_only_connect_without_cn_claim_authorizes() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        let mut req =
+            make_connect_request(vec![oidc_blob(mint_signed(oidc_base_claims()))], "some.cn");
+        // What a bootstrap-key-less adapter actually sends: no claims at all.
+        req.claims = Vec::new();
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("user-only connect without a CN claim should authorize");
+
+        assert!(actor.get_attribute(key::CN).is_none());
+        assert_eq!(
+            actor
+                .get_attribute("user.oidc-subject")
+                .expect("mapped sub must be present")
+                .get_single_value()
+                .unwrap(),
+            OIDC_SUB
         );
     }
 
