@@ -721,7 +721,10 @@ impl ConnectionControl {
                     // that user identity, so it installs `user.zpr.authority = <source id>`
                     // alongside them (#324 follow-up); see [derive_user_authority]. The
                     // identity-key registration below then picks it up unchanged.
-                    if let Some(authority) = derive_user_authority(&source_id, &ts_attrs) {
+                    // `existing_authority` is deliberately `None` here: threading the
+                    // actor's real authority through is the behavioural wiring of
+                    // zipline#26 (V3); passing `None` preserves today's behaviour.
+                    if let Some(authority) = derive_user_authority(&source_id, &ts_attrs, None) {
                         authd_claims.push(authority);
                     }
                     for attr in ts_attrs {
