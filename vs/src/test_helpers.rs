@@ -87,6 +87,27 @@ pub fn make_adapter_actor_defexp(zpr_addr: &str, cn: &str) -> Actor {
     make_adapter_actor(zpr_addr, cn, DEFAULT_EXPIRES)
 }
 
+/// Build a CN-less adapter [Actor], shaped like the real OIDC-only connect case:
+/// adapter role, a ZPR address, a `user.*` identity attribute — and **no `cn`
+/// attribute**. This is what a bootstrap-key-less adapter looks like after an
+/// OIDC-only connect: see `test_oidc_only_connect_without_cn_claim_authorizes`
+/// (vs/src/connection_control.rs), which asserts
+/// `actor.get_attribute(key::CN).is_none()` for exactly this shape.
+///
+/// Shared fixture for the zipline#29 CN-keyed-surface work (zipline#30/#31/...).
+pub fn make_oidc_only_adapter_defexp(zpr_addr: &str) -> Actor {
+    let actor = make_actor(
+        &[
+            (key::ROLE, ROLE_ADAPTER),
+            (key::ZPR_ADDR, zpr_addr),
+            ("user.oidc-subject", "oidc-user@example.com"),
+        ],
+        DEFAULT_EXPIRES,
+    );
+    debug_assert!(actor.get_attribute(key::CN).is_none());
+    actor
+}
+
 /// Build an [Actor] with role/CN/ZPR addr plus services and an identity attribute.
 pub fn make_actor_with_services(
     role: &str,
