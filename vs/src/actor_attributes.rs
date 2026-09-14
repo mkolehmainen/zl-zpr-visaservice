@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use libeval::actor::Actor;
-use libeval::attribute::Attribute;
+use libeval::attribute::{Attribute, key};
 
 use tracing::{debug, warn};
 
@@ -146,6 +146,20 @@ async fn refresh_expired_attributes(
         .collect();
     sources.extend(stale.keys().cloned());
 
+    // The actor's authority AS OF THE START OF THE PASS gates authority derivation
+    // for every source in the loop below (zipline#26, Codex P1 on PR #12): a
+    // per-iteration read would observe mutations made by earlier iterations, so
+    // when the authority-owning source and a decorating source refresh in the same
+    // pass and the owner stops vending its user record, `sources`' hash order
+    // would decide whether the decorator gets promoted to authority (owner pruned
+    // first) or blocked (decorator first). Snapshotting makes the pass
+    // order-independent: the decorator is blocked by the owner's starting stamp in
+    // both orders, and if the owner pruned its record the authority is simply gone
+    // until a later pass re-derives it against the post-prune state.
+    let starting_authority: Option<String> = actor
+        .get_attribute(key::USER_AUTHORITY)
+        .and_then(|a| a.get_value().first().cloned());
+
     for source in &sources {
         let stale_rev = stale.get(source);
         for ts_result in ts_mgr
@@ -163,10 +177,14 @@ async fn refresh_expired_attributes(
                     // attribute the source stopped vending).
                     let ts_attrs = {
                         let mut ts_attrs = ts_attrs;
-                        // `existing_authority` is deliberately `None` here: threading
-                        // the actor's real authority through is the behavioural wiring
-                        // of zipline#26 (V3); `None` preserves today's behaviour.
-                        if let Some(authority) = derive_user_authority(source, &ts_attrs, None) {
+                        // The pass's starting authority (snapshotted above) gates
+                        // derivation (zipline#26): a decorating source never
+                        // displaces the authenticator's stamp, while the
+                        // authenticating source itself re-stamps expiry on its own
+                        // refresh (same-source arm in [derive_user_authority]).
+                        if let Some(authority) =
+                            derive_user_authority(source, &ts_attrs, starting_authority.as_deref())
+                        {
                             ts_attrs.push(authority);
                         }
                         ts_attrs
@@ -890,7 +908,6 @@ mod tests {
     /// [derive_user_authority] mints `user.zpr.authority = happyfile` on the refresh
     /// (vs/src/actor_attributes.rs) and `add_attribute` overwrites google's stamp.
     #[tokio::test]
-    #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
     async fn test_refresh_of_decorating_store_keeps_google_authority_zipline24() {
         let mgr = TrustedServicesMgr::new();
         mgr.update_services(vec![Arc::new(HappyfileFake)]);
@@ -937,7 +954,6 @@ mod tests {
     /// Today this FAILS at the tag-loss check below: pass 1 displaces the
     /// authority to `happyfile`, pass 2 prunes `user.sub`, pass 3 prunes the tag.
     #[tokio::test]
-    #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
     async fn test_refresh_after_displacement_loses_user_record_and_tag_zipline24() {
         let mgr = TrustedServicesMgr::new();
         mgr.update_services(vec![Arc::new(VouchedOidcFake), Arc::new(HappyfileFake)]);
@@ -983,5 +999,79 @@ mod tests {
             "the authenticated user.sub must survive refreshes (zipline#24: pruned \
              because the displaced authority fails google's vouched_here gate)"
         );
+    }
+
+    /// The OIDC-shaped owner (`google`) after it stops vending the actor's user
+    /// record: every lookup answers with an empty, successful result, like a store
+    /// whose user entry was deleted between revisions.
+    struct GoneOidcFake;
+
+    #[async_trait::async_trait]
+    impl crate::trusted_services::TrustedServiceInterface for GoneOidcFake {
+        async fn get_attributes_for_actor(
+            &self,
+            _identities: &[(String, String)],
+        ) -> Result<Vec<Attribute>, ServiceError> {
+            Ok(Vec::new())
+        }
+
+        async fn flush(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        // Never flushed in these tests.
+        fn current_revision(&self) -> u64 {
+            1
+        }
+
+        fn get_source_id(&self) -> &str {
+            GOOGLE
+        }
+    }
+
+    /// zipline#26 (Codex P1 review on PR #12): when the authority-owning source and
+    /// a decorating source refresh in the SAME pass and the owner stops vending its
+    /// user record, the outcome must not depend on the `sources` hash order. A
+    /// per-iteration read of the actor's authority lets owner-first processing
+    /// prune google's stamp and then mint `user.zpr.authority = happyfile` from the
+    /// decorator's re-vended tag — promoting a non-authenticating store — while
+    /// decorator-first processing (correctly) blocks that derivation and ends with
+    /// no authority. Snapshotting the starting authority before the source loop
+    /// makes both orders end with no authority.
+    ///
+    /// `sources` is a `HashSet` built inside [refresh_expired_attributes], so a
+    /// single two-source pass cannot pin which order runs; instead the scenario is
+    /// repeated with a fresh manager and actor each time (every `HashSet` hashes
+    /// with fresh keys, so both orders occur across the runs) and the invariant is
+    /// asserted on every pass.
+    #[tokio::test]
+    async fn test_refresh_same_pass_owner_prune_does_not_promote_decorator_zipline26() {
+        for _ in 0..256 {
+            let mgr = TrustedServicesMgr::new();
+            // The owner has stopped vending its user record; the decorator still
+            // vends its tag (keyed on the pre-loop identity snapshot's user.sub).
+            mgr.update_services(vec![Arc::new(GoneOidcFake), Arc::new(HappyfileFake)]);
+            // As the connect path left it: authority = google, fresh user.sub,
+            // fresh happyfile tag. Nothing is TTL-expired and no revision is
+            // recorded, so BOTH sources are revision-stale in a single pass.
+            let mut actor = post_connect_actor(GOOGLE, GOOGLE, 600);
+
+            let outcome = refresh_expired_attributes(&mgr, &[USER_SUB_KEY], &mut actor).await;
+            assert!(outcome.indeterminate.is_empty());
+
+            // The owner's empty result pruned its user record...
+            assert!(actor.get_attribute(USER_SUB_KEY).is_none());
+            // ...and whatever order the two sources ran in, the decorating store
+            // must not have been promoted to authority off the back of that prune.
+            let authority = actor
+                .get_attribute(key::USER_AUTHORITY)
+                .map(|a| a.get_value().to_vec());
+            assert!(
+                authority.is_none(),
+                "no source may hold user.zpr.authority once the authenticator stops \
+                 vending the user record, in either processing order (got {authority:?}; \
+                 hash-order-dependent promotion, zipline#26 Codex P1)"
+            );
+        }
     }
 }

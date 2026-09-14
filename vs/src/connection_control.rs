@@ -721,10 +721,17 @@ impl ConnectionControl {
                     // that user identity, so it installs `user.zpr.authority = <source id>`
                     // alongside them (#324 follow-up); see [derive_user_authority]. The
                     // identity-key registration below then picks it up unchanged.
-                    // `existing_authority` is deliberately `None` here: threading the
-                    // actor's real authority through is the behavioural wiring of
-                    // zipline#26 (V3); passing `None` preserves today's behaviour.
-                    if let Some(authority) = derive_user_authority(&source_id, &ts_attrs, None) {
+                    // Recomputed per iteration so the first vouching source in
+                    // `policy.list_services()` order wins — and an authority stamped by
+                    // the auth-blob arm before this loop wins over all of them
+                    // (zipline#26).
+                    let existing_authority: Option<String> = authd_claims
+                        .iter()
+                        .find(|a| a.get_key() == key::USER_AUTHORITY)
+                        .and_then(|a| a.get_value().first().cloned());
+                    if let Some(authority) =
+                        derive_user_authority(&source_id, &ts_attrs, existing_authority.as_deref())
+                    {
                         authd_claims.push(authority);
                     }
                     for attr in ts_attrs {
@@ -2962,7 +2969,6 @@ mod tests {
     /// build but not sorted -- so the displacement direction must not be left to
     /// accident in this test.
     #[tokio::test]
-    #[ignore = "known defect, zipline#24; fix lands in zipline#25/#26"]
     async fn test_oidc_connect_with_decorating_file_store_keeps_google_authority_zipline24() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         // Install a `google` OIDC policy mapping `sub -> user.sub` so the minted blob
