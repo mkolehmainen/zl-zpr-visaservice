@@ -1051,15 +1051,15 @@ mod test {
     }
 
     /// F2 (zipline#29 / zipline#30, A1 gate): a CN-less adapter (OIDC-only connect)
-    /// connected to a node must still be represented in
-    /// `get_adapter_cns_connected_to_node`. Today the method ends in
-    /// `.filter_map(|actor| actor.get_cn()...)`, so the adapter is silently dropped
-    /// from `NodeRecordBrief.adapters` — an omission path independent of F1's
-    /// `list_actor_cns` drop. Fix lands in zipline#31 (A2), which removes the
-    /// #[ignore].
+    /// connected to a node must still be represented in the node's adapter list.
+    /// Pre-A2, `get_adapter_cns_connected_to_node` ended in
+    /// `.filter_map(|actor| actor.get_cn()...)`, so the adapter was silently
+    /// dropped from `NodeRecordBrief.adapters` -- an omission path independent of
+    /// F1's `list_actor_cns` drop. zipline#31 (A2) deletes that CN-mapping wrapper:
+    /// the address list from `get_adapters_connected_to_node` is the surface, and
+    /// it cannot drop a CN-less adapter.
     #[tokio::test]
-    #[ignore = "known defect F2, zipline#29; fix lands in zipline#31"]
-    async fn test_get_adapter_cns_includes_cn_less_adapter() {
+    async fn test_get_adapters_includes_cn_less_adapter() {
         let mgr = make_mgr();
         let node_actor =
             make_node_actor_defexp("fd5a:5052::60", "node-cn-f2", "[fd5a:5052::160]:1234");
@@ -1075,17 +1075,20 @@ mod test {
             .await
             .unwrap();
 
-        let cns = mgr
-            .get_adapter_cns_connected_to_node(&node_addr)
+        // Both connected adapters must be represented by address; the CN-less one
+        // must not be filter_map'd away.
+        let mut addrs = mgr
+            .get_adapters_connected_to_node(&node_addr)
             .await
             .unwrap();
-        // Both connected adapters must be represented; the CN-less one must not be
-        // filter_map'd away. (What its entry should say is A2's design call — the
-        // pinned contract here is presence.)
+        addrs.sort();
         assert_eq!(
-            cns.len(),
-            2,
-            "CN-less adapter was dropped from get_adapter_cns_connected_to_node: {cns:?}"
+            addrs,
+            vec![
+                "fd5a:5052::61".parse::<IpAddr>().unwrap(),
+                "fd5a:5052::62".parse::<IpAddr>().unwrap(),
+            ],
+            "CN-less adapter was dropped from the node's adapter list"
         );
     }
 

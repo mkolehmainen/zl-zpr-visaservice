@@ -1759,11 +1759,11 @@ mod tests {
     /// F1 endpoint view (zipline#29 / zipline#30, A1 gate): `GET /admin/actors` must
     /// represent a CN-less actor (OIDC-only connect). This encodes the reported
     /// symptom directly: an OIDC-only actor connects and no dashboard row appears.
-    /// Today `list_actor_cns` skips the actor (warn + continue on the missing `cn`
-    /// attribute), so the endpoint returns only the CN-bearing actor. Fix lands in
-    /// zipline#31 (A2), which removes the #[ignore].
+    /// Pre-A2 `list_actor_cns` skipped the actor (warn + continue on the missing
+    /// `cn` attribute), so the endpoint returned only the CN-bearing actor.
+    /// Re-keyed by zipline#31 (A2): every actor appears as an `ActorEntry` with its
+    /// ZPR address and an optional CN.
     #[tokio::test]
-    #[ignore = "known defect F1 (endpoint), zipline#29; fix lands in zipline#31"]
     async fn test_admin_actors_lists_cn_less_actor() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_r_key(&asm);
@@ -1793,15 +1793,26 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let actors: Vec<CnEntry> = serde_json::from_slice(&body).unwrap();
+        let mut actors: Vec<ActorEntry> = serde_json::from_slice(&body).unwrap();
         // Both connected actors must have an entry; the CN-less adapter must not be
-        // omitted from the admin listing. (What its `cn` field should carry is A2's
-        // design call — the pinned contract here is presence.)
+        // omitted from the admin listing. It carries its address and a null cn.
+        actors.sort_by(|a, b| a.zpr_addr.cmp(&b.zpr_addr));
         assert_eq!(
             actors.len(),
             2,
             "CN-less actor omitted from GET /admin/actors: {actors:?}"
         );
+        assert_eq!(actors[0].zpr_addr, "fd5a:5052::30");
+        assert_eq!(actors[0].cn, Some("node-f1".to_string()));
+        assert_eq!(actors[1].zpr_addr, "fd5a:5052::31");
+        assert_eq!(actors[1].cn, None, "CN-less actor must carry a null cn");
+        // Every listed address is parseable.
+        for entry in &actors {
+            entry
+                .zpr_addr
+                .parse::<IpAddr>()
+                .expect("zpr_addr must be a parseable IP address");
+        }
     }
 
     #[tokio::test]
