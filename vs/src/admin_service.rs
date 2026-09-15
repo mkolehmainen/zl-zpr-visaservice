@@ -3044,4 +3044,52 @@ mod e2e_actor_guard {
             Some(SUB)
         );
     }
+
+    /// Not an assertion-carrying test: the server-side launcher for
+    /// `integration-test/admin-actor-test.sh`, which drives the same two
+    /// checks through the `vs-admin` CLI. Ignored by default so `cargo test`
+    /// never runs it; the script invokes it by exact name with `--ignored`.
+    ///
+    /// When `ZPR_E2E_HARNESS_DIR` is set, this builds the exact fixture the
+    /// tests above use (FakeDb assembly, on-disk keys file, OIDC-only
+    /// connected actor, real HTTPS admin server — no ValKey, no root, no
+    /// docker), probes the server for readiness, writes `harness.json`
+    /// (`base_url`, `api_key`, `actor_addr`; the TLS cert is already in the
+    /// directory as `admin-tls-cert.pem`), and serves until `<dir>/stop`
+    /// appears or a 120 s safety timeout expires.
+    #[tokio::test]
+    #[ignore = "harness launcher for integration-test/admin-actor-test.sh, not a test"]
+    async fn serve_admin_for_cli_harness() {
+        let dir = match std::env::var("ZPR_E2E_HARNESS_DIR") {
+            Ok(d) => std::path::PathBuf::from(d),
+            // Not invoked by the harness script: nothing to do.
+            Err(_) => return,
+        };
+        let (asm, api_key) = make_asm_with_keyfile(&dir).await;
+        let actor_addr = connect_oidc_only_actor(&asm).await;
+        let (base, client) = start_real_admin_server(&asm, &dir).await;
+
+        // Only publish the manifest once the server actually answers, so the
+        // script never races the TLS listener coming up.
+        let probe = admin_get(&client, &format!("{base}/admin/actors"), &api_key).await;
+        assert_eq!(probe.status(), 200, "harness server must be up and keyed");
+
+        let manifest = json!({
+            "base_url": base,
+            "api_key": api_key,
+            "actor_addr": actor_addr.to_string(),
+        });
+        // Write-then-rename so the script never reads a half-written manifest.
+        let tmp = dir.join("harness.json.tmp");
+        std::fs::write(&tmp, manifest.to_string()).unwrap();
+        std::fs::rename(&tmp, dir.join("harness.json")).unwrap();
+
+        let stop = dir.join("stop");
+        for _ in 0..1200 {
+            if stop.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
