@@ -74,12 +74,12 @@ fn main() {
         }) => exec.do_cmd_actors(addr, revoke, nodes, visas),
 
         Some(SubCmd::Services { id, flush }) => exec.do_cmd_services(id, flush),
-        // Some(SubCmd::Install {
-        //     compiler_version,
-        //     policy,
-        // }) => install(&args.svc_url, ca_cert, &compiler_version, &policy).unwrap_or_else(|e| {
-        //     eprintln!("{} {}", "Error: ".red(), e);
-        // }),
+
+        // The historical commented-out Install arm, now live: POST the compiled
+        // policy container to /admin/policies via the Executor like every other
+        // subcommand (first real use of the hot-install path — zipline#38).
+        Some(SubCmd::Install { policy }) => exec.do_cmd_install(&policy),
+
         Some(SubCmd::AuthRevoke {
             clear,
             add,
@@ -95,6 +95,10 @@ fn main() {
     }
     .unwrap_or_else(|e| {
         eprintln!("{} {}", "Error: ".red(), e);
+        // Shell automation keys off the exit status: a failed subcommand
+        // (e.g. a rejected hot policy install) must not exit 0 (zipline#38
+        // review, Codex P1).
+        std::process::exit(1);
     })
 }
 
