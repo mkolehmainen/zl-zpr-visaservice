@@ -23,8 +23,10 @@ API KEY
 -------
   Every request requires passing the api key in the `X-API-Key` header.
   A missing, malformed, or unknown key gets a 401 (not listed per endpoint).
-  Keys carry a permission (read or read/write). Read endpoints require read;
-  write endpoints (POST/DELETE) require read/write, else 403.
+  Keys carry one of three permission levels: resolve, read, or read/write.
+  GET /admin/services and GET /admin/services/{name} accept any active key,
+  including a resolve key. All other read endpoints require read; write
+  endpoints (POST/DELETE) require read/write, else 403.
 
 Notes
 -----
