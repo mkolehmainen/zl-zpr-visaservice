@@ -2753,3 +2753,295 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 }
+
+/// End-to-end guard on the admin actor surface (zipline#33, A4 — final
+/// sub-issue of zipline#29).
+///
+/// This exercises the REAL admin HTTPS server — `start_admin_server` with
+/// rustls TLS, the API-key middleware reading a `vsapikey`-format keys file,
+/// and the real router — over the FakeDb-backed test assembly, after an
+/// OIDC-only connect driven through the real connect entry point
+/// (`authenticate_adapter_or_node`). The connected actor is the exact defect
+/// class of the original report (A1): it authenticates successfully and has
+/// **no CN**.
+///
+/// The two assertions come verbatim from the issue:
+///  1. `GET /admin/actors` contains an entry whose `zpr_addr` is the
+///     connected actor's address, with a **null** `cn`.
+///  2. `GET /admin/actors/<that address>` returns 200 and a descriptor
+///     carrying the actor's `user.*` attributes.
+///
+/// Responses are asserted through `serde_json::Value` rather than the
+/// admin-api-types structs, so this module compiles unchanged against pre-A2
+/// revisions of the server — which is what makes the revert-RED proof against
+/// `e1b7c2d` possible (quoted in the PR): there, `GET /admin/actors` returns
+/// CN entries and silently skips the CN-less actor, and
+/// `GET /admin/actors/{addr}` is CN-keyed so the address lookup misses.
+#[cfg(test)]
+mod e2e_actor_guard {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, SocketAddr};
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use jsonwebtoken as jwt;
+    use serde_json::{Value, json};
+
+    use libeval::attribute::key;
+    use zpr::vsapi_types::{AuthBlob, ConnectRequest, OidcBlob, PublicKey};
+
+    use super::start_admin_server;
+    use crate::admin_apikeys::{ApiKeyRecord, KeyStatus, KeysFile, Permission, ReloadableApiKeys};
+    use crate::apikey::sha256_hex;
+    use crate::assembly::Assembly;
+    use crate::assembly::tests::new_assembly_for_tests;
+    use crate::oidc::mint::{TEST_KID, test_rsa_pem, token as mint_token};
+    use crate::test_helpers::{
+        make_node_actor_defexp, make_oidc_connect_policy, make_test_oidc_config,
+    };
+
+    /// Issuer/client of the fixture config ([make_test_oidc_config]).
+    const ISSUER: &str = "https://accounts.google.com";
+    const CLIENT_ID: &str = "test-client-id.apps.googleusercontent.com";
+    const NONCE: &str = "e2e-guard-nonce";
+    const SUB: &str = "e2e-guard-sub-33";
+    /// The ZPR address of the node the adapter connects through.
+    const NODE_ADDR: &str = "fd5a:5052:3000::1";
+
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Build the FakeDb assembly with the admin API keys loaded from a real
+    /// on-disk keys file (the same TOML format `vsapikey` writes), returning
+    /// the assembly and the key string for the `X-API-Key` header. The key
+    /// string is assembled by hand in the documented `zpr_vsapi.<id>.<secret>`
+    /// wire format, so this covers the real parse-and-hash path in the
+    /// middleware rather than a test-only insertion hook.
+    async fn make_asm_with_keyfile(dir: &Path) -> (Arc<Assembly>, String) {
+        let secret_bytes: [u8; 32] = (100u8..132).collect::<Vec<_>>().try_into().unwrap();
+        let key_id_hex = format!("{:08x}", 0x33a4_e2e1u32);
+        let header_value = format!(
+            "zpr_vsapi.{key_id_hex}.{}",
+            URL_SAFE_NO_PAD.encode(secret_bytes)
+        );
+        let record = ApiKeyRecord {
+            owner: "e2e".to_string(),
+            permission: Permission::Read,
+            status: KeyStatus::Active,
+            created: "2026-09-15".to_string(),
+            secret_hash: sha256_hex(&secret_bytes).unwrap(),
+            description: "zipline#33 e2e guard".to_string(),
+        };
+        let mut keys = HashMap::new();
+        keys.insert(key_id_hex, record);
+        let keys_path = dir.join("vs_keys.toml");
+        std::fs::write(&keys_path, toml::to_string(&KeysFile { keys }).unwrap()).unwrap();
+
+        let mut asm = new_assembly_for_tests(None).await;
+        asm.admin_api_keys = Arc::new(ReloadableApiKeys::new_from_file(keys_path, false).unwrap());
+        (Arc::new(asm), header_value)
+    }
+
+    /// Drive an OIDC-only connect through the real connect path and store the
+    /// resulting actor the way `authorize_connect` does. Returns the actor's
+    /// assigned ZPR address. The actor authenticates with an OIDC blob only —
+    /// no bootstrap key, no CN claim (the real wire shape of a
+    /// bootstrap-key-less adapter) — so the stored actor has NO `cn`.
+    async fn connect_oidc_only_actor(asm: &Arc<Assembly>) -> IpAddr {
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                43200,
+                &["sub -> user.oidc-subject", "email -> user.email"],
+                &["sub"],
+                make_test_oidc_config(),
+                &[],
+                &[],
+            ))
+            .await
+            .expect("OIDC test policy must install");
+
+        // The node the adapter docks through, stored like a connected node.
+        let node_addr: IpAddr = NODE_ADDR.parse().unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp(NODE_ADDR, "node-a", "10.0.0.1:1"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let claims = json!({
+            "iss": ISSUER,
+            "aud": CLIENT_ID,
+            "sub": SUB,
+            "exp": unix_now() + 3600,
+            "iat": unix_now(),
+            "nonce": NONCE,
+            "email": "e2e@example.com",
+            "email_verified": true,
+        });
+        let signing_key = jwt::EncodingKey::from_rsa_pem(test_rsa_pem()).unwrap();
+        let id_token = mint_token(claims, TEST_KID, jwt::Algorithm::RS256, &signing_key);
+
+        let req = ConnectRequest {
+            blobs: vec![AuthBlob::Oidc(OidcBlob {
+                issuer: ISSUER.to_string(),
+                id_token,
+                nonce: NONCE.to_string(),
+            })],
+            // A bootstrap-key-less adapter sends no claims at all.
+            claims: Vec::new(),
+            substrate_addr: "127.0.0.1".parse().unwrap(),
+            dock_interface: 0,
+            a2a_dh_public_key: PublicKey::new(&[7u8; 32]),
+        };
+
+        let actor = asm
+            .cc
+            .authenticate_adapter_or_node(asm.clone(), req, &node_addr)
+            .await
+            .expect("OIDC-only connect must authorize");
+        assert!(
+            actor.get_attribute(key::CN).is_none(),
+            "fixture must be CN-less; the defect class is a CN-less actor"
+        );
+        // Store it exactly the way vsapi_worker::authorize_connect does.
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, &node_addr)
+            .await
+            .unwrap();
+        *actor
+            .get_zpr_addr()
+            .expect("connect must assign a ZPR address")
+    }
+
+    /// Start the real HTTPS admin server (self-signed cert written to disk,
+    /// exactly the `admin-tls-cert.pem`/`admin-tls-key.pem` shape the VS
+    /// writes out) and return the base URL plus a client trusting that cert.
+    async fn start_real_admin_server(asm: &Arc<Assembly>, dir: &Path) -> (String, reqwest::Client) {
+        let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_path = dir.join("admin-tls-cert.pem");
+        let key_path = dir.join("admin-tls-key.pem");
+        std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+        std::fs::write(&key_path, ck.signing_key.serialize_pem()).unwrap();
+
+        // Ephemeral port: bind-and-release, then hand it to the real server.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let listen: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
+        let asm = asm.clone();
+        tokio::spawn(async move {
+            start_admin_server(&key_path, &cert_path, listen, &asm).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(ck.cert.pem().as_bytes()).unwrap())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        (format!("https://127.0.0.1:{port}"), client)
+    }
+
+    /// GET `url` with the API key, retrying while the server task binds.
+    async fn admin_get(client: &reqwest::Client, url: &str, api_key: &str) -> reqwest::Response {
+        for _ in 0..100 {
+            match client.get(url).header("X-API-Key", api_key).send().await {
+                Ok(resp) => return resp,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        panic!("admin server never became reachable at {url}");
+    }
+
+    /// Issue assertion 1: after an OIDC-only connect, `GET /admin/actors`
+    /// (over real HTTPS, real API-key auth) lists the actor keyed by its ZPR
+    /// address, with a null `cn`. This is the check that would have caught
+    /// the original report: an actor that connects but is invisible to every
+    /// operator-facing tool.
+    #[tokio::test]
+    async fn e2e_cnless_actor_listed_by_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let (asm, api_key) = make_asm_with_keyfile(dir.path()).await;
+        let actor_addr = connect_oidc_only_actor(&asm).await;
+        let (base, client) = start_real_admin_server(&asm, dir.path()).await;
+
+        let resp = admin_get(&client, &format!("{base}/admin/actors"), &api_key).await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let list = body
+            .as_array()
+            .unwrap_or_else(|| panic!("GET /admin/actors must return a JSON array, got: {body}"));
+        let addr_str = actor_addr.to_string();
+        let entry = list
+            .iter()
+            .find(|e| e.get("zpr_addr").and_then(Value::as_str) == Some(addr_str.as_str()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "connected actor {addr_str} missing from GET /admin/actors \
+                     (the A1 defect: connected but invisible): {body}"
+                )
+            });
+        assert!(
+            entry.get("cn").is_some_and(Value::is_null),
+            "CN-less actor must carry a null cn, got: {entry}"
+        );
+    }
+
+    /// Issue assertion 2: `GET /admin/actors/<address>` returns 200 and a
+    /// descriptor carrying the actor's `user.*` attributes (the mapped OIDC
+    /// claims), with a null `cn`.
+    #[tokio::test]
+    async fn e2e_actor_descriptor_fetched_by_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let (asm, api_key) = make_asm_with_keyfile(dir.path()).await;
+        let actor_addr = connect_oidc_only_actor(&asm).await;
+        let (base, client) = start_real_admin_server(&asm, dir.path()).await;
+
+        let resp = admin_get(
+            &client,
+            &format!("{base}/admin/actors/{actor_addr}"),
+            &api_key,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            200,
+            "GET /admin/actors/{{addr}} must resolve the actor by ZPR address"
+        );
+        let desc: Value = resp.json().await.unwrap();
+        assert_eq!(
+            desc.get("zpr_addr").and_then(Value::as_str),
+            Some(actor_addr.to_string().as_str())
+        );
+        assert!(
+            desc.get("cn").is_some_and(Value::is_null),
+            "OIDC-only actor has no CN; descriptor must say so: {desc}"
+        );
+        let attrs = desc
+            .get("attrs")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("descriptor must carry attrs: {desc}"));
+        let sub_attr = attrs
+            .iter()
+            .find(|a| a.get("key").and_then(Value::as_str) == Some("user.oidc-subject"))
+            .unwrap_or_else(|| panic!("descriptor must carry the user.* attributes: {desc}"));
+        assert_eq!(
+            sub_attr
+                .get("value")
+                .and_then(Value::as_array)
+                .and_then(|v| v.first())
+                .and_then(Value::as_str),
+            Some(SUB)
+        );
+    }
+}
