@@ -92,15 +92,7 @@ fn cmd_create(
     status: Option<&str>,
     created: Option<&str>,
 ) -> Result<(), String> {
-    let permission = match perms {
-        "read" => Permission::Read,
-        "readwrite" => Permission::ReadWrite,
-        other => {
-            return Err(format!(
-                "invalid permission '{other}': must be read or readwrite"
-            ));
-        }
-    };
+    let permission = parse_permission(perms)?;
 
     let key_status = match status.unwrap_or("active") {
         "active" => KeyStatus::Active,
@@ -217,5 +209,32 @@ fn main() {
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The permission parser accepts all three levels, lowercase (zipline#36).
+    #[test]
+    fn test_parse_permission_accepts_all_three_levels() {
+        assert_eq!(parse_permission("resolve").unwrap(), Permission::Resolve);
+        assert_eq!(parse_permission("read").unwrap(), Permission::Read);
+        assert_eq!(
+            parse_permission("readwrite").unwrap(),
+            Permission::ReadWrite
+        );
+    }
+
+    /// The rejection message for an invalid value names all three levels
+    /// (zipline#36), so users learn about `resolve` from the error itself.
+    #[test]
+    fn test_parse_permission_rejects_invalid_naming_all_levels() {
+        let err = parse_permission("bogus").unwrap_err();
+        assert_eq!(
+            err,
+            "invalid permission 'bogus': must be resolve, read or readwrite"
+        );
     }
 }
