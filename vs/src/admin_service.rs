@@ -834,7 +834,7 @@ async fn get_services(
     Extension(perm): Extension<Permission>,
     State(state): State<SharedState>,
 ) -> (StatusCode, Json<Vec<NamedListEntry>>) {
-    if !perm.can_read() {
+    if !perm.can_resolve() {
         return (StatusCode::FORBIDDEN, Json(Vec::<NamedListEntry>::new()));
     }
     debug!(target: ADMIN, "GET /admin/services");
@@ -863,7 +863,7 @@ async fn get_service(
     State(state): State<SharedState>,
     EPath(svc_name): EPath<String>,
 ) -> Result<Json<ServiceDescriptor>, StatusCode> {
-    if !perm.can_read() {
+    if !perm.can_resolve() {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1177,7 +1177,7 @@ mod tests {
         make_actor_with_services_defexp, make_adapter_actor_defexp, make_node_actor_defexp,
         make_oidc_only_adapter_defexp, make_peering, policy_with_peerings,
     };
-    use libeval::attribute::ROLE_NODE;
+    use libeval::attribute::ROLE_ADAPTER;
     use zpr::policy_types::AttrExp;
 
     /// Insert a readwrite test key into the assembly's key store and return the
@@ -2770,9 +2770,14 @@ mod tests {
     async fn test_get_services_resolve_key_ok() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_resolve_key(&asm);
-        let actor =
-            make_actor_with_services_defexp(ROLE_NODE, "fd5a:5052::3", &["svc:one"], "actor-1");
-        asm.actor_mgr.add_node(&actor, false).await.unwrap();
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        let adapter =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::3", &["svc:one"], "actor-1");
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap())
+            .await
+            .unwrap();
 
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
         let app = admin_app(shared_state);
@@ -2802,9 +2807,14 @@ mod tests {
     async fn test_get_service_resolve_key_ok_and_unknown_not_found() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_resolve_key(&asm);
-        let actor =
-            make_actor_with_services_defexp(ROLE_NODE, "fd5a:5052::3", &["svc:one"], "actor-1");
-        asm.actor_mgr.add_node(&actor, false).await.unwrap();
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        let adapter =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::3", &["svc:one"], "actor-1");
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap())
+            .await
+            .unwrap();
 
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
         let app = admin_app(shared_state);

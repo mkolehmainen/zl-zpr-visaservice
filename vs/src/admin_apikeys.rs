@@ -15,6 +15,7 @@ pub enum KeyStatus {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
+    Resolve,
     Read,
     #[serde(rename = "readwrite")]
     ReadWrite,
@@ -49,6 +50,12 @@ impl KeysFile {
 }
 
 impl Permission {
+    /// GET /admin/services and GET /admin/services/{name}: any active key.
+    pub fn can_resolve(&self) -> bool {
+        true
+    }
+
+    /// Every other GET. Resolve keys are excluded on purpose.
     pub fn can_read(&self) -> bool {
         matches!(self, Permission::Read | Permission::ReadWrite)
     }
