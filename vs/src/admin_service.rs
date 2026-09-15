@@ -707,9 +707,12 @@ async fn build_node_record_brief(
     })
 }
 
-/// DELETE /admin/actors/{addr} -- kicks the actor's live session (its credential
-/// is untouched; credential revocation is /admin/authrevoke). Placeholder: the
-/// address is validated (400 malformed, 404 unknown) but the response is fixed.
+/// DELETE /admin/actors/{addr} -- validation-only placeholder, no side effect.
+/// Parses the address (400 malformed), confirms the actor exists (404 unknown),
+/// and returns a fixed Revokes value; it does NOT kick, disconnect, or otherwise
+/// touch the actor's live session or credential. Kicking the live session is the
+/// intended behavior once implemented (credential revocation stays
+/// /admin/authrevoke).
 async fn revoke_actor(
     State(state): State<SharedState>,
     Extension(perm): Extension<Permission>,
@@ -2926,6 +2929,20 @@ mod e2e_actor_guard {
     /// Start the real HTTPS admin server (self-signed cert written to disk,
     /// exactly the `admin-tls-cert.pem`/`admin-tls-key.pem` shape the VS
     /// writes out) and return the base URL plus a client trusting that cert.
+    /// The server is verified up and serving OUR cert before this returns.
+    ///
+    /// Port selection under cargo's parallel test harness is inherently racy:
+    /// the OS-assigned probe listener must be dropped before
+    /// `start_admin_server` re-binds the port, and another test or process can
+    /// claim it in that gap, panicking the server task. `start_admin_server`
+    /// takes only a `SocketAddr` — threading a pre-bound listener through it
+    /// would be a production-code change, and zipline#33 is docs-and-tests
+    /// only — so instead the race is made detectable-and-retryable here: a
+    /// lost bind panics the spawned task, `JoinHandle::is_finished()` exposes
+    /// that, and the loop probes a fresh port. A successful response on the
+    /// cert-pinned client proves the port is served by THIS server (no other
+    /// process holds this test's freshly generated key), so the returned base
+    /// URL can never point at a foreign squatter.
     async fn start_real_admin_server(asm: &Arc<Assembly>, dir: &Path) -> (String, reqwest::Client) {
         let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let cert_path = dir.join("admin-tls-cert.pem");
@@ -2933,23 +2950,52 @@ mod e2e_actor_guard {
         std::fs::write(&cert_path, ck.cert.pem()).unwrap();
         std::fs::write(&key_path, ck.signing_key.serialize_pem()).unwrap();
 
-        // Ephemeral port: bind-and-release, then hand it to the real server.
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
-        let listen: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
-        let asm = asm.clone();
-        tokio::spawn(async move {
-            start_admin_server(&key_path, &cert_path, listen, &asm).await;
-        });
-
         let client = reqwest::Client::builder()
             .add_root_certificate(reqwest::Certificate::from_pem(ck.cert.pem().as_bytes()).unwrap())
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
-        (format!("https://127.0.0.1:{port}"), client)
+
+        for _ in 0..10 {
+            // Ephemeral port: bind-and-release, then hand it to the real server.
+            let port = {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                probe.local_addr().unwrap().port()
+            };
+            let listen: SocketAddr = SocketAddr::from(([127, 0, 0, 1], port));
+            let asm = asm.clone();
+            let (key_path, cert_path) = (key_path.clone(), cert_path.clone());
+            let handle = tokio::spawn(async move {
+                start_admin_server(&key_path, &cert_path, listen, &asm).await;
+            });
+
+            let base = format!("https://127.0.0.1:{port}");
+            for _ in 0..250 {
+                if handle.is_finished() {
+                    // The bind panicked: something else claimed the port in
+                    // the probe-to-bind gap. Retry with a fresh port.
+                    break;
+                }
+                // Any HTTP status back (401 — no API key) proves the TLS
+                // server on `port` presented our pinned cert; a connect or
+                // handshake error means not up yet (or a foreign squatter,
+                // in which case our task's bind panic ends the inner loop).
+                if client
+                    .get(format!("{base}/admin/stats"))
+                    .send()
+                    .await
+                    .is_ok()
+                {
+                    return (base, client);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                handle.is_finished(),
+                "admin server on {base} neither served nor failed within 5s"
+            );
+        }
+        panic!("could not win a free port for the admin server in 10 attempts");
     }
 
     /// GET `url` with the API key, retrying while the server task binds.

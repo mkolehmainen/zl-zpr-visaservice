@@ -179,9 +179,12 @@ Returns:
 
 ## Revoke actor `DELETE /admin/actors/{zpr_addr}`
 
-Kicks the actor's live session; its credential is untouched (credential
-revocation is `/admin/authrevoke`). Placeholder: the address is validated
-(400 malformed, 404 unknown) but the response is fixed.
+**Validation-only placeholder — no side effect yet.** The address is parsed
+(400 malformed) and checked for existence (404 unknown), then a fixed
+`Revokes` value is returned; the actor's live session is NOT kicked or
+disconnected and its credential is untouched. Do not treat a 200 as the
+session being gone. Kicking the live session is the intended behavior once
+implemented; credential revocation is (and will remain) `/admin/authrevoke`.
 
 Returns:
 
