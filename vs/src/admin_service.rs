@@ -2906,6 +2906,44 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
+
+    /// A resolve-only key may not touch the auth-revocation surface
+    /// (zipline#36): every /admin/authrevoke route returns 403, not the
+    /// handler's normal (stub) behavior. Guards the guarantee that resolve
+    /// keys reach only the two service-resolution GETs.
+    #[tokio::test]
+    async fn test_authrevoke_endpoints_resolve_key_forbidden() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_resolve_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        for (method, path) in [
+            ("GET", "/admin/authrevoke"),
+            ("GET", "/admin/authrevoke/some-id"),
+            ("POST", "/admin/authrevoke/some-id"),
+            ("POST", "/admin/authrevoke/clear"),
+            ("DELETE", "/admin/authrevoke/some-id"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("X-API-Key", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "for {method} {path}"
+            );
+        }
+    }
 }
 
 /// End-to-end guard on the admin actor surface (zipline#33, A4 — final
