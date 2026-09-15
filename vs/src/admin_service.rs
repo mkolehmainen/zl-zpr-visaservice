@@ -972,29 +972,53 @@ fn service_endpoints_to_string(endpoints: &[Scope]) -> String {
     ep_strs.join(",")
 }
 
-async fn get_revokes() -> impl IntoResponse {
+async fn get_revokes(Extension(perm): Extension<Permission>) -> impl IntoResponse {
+    if !perm.can_read() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "GET /admin/authrevoke - NOT IMPLEMENTED");
     (StatusCode::OK, Json(Vec::<ListEntry>::new())).into_response()
 }
 
-async fn get_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
+async fn get_revoke(
+    Extension(perm): Extension<Permission>,
+    EPath(id): EPath<String>,
+) -> impl IntoResponse {
+    if !perm.can_read() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "GET /admin/authrevoke/{} - NOT IMPLEMENTED", id);
-    (StatusCode::NOT_FOUND, Json(()).into_response())
+    (StatusCode::NOT_FOUND, Json(()).into_response()).into_response()
 }
 
-async fn clear_revokes() -> impl IntoResponse {
+async fn clear_revokes(Extension(perm): Extension<Permission>) -> impl IntoResponse {
+    if !perm.can_write() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "POST /admin/authrevoke/clear - NOT IMPLEMENTED");
-    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
+    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response()).into_response()
 }
 
-async fn remove_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
+async fn remove_revoke(
+    Extension(perm): Extension<Permission>,
+    EPath(id): EPath<String>,
+) -> impl IntoResponse {
+    if !perm.can_write() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "DELETE /admin/authrevoke/{} - NOT IMPLEMENTED", id);
-    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
+    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response()).into_response()
 }
 
-async fn add_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
+async fn add_revoke(
+    Extension(perm): Extension<Permission>,
+    EPath(id): EPath<String>,
+) -> impl IntoResponse {
+    if !perm.can_write() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "POST /admin/authrevoke/{} - NOT IMPLEMENTED", id);
-    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
+    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response()).into_response()
 }
 
 /// Stringify a substrate address as a parseable `host:port`. IPv6 hosts get bracketed
