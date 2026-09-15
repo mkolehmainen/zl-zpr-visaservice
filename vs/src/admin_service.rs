@@ -834,7 +834,7 @@ async fn get_services(
     Extension(perm): Extension<Permission>,
     State(state): State<SharedState>,
 ) -> (StatusCode, Json<Vec<NamedListEntry>>) {
-    if !perm.can_read() {
+    if !perm.can_resolve() {
         return (StatusCode::FORBIDDEN, Json(Vec::<NamedListEntry>::new()));
     }
     debug!(target: ADMIN, "GET /admin/services");
@@ -863,7 +863,7 @@ async fn get_service(
     State(state): State<SharedState>,
     EPath(svc_name): EPath<String>,
 ) -> Result<Json<ServiceDescriptor>, StatusCode> {
-    if !perm.can_read() {
+    if !perm.can_resolve() {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -972,29 +972,53 @@ fn service_endpoints_to_string(endpoints: &[Scope]) -> String {
     ep_strs.join(",")
 }
 
-async fn get_revokes() -> impl IntoResponse {
+async fn get_revokes(Extension(perm): Extension<Permission>) -> impl IntoResponse {
+    if !perm.can_read() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "GET /admin/authrevoke - NOT IMPLEMENTED");
     (StatusCode::OK, Json(Vec::<ListEntry>::new())).into_response()
 }
 
-async fn get_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
+async fn get_revoke(
+    Extension(perm): Extension<Permission>,
+    EPath(id): EPath<String>,
+) -> impl IntoResponse {
+    if !perm.can_read() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "GET /admin/authrevoke/{} - NOT IMPLEMENTED", id);
-    (StatusCode::NOT_FOUND, Json(()).into_response())
+    (StatusCode::NOT_FOUND, Json(()).into_response()).into_response()
 }
 
-async fn clear_revokes() -> impl IntoResponse {
+async fn clear_revokes(Extension(perm): Extension<Permission>) -> impl IntoResponse {
+    if !perm.can_write() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "POST /admin/authrevoke/clear - NOT IMPLEMENTED");
-    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
+    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response()).into_response()
 }
 
-async fn remove_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
+async fn remove_revoke(
+    Extension(perm): Extension<Permission>,
+    EPath(id): EPath<String>,
+) -> impl IntoResponse {
+    if !perm.can_write() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "DELETE /admin/authrevoke/{} - NOT IMPLEMENTED", id);
-    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
+    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response()).into_response()
 }
 
-async fn add_revoke(EPath(id): EPath<String>) -> impl IntoResponse {
+async fn add_revoke(
+    Extension(perm): Extension<Permission>,
+    EPath(id): EPath<String>,
+) -> impl IntoResponse {
+    if !perm.can_write() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     debug!(target: ADMIN, "POST /admin/authrevoke/{} - NOT IMPLEMENTED", id);
-    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response())
+    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response()).into_response()
 }
 
 /// Stringify a substrate address as a parseable `host:port`. IPv6 hosts get bracketed
@@ -1174,9 +1198,10 @@ mod tests {
     use crate::admin_apikeys::{ApiKeyRecord, KeyStatus};
     use crate::assembly::tests::{new_assembly_for_tests, new_assembly_with_event_rx};
     use crate::test_helpers::{
-        make_adapter_actor_defexp, make_node_actor_defexp, make_oidc_only_adapter_defexp,
-        make_peering, policy_with_peerings,
+        make_actor_with_services_defexp, make_adapter_actor_defexp, make_node_actor_defexp,
+        make_oidc_only_adapter_defexp, make_peering, policy_with_peerings,
     };
+    use libeval::attribute::ROLE_ADAPTER;
     use zpr::policy_types::AttrExp;
 
     /// Insert a readwrite test key into the assembly's key store and return the
@@ -1187,6 +1212,12 @@ mod tests {
 
     fn setup_test_api_r_key(asm: &Arc<Assembly>) -> String {
         setup_test_api_key_with_perm(asm, Permission::Read)
+    }
+
+    /// Insert a resolve-only test key into the assembly's key store and return
+    /// the key string to use in the X-API-Key header (zipline#36).
+    fn setup_test_api_resolve_key(asm: &Arc<Assembly>) -> String {
+        setup_test_api_key_with_perm(asm, Permission::Resolve)
     }
 
     /// Insert a test key with the given permission into the assembly's key store
@@ -2754,6 +2785,188 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(event_rx.try_recv().is_err());
+    }
+
+    /// GET /admin/services returns the service list with a resolve-only key
+    /// (zipline#36): the two service-resolution endpoints accept any active
+    /// key, including the least-privilege `resolve` permission.
+    #[tokio::test]
+    async fn test_get_services_resolve_key_ok() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_resolve_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        let adapter =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::3", &["svc:one"], "actor-1");
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap())
+            .await
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/services")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let services: Vec<NamedListEntry> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id, "svc:one");
+    }
+
+    /// GET /admin/services/{name} with a resolve-only key (zipline#36): 200
+    /// with a descriptor for a registered service, 404 for an unknown name —
+    /// i.e. the resolve key gets the endpoint's normal behavior, not a 403.
+    #[tokio::test]
+    async fn test_get_service_resolve_key_ok_and_unknown_not_found() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_resolve_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        let adapter =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::3", &["svc:one"], "actor-1");
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap())
+            .await
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/services/svc:one")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sd: ServiceDescriptor = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sd.service_name, "svc:one");
+        assert_eq!(sd.zpr_addr, "fd5a:5052::3");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/services/no-such-service")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A resolve-only key is least-privilege (zipline#36): every read
+    /// endpoint other than the two service-resolution endpoints stays 403.
+    #[tokio::test]
+    async fn test_read_endpoints_resolve_key_forbidden() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_resolve_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        for path in [
+            "/admin/visas",
+            "/admin/actors",
+            "/admin/policies/curr",
+            "/admin/network",
+            "/admin/stats",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header("X-API-Key", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "for {path}");
+        }
+    }
+
+    /// A resolve-only key may not flush a trusted service (zipline#36): the
+    /// write gate stays closed and the flush counter never moves.
+    #[tokio::test]
+    async fn test_flush_service_cache_resolve_key_forbidden() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let svc = register_flush_counting_service(&asm);
+        let api_key = setup_test_api_resolve_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/admin/services/{FLUSH_TS_ID}/cache"))
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A resolve-only key may not touch the auth-revocation surface
+    /// (zipline#36): every /admin/authrevoke route returns 403, not the
+    /// handler's normal (stub) behavior. Guards the guarantee that resolve
+    /// keys reach only the two service-resolution GETs.
+    #[tokio::test]
+    async fn test_authrevoke_endpoints_resolve_key_forbidden() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_resolve_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        for (method, path) in [
+            ("GET", "/admin/authrevoke"),
+            ("GET", "/admin/authrevoke/some-id"),
+            ("POST", "/admin/authrevoke/some-id"),
+            ("POST", "/admin/authrevoke/clear"),
+            ("DELETE", "/admin/authrevoke/some-id"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("X-API-Key", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "for {method} {path}"
+            );
+        }
     }
 }
 

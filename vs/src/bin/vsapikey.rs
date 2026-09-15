@@ -44,6 +44,19 @@ fn pick_new_id(keys: &HashMap<String, ApiKeyRecord>) -> Result<u32, String> {
     }
 }
 
+/// Parse a permission level given on the command line. Lowercase only, and the
+/// rejection message names all three accepted levels.
+fn parse_permission(perms: &str) -> Result<Permission, String> {
+    match perms {
+        "resolve" => Ok(Permission::Resolve),
+        "read" => Ok(Permission::Read),
+        "readwrite" => Ok(Permission::ReadWrite),
+        other => Err(format!(
+            "invalid permission '{other}': must be resolve, read or readwrite"
+        )),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "vsapikey", about = "Manage VS API keys")]
 struct Cli {
@@ -55,7 +68,7 @@ struct Cli {
 enum Commands {
     /// Create a new API key
     Create {
-        /// Permission level: read or readwrite
+        /// Permission level: resolve, read or readwrite
         perms: String,
         /// Owner identifier
         owner: String,
@@ -92,15 +105,7 @@ fn cmd_create(
     status: Option<&str>,
     created: Option<&str>,
 ) -> Result<(), String> {
-    let permission = match perms {
-        "read" => Permission::Read,
-        "readwrite" => Permission::ReadWrite,
-        other => {
-            return Err(format!(
-                "invalid permission '{other}': must be read or readwrite"
-            ));
-        }
-    };
+    let permission = parse_permission(perms)?;
 
     let key_status = match status.unwrap_or("active") {
         "active" => KeyStatus::Active,
@@ -217,5 +222,32 @@ fn main() {
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The permission parser accepts all three levels, lowercase (zipline#36).
+    #[test]
+    fn test_parse_permission_accepts_all_three_levels() {
+        assert_eq!(parse_permission("resolve").unwrap(), Permission::Resolve);
+        assert_eq!(parse_permission("read").unwrap(), Permission::Read);
+        assert_eq!(
+            parse_permission("readwrite").unwrap(),
+            Permission::ReadWrite
+        );
+    }
+
+    /// The rejection message for an invalid value names all three levels
+    /// (zipline#36), so users learn about `resolve` from the error itself.
+    #[test]
+    fn test_parse_permission_rejects_invalid_naming_all_levels() {
+        let err = parse_permission("bogus").unwrap_err();
+        assert_eq!(
+            err,
+            "invalid permission 'bogus': must be resolve, read or readwrite"
+        );
     }
 }

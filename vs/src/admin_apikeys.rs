@@ -15,6 +15,7 @@ pub enum KeyStatus {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
+    Resolve,
     Read,
     #[serde(rename = "readwrite")]
     ReadWrite,
@@ -49,6 +50,12 @@ impl KeysFile {
 }
 
 impl Permission {
+    /// GET /admin/services and GET /admin/services/{name}: any active key.
+    pub fn can_resolve(&self) -> bool {
+        true
+    }
+
+    /// Every other GET. Resolve keys are excluded on purpose.
     pub fn can_read(&self) -> bool {
         matches!(self, Permission::Read | Permission::ReadWrite)
     }
@@ -168,5 +175,48 @@ impl Default for ReloadableApiKeys {
             keys_file_path: std::path::PathBuf::new(),
             keys_file: RwLock::new(KeysFile::empty()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A keys-file entry with permission = "resolve" deserializes to
+    /// Permission::Resolve (zipline#36): the new least-privilege level
+    /// round-trips through the vsapikey TOML format.
+    #[test]
+    fn test_keys_file_resolve_permission_parses() {
+        let toml_src = r#"
+            [keys.00000001]
+            owner = "test"
+            permission = "resolve"
+            status = "active"
+            created = "2026-09-15"
+            secret_hash = "abc123"
+            description = "resolve key"
+        "#;
+        let kf: KeysFile = toml::from_str(toml_src).unwrap();
+        let record = &kf.keys["00000001"];
+        assert_eq!(record.permission, Permission::Resolve);
+        assert_eq!(record.status, KeyStatus::Active);
+    }
+
+    /// An existing-style entry with permission = "read" still parses
+    /// unchanged: adding the Resolve variant is backward compatible.
+    #[test]
+    fn test_keys_file_read_permission_still_parses() {
+        let toml_src = r#"
+            [keys.00000002]
+            owner = "test"
+            permission = "read"
+            status = "active"
+            created = "2026-01-01"
+            secret_hash = "def456"
+            description = "read key"
+        "#;
+        let kf: KeysFile = toml::from_str(toml_src).unwrap();
+        let record = &kf.keys["00000002"];
+        assert_eq!(record.permission, Permission::Read);
     }
 }
