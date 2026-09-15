@@ -10,4 +10,6 @@ test:
 	./zpt-test-oidc.sh
 	@echo "==== TRY tag-test.sh ===="
 	./tag-test.sh
+	@echo "==== TRY admin-actor-test.sh ===="
+	./admin-actor-test.sh
 

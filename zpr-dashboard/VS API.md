@@ -9,11 +9,11 @@
 | GET | `/admin/visas` | list visas |
 | GET | `/admin/visas/{ID}` | get visa with ID |
 | DELETE | `/admin/visas/{ID}` | revoke a visa by its ID |
-| GET | `/admin/actors` | list connected actors |
+| GET | `/admin/actors` | list connected actors (ZPR address plus optional CN) |
 | GET | `/admin/actors?role=node` | list connected nodes |
-| GET | `/admin/actors/{CN}` | get actor with CN |
-| DELETE | `/admin/actors/{CN}` | revoke an actor (and all its visas) by adapter CN |
-| GET | `/admin/actors/{CN}/visas` | get visa ids related to actor with CN |
+| GET | `/admin/actors/{zpr_addr}` | get the actor at the given ZPR address |
+| DELETE | `/admin/actors/{zpr_addr}` | kick the live session of the actor at the given ZPR address |
+| GET | `/admin/actors/{zpr_addr}/visas` | get visa ids related to the actor at the given ZPR address |
 | GET | `/admin/services` | a service-oriented list of connected actors |
 | GET | `/admin/services/{ID}` | gets service with ID |
 | GET | `/admin/authrevoke` | returns list of revocation IDs |
@@ -124,69 +124,87 @@ Returns:
 
 ## List actors `GET /admin/actors`
 
-Returns:
+Actors are keyed by ZPR address. `cn` is a display label that may be null
+(e.g. an OIDC-only connect).
+
+Returns an array of ActorEntry:
 
 ```json
-{
-    "cns": ["CN"],
-}
-
+[
+    { "zpr_addr": "ADDR", "cn": "CN" },
+    { "zpr_addr": "ADDR", "cn": null }
+]
 ```
 
 ## List nodes `GET /admin/actors?role=node`
 
-Returns:
+Same shape, filtered to node actors (an invalid role value is a 400):
 
 ```json
-
-{
-    "cns": ["CN"],
-}
-
+[
+    { "zpr_addr": "ADDR", "cn": "CN" }
+]
 ```
 
-## Get actor `GET /admin/actors/{ID}`
+## Get actor `GET /admin/actors/{zpr_addr}`
 
-Used to get both actors and nodes, since nodes are a special type of actors
+Used to get both actors and nodes, since nodes are a special type of actors.
+The path segment is the actor's ZPR address; a malformed address is a 400,
+an unknown one a 404.
 
 Returns:
 
 ```json
 {
-    "cn": "CN",
-    "ctime": CTIME_S,
+    "cn": "CN or null",
+    "created": CTIME_S,
     "ident": "IDENT",
     "node": NODE_BOOL,
     "zpr_addr": "ADDR",
+    "attrs": [{ "key": "KEY", "value": ["VALUE"], "expires_at": EXP_S }],
+    "auth_exp": EXP_S_OR_NULL,
     "node_details": {
-        "connect_requests": REQS
+        "connect_requests": REQS,
         "in_sync": SYNC_BOOL,
         "last_contact": CONTACT,
-        "pending": PENDING,
+        "pending_install": PENDING,
         "visa_requests": REQS,
     },
 }
 ```
 
-## Revoke actor `DELETE /admin/actors/{CN}`
+`cn` is null for actors without a CN (e.g. an OIDC-only connect).
+`node_details` is null for non-node actors (further fields elided above; see
+`admin-http-api.txt` for the full NodeRecordBrief shape).
+
+## Revoke actor `DELETE /admin/actors/{zpr_addr}`
+
+**Validation-only placeholder — no side effect yet.** The address is parsed
+(400 malformed) and checked for existence (404 unknown), then a fixed
+`Revokes` value is returned; the actor's live session is NOT kicked or
+disconnected and its credential is untouched. Do not treat a 200 as the
+session being gone. Kicking the live session is the intended behavior once
+implemented; credential revocation is (and will remain) `/admin/authrevoke`.
 
 Returns:
 
 ```json
 {
-    "identifier": "IDEN",
-    "revoked_visas": ["ID1", "ID2", "..."]
+    "id": "IDEN",
+    "revoked": [ID1, ID2]
 }
 ```
 
-## Visa IDs by actor `GET /admin/actors/{CN}/visas`
+## Visa IDs by actor `GET /admin/actors/{zpr_addr}/visas`
+
+A malformed address is a 400, an unknown one a 404.
 
 Returns:
 
 ```json
-{
-    "ids": ["ID"]
-}
+[
+    { "id": ID }
+]
 ```
 
 ## List services `GET /admin/services`

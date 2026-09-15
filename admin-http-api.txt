@@ -1,4 +1,4 @@
-Admin HTTP API  - Current as of 8/10/2026
+Admin HTTP API  - Current as of 9/15/2026
 -----------------------------------------
 
 This document describes the admin HTTPS API implemented by the server and
