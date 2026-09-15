@@ -127,6 +127,12 @@ impl Executor {
         Ok(())
     }
 
+    /// `install <POLICY_FILE>` — hot-install a compiled policy container and
+    /// make it current. Same wire path as `policies --path`.
+    pub fn do_cmd_install(&self, policy: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.install_policy(policy)
+    }
+
     pub fn do_cmd_auth_revoke(
         &self,
         clear: bool,

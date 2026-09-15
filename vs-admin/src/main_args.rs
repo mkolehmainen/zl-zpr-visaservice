@@ -130,6 +130,15 @@ pub enum SubCmd {
     /// Show visa service statistics
     #[command()]
     Stats,
+
+    /// Install a compiled policy bundle and make it the current policy
+    /// (equivalent to `policies --path`, kept as a first-class verb).
+    #[command()]
+    Install {
+        /// Path to the compiled policy container (.bin2) to install
+        #[arg(value_name = "POLICY_FILE")]
+        policy: PathBuf,
+    },
 }
 
 /// Parses a `<N><unit>` duration into milliseconds, where the unit is exactly
@@ -251,5 +260,38 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cmd::command().debug_assert();
+    }
+
+    /// Parses a `vs-admin install ...` command line with the required global args.
+    fn try_parse_install(extra: &[&str]) -> Result<Cmd, clap::Error> {
+        let mut argv = vec![
+            "vs-admin",
+            "--svc-url",
+            "https://[::1]:8182",
+            "--ca-cert",
+            "ca.pem",
+            "--api-key",
+            "k",
+            "install",
+        ];
+        argv.extend_from_slice(extra);
+        Cmd::try_parse_from(argv)
+    }
+
+    /// `install` takes exactly one positional policy path.
+    #[test]
+    fn install_takes_one_policy_path() {
+        let cmd = try_parse_install(&["policy.bin2"]).unwrap();
+        match cmd.command {
+            Some(SubCmd::Install { policy }) => {
+                assert_eq!(policy, PathBuf::from("policy.bin2"));
+            }
+            _ => panic!("expected SubCmd::Install"),
+        }
+        assert!(try_parse_install(&[]).is_err(), "path is required");
+        assert!(
+            try_parse_install(&["a.bin2", "b.bin2"]).is_err(),
+            "only one path"
+        );
     }
 }
