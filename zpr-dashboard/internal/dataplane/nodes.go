@@ -21,6 +21,10 @@ type ActorDescriptor struct {
 	// Null when the actor has no authentication expiry.
 	AuthExp     *int64           `json:"auth_exp"`     // seconds since epoch
 	NodeDetails *NodeRecordBrief `json:"node_details"` // nil for adapters
+
+	// Client-side only: true for the degraded stub FetchActors keeps when an
+	// actor's detail lookup fails. Feeds the "cannot be described" alert.
+	Undescribed bool `json:"-"`
 }
 
 type Attribute struct {
@@ -55,8 +59,8 @@ type NodeRecordBrief struct {
 	InSync  bool `json:"in_sync"`
 	VssPort *int `json:"vss_port"`
 
-	Adapters []string `json:"adapters"` // CNs of the adapters connected via this node
-	Links    []string `json:"links"`    // CNs of this node's topology peers
+	Adapters []string `json:"adapters"` // ZPR addresses of the adapters connected via this node
+	Links    []string `json:"links"`    // ZPR addresses of this node's topology peers
 
 	Visas             []int64 `json:"visas"`          // installed on the node
 	VisasEnqueued     []int64 `json:"visas_enqueued"` // queued for install
@@ -67,7 +71,7 @@ type VisaIDEntry struct {
 	ID int64 `json:"id"`
 }
 
-func (c *Client) ListNodes(ctx context.Context) ([]CnEntry, error) {
+func (c *Client) ListNodes(ctx context.Context) ([]ActorEntry, error) {
 	path := "/admin/actors?" + url.Values{"role": {"node"}}.Encode()
 
 	resp, err := c.Get(ctx, path)
@@ -80,7 +84,7 @@ func (c *Client) ListNodes(ctx context.Context) ([]CnEntry, error) {
 		return nil, fmt.Errorf("List nodes: %s", resp.Status)
 	}
 
-	var entries []CnEntry
+	var entries []ActorEntry
 	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
 		return nil, fmt.Errorf("Decode nodes: %w", err)
 	}
@@ -96,7 +100,7 @@ func (c *Client) FetchNodes(ctx context.Context) ([]ActorDescriptor, error) {
 
 	var nodes []ActorDescriptor
 	for _, entry := range entries {
-		node, err := c.GetActor(ctx, entry.CName)
+		node, err := c.GetActor(ctx, entry.ZprAddress)
 		if err != nil {
 			continue
 		}
@@ -106,8 +110,11 @@ func (c *Client) FetchNodes(ctx context.Context) ([]ActorDescriptor, error) {
 	return nodes, nil
 }
 
-func (c *Client) GetActor(ctx context.Context, cn string) (ActorDescriptor, error) {
-	path := "/admin/actors/" + url.PathEscape(cn)
+// GetActor fetches one actor's descriptor by its ZPR address — the actor's
+// identity on the admin API. url.PathEscape passes an IPv6 literal's colons
+// through untouched, so the address arrives as a clean path segment.
+func (c *Client) GetActor(ctx context.Context, addr string) (ActorDescriptor, error) {
+	path := "/admin/actors/" + url.PathEscape(addr)
 
 	resp, err := c.Get(ctx, path)
 	if err != nil {
@@ -116,7 +123,7 @@ func (c *Client) GetActor(ctx context.Context, cn string) (ActorDescriptor, erro
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return ActorDescriptor{}, fmt.Errorf("Get actor %s: %s", cn, resp.Status)
+		return ActorDescriptor{}, fmt.Errorf("Get actor %s: %s", addr, resp.Status)
 	}
 
 	var actor ActorDescriptor
@@ -133,15 +140,15 @@ func (c *Client) GetActor(ctx context.Context, cn string) (ActorDescriptor, erro
 	return actor, nil
 }
 
-func (c *Client) ListActorVisas(ctx context.Context, cn string) ([]VisaIDEntry, error) {
-	return c.listVisaIDs(ctx, "/admin/actors/"+url.PathEscape(cn)+"/visas", cn)
+func (c *Client) ListActorVisas(ctx context.Context, addr string) ([]VisaIDEntry, error) {
+	return c.listVisaIDs(ctx, "/admin/actors/"+url.PathEscape(addr)+"/visas", addr)
 }
 
-func (c *Client) ListNodeVisas(ctx context.Context, cn string) ([]VisaIDEntry, error) {
-	return c.listVisaIDs(ctx, "/admin/nodes/"+url.PathEscape(cn)+"/visas", cn)
+func (c *Client) ListNodeVisas(ctx context.Context, addr string) ([]VisaIDEntry, error) {
+	return c.listVisaIDs(ctx, "/admin/nodes/"+url.PathEscape(addr)+"/visas", addr)
 }
 
-func (c *Client) listVisaIDs(ctx context.Context, path, cn string) ([]VisaIDEntry, error) {
+func (c *Client) listVisaIDs(ctx context.Context, path, addr string) ([]VisaIDEntry, error) {
 	resp, err := c.Get(ctx, path)
 	if err != nil {
 		return nil, err
@@ -149,7 +156,7 @@ func (c *Client) listVisaIDs(ctx context.Context, path, cn string) ([]VisaIDEntr
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("List visas for %s: %s", cn, resp.Status)
+		return nil, fmt.Errorf("List visas for %s: %s", addr, resp.Status)
 	}
 
 	var entries []VisaIDEntry
@@ -160,8 +167,8 @@ func (c *Client) listVisaIDs(ctx context.Context, path, cn string) ([]VisaIDEntr
 	return entries, nil
 }
 
-func (c *Client) FetchActorVisas(ctx context.Context, cn string) ([]VisaDescriptor, error) {
-	ids, err := c.ListActorVisas(ctx, cn)
+func (c *Client) FetchActorVisas(ctx context.Context, addr string) ([]VisaDescriptor, error) {
+	ids, err := c.ListActorVisas(ctx, addr)
 	if err != nil {
 		return nil, err
 	}

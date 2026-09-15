@@ -129,11 +129,12 @@ func denyTable(width int, records []dataplane.DenyRecord, actors []dataplane.Act
 	return t.Render()
 }
 
-// endpointLabel labels a ZPR address with its actor CN when the current actor
-// snapshot knows the address, and returns the address otherwise.
+// endpointLabel labels a ZPR address with its actor's CN when the current
+// actor snapshot knows the address and the actor has one, and returns the
+// address otherwise.
 func endpointLabel(addr string, actors []dataplane.ActorDescriptor) string {
 	if actor, ok := actorByAddr(actors, addr); ok && actor.CName != "" {
-		return actor.CName
+		return actorLabel(actor)
 	}
 
 	return orDash(addr)

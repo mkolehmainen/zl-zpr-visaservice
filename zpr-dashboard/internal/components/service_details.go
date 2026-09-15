@@ -22,7 +22,7 @@ func ServiceDetails(width, height int, services []dataplane.ServiceDescriptor, s
 
 	body := "\n"
 	body += fmt.Sprintf("%s %s\n", label("Name"), svc.ServiceName)
-	body += fmt.Sprintf("%s %s\n", label("Actor"), svc.ActorCN)
+	body += fmt.Sprintf("%s %s\n", label("Actor"), orDash(serviceActorLabel(svc)))
 	body += fmt.Sprintf("%s %s\n", label("Address"), orDash(svc.ZprAddress))
 	body += fmt.Sprintf("%s %s\n", label("Dock"), orDash(svc.DockZprAddress))
 	body += fmt.Sprintf("%s %s\n", label("Kind"), orDash(svc.KindName()))

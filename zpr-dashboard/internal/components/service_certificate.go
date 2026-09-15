@@ -31,7 +31,7 @@ func ServiceCertificate(
 
 	svc := services[selectedIndex]
 
-	owner, ok := actorByCN(actors, svc.ActorCN)
+	owner, ok := actorByAddr(actors, svc.ZprAddress)
 	if !ok {
 		return detailPanel(width, height, title, subtitle, panelNote("Owning actor not connected"))
 	}
@@ -89,14 +89,4 @@ func certBar(width, days int, remaining string, barColor color.Color) string {
 		styles.ValueStyle.Foreground(styles.ColorDimmed).Render(strings.Repeat("░", barWidth-filled))
 
 	return bar + styles.ValueStyle.Foreground(styles.ColorDimmed).Render(" "+remaining)
-}
-
-func actorByCN(actors []dataplane.ActorDescriptor, cn string) (dataplane.ActorDescriptor, bool) {
-	for _, actor := range actors {
-		if actor.CName == cn {
-			return actor, true
-		}
-	}
-
-	return dataplane.ActorDescriptor{}, false
 }

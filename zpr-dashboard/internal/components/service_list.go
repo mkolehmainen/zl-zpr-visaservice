@@ -65,7 +65,7 @@ func ServiceList(width, height int, services []dataplane.ServiceDescriptor, sele
 	for _, svc := range services {
 		t.Row(
 			ansi.Truncate(svc.ServiceName, nameSize, "..."),
-			ansi.Truncate(svc.ActorCN, actorSize, "..."),
+			ansi.Truncate(orDash(serviceActorLabel(svc)), actorSize, "..."),
 		)
 	}
 
@@ -81,10 +81,13 @@ func ServiceList(width, height int, services []dataplane.ServiceDescriptor, sele
 	return styles.ContainerStyle.Height(height).Width(width).Render(content)
 }
 
+// distinctActors counts the actors behind the services, keyed on the ZPR
+// address: keyed on the CN, any number of CN-less actors would collapse to
+// the one "" entry.
 func distinctActors(services []dataplane.ServiceDescriptor) int {
 	seen := make(map[string]struct{}, len(services))
 	for _, svc := range services {
-		seen[svc.ActorCN] = struct{}{}
+		seen[svc.ZprAddress] = struct{}{}
 	}
 
 	return len(seen)

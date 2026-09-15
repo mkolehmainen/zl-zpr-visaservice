@@ -98,7 +98,7 @@ func ActorDetails(width, height int, actors []dataplane.ActorDescriptor, selecte
 	}
 
 	fields := []string{
-		fmt.Sprintf("%s %s", label("Name"), actor.CName),
+		fmt.Sprintf("%s %s", label("Name"), actorLabel(actor)),
 		fmt.Sprintf("%s %s", label("Address"), orDash(actor.ZprAddress)),
 		fmt.Sprintf("%s %s", label("Created"), formatCreated(actor.Created)),
 		fmt.Sprintf("%s %s", label("Role"), actorRole(actor)),

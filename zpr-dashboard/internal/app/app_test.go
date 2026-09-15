@@ -67,20 +67,58 @@ func TestNetworkErrorAffectsOnlineState(t *testing.T) {
 }
 
 // TestSelectionFollowsActorAcrossRefresh checks the selected actor is tracked
-// by CN, so an actor joining ahead of it in sort order does not shift the
-// selection onto a neighbour.
+// by ZPR address, so an actor joining ahead of it in sort order does not shift
+// the selection onto a neighbour — including when the selected actor has no CN.
 func TestSelectionFollowsActorAcrossRefresh(t *testing.T) {
 	m := applySnapshot(t, InitialModel(), actorSnapshotMsg{
-		actors: []dataplane.ActorDescriptor{{CName: "node-b"}, {CName: "node-c"}},
+		actors: []dataplane.ActorDescriptor{
+			{CName: "node-b", ZprAddress: "fd5a:5052::2"},
+			{ZprAddress: "fd5a:5052::3"}, // CN-less
+		},
 	})
 	m.state.actor.selectedIndex = 1
 
 	m = applySnapshot(t, m, actorSnapshotMsg{
-		actors: []dataplane.ActorDescriptor{{CName: "node-c"}, {CName: "node-a"}, {CName: "node-b"}},
+		actors: []dataplane.ActorDescriptor{
+			{ZprAddress: "fd5a:5052::3"},
+			{CName: "node-a", ZprAddress: "fd5a:5052::1"},
+			{CName: "node-b", ZprAddress: "fd5a:5052::2"},
+		},
 	})
 
-	if cn, ok := m.selectedActorCN(); !ok || cn != "node-c" {
-		t.Errorf("selected actor = %q (ok=%v), want node-c", cn, ok)
+	if addr, ok := m.selectedActorAddr(); !ok || addr != "fd5a:5052::3" {
+		t.Errorf("selected actor = %q (ok=%v), want fd5a:5052::3", addr, ok)
+	}
+}
+
+// TestCnLessActorsDoNotAliasInVisaGuard checks the stale-response guard keys
+// on the address: with two CN-less actors connected, a visa response for one
+// must not be delivered to a selection of the other.
+func TestCnLessActorsDoNotAliasInVisaGuard(t *testing.T) {
+	m := applySnapshot(t, InitialModel(), actorSnapshotMsg{
+		actors: []dataplane.ActorDescriptor{
+			{ZprAddress: "fd5a:5052::1"},
+			{ZprAddress: "fd5a:5052::2"},
+		},
+	})
+	m.state.actor.selectedIndex = 1 // fd5a:5052::2 after the address sort
+
+	if addr, ok := m.selectedActorAddr(); !ok || addr != "fd5a:5052::2" {
+		t.Fatalf("selected actor = %q (ok=%v), want fd5a:5052::2", addr, ok)
+	}
+
+	// The other CN-less actor's visas must be dropped, not cross-delivered.
+	next, _ := m.Update(actorVisasMsg{addr: "fd5a:5052::1", visas: []dataplane.VisaDescriptor{{ID: 7}}})
+	m = next.(Model)
+	if m.state.actor.visas != nil {
+		t.Error("a CN-less actor accepted another CN-less actor's visa response")
+	}
+
+	// The selected actor's own visas land.
+	next, _ = m.Update(actorVisasMsg{addr: "fd5a:5052::2", visas: []dataplane.VisaDescriptor{{ID: 9}}})
+	m = next.(Model)
+	if len(m.state.actor.visas) != 1 || m.state.actor.visas[0].ID != 9 {
+		t.Errorf("visas = %+v, want the selected actor's visa 9", m.state.actor.visas)
 	}
 }
 
@@ -88,7 +126,10 @@ func TestSelectionFollowsActorAcrossRefresh(t *testing.T) {
 // its cached visas and closes the revoke dialogue instead of retargeting it.
 func TestDepartedActorClearsSelectionState(t *testing.T) {
 	m := applySnapshot(t, InitialModel(), actorSnapshotMsg{
-		actors: []dataplane.ActorDescriptor{{CName: "node-b"}, {CName: "node-c"}},
+		actors: []dataplane.ActorDescriptor{
+			{CName: "node-b", ZprAddress: "fd5a:5052::2"},
+			{CName: "node-c", ZprAddress: "fd5a:5052::3"},
+		},
 	})
 	m.state.actor.selectedIndex = 1
 	m.state.actor.visas = []dataplane.VisaDescriptor{{ID: 1}}
@@ -98,7 +139,10 @@ func TestDepartedActorClearsSelectionState(t *testing.T) {
 	m.state.actor.revokeVisas = true
 
 	m = applySnapshot(t, m, actorSnapshotMsg{
-		actors: []dataplane.ActorDescriptor{{CName: "node-a"}, {CName: "node-b"}},
+		actors: []dataplane.ActorDescriptor{
+			{CName: "node-a", ZprAddress: "fd5a:5052::1"},
+			{CName: "node-b", ZprAddress: "fd5a:5052::2"},
+		},
 	})
 
 	if m.state.actor.visas != nil || m.state.actor.visaCountHistory != nil || m.state.actor.visasFetchErr != nil {

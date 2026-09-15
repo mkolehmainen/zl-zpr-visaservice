@@ -64,7 +64,7 @@ func RevocationList(width, height int, revocations []dataplane.AuthRevokeDescrip
 				s = s.Foreground(styles.ColorFg)
 
 				if col == 3 && row < len(revocations) {
-					if _, connected := actorByCN(actors, revocations[row].CN); connected {
+					if revokedCNConnected(actors, revocations[row].CN) {
 						s = s.Foreground(styles.ColorYellow)
 					} else {
 						s = s.Foreground(styles.ColorDimmed)
@@ -96,8 +96,27 @@ func RevocationList(width, height int, revocations []dataplane.AuthRevokeDescrip
 	return styles.ContainerStyle.Height(height).Width(width).Render(content)
 }
 
+// revokedCNConnected reports whether a connected actor presents the revoked
+// entry's CN. This deliberately stays CN-matched while everything else keys on
+// the ZPR address: an auth-revoke entry names a credential, not a connected
+// actor, and AuthRevokeDescriptor carries no address to join on. A CN-less
+// (e.g. OIDC-only) actor therefore always reads as "not connected" here.
+func revokedCNConnected(actors []dataplane.ActorDescriptor, cn string) bool {
+	if cn == "" {
+		return false
+	}
+
+	for _, actor := range actors {
+		if actor.CName == cn {
+			return true
+		}
+	}
+
+	return false
+}
+
 func revocationActor(revocation dataplane.AuthRevokeDescriptor, actors []dataplane.ActorDescriptor) string {
-	if _, ok := actorByCN(actors, revocation.CN); ok {
+	if revokedCNConnected(actors, revocation.CN) {
 		return "still connected"
 	}
 

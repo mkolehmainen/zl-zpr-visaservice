@@ -29,9 +29,11 @@ func ActorServicesOffered(
 	actor := actors[selectedIndex]
 
 	// FetchServices sorts by ServiceName, so the filtered copy stays sorted.
+	// The join keys on the ZPR address: a CN may be absent, and matching on it
+	// would hand every CN-less actor every CN-less registration.
 	var offered []dataplane.ServiceDescriptor
 	for _, svc := range services {
-		if svc.ActorCN == actor.CName {
+		if svc.ZprAddress != "" && svc.ZprAddress == actor.ZprAddress {
 			offered = append(offered, svc)
 		}
 	}

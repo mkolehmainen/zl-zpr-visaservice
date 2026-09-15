@@ -89,7 +89,7 @@ func ActorList(
 
 	for i, a := range actors[:fits] {
 		cells := []string{
-			ansi.Truncate(a.CName, widths[0], "..."),
+			ansi.Truncate(actorLabel(a), widths[0], "..."),
 			ansi.Truncate(orDash(actorDock(actors, a)), widths[1], "..."),
 		}
 
