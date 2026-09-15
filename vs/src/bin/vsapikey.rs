@@ -44,6 +44,19 @@ fn pick_new_id(keys: &HashMap<String, ApiKeyRecord>) -> Result<u32, String> {
     }
 }
 
+/// Parse a permission level given on the command line. Lowercase only, and the
+/// rejection message names all three accepted levels.
+fn parse_permission(perms: &str) -> Result<Permission, String> {
+    match perms {
+        "resolve" => Ok(Permission::Resolve),
+        "read" => Ok(Permission::Read),
+        "readwrite" => Ok(Permission::ReadWrite),
+        other => Err(format!(
+            "invalid permission '{other}': must be resolve, read or readwrite"
+        )),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "vsapikey", about = "Manage VS API keys")]
 struct Cli {
@@ -55,7 +68,7 @@ struct Cli {
 enum Commands {
     /// Create a new API key
     Create {
-        /// Permission level: read or readwrite
+        /// Permission level: resolve, read or readwrite
         perms: String,
         /// Owner identifier
         owner: String,
