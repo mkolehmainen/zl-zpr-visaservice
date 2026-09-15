@@ -95,6 +95,10 @@ fn main() {
     }
     .unwrap_or_else(|e| {
         eprintln!("{} {}", "Error: ".red(), e);
+        // Shell automation keys off the exit status: a failed subcommand
+        // (e.g. a rejected hot policy install) must not exit 0 (zipline#38
+        // review, Codex P1).
+        std::process::exit(1);
     })
 }
 
