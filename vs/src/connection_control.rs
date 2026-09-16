@@ -85,9 +85,11 @@ pub(crate) fn compute_authority_expiry(
     session_ceiling: Option<SystemTime>,
     lifetime: Duration,
 ) -> SystemTime {
-    // RED stub (zipline#42): GREEN computes min(iat + lifetime, ceiling).
-    let _ = (iat, session_ceiling);
-    SystemTime::UNIX_EPOCH + lifetime
+    let renewal_expires = iat + lifetime;
+    match session_ceiling {
+        Some(ceiling) => renewal_expires.min(ceiling),
+        None => renewal_expires,
+    }
 }
 
 /// The endpoint CN for logging/JWT purposes: the authenticated CN when a device blob
@@ -584,10 +586,19 @@ impl ConnectionControl {
             }
         };
 
-        // The credential lifetime anchors on the authentication moment
-        // (`auth_time`, or `iat` when absent); the token's `exp` was reject-only
-        // during validation and plays no part here (Contract 7).
-        let expires = token.auth_time + svc.lifetime();
+        // Dual-clock credential lifetime (zipline#42): the renewal window
+        // anchors on the token mint moment (`iat + lifetime`, so a refreshed
+        // token restarts the window), capped by the fixed per-login session
+        // ceiling (`auth_time + max_auth_age`, absent when the knob is 0).
+        // The ceiling is auth_time-anchored because the authentication event
+        // is what policy bounds — refreshes must not extend it. The token's
+        // `exp` was reject-only during validation and plays no part here
+        // (Contract 7).
+        let expires = compute_authority_expiry(
+            token.iat,
+            svc.session_ceiling(token.auth_time),
+            svc.lifetime(),
+        );
         let mapped = svc.admit(&token, expires)?;
 
         let src = AttributeSource::new(svc.id());

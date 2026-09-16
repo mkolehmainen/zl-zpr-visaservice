@@ -192,18 +192,27 @@ pub fn validate_id_token(
         None
     };
 
-    // Token mint moment: `iat` is always required (it already had to exist
-    // for the auth_time fallback). RED stub (zipline#42): the fallback below
-    // is still unconditional; the offline-access split lands in GREEN.
+    // Token mint moment: `iat` is always required (the JWT profile mandates
+    // it, and it anchors the renewal window of the dual-clock lifetime).
     let iat_secs = claims
         .get("iat")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| OidcError::Signature("iat claim missing or not a number".to_string()))?;
-    // Authentication moment: `auth_time` when present, else `iat`.
-    let auth_time_secs = claims
-        .get("auth_time")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(iat_secs);
+    // Authentication moment: `auth_time` when present. The `iat` fallback is
+    // only sound for providers WITHOUT offline access: their session cannot
+    // renew, so the first token's mint moment approximates the login. A
+    // provider issuing refresh tokens renews `iat` on every refresh, which
+    // would let the session ceiling creep forever — those must assert a real
+    // `auth_time` (zipline#42).
+    let auth_time_secs = match claims.get("auth_time").and_then(|v| v.as_u64()) {
+        Some(secs) => secs,
+        None if !params.allow_offline_access => iat_secs,
+        None => {
+            return Err(OidcError::Rejected(
+                "auth_time required for a renewable session".to_string(),
+            ));
+        }
+    };
     // Checked: a huge value (e.g. u64::MAX) is unrepresentable as SystemTime
     // and would panic on `UNIX_EPOCH + Duration`. Such a token is nonsense —
     // reject it like any other bad `auth_time`.

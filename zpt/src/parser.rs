@@ -133,6 +133,11 @@ pub fn split_values(value: &str) -> Vec<String> {
 //     `--ac` for an authentication claim
 //     `--uc` for an unauthenticated claim
 //
+//   An `--ac` claim may pin an explicit expiry with a `@<epoch-secs>` suffix
+//   (zipline#42), e.g. `--ac user.zpr.authority:google@1893456000`. The
+//   suffix counts only when everything after the LAST '@' is digits, so a
+//   value containing '@' (an email) is untouched.
+//
 fn parse_connect_expr(expr: String) -> Result<Instruction, ParseError> {
     let mut authd_claims = Vec::new();
     let mut unauthd_claims = Vec::new();
@@ -158,14 +163,22 @@ fn parse_connect_expr(expr: String) -> Result<Instruction, ParseError> {
             claim_kv.push(' ');
             claim_kv.push_str(more);
         }
-        let (key, value) = parse_key_value(claim_kv)?;
-        let values = split_values(&value);
 
         match claim_type {
             "--ac" => {
-                authd_claims.push(Attribute::builder(key).values(values));
+                let (claim_kv, expires) = split_claim_expiry(claim_kv);
+                let (key, value) = parse_key_value(claim_kv)?;
+                let values = split_values(&value);
+                let builder = Attribute::builder(key);
+                let attr = match expires {
+                    Some(at) => builder.expires(at).values(values),
+                    None => builder.values(values),
+                };
+                authd_claims.push(attr);
             }
             "--uc" => {
+                let (key, value) = parse_key_value(claim_kv)?;
+                let values = split_values(&value);
                 unauthd_claims.push(Attribute::builder(key).values(values));
             }
             _ => {
@@ -188,6 +201,25 @@ fn parse_connect_expr(expr: String) -> Result<Instruction, ParseError> {
             Some(unauthd_claims)
         },
     })
+}
+
+/// Split a trailing `@<epoch-secs>` expiry off a claim expression
+/// (zipline#42). The suffix counts only when the text after the LAST '@' is
+/// one or more digits that parse as u64 — anything else (an email value, no
+/// '@' at all) leaves the expression unchanged.
+fn split_claim_expiry(claim_kv: String) -> (String, Option<std::time::SystemTime>) {
+    if let Some(at_pos) = claim_kv.rfind('@') {
+        let suffix = &claim_kv[at_pos + 1..];
+        if !suffix.is_empty()
+            && suffix.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(secs) = suffix.parse::<u64>()
+            && let Some(expires) =
+                std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
+        {
+            return (claim_kv[..at_pos].to_string(), Some(expires));
+        }
+    }
+    (claim_kv, None)
 }
 
 // format is:

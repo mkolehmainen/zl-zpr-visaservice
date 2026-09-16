@@ -98,8 +98,7 @@ impl OidcTrustedService {
             allowed_domains: &self.cfg.allowed_domains,
             max_auth_age: (self.cfg.max_auth_age_seconds > 0)
                 .then(|| Duration::from_secs(self.cfg.max_auth_age_seconds as u64)),
-            // RED stub (zipline#42): GREEN passes cfg.allow_offline_access.
-            allow_offline_access: false,
+            allow_offline_access: self.cfg.allow_offline_access,
             clock_skew: IdpParams::default_clock_skew(),
         }
     }
@@ -108,9 +107,9 @@ impl OidcTrustedService {
     /// `auth_time`: `auth_time + max_auth_age_seconds`. `None` when the knob
     /// is 0 (no ceiling — the session may renew forever). Zipline#42.
     #[allow(dead_code)] // consumed by the C5 connect path
-    pub fn session_ceiling(&self, _auth_time: SystemTime) -> Option<SystemTime> {
-        // RED stub (zipline#42): GREEN derives it from cfg.max_auth_age_seconds.
-        None
+    pub fn session_ceiling(&self, auth_time: SystemTime) -> Option<SystemTime> {
+        (self.cfg.max_auth_age_seconds > 0)
+            .then(|| auth_time + Duration::from_secs(self.cfg.max_auth_age_seconds as u64))
     }
 
     /// This provider's cached signing keys.
