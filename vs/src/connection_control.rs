@@ -40,7 +40,7 @@ use crate::auth;
 use crate::config;
 use crate::error::ServiceError;
 use crate::logging::targets::CC;
-use crate::oidc::{OidcError, validate_id_token};
+use crate::oidc::{NonceExpectation, OidcError, validate_id_token};
 use crate::policy_mgr::PolicySnapshot;
 use crate::trusted_services::{TrustedServicesMgr, derive_user_authority, lookup_identities};
 
@@ -534,7 +534,7 @@ impl ConnectionControl {
             &blob.id_token,
             &svc.keys().current(),
             &svc.params(),
-            &blob.nonce,
+            NonceExpectation::Required(&blob.nonce),
             now,
         );
         if matches!(
@@ -556,7 +556,7 @@ impl ConnectionControl {
                 &blob.id_token,
                 &svc.keys().current(),
                 &svc.params(),
-                &blob.nonce,
+                NonceExpectation::Required(&blob.nonce),
                 now,
             );
         }

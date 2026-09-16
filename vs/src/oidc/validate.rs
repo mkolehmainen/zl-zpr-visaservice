@@ -62,6 +62,22 @@ pub struct ValidatedToken {
     pub raw_claims: serde_json::Map<String, serde_json::Value>,
 }
 
+/// How the token's `nonce` claim is checked. An enum rather than a boolean so
+/// the connect arm cannot be constructed with checking off by accident
+/// (zipline#43 constraint: the two paths must not share a validation function
+/// that takes a "skip nonce" flag).
+pub enum NonceExpectation<'a> {
+    /// Connect path: the token must carry exactly this nonce. Missing and
+    /// mismatched are the same failure; the expected value is never echoed.
+    Required(&'a str),
+    /// Reauth path (zipline#43): a refresh-grant `id_token` carries the
+    /// *original* login nonce (OIDC Core §12.2), so it can never match a
+    /// fresh challenge. The caller binds the token to the live session
+    /// (same `sub`, increasing `iat`, unchanged `auth_time`) instead; only
+    /// the nonce equality is skipped — every other check runs unchanged.
+    SessionBound,
+}
+
 /// Validation failures, partitioned by the `ErrorCode` they map to on the
 /// connect path (Contract 2 error table).
 #[derive(Debug, thiserror::Error)]
@@ -80,8 +96,10 @@ pub enum OidcError {
     NoKeys,
 }
 
-/// Validate `id_token` against `keys` (a JWKS) and `params`, requiring
-/// `expected_nonce`. Allowlist: RS256 only. Rejects `alg: none`, HS*, ES*,
+/// Validate `id_token` against `keys` (a JWKS) and `params`, checking the
+/// `nonce` claim per `nonce` (required equality on the connect path; skipped —
+/// and only it — under [NonceExpectation::SessionBound] on the reauth path).
+/// Allowlist: RS256 only. Rejects `alg: none`, HS*, ES*,
 /// PS*. `now` governs the `auth_time` freshness check and the future-`iat`
 /// rejection; `exp` is checked by the JWT library against the real clock
 /// with `params.clock_skew` leeway.
@@ -89,7 +107,7 @@ pub fn validate_id_token(
     id_token: &str,
     keys: &jwt::jwk::JwkSet,
     params: &IdpParams,
-    expected_nonce: &str,
+    nonce: NonceExpectation<'_>,
     now: SystemTime,
 ) -> Result<ValidatedToken, OidcError> {
     // Header first: the algorithm allowlist must be enforced before any key
@@ -132,13 +150,20 @@ pub fn validate_id_token(
 
     // `nonce` binds the token to this connection attempt. Missing and
     // mismatched are the same failure; the expected value is never echoed.
-    match claims.get("nonce").and_then(|v| v.as_str()) {
-        Some(n) if n == expected_nonce => (),
-        _ => {
-            return Err(OidcError::Signature(
-                "nonce missing or mismatched".to_string(),
-            ));
+    // The reauth path (zipline#43) binds to the live session instead, so
+    // `SessionBound` skips only this equality — nothing else.
+    match nonce {
+        NonceExpectation::Required(expected) => {
+            match claims.get("nonce").and_then(|v| v.as_str()) {
+                Some(n) if n == expected => (),
+                _ => {
+                    return Err(OidcError::Signature(
+                        "nonce missing or mismatched".to_string(),
+                    ));
+                }
+            }
         }
+        NonceExpectation::SessionBound => (),
     }
 
     let sub = claims
@@ -384,7 +409,7 @@ mod tests {
             &sign(claims),
             &test_jwks(),
             &params(&allowed),
-            NONCE,
+            NonceExpectation::Required(NONCE),
             SystemTime::now(),
         )
     }
@@ -409,7 +434,7 @@ mod tests {
             &t,
             &test_jwks(),
             &params(&allowed),
-            NONCE,
+            NonceExpectation::Required(NONCE),
             SystemTime::now(),
         )
         .unwrap_err();
@@ -427,7 +452,7 @@ mod tests {
             &t,
             &test_jwks(),
             &params(&allowed),
-            NONCE,
+            NonceExpectation::Required(NONCE),
             SystemTime::now(),
         )
         .unwrap_err();
@@ -477,6 +502,52 @@ mod tests {
         let mut c = base_claims();
         c["nonce"] = json!("some-other-nonce");
         let err = validate(c).unwrap_err();
+        assert!(matches!(err, OidcError::Signature(_)), "{err}");
+    }
+
+    // zipline#43 (R3): under SessionBound the nonce equality — and only it —
+    // is skipped: a token whose nonce matches no fresh challenge (a refresh
+    // grant carries the original login nonce, OIDC Core §12.2) validates,
+    // and a token with no nonce at all validates too. Every other check
+    // stays live, e.g. a wrong audience still fails.
+    #[test]
+    fn session_bound_ignores_nonce_mismatch() {
+        let allowed = vec!["example.com".to_string()];
+
+        let mut c = base_claims();
+        c["nonce"] = json!("the-original-login-nonce");
+        let tok = validate_id_token(
+            &sign(c),
+            &test_jwks(),
+            &params(&allowed),
+            NonceExpectation::SessionBound,
+            SystemTime::now(),
+        )
+        .expect("SessionBound must not check the nonce");
+        assert_eq!(tok.sub, "10769150350006150715113082367");
+
+        let mut c2 = base_claims();
+        c2.as_object_mut().unwrap().remove("nonce");
+        validate_id_token(
+            &sign(c2),
+            &test_jwks(),
+            &params(&allowed),
+            NonceExpectation::SessionBound,
+            SystemTime::now(),
+        )
+        .expect("SessionBound must accept a missing nonce");
+
+        // Only the nonce check is relaxed: everything else still runs.
+        let mut c3 = base_claims();
+        c3["aud"] = json!("attacker-client-id.apps.googleusercontent.com");
+        let err = validate_id_token(
+            &sign(c3),
+            &test_jwks(),
+            &params(&allowed),
+            NonceExpectation::SessionBound,
+            SystemTime::now(),
+        )
+        .unwrap_err();
         assert!(matches!(err, OidcError::Signature(_)), "{err}");
     }
 
@@ -545,7 +616,7 @@ mod tests {
             &t,
             &test_jwks(),
             &params(&allowed),
-            NONCE,
+            NonceExpectation::Required(NONCE),
             SystemTime::now(),
         )
         .unwrap_err();
@@ -563,8 +634,14 @@ mod tests {
         let allowed = vec!["example.com".to_string()];
         let mut p = params(&allowed);
         p.max_auth_age = Some(Duration::from_secs(3600));
-        let err =
-            validate_id_token(&sign(c), &test_jwks(), &p, NONCE, SystemTime::now()).unwrap_err();
+        let err = validate_id_token(
+            &sign(c),
+            &test_jwks(),
+            &p,
+            NonceExpectation::Required(NONCE),
+            SystemTime::now(),
+        )
+        .unwrap_err();
         assert!(matches!(err, OidcError::Rejected(_)), "{err}");
     }
 
@@ -578,7 +655,7 @@ mod tests {
             &sign(c),
             &test_jwks(),
             &params(&allowed),
-            NONCE,
+            NonceExpectation::Required(NONCE),
             SystemTime::now(),
         )
         .unwrap();
@@ -611,8 +688,14 @@ mod tests {
         let allowed = vec!["example.com".to_string()];
         let mut p = params(&allowed);
         p.allow_offline_access = true;
-        let err =
-            validate_id_token(&sign(c), &test_jwks(), &p, NONCE, SystemTime::now()).unwrap_err();
+        let err = validate_id_token(
+            &sign(c),
+            &test_jwks(),
+            &p,
+            NonceExpectation::Required(NONCE),
+            SystemTime::now(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, OidcError::Rejected(ref msg)
                 if msg == "auth_time required for a renewable session"),
@@ -630,7 +713,14 @@ mod tests {
         let allowed = vec!["example.com".to_string()];
         let mut p = params(&allowed);
         p.allow_offline_access = true;
-        let tok = validate_id_token(&sign(c), &test_jwks(), &p, NONCE, SystemTime::now()).unwrap();
+        let tok = validate_id_token(
+            &sign(c),
+            &test_jwks(),
+            &p,
+            NonceExpectation::Required(NONCE),
+            SystemTime::now(),
+        )
+        .unwrap();
         assert_eq!(tok.auth_time, UNIX_EPOCH + Duration::from_secs(at));
     }
 
@@ -689,16 +779,28 @@ mod tests {
         // Just beyond the leeway: rejected, claim name only (never the value).
         let mut c = base_claims();
         c["iat"] = json!(now_s + skew + 61);
-        let err =
-            validate_id_token(&sign(c), &test_jwks(), &params(&allowed), NONCE, now).unwrap_err();
+        let err = validate_id_token(
+            &sign(c),
+            &test_jwks(),
+            &params(&allowed),
+            NonceExpectation::Required(NONCE),
+            now,
+        )
+        .unwrap_err();
         assert!(matches!(err, OidcError::Rejected(_)), "{err}");
 
         // Within the leeway: accepted — provider clocks legitimately drift,
         // and this is the same allowance `exp` and `max_auth_age` get.
         let mut c2 = base_claims();
         c2["iat"] = json!(now_s + skew - 60);
-        let tok =
-            validate_id_token(&sign(c2), &test_jwks(), &params(&allowed), NONCE, now).unwrap();
+        let tok = validate_id_token(
+            &sign(c2),
+            &test_jwks(),
+            &params(&allowed),
+            NonceExpectation::Required(NONCE),
+            now,
+        )
+        .unwrap();
         assert_eq!(tok.iat, UNIX_EPOCH + Duration::from_secs(now_s + skew - 60));
     }
 
@@ -718,14 +820,27 @@ mod tests {
         // One past the leeway window: rejected.
         let mut c = base_claims();
         c["auth_time"] = json!(now_s - 7200 - skew - 1);
-        let err = validate_id_token(&sign(c), &test_jwks(), &p, NONCE, now).unwrap_err();
+        let err = validate_id_token(
+            &sign(c),
+            &test_jwks(),
+            &p,
+            NonceExpectation::Required(NONCE),
+            now,
+        )
+        .unwrap_err();
         assert!(matches!(err, OidcError::Rejected(_)), "{err}");
 
         // Exactly at the leeway boundary: still accepted (skew allowance).
         let mut c2 = base_claims();
         c2["auth_time"] = json!(now_s - 7200 - skew);
-        validate_id_token(&sign(c2), &test_jwks(), &p, NONCE, now)
-            .expect("auth_time exactly max_auth_age + clock_skew old is accepted");
+        validate_id_token(
+            &sign(c2),
+            &test_jwks(),
+            &p,
+            NonceExpectation::Required(NONCE),
+            now,
+        )
+        .expect("auth_time exactly max_auth_age + clock_skew old is accepted");
     }
 
     // empty key set -> NoKeys (not a table row; completes the error taxonomy)
@@ -737,7 +852,7 @@ mod tests {
             &sign(base_claims()),
             &empty,
             &params(&allowed),
-            NONCE,
+            NonceExpectation::Required(NONCE),
             SystemTime::now(),
         )
         .unwrap_err();
