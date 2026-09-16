@@ -75,6 +75,21 @@ struct BlobOutcome {
     namespace: Namespace,
 }
 
+/// Dual-clock OIDC credential expiry (zipline#42): the renewal window
+/// `iat + lifetime` (advances on refresh), capped by the fixed per-login
+/// session ceiling (`auth_time + max_auth_age`; `None` = unbounded). The
+/// token's `exp` is reject-only at validation and plays no part here
+/// (Contract 7).
+pub(crate) fn compute_authority_expiry(
+    iat: SystemTime,
+    session_ceiling: Option<SystemTime>,
+    lifetime: Duration,
+) -> SystemTime {
+    // RED stub (zipline#42): GREEN computes min(iat + lifetime, ceiling).
+    let _ = (iat, session_ceiling);
+    SystemTime::UNIX_EPOCH + lifetime
+}
+
 /// The endpoint CN for logging/JWT purposes: the authenticated CN when a device blob
 /// verified one, else the (unauthenticated) claimed CN, else empty.
 fn authd_or_claimed_cn(authd_claims: &[Attribute], unauthd_claims: &[Attribute]) -> String {
@@ -2867,17 +2882,56 @@ mod tests {
         );
     }
 
-    /// `user.zpr.authority` expires at `auth_time + expiration_seconds`, anchored to
-    /// the authentication moment — not at the token's `exp`, which is reject-only.
+    /// T2 (zipline#42): the dual-clock helper. (a) with the same session
+    /// ceiling, a later `iat` yields a strictly later expiry (the renewal
+    /// window is iat-anchored); (b) a ceiling sooner than `iat + lifetime`
+    /// wins; (e) no ceiling (`max_auth_age_seconds = 0`) means the expiry is
+    /// `iat + lifetime` alone.
+    #[test]
+    fn test_compute_authority_expiry_dual_clock() {
+        let lifetime = Duration::from_secs(OIDC_LIFETIME_SECS as u64);
+        let auth_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let iat1 = auth_time + Duration::from_secs(600);
+        let iat2 = auth_time + Duration::from_secs(1200);
+        let far_ceiling = auth_time + Duration::from_secs(1_000_000);
+
+        // (a) same ceiling, later iat => strictly later expiry.
+        let e1 = compute_authority_expiry(iat1, Some(far_ceiling), lifetime);
+        let e2 = compute_authority_expiry(iat2, Some(far_ceiling), lifetime);
+        assert_eq!(e1, iat1 + lifetime);
+        assert!(e2 > e1, "renewal window must anchor on iat");
+
+        // (b) ceiling sooner than iat + lifetime => ceiling wins.
+        let near_ceiling = iat1 + Duration::from_secs(60);
+        assert_eq!(
+            compute_authority_expiry(iat1, Some(near_ceiling), lifetime),
+            near_ceiling
+        );
+
+        // (e) no ceiling => iat + lifetime alone.
+        assert_eq!(
+            compute_authority_expiry(iat1, None, lifetime),
+            iat1 + lifetime
+        );
+    }
+
+    /// T4 (zipline#42): `user.zpr.authority` expires at the dual-clock min.
+    /// With `max_auth_age_seconds = 0` (no ceiling) and an `auth_time` an hour
+    /// old, the expiry anchors on the fresh `iat` — a renewable session gets a
+    /// full lifetime per refresh, regardless of the token's 1 h `exp`
+    /// (reject-only) and of the old `auth_time`.
     #[tokio::test]
-    async fn test_user_authority_expiry_is_auth_time_plus_lifetime() {
+    async fn test_user_authority_expiry_is_dual_clock_min() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         install_oidc_policy(&asm, make_test_oidc_config()).await;
         let cc = make_cc("test-vs");
-        // Authenticated an hour ago; policy lifetime is 12 h, so the authority must
-        // expire ~11 h from now regardless of the token's 1 h `exp`.
-        let auth_time = unix_now() - 3600;
+        // Authenticated an hour ago; policy lifetime is 12 h and there is no
+        // session ceiling, so the authority must expire ~12 h from the fresh
+        // iat (i.e. ~ now + 12 h), NOT auth_time + 12 h.
+        let iat = unix_now();
+        let auth_time = iat - 3600;
         let mut claims = oidc_base_claims();
+        claims["iat"] = json!(iat);
         claims["auth_time"] = json!(auth_time);
         let req = make_connect_request(vec![oidc_blob(mint_signed(claims))], "some.cn");
 
@@ -2891,13 +2945,50 @@ mod tests {
             .expect("user authority must be stamped")
             .get_expires();
         let expected =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(auth_time + OIDC_LIFETIME_SECS as u64);
+            SystemTime::UNIX_EPOCH + Duration::from_secs(iat + OIDC_LIFETIME_SECS as u64);
         let drift = expires
             .duration_since(expected)
             .unwrap_or_else(|e| e.duration());
         assert!(
             drift < Duration::from_secs(30),
-            "authority expiry must be auth_time + lifetime (drift {}s)",
+            "authority expiry must be iat + lifetime when there is no ceiling (drift {}s)",
+            drift.as_secs()
+        );
+    }
+
+    /// T4 variant (zipline#42): when `auth_time + max_auth_age` lands sooner
+    /// than `iat + lifetime`, the fixed session ceiling is what gets stamped.
+    #[tokio::test]
+    async fn test_user_authority_expiry_capped_by_session_ceiling() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let mut cfg = make_test_oidc_config();
+        // Ceiling: auth_time + 2 h, far sooner than iat + 12 h lifetime.
+        cfg.max_auth_age_seconds = 7200;
+        install_oidc_policy(&asm, cfg).await;
+        let cc = make_cc("test-vs");
+        let iat = unix_now();
+        let auth_time = iat - 3600; // 1 h into a 2 h window: still fresh
+        let mut claims = oidc_base_claims();
+        claims["iat"] = json!(iat);
+        claims["auth_time"] = json!(auth_time);
+        let req = make_connect_request(vec![oidc_blob(mint_signed(claims))], "some.cn");
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("valid OIDC connect should authorize");
+
+        let expires = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .expect("user authority must be stamped")
+            .get_expires();
+        let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(auth_time + 7200);
+        let drift = expires
+            .duration_since(expected)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            drift < Duration::from_secs(30),
+            "authority expiry must be capped at auth_time + max_auth_age (drift {}s)",
             drift.as_secs()
         );
     }

@@ -24,6 +24,11 @@ pub struct IdpParams<'a> {
     /// Maximum acceptable age of the authentication event (`auth_time`).
     /// `None` = no freshness requirement.
     pub max_auth_age: Option<Duration>,
+    /// Whether this provider issues refresh tokens (`allow_offline_access`).
+    /// A refreshable session is renewable, so the fixed session ceiling must
+    /// anchor on a provider-asserted `auth_time`: the `auth_time -> iat`
+    /// fallback closes for these providers (zipline#42).
+    pub allow_offline_access: bool,
     /// Leeway for clock comparisons; use `config::MAX_CLOCK_SKEW_SECS`.
     pub clock_skew: Duration,
 }
@@ -45,8 +50,14 @@ pub struct ValidatedToken {
     pub email: Option<String>,
     /// Google Workspace hosted domain, when present.
     pub hd: Option<String>,
-    /// The `auth_time` claim, else `iat`.
+    /// The `auth_time` claim; `iat` when absent and the provider has no
+    /// offline access (a renewable session requires a real `auth_time`).
+    /// Anchors the fixed session ceiling of the dual-clock credential
+    /// lifetime (zipline#42).
     pub auth_time: SystemTime,
+    /// The `iat` claim: when this token was minted. Anchors the renewal
+    /// window of the dual-clock credential lifetime (zipline#42).
+    pub iat: SystemTime,
     /// The full validated claim set, for `returns_attributes` mapping (C4).
     pub raw_claims: serde_json::Map<String, serde_json::Value>,
 }
@@ -181,17 +192,28 @@ pub fn validate_id_token(
         None
     };
 
+    // Token mint moment: `iat` is always required (it already had to exist
+    // for the auth_time fallback). RED stub (zipline#42): the fallback below
+    // is still unconditional; the offline-access split lands in GREEN.
+    let iat_secs = claims
+        .get("iat")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| OidcError::Signature("iat claim missing or not a number".to_string()))?;
     // Authentication moment: `auth_time` when present, else `iat`.
     let auth_time_secs = claims
         .get("auth_time")
         .and_then(|v| v.as_u64())
-        .or_else(|| claims.get("iat").and_then(|v| v.as_u64()))
-        .ok_or_else(|| OidcError::Signature("neither auth_time nor iat present".to_string()))?;
+        .unwrap_or(iat_secs);
     // Checked: a huge value (e.g. u64::MAX) is unrepresentable as SystemTime
     // and would panic on `UNIX_EPOCH + Duration`. Such a token is nonsense —
     // reject it like any other bad `auth_time`.
     let auth_time = UNIX_EPOCH
         .checked_add(Duration::from_secs(auth_time_secs))
+        .ok_or_else(|| {
+            OidcError::Rejected("auth_time/iat out of representable range".to_string())
+        })?;
+    let iat = UNIX_EPOCH
+        .checked_add(Duration::from_secs(iat_secs))
         .ok_or_else(|| {
             OidcError::Rejected("auth_time/iat out of representable range".to_string())
         })?;
@@ -214,6 +236,7 @@ pub fn validate_id_token(
         email,
         hd,
         auth_time,
+        iat,
         raw_claims: claims,
     })
 }
@@ -318,6 +341,7 @@ mod tests {
             client_id: CLIENT_ID,
             allowed_domains: allowed,
             max_auth_age: None,
+            allow_offline_access: false,
             clock_skew: IdpParams::default_clock_skew(),
         }
     }
@@ -536,7 +560,7 @@ mod tests {
         assert_eq!(tok.hd, None);
     }
 
-    // no auth_time -> auth_time == iat
+    // no auth_time -> auth_time == iat (providers WITHOUT offline access only)
     #[test]
     fn auth_time_falls_back_to_iat() {
         let iat = now_secs();
@@ -551,6 +575,58 @@ mod tests {
         c2["auth_time"] = json!(iat - 100);
         let tok2 = validate(c2).unwrap();
         assert_eq!(tok2.auth_time, UNIX_EPOCH + Duration::from_secs(iat - 100));
+    }
+
+    // T1(c) (zipline#42): a provider with offline access issues refresh
+    // tokens, so its session is renewable and the fixed session ceiling must
+    // anchor on a provider-asserted `auth_time` — the iat fallback closes.
+    #[test]
+    fn offline_access_without_auth_time_rejected() {
+        let c = base_claims(); // no auth_time
+        let allowed = vec!["example.com".to_string()];
+        let mut p = params(&allowed);
+        p.allow_offline_access = true;
+        let err =
+            validate_id_token(&sign(c), &test_jwks(), &p, NONCE, SystemTime::now()).unwrap_err();
+        assert!(
+            matches!(err, OidcError::Rejected(ref msg)
+                if msg == "auth_time required for a renewable session"),
+            "expected the exact renewable-session rejection, got: {err}"
+        );
+    }
+
+    // T1(c) counterpart: with offline access, a token that DOES carry
+    // auth_time still validates.
+    #[test]
+    fn offline_access_with_auth_time_accepted() {
+        let at = now_secs() - 100;
+        let mut c = base_claims();
+        c["auth_time"] = json!(at);
+        let allowed = vec!["example.com".to_string()];
+        let mut p = params(&allowed);
+        p.allow_offline_access = true;
+        let tok = validate_id_token(&sign(c), &test_jwks(), &p, NONCE, SystemTime::now()).unwrap();
+        assert_eq!(tok.auth_time, UNIX_EPOCH + Duration::from_secs(at));
+    }
+
+    // T1 (zipline#42): `iat` lands in ValidatedToken.iat, and `auth_time`,
+    // when present, still wins for `.auth_time` while `.iat` stays the iat.
+    #[test]
+    fn iat_is_kept_alongside_auth_time() {
+        let iat = now_secs();
+        let mut c = base_claims();
+        c["iat"] = json!(iat);
+        c["auth_time"] = json!(iat - 3600);
+        let tok = validate(c).unwrap();
+        assert_eq!(tok.iat, UNIX_EPOCH + Duration::from_secs(iat));
+        assert_eq!(tok.auth_time, UNIX_EPOCH + Duration::from_secs(iat - 3600));
+
+        // without auth_time (and no offline access) both anchor on iat
+        let mut c2 = base_claims();
+        c2["iat"] = json!(iat);
+        let tok2 = validate(c2).unwrap();
+        assert_eq!(tok2.iat, UNIX_EPOCH + Duration::from_secs(iat));
+        assert_eq!(tok2.auth_time, tok2.iat);
     }
 
     // auth_time near u64::MAX -> Rejected, never a panic on

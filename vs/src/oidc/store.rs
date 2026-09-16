@@ -27,6 +27,21 @@ use super::validate::{IdpParams, ValidatedToken};
 /// identity claim this store admits and looks up under.
 const SUB_CLAIM: &str = "sub";
 
+/// One admitted subject's cached record: the mapped attributes, when they
+/// expire, and the dual-clock anchors from the validated token — `auth_time`
+/// (fixed per login: the session ceiling) and `iat` (advances on refresh: the
+/// renewal window). R3 (zipline#43) reads both on re-admission.
+pub(crate) struct AdmittedEntry {
+    /// The mapped attributes served to lookups.
+    pub attrs: Vec<Attribute>,
+    /// When this record stops being served (the stamped authority expiry).
+    pub expires: SystemTime,
+    /// The token's authentication moment (`auth_time`).
+    pub auth_time: SystemTime,
+    /// The token's mint moment (`iat`).
+    pub iat: SystemTime,
+}
+
 /// An `api = "oidc"` trusted service: a claim cache keyed by the provider's
 /// `sub`, populated by [`OidcTrustedService::admit`] on the connect path and
 /// served through [`TrustedServiceInterface`].
@@ -40,8 +55,8 @@ pub struct OidcTrustedService {
     mapper: AttributeMapper,
     /// Cached signing keys for this provider (C3).
     keys: Arc<KeySource>,
-    /// Admitted claims: `sub` -> (mapped attributes, record expiry).
-    admitted: DashMap<String, (Vec<Attribute>, SystemTime)>,
+    /// Admitted claims, keyed by the provider's `sub`.
+    admitted: DashMap<String, AdmittedEntry>,
     /// How long admitted attributes live, from the policy record.
     expiration_seconds: u32,
     /// Snapshot revision, from the process-wide trusted-service counter so the
@@ -83,8 +98,19 @@ impl OidcTrustedService {
             allowed_domains: &self.cfg.allowed_domains,
             max_auth_age: (self.cfg.max_auth_age_seconds > 0)
                 .then(|| Duration::from_secs(self.cfg.max_auth_age_seconds as u64)),
+            // RED stub (zipline#42): GREEN passes cfg.allow_offline_access.
+            allow_offline_access: false,
             clock_skew: IdpParams::default_clock_skew(),
         }
+    }
+
+    /// The fixed session ceiling for a login whose authentication moment is
+    /// `auth_time`: `auth_time + max_auth_age_seconds`. `None` when the knob
+    /// is 0 (no ceiling — the session may renew forever). Zipline#42.
+    #[allow(dead_code)] // consumed by the C5 connect path
+    pub fn session_ceiling(&self, _auth_time: SystemTime) -> Option<SystemTime> {
+        // RED stub (zipline#42): GREEN derives it from cfg.max_auth_age_seconds.
+        None
     }
 
     /// This provider's cached signing keys.
@@ -167,9 +193,16 @@ impl OidcTrustedService {
         // of that exact subject). Sweeping on every admission bounds the cache
         // to subjects admitted within one expiration window.
         let now = SystemTime::now();
-        self.admitted.retain(|_, (_, expiry)| *expiry > now);
-        self.admitted
-            .insert(token.sub.clone(), (attrs.clone(), expires));
+        self.admitted.retain(|_, entry| entry.expires > now);
+        self.admitted.insert(
+            token.sub.clone(),
+            AdmittedEntry {
+                attrs: attrs.clone(),
+                expires,
+                auth_time: token.auth_time,
+                iat: token.iat,
+            },
+        );
         self.revision.store(next_revision(), Ordering::SeqCst);
         Ok(attrs)
     }
@@ -224,14 +257,13 @@ impl TrustedServiceInterface for OidcTrustedService {
             let Some(entry) = self.admitted.get(ident_value) else {
                 continue;
             };
-            let (attrs, expires) = entry.value();
-            if *expires <= now {
+            if entry.expires <= now {
                 drop(entry);
                 self.admitted
-                    .remove_if(ident_value, |_, (_, expiry)| *expiry <= now);
+                    .remove_if(ident_value, |_, entry| entry.expires <= now);
                 continue;
             }
-            for attr in attrs {
+            for attr in &entry.attrs {
                 match merged.get(attr.get_key()) {
                     None => {
                         merged.insert(attr.get_key().to_string(), attr.clone());
@@ -340,6 +372,7 @@ mod tests {
             email: email.map(str::to_string),
             hd: Some("example.com".to_string()),
             auth_time: SystemTime::now(),
+            iat: SystemTime::now(),
             raw_claims,
         }
     }
@@ -530,5 +563,51 @@ mod tests {
             "admission must sweep out expired records"
         );
         assert!(store.admitted.contains_key("s-new"));
+    }
+
+    /// T3 (zipline#42): the admitted cache entry carries the token's
+    /// `auth_time` and `iat` alongside the attributes and expiry, so R3
+    /// (re-admission on refresh) can read both dual-clock anchors.
+    #[tokio::test]
+    async fn test_admitted_entry_carries_auth_time_and_iat() {
+        let store = make_store(MAPPINGS).await;
+        let auth_time = SystemTime::now() - Duration::from_secs(3600);
+        let iat = SystemTime::now();
+        let expires = SystemTime::now() + Duration::from_secs(300);
+        let mut token = make_token("s-123", Some("jane@example.com"));
+        token.auth_time = auth_time;
+        token.iat = iat;
+        store.admit(&token, expires).unwrap();
+
+        let entry = store.admitted.get("s-123").expect("admitted entry");
+        assert_eq!(entry.expires, expires);
+        assert_eq!(entry.auth_time, auth_time);
+        assert_eq!(entry.iat, iat);
+        assert!(!entry.attrs.is_empty());
+    }
+
+    /// T3 (zipline#42): `session_ceiling` is `auth_time + max_auth_age_seconds`
+    /// and `None` when the knob is 0 (no ceiling: the session may renew
+    /// forever).
+    #[tokio::test]
+    async fn test_session_ceiling_from_max_auth_age() {
+        // Fixture config has max_auth_age_seconds = 0: no ceiling.
+        let store = make_store(MAPPINGS).await;
+        let auth_time = SystemTime::now();
+        assert_eq!(store.session_ceiling(auth_time), None);
+
+        // With the knob set, the ceiling is auth_time + max_auth_age.
+        let mut record = make_record(MAPPINGS);
+        record.oidc.as_mut().unwrap().max_auth_age_seconds = 7200;
+        let keys = Arc::new(
+            KeySource::from_policy(record.oidc.as_ref().unwrap(), static_proxy(None))
+                .await
+                .unwrap(),
+        );
+        let store = OidcTrustedService::new(&record, keys).unwrap();
+        assert_eq!(
+            store.session_ceiling(auth_time),
+            Some(auth_time + Duration::from_secs(7200))
+        );
     }
 }

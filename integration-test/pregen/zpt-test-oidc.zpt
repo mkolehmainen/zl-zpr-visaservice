@@ -37,3 +37,9 @@ eval TCP devonly > webby.80 [S]
 eval TCP devonly > devy.80 [S]
 # eval 5: both matches the device rule AND the bare users rule.
 eval TCP both > devy.80 [S]
+
+# APPROVE_CONNECTION 4 (zipline#42): expiry pass-through. The VS stamps the
+# dual-clock min onto user.zpr.authority upstream; zpt cannot run token
+# validation, so this pins that an authenticated claim's explicit expiry
+# (`@<epoch-secs>`) survives approve_connection unchanged onto the actor.
+connect --ac user.oidc-subject:s-123 --ac user.zpr.authority:google@1893456000 --ac user.domain:example.com

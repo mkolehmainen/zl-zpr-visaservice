@@ -639,6 +639,33 @@ mod test {
         }
     }
 
+    // zipline#42: `--ac key:value@<epoch-secs>` pins the claim's expiry so an
+    // integration test can assert pass-through of an explicit expiration. The
+    // suffix must be all digits after the LAST '@' — a value that itself
+    // contains '@' (an email) keeps working.
+    #[test]
+    fn test_parses_connect_claim_with_expiry() {
+        let ins =
+            parse("connect --ac user.zpr.authority:google@1893456000 --ac email:jane@example.com")
+                .unwrap();
+        match ins {
+            Instruction::Connect { authd_claims, .. } => {
+                let ac = authd_claims.expect("expected authenticated claims");
+                assert_eq!(ac[0].get_key(), "user.zpr.authority");
+                assert_eq!(ac[0].get_value(), &["google"]);
+                assert_eq!(
+                    ac[0].get_expires(),
+                    std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_893_456_000)
+                );
+                // no digit suffix after the last '@': the '@' stays in the value
+                assert_eq!(ac[1].get_key(), "email");
+                assert_eq!(ac[1].get_value(), &["jane@example.com"]);
+            }
+            _ => panic!("expected Connect instruction"),
+        }
+    }
+
     #[test]
     fn test_parse_tcp_expr() {
         let ins = parse("eval tcp alice.1234 > bob.80 [S.]").unwrap();
