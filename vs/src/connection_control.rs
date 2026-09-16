@@ -2926,6 +2926,31 @@ mod tests {
         );
     }
 
+    /// zipline#42 review (PR #18): expiry derivation must be total — no
+    /// representable `iat` may panic the `iat + lifetime` sum. Overflow
+    /// saturates conservatively (never past the ceiling when one exists).
+    #[test]
+    fn test_compute_authority_expiry_never_panics_on_extreme_iat() {
+        // The latest representable SystemTime on this platform, by descent.
+        let mut far = SystemTime::UNIX_EPOCH;
+        let mut step = Duration::from_secs(u64::MAX);
+        while step > Duration::ZERO {
+            match far.checked_add(step) {
+                Some(next) => far = next,
+                None => step /= 2,
+            }
+        }
+        let lifetime = Duration::from_secs(u64::MAX);
+
+        // No ceiling: saturates instead of panicking.
+        let e = compute_authority_expiry(far, None, lifetime);
+        assert!(e >= far, "saturation must never move the expiry before iat");
+
+        // With a ceiling, the ceiling still caps the saturated window.
+        let ceiling = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        assert_eq!(compute_authority_expiry(far, Some(ceiling), lifetime), ceiling);
+    }
+
     /// T4 (zipline#42): `user.zpr.authority` expires at the dual-clock min.
     /// With `max_auth_age_seconds = 0` (no ceiling) and an `auth_time` an hour
     /// old, the expiry anchors on the fresh `iat` — a renewable session gets a

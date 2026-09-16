@@ -609,4 +609,63 @@ mod tests {
             Some(auth_time + Duration::from_secs(7200))
         );
     }
+
+    /// zipline#42 review (PR #18): validation accepts an `auth_time` up to
+    /// `max_auth_age + clock_skew` old (C2 skew leeway), so the ceiling must
+    /// carry the same allowance — an accepted token must never be stamped an
+    /// already-expired `user.zpr.authority`. The worst accepted case
+    /// (`auth_time` exactly `max_auth_age + clock_skew` old) yields a ceiling
+    /// that is not in the past.
+    #[tokio::test]
+    async fn test_session_ceiling_covers_accepted_skew() {
+        let mut record = make_record(MAPPINGS);
+        record.oidc.as_mut().unwrap().max_auth_age_seconds = 7200;
+        let keys = Arc::new(
+            KeySource::from_policy(record.oidc.as_ref().unwrap(), static_proxy(None))
+                .await
+                .unwrap(),
+        );
+        let store = OidcTrustedService::new(&record, keys).unwrap();
+        let skew = IdpParams::default_clock_skew();
+
+        let now = SystemTime::now();
+        let auth_time = now - (Duration::from_secs(7200) + skew);
+        let ceiling = store
+            .session_ceiling(auth_time)
+            .expect("knob set: there must be a ceiling");
+        assert!(
+            ceiling >= now,
+            "an auth_time validation accepts must never yield an already-expired ceiling"
+        );
+        // Symmetric with acceptance: the ceiling is extended by the same
+        // clock_skew used to accept, no more.
+        assert_eq!(ceiling, auth_time + Duration::from_secs(7200) + skew);
+    }
+
+    /// zipline#42 review (PR #18): the ceiling addition must be total — an
+    /// extreme but representable `auth_time` must not panic the unchecked
+    /// `auth_time + max_auth_age` sum. An unrepresentably far ceiling bounds
+    /// nothing, which is exactly what `None` (no ceiling) means.
+    #[tokio::test]
+    async fn test_session_ceiling_overflow_is_no_ceiling() {
+        let mut record = make_record(MAPPINGS);
+        record.oidc.as_mut().unwrap().max_auth_age_seconds = 7200;
+        let keys = Arc::new(
+            KeySource::from_policy(record.oidc.as_ref().unwrap(), static_proxy(None))
+                .await
+                .unwrap(),
+        );
+        let store = OidcTrustedService::new(&record, keys).unwrap();
+
+        // The latest representable SystemTime on this platform, by descent.
+        let mut far = SystemTime::UNIX_EPOCH;
+        let mut step = Duration::from_secs(u64::MAX);
+        while step > Duration::ZERO {
+            match far.checked_add(step) {
+                Some(next) => far = next,
+                None => step /= 2,
+            }
+        }
+        assert_eq!(store.session_ceiling(far), None);
+    }
 }

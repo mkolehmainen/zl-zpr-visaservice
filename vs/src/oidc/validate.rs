@@ -656,6 +656,62 @@ mod tests {
         let _ = validate(c2).unwrap_err();
     }
 
+    // zipline#42 review (PR #18): `jsonwebtoken` does not temporally validate
+    // `iat`, so a correctly signed token minted "in the future" (provider
+    // clock skew or misconfiguration) would otherwise have its entire clock
+    // error stamped into the credential lifetime (the connect path derives
+    // `iat + expiration_seconds`). Beyond the shared clock-skew leeway a
+    // future `iat` is rejected; within it, accepted.
+    #[test]
+    fn future_iat_beyond_skew_rejected() {
+        let now_s = now_secs();
+        // Whole-second "now" so boundary comparisons are exact.
+        let now = UNIX_EPOCH + Duration::from_secs(now_s);
+        let skew = IdpParams::default_clock_skew().as_secs();
+        let allowed = vec!["example.com".to_string()];
+
+        // Just beyond the leeway: rejected, claim name only (never the value).
+        let mut c = base_claims();
+        c["iat"] = json!(now_s + skew + 61);
+        let err =
+            validate_id_token(&sign(c), &test_jwks(), &params(&allowed), NONCE, now).unwrap_err();
+        assert!(matches!(err, OidcError::Rejected(_)), "{err}");
+
+        // Within the leeway: accepted — provider clocks legitimately drift,
+        // and this is the same allowance `exp` and `max_auth_age` get.
+        let mut c2 = base_claims();
+        c2["iat"] = json!(now_s + skew - 60);
+        let tok =
+            validate_id_token(&sign(c2), &test_jwks(), &params(&allowed), NONCE, now).unwrap();
+        assert_eq!(tok.iat, UNIX_EPOCH + Duration::from_secs(now_s + skew - 60));
+    }
+
+    // zipline#42 review (PR #18) guard: fixing the skewed-ceiling finding must
+    // not widen acceptance — an auth_time older than max_auth_age + clock_skew
+    // is still rejected, right at the boundary.
+    #[test]
+    fn auth_time_just_beyond_skew_leeway_still_rejected() {
+        let now_s = now_secs();
+        // Whole-second "now" so boundary comparisons are exact.
+        let now = UNIX_EPOCH + Duration::from_secs(now_s);
+        let skew = IdpParams::default_clock_skew().as_secs();
+        let allowed = vec!["example.com".to_string()];
+        let mut p = params(&allowed);
+        p.max_auth_age = Some(Duration::from_secs(7200));
+
+        // One past the leeway window: rejected.
+        let mut c = base_claims();
+        c["auth_time"] = json!(now_s - 7200 - skew - 1);
+        let err = validate_id_token(&sign(c), &test_jwks(), &p, NONCE, now).unwrap_err();
+        assert!(matches!(err, OidcError::Rejected(_)), "{err}");
+
+        // Exactly at the leeway boundary: still accepted (skew allowance).
+        let mut c2 = base_claims();
+        c2["auth_time"] = json!(now_s - 7200 - skew);
+        validate_id_token(&sign(c2), &test_jwks(), &p, NONCE, now)
+            .expect("auth_time exactly max_auth_age + clock_skew old is accepted");
+    }
+
     // empty key set -> NoKeys (not a table row; completes the error taxonomy)
     #[test]
     fn empty_jwks_is_no_keys() {
