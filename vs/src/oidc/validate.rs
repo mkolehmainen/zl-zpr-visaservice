@@ -24,6 +24,11 @@ pub struct IdpParams<'a> {
     /// Maximum acceptable age of the authentication event (`auth_time`).
     /// `None` = no freshness requirement.
     pub max_auth_age: Option<Duration>,
+    /// Whether this provider issues refresh tokens (`allow_offline_access`).
+    /// A refreshable session is renewable, so the fixed session ceiling must
+    /// anchor on a provider-asserted `auth_time`: the `auth_time -> iat`
+    /// fallback closes for these providers (zipline#42).
+    pub allow_offline_access: bool,
     /// Leeway for clock comparisons; use `config::MAX_CLOCK_SKEW_SECS`.
     pub clock_skew: Duration,
 }
@@ -45,8 +50,14 @@ pub struct ValidatedToken {
     pub email: Option<String>,
     /// Google Workspace hosted domain, when present.
     pub hd: Option<String>,
-    /// The `auth_time` claim, else `iat`.
+    /// The `auth_time` claim; `iat` when absent and the provider has no
+    /// offline access (a renewable session requires a real `auth_time`).
+    /// Anchors the fixed session ceiling of the dual-clock credential
+    /// lifetime (zipline#42).
     pub auth_time: SystemTime,
+    /// The `iat` claim: when this token was minted. Anchors the renewal
+    /// window of the dual-clock credential lifetime (zipline#42).
+    pub iat: SystemTime,
     /// The full validated claim set, for `returns_attributes` mapping (C4).
     pub raw_claims: serde_json::Map<String, serde_json::Value>,
 }
@@ -71,9 +82,9 @@ pub enum OidcError {
 
 /// Validate `id_token` against `keys` (a JWKS) and `params`, requiring
 /// `expected_nonce`. Allowlist: RS256 only. Rejects `alg: none`, HS*, ES*,
-/// PS*. `now` governs the `auth_time` freshness check; `exp`/`iat` are
-/// checked by the JWT library against the real clock with
-/// `params.clock_skew` leeway.
+/// PS*. `now` governs the `auth_time` freshness check and the future-`iat`
+/// rejection; `exp` is checked by the JWT library against the real clock
+/// with `params.clock_skew` leeway.
 pub fn validate_id_token(
     id_token: &str,
     keys: &jwt::jwk::JwkSet,
@@ -181,12 +192,27 @@ pub fn validate_id_token(
         None
     };
 
-    // Authentication moment: `auth_time` when present, else `iat`.
-    let auth_time_secs = claims
-        .get("auth_time")
+    // Token mint moment: `iat` is always required (the JWT profile mandates
+    // it, and it anchors the renewal window of the dual-clock lifetime).
+    let iat_secs = claims
+        .get("iat")
         .and_then(|v| v.as_u64())
-        .or_else(|| claims.get("iat").and_then(|v| v.as_u64()))
-        .ok_or_else(|| OidcError::Signature("neither auth_time nor iat present".to_string()))?;
+        .ok_or_else(|| OidcError::Signature("iat claim missing or not a number".to_string()))?;
+    // Authentication moment: `auth_time` when present. The `iat` fallback is
+    // only sound for providers WITHOUT offline access: their session cannot
+    // renew, so the first token's mint moment approximates the login. A
+    // provider issuing refresh tokens renews `iat` on every refresh, which
+    // would let the session ceiling creep forever — those must assert a real
+    // `auth_time` (zipline#42).
+    let auth_time_secs = match claims.get("auth_time").and_then(|v| v.as_u64()) {
+        Some(secs) => secs,
+        None if !params.allow_offline_access => iat_secs,
+        None => {
+            return Err(OidcError::Rejected(
+                "auth_time required for a renewable session".to_string(),
+            ));
+        }
+    };
     // Checked: a huge value (e.g. u64::MAX) is unrepresentable as SystemTime
     // and would panic on `UNIX_EPOCH + Duration`. Such a token is nonsense —
     // reject it like any other bad `auth_time`.
@@ -195,6 +221,27 @@ pub fn validate_id_token(
         .ok_or_else(|| {
             OidcError::Rejected("auth_time/iat out of representable range".to_string())
         })?;
+    let iat = UNIX_EPOCH
+        .checked_add(Duration::from_secs(iat_secs))
+        .ok_or_else(|| {
+            OidcError::Rejected("auth_time/iat out of representable range".to_string())
+        })?;
+
+    // A future `iat` is a provider clock error (PR #18 review): the JWT
+    // library does not temporally validate `iat`, and the connect path
+    // derives the credential expiry from it — accepting would extend the
+    // credential by the entire clock error. The allowance is the same
+    // `clock_skew` leeway `exp` and `max_auth_age` get. `duration_since`
+    // keeps the comparison total: Ok(ahead) only when `iat` is ahead of
+    // `now`, no arithmetic that can overflow.
+    if iat
+        .duration_since(now)
+        .is_ok_and(|ahead| ahead > params.clock_skew)
+    {
+        return Err(OidcError::Rejected(
+            "iat is in the future beyond clock-skew leeway".to_string(),
+        ));
+    }
 
     // Freshness: the authentication event must be recent enough when policy
     // demands it (`max_auth_age_seconds`), with clock-skew leeway.
@@ -214,6 +261,7 @@ pub fn validate_id_token(
         email,
         hd,
         auth_time,
+        iat,
         raw_claims: claims,
     })
 }
@@ -318,6 +366,7 @@ mod tests {
             client_id: CLIENT_ID,
             allowed_domains: allowed,
             max_auth_age: None,
+            allow_offline_access: false,
             clock_skew: IdpParams::default_clock_skew(),
         }
     }
@@ -536,7 +585,7 @@ mod tests {
         assert_eq!(tok.hd, None);
     }
 
-    // no auth_time -> auth_time == iat
+    // no auth_time -> auth_time == iat (providers WITHOUT offline access only)
     #[test]
     fn auth_time_falls_back_to_iat() {
         let iat = now_secs();
@@ -551,6 +600,58 @@ mod tests {
         c2["auth_time"] = json!(iat - 100);
         let tok2 = validate(c2).unwrap();
         assert_eq!(tok2.auth_time, UNIX_EPOCH + Duration::from_secs(iat - 100));
+    }
+
+    // T1(c) (zipline#42): a provider with offline access issues refresh
+    // tokens, so its session is renewable and the fixed session ceiling must
+    // anchor on a provider-asserted `auth_time` — the iat fallback closes.
+    #[test]
+    fn offline_access_without_auth_time_rejected() {
+        let c = base_claims(); // no auth_time
+        let allowed = vec!["example.com".to_string()];
+        let mut p = params(&allowed);
+        p.allow_offline_access = true;
+        let err =
+            validate_id_token(&sign(c), &test_jwks(), &p, NONCE, SystemTime::now()).unwrap_err();
+        assert!(
+            matches!(err, OidcError::Rejected(ref msg)
+                if msg == "auth_time required for a renewable session"),
+            "expected the exact renewable-session rejection, got: {err}"
+        );
+    }
+
+    // T1(c) counterpart: with offline access, a token that DOES carry
+    // auth_time still validates.
+    #[test]
+    fn offline_access_with_auth_time_accepted() {
+        let at = now_secs() - 100;
+        let mut c = base_claims();
+        c["auth_time"] = json!(at);
+        let allowed = vec!["example.com".to_string()];
+        let mut p = params(&allowed);
+        p.allow_offline_access = true;
+        let tok = validate_id_token(&sign(c), &test_jwks(), &p, NONCE, SystemTime::now()).unwrap();
+        assert_eq!(tok.auth_time, UNIX_EPOCH + Duration::from_secs(at));
+    }
+
+    // T1 (zipline#42): `iat` lands in ValidatedToken.iat, and `auth_time`,
+    // when present, still wins for `.auth_time` while `.iat` stays the iat.
+    #[test]
+    fn iat_is_kept_alongside_auth_time() {
+        let iat = now_secs();
+        let mut c = base_claims();
+        c["iat"] = json!(iat);
+        c["auth_time"] = json!(iat - 3600);
+        let tok = validate(c).unwrap();
+        assert_eq!(tok.iat, UNIX_EPOCH + Duration::from_secs(iat));
+        assert_eq!(tok.auth_time, UNIX_EPOCH + Duration::from_secs(iat - 3600));
+
+        // without auth_time (and no offline access) both anchor on iat
+        let mut c2 = base_claims();
+        c2["iat"] = json!(iat);
+        let tok2 = validate(c2).unwrap();
+        assert_eq!(tok2.iat, UNIX_EPOCH + Duration::from_secs(iat));
+        assert_eq!(tok2.auth_time, tok2.iat);
     }
 
     // auth_time near u64::MAX -> Rejected, never a panic on
@@ -569,6 +670,62 @@ mod tests {
         // a u64::MAX iat also fails the library's iat sanity; either way it
         // must be an error, not a panic
         let _ = validate(c2).unwrap_err();
+    }
+
+    // zipline#42 review (PR #18): `jsonwebtoken` does not temporally validate
+    // `iat`, so a correctly signed token minted "in the future" (provider
+    // clock skew or misconfiguration) would otherwise have its entire clock
+    // error stamped into the credential lifetime (the connect path derives
+    // `iat + expiration_seconds`). Beyond the shared clock-skew leeway a
+    // future `iat` is rejected; within it, accepted.
+    #[test]
+    fn future_iat_beyond_skew_rejected() {
+        let now_s = now_secs();
+        // Whole-second "now" so boundary comparisons are exact.
+        let now = UNIX_EPOCH + Duration::from_secs(now_s);
+        let skew = IdpParams::default_clock_skew().as_secs();
+        let allowed = vec!["example.com".to_string()];
+
+        // Just beyond the leeway: rejected, claim name only (never the value).
+        let mut c = base_claims();
+        c["iat"] = json!(now_s + skew + 61);
+        let err =
+            validate_id_token(&sign(c), &test_jwks(), &params(&allowed), NONCE, now).unwrap_err();
+        assert!(matches!(err, OidcError::Rejected(_)), "{err}");
+
+        // Within the leeway: accepted — provider clocks legitimately drift,
+        // and this is the same allowance `exp` and `max_auth_age` get.
+        let mut c2 = base_claims();
+        c2["iat"] = json!(now_s + skew - 60);
+        let tok =
+            validate_id_token(&sign(c2), &test_jwks(), &params(&allowed), NONCE, now).unwrap();
+        assert_eq!(tok.iat, UNIX_EPOCH + Duration::from_secs(now_s + skew - 60));
+    }
+
+    // zipline#42 review (PR #18) guard: fixing the skewed-ceiling finding must
+    // not widen acceptance — an auth_time older than max_auth_age + clock_skew
+    // is still rejected, right at the boundary.
+    #[test]
+    fn auth_time_just_beyond_skew_leeway_still_rejected() {
+        let now_s = now_secs();
+        // Whole-second "now" so boundary comparisons are exact.
+        let now = UNIX_EPOCH + Duration::from_secs(now_s);
+        let skew = IdpParams::default_clock_skew().as_secs();
+        let allowed = vec!["example.com".to_string()];
+        let mut p = params(&allowed);
+        p.max_auth_age = Some(Duration::from_secs(7200));
+
+        // One past the leeway window: rejected.
+        let mut c = base_claims();
+        c["auth_time"] = json!(now_s - 7200 - skew - 1);
+        let err = validate_id_token(&sign(c), &test_jwks(), &p, NONCE, now).unwrap_err();
+        assert!(matches!(err, OidcError::Rejected(_)), "{err}");
+
+        // Exactly at the leeway boundary: still accepted (skew allowance).
+        let mut c2 = base_claims();
+        c2["auth_time"] = json!(now_s - 7200 - skew);
+        validate_id_token(&sign(c2), &test_jwks(), &p, NONCE, now)
+            .expect("auth_time exactly max_auth_age + clock_skew old is accepted");
     }
 
     // empty key set -> NoKeys (not a table row; completes the error taxonomy)

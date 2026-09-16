@@ -133,6 +133,11 @@ pub fn split_values(value: &str) -> Vec<String> {
 //     `--ac` for an authentication claim
 //     `--uc` for an unauthenticated claim
 //
+//   An `--ac` claim may pin an explicit expiry with a `@<epoch-secs>` suffix
+//   (zipline#42), e.g. `--ac user.zpr.authority:google@1893456000`. The
+//   suffix counts only when everything after the LAST '@' is digits, so a
+//   value containing '@' (an email) is untouched.
+//
 fn parse_connect_expr(expr: String) -> Result<Instruction, ParseError> {
     let mut authd_claims = Vec::new();
     let mut unauthd_claims = Vec::new();
@@ -158,14 +163,22 @@ fn parse_connect_expr(expr: String) -> Result<Instruction, ParseError> {
             claim_kv.push(' ');
             claim_kv.push_str(more);
         }
-        let (key, value) = parse_key_value(claim_kv)?;
-        let values = split_values(&value);
 
         match claim_type {
             "--ac" => {
-                authd_claims.push(Attribute::builder(key).values(values));
+                let (claim_kv, expires) = split_claim_expiry(claim_kv);
+                let (key, value) = parse_key_value(claim_kv)?;
+                let values = split_values(&value);
+                let builder = Attribute::builder(key);
+                let attr = match expires {
+                    Some(at) => builder.expires(at).values(values),
+                    None => builder.values(values),
+                };
+                authd_claims.push(attr);
             }
             "--uc" => {
+                let (key, value) = parse_key_value(claim_kv)?;
+                let values = split_values(&value);
                 unauthd_claims.push(Attribute::builder(key).values(values));
             }
             _ => {
@@ -188,6 +201,25 @@ fn parse_connect_expr(expr: String) -> Result<Instruction, ParseError> {
             Some(unauthd_claims)
         },
     })
+}
+
+/// Split a trailing `@<epoch-secs>` expiry off a claim expression
+/// (zipline#42). The suffix counts only when the text after the LAST '@' is
+/// one or more digits that parse as u64 — anything else (an email value, no
+/// '@' at all) leaves the expression unchanged.
+fn split_claim_expiry(claim_kv: String) -> (String, Option<std::time::SystemTime>) {
+    if let Some(at_pos) = claim_kv.rfind('@') {
+        let suffix = &claim_kv[at_pos + 1..];
+        if !suffix.is_empty()
+            && suffix.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(secs) = suffix.parse::<u64>()
+            && let Some(expires) =
+                std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
+        {
+            return (claim_kv[..at_pos].to_string(), Some(expires));
+        }
+    }
+    (claim_kv, None)
 }
 
 // format is:
@@ -634,6 +666,33 @@ mod test {
                 let uc = unauthd_claims.expect("expected unauthenticated claims");
                 assert_eq!(uc[0].get_key(), "colors");
                 assert_eq!(uc[0].get_value(), &["red", "blue"]);
+            }
+            _ => panic!("expected Connect instruction"),
+        }
+    }
+
+    // zipline#42: `--ac key:value@<epoch-secs>` pins the claim's expiry so an
+    // integration test can assert pass-through of an explicit expiration. The
+    // suffix must be all digits after the LAST '@' — a value that itself
+    // contains '@' (an email) keeps working.
+    #[test]
+    fn test_parses_connect_claim_with_expiry() {
+        let ins =
+            parse("connect --ac user.zpr.authority:google@1893456000 --ac email:jane@example.com")
+                .unwrap();
+        match ins {
+            Instruction::Connect { authd_claims, .. } => {
+                let ac = authd_claims.expect("expected authenticated claims");
+                assert_eq!(ac[0].get_key(), "user.zpr.authority");
+                assert_eq!(ac[0].get_value(), &["google"]);
+                assert_eq!(
+                    ac[0].get_expires(),
+                    std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_893_456_000)
+                );
+                // no digit suffix after the last '@': the '@' stays in the value
+                assert_eq!(ac[1].get_key(), "email");
+                assert_eq!(ac[1].get_value(), &["jane@example.com"]);
             }
             _ => panic!("expected Connect instruction"),
         }

@@ -80,4 +80,12 @@ jq -e '.kind == "EVAL" and .decision == "ALLOW"
     >/dev/null <<<"$(line 11)"
 echo "TEST OK"
 
+echo "TESTING EXPLICIT CLAIM EXPIRY PASSES THROUGH TO THE ACTOR (zipline#42)"
+jq -e \
+    '.kind == "APPROVE_CONNECTION"
+     and .actor.attrs["user.zpr.authority"].value == ["google"]
+     and .actor.attrs["user.zpr.authority"].expires_at.secs_since_epoch == 1893456000' \
+    >/dev/null <<<"$(line 12)"
+echo "TEST OK"
+
 echo "OK"
