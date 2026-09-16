@@ -2951,7 +2951,10 @@ mod tests {
 
         // With a ceiling, the ceiling still caps the saturated window.
         let ceiling = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-        assert_eq!(compute_authority_expiry(far, Some(ceiling), lifetime), ceiling);
+        assert_eq!(
+            compute_authority_expiry(far, Some(ceiling), lifetime),
+            ceiling
+        );
     }
 
     /// T4 (zipline#42): `user.zpr.authority` expires at the dual-clock min.
