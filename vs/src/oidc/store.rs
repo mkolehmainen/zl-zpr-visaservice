@@ -104,12 +104,26 @@ impl OidcTrustedService {
     }
 
     /// The fixed session ceiling for a login whose authentication moment is
-    /// `auth_time`: `auth_time + max_auth_age_seconds`. `None` when the knob
-    /// is 0 (no ceiling — the session may renew forever). Zipline#42.
+    /// `auth_time`: `auth_time + max_auth_age_seconds + clock_skew`. `None`
+    /// when the knob is 0 (no ceiling — the session may renew forever).
+    /// Zipline#42.
+    ///
+    /// The `clock_skew` term is symmetric with acceptance (PR #18 review):
+    /// C2 validation accepts an `auth_time` up to `max_auth_age + clock_skew`
+    /// old, so without it the skew window would admit tokens whose ceiling is
+    /// already in the past — a successful connect carrying an expired
+    /// `user.zpr.authority` that policy then immediately denies. The addition
+    /// is checked: an unrepresentably far ceiling bounds nothing, which is
+    /// exactly what `None` means (and only a nonsense `auth_time` gets there).
     #[allow(dead_code)] // consumed by the C5 connect path
     pub fn session_ceiling(&self, auth_time: SystemTime) -> Option<SystemTime> {
-        (self.cfg.max_auth_age_seconds > 0)
-            .then(|| auth_time + Duration::from_secs(self.cfg.max_auth_age_seconds as u64))
+        if self.cfg.max_auth_age_seconds == 0 {
+            return None;
+        }
+        auth_time.checked_add(
+            Duration::from_secs(self.cfg.max_auth_age_seconds as u64)
+                + IdpParams::default_clock_skew(),
+        )
     }
 
     /// This provider's cached signing keys.
@@ -585,9 +599,9 @@ mod tests {
         assert!(!entry.attrs.is_empty());
     }
 
-    /// T3 (zipline#42): `session_ceiling` is `auth_time + max_auth_age_seconds`
-    /// and `None` when the knob is 0 (no ceiling: the session may renew
-    /// forever).
+    /// T3 (zipline#42): `session_ceiling` is `auth_time + max_auth_age_seconds
+    /// + clock_skew` (the skew term mirrors C2 acceptance, PR #18 review) and
+    /// `None` when the knob is 0 (no ceiling: the session may renew forever).
     #[tokio::test]
     async fn test_session_ceiling_from_max_auth_age() {
         // Fixture config has max_auth_age_seconds = 0: no ceiling.
@@ -595,7 +609,7 @@ mod tests {
         let auth_time = SystemTime::now();
         assert_eq!(store.session_ceiling(auth_time), None);
 
-        // With the knob set, the ceiling is auth_time + max_auth_age.
+        // With the knob set, the ceiling is auth_time + max_auth_age + skew.
         let mut record = make_record(MAPPINGS);
         record.oidc.as_mut().unwrap().max_auth_age_seconds = 7200;
         let keys = Arc::new(
@@ -606,7 +620,7 @@ mod tests {
         let store = OidcTrustedService::new(&record, keys).unwrap();
         assert_eq!(
             store.session_ceiling(auth_time),
-            Some(auth_time + Duration::from_secs(7200))
+            Some(auth_time + Duration::from_secs(7200) + IdpParams::default_clock_skew())
         );
     }
 

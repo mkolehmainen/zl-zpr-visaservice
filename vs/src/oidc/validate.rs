@@ -82,9 +82,9 @@ pub enum OidcError {
 
 /// Validate `id_token` against `keys` (a JWKS) and `params`, requiring
 /// `expected_nonce`. Allowlist: RS256 only. Rejects `alg: none`, HS*, ES*,
-/// PS*. `now` governs the `auth_time` freshness check; `exp`/`iat` are
-/// checked by the JWT library against the real clock with
-/// `params.clock_skew` leeway.
+/// PS*. `now` governs the `auth_time` freshness check and the future-`iat`
+/// rejection; `exp` is checked by the JWT library against the real clock
+/// with `params.clock_skew` leeway.
 pub fn validate_id_token(
     id_token: &str,
     keys: &jwt::jwk::JwkSet,
@@ -226,6 +226,22 @@ pub fn validate_id_token(
         .ok_or_else(|| {
             OidcError::Rejected("auth_time/iat out of representable range".to_string())
         })?;
+
+    // A future `iat` is a provider clock error (PR #18 review): the JWT
+    // library does not temporally validate `iat`, and the connect path
+    // derives the credential expiry from it — accepting would extend the
+    // credential by the entire clock error. The allowance is the same
+    // `clock_skew` leeway `exp` and `max_auth_age` get. `duration_since`
+    // keeps the comparison total: Ok(ahead) only when `iat` is ahead of
+    // `now`, no arithmetic that can overflow.
+    if iat
+        .duration_since(now)
+        .is_ok_and(|ahead| ahead > params.clock_skew)
+    {
+        return Err(OidcError::Rejected(
+            "iat is in the future beyond clock-skew leeway".to_string(),
+        ));
+    }
 
     // Freshness: the authentication event must be recent enough when policy
     // demands it (`max_auth_age_seconds`), with clock-skew leeway.

@@ -85,7 +85,10 @@ pub(crate) fn compute_authority_expiry(
     session_ceiling: Option<SystemTime>,
     lifetime: Duration,
 ) -> SystemTime {
-    let renewal_expires = iat + lifetime;
+    // Total on any representable input (PR #18 review): an `iat + lifetime`
+    // sum past the representable range collapses to `iat` — fail closed (an
+    // immediately-expired credential for nonsense input), never a panic.
+    let renewal_expires = iat.checked_add(lifetime).unwrap_or(iat);
     match session_ceiling {
         Some(ceiling) => renewal_expires.min(ceiling),
         None => renewal_expires,
@@ -3018,13 +3021,16 @@ mod tests {
             .get_attribute(key::USER_AUTHORITY)
             .expect("user authority must be stamped")
             .get_expires();
-        let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(auth_time + 7200);
+        // The ceiling carries the acceptance clock-skew allowance (PR #18
+        // review): auth_time + max_auth_age + clock_skew.
+        let expected = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(auth_time + 7200 + crate::config::MAX_CLOCK_SKEW_SECS);
         let drift = expires
             .duration_since(expected)
             .unwrap_or_else(|e| e.duration());
         assert!(
             drift < Duration::from_secs(30),
-            "authority expiry must be capped at auth_time + max_auth_age (drift {}s)",
+            "authority expiry must be capped at auth_time + max_auth_age + clock_skew (drift {}s)",
             drift.as_secs()
         );
     }
