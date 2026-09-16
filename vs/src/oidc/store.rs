@@ -228,6 +228,18 @@ impl OidcTrustedService {
     pub(crate) fn mapped_sub_key(&self) -> Option<String> {
         self.mapper.map_attribute(SUB_CLAIM).map(|(key, _)| key)
     }
+
+    /// The recorded dual-clock anchors `(auth_time, iat)` of `sub`'s live
+    /// admission, or `None` when this store never admitted that subject (or
+    /// the record was swept). R3 (zipline#43) reads these on re-admission to
+    /// bind a refreshed token to the same login session: `auth_time` must be
+    /// unchanged and `iat` strictly greater. In-memory only — after a VS
+    /// restart there is no admission and reauth fails, so the node reconnects.
+    pub(crate) fn admitted_session(&self, sub: &str) -> Option<(SystemTime, SystemTime)> {
+        self.admitted
+            .get(sub)
+            .map(|entry| (entry.auth_time, entry.iat))
+    }
 }
 
 // `expiration_seconds` lives on the policy record, not `OidcConfig`, so the
@@ -597,6 +609,28 @@ mod tests {
         assert_eq!(entry.auth_time, auth_time);
         assert_eq!(entry.iat, iat);
         assert!(!entry.attrs.is_empty());
+    }
+
+    /// R3 (zipline#43): `admitted_session` exposes the recorded dual-clock
+    /// anchors `(auth_time, iat)` for an admitted subject, and `None` for a
+    /// subject this store never admitted.
+    #[tokio::test]
+    async fn test_admitted_session_returns_recorded_anchors() {
+        let store = make_store(MAPPINGS).await;
+        let auth_time = SystemTime::now() - Duration::from_secs(3600);
+        let iat = SystemTime::now();
+        let expires = SystemTime::now() + Duration::from_secs(300);
+        let mut token = make_token("s-123", Some("jane@example.com"));
+        token.auth_time = auth_time;
+        token.iat = iat;
+        store.admit(&token, expires).unwrap();
+
+        assert_eq!(store.admitted_session("s-123"), Some((auth_time, iat)));
+        assert_eq!(
+            store.admitted_session("s-never-admitted"),
+            None,
+            "an unknown subject has no recorded session"
+        );
     }
 
     /// T3 (zipline#42): `session_ceiling` is `auth_time + max_auth_age_seconds
