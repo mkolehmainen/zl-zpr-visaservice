@@ -15,8 +15,8 @@ use ::zpr::vsapi::v1 as vsapi;
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
 use zpr::vsapi_types::{
-    AuthBlob, ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, PublicKey,
-    SockAddr, VSConnectRequest, VisaOp, pname,
+    ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, PublicKey,
+    ReauthRequest, SockAddr, VSConnectRequest, VisaOp, pname,
 };
 use zpr::write_to::WriteTo;
 
@@ -1388,16 +1388,10 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "reauthorize from {:?}", self.node.get_cn());
 
-        // Parse the request inline with the existing vsapi_types conversions
-        // (a ReauthRequest wrapper in zl-zpr-common is zipline#48).
-        let req_rdr = params.get()?.get_req()?;
-        let zpr_addr = ipaddr_from_capnp(req_rdr.get_zpr_addr()?)?;
-        let mut blobs: Vec<AuthBlob> = Vec::new();
-        for blob_rdr in req_rdr.get_blobs()? {
-            blobs.push(AuthBlob::try_from(blob_rdr).map_err(|e| {
-                capnp::Error::failed(format!("failed to parse ReauthRequest blob: {}", e))
-            })?);
-        }
+        let req = ReauthRequest::try_from(params.get()?.get_req()?)
+            .map_err(|e| capnp::Error::failed(format!("failed to parse ReauthRequest: {}", e)))?;
+        let zpr_addr = req.zpr_addr;
+        let blobs = req.blobs;
 
         let connect_via = self.node.get_zpr_addr().unwrap();
         self.update_last_seen_time(connect_via).await;
