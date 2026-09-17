@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 use zpr::vsapi_types::PublicKey;
 
-use crate::counters::Counters;
+use crate::counters::{CounterType, Counters};
 use crate::db::{DbConnection, DbOp, KeyString, ZAddr, gen_timestamp};
 use crate::error::StoreError;
 use crate::logging::targets::DB;
@@ -417,8 +417,76 @@ impl ActorRepo {
         policy_service_names: &HashSet<String>,
         counters: &Counters,
     ) -> Result<(), StoreError> {
-        // TODO(zipline#53): implement the claim path.
-        let _ = (actor, policy_service_names, counters);
+        let Some(zpraddr) = actor.get_zpr_addr() else {
+            // Both callers require an address before reaching this point.
+            return Ok(());
+        };
+        let zpraddr_str = zpraddr.to_string();
+        let hostnames_key = actor_hostnames_key_for(zpraddr);
+        let base_key = actor_key_for(zpraddr);
+
+        // The names this actor may claim: validated values of the attribute,
+        // minus policy service names ("policy services win"). Invalid values
+        // are rejected and logged, never transformed.
+        let mut desired: Vec<&str> = Vec::new();
+        let mut conflicts: Vec<String> = Vec::new();
+        if let Some(attr) = actor.get_attribute(ATTR_DEVICE_HOSTNAME) {
+            for value in attr.get_value() {
+                if !is_valid_hostname_label(value) {
+                    error!(target: DB, "invalid {ATTR_DEVICE_HOSTNAME} value rejected (not a lowercase DNS label): actor={zpraddr} value={value:?}");
+                    continue;
+                }
+                if policy_service_names.contains(value.as_str()) {
+                    error!(target: DB, "{ATTR_DEVICE_HOSTNAME} claim rejected, name is a policy service: actor={zpraddr} name={value}");
+                    counters.incr(CounterType::HostnameClaimRejected);
+                    conflicts.push(value.clone());
+                    continue;
+                }
+                desired.push(value);
+            }
+        }
+
+        // Release names the actor stopped claiming — owner-checked, so a name
+        // lost to another actor is left alone. The set is rebuilt below from
+        // the claims that actually hold.
+        let existing: HashSet<String> = self.db.smembers(&hostnames_key).await?;
+        let dropped: Vec<&String> = existing
+            .iter()
+            .filter(|name| !desired.iter().any(|d| *d == name.as_str()))
+            .collect();
+        self.release_owned_host_entries(&zpraddr_str, dropped)
+            .await?;
+        self.db.del(&hostnames_key).await?;
+
+        // Claim each value independently: losing one never costs the others.
+        for name in desired {
+            let host_key = host_key_for(name);
+            let claimed = self.db.hset_nx(&host_key, "zpr_addr", &zpraddr_str).await?;
+            if claimed {
+                debug!(target: DB, "claimed hostname for actor: addr={zpraddr} name={name}");
+                self.db.sadd(&hostnames_key, name).await?;
+                continue;
+            }
+            // Not set by this call: the claim test is "unset, or already mine".
+            let owner: Option<String> = self.db.hget(&host_key, "zpr_addr").await?;
+            if owner.as_deref() == Some(zpraddr_str.as_str()) {
+                self.db.sadd(&hostnames_key, name).await?;
+            } else {
+                error!(target: DB, "{ATTR_DEVICE_HOSTNAME} claim rejected, name held by another actor: actor={zpraddr} name={name} holder={owner:?}");
+                counters.incr(CounterType::HostnameClaimRejected);
+                conflicts.push(name.to_string());
+            }
+        }
+
+        // Display data for #54: rewritten on every claim attempt, never an
+        // input to a decision.
+        self.db
+            .hset(
+                &base_key,
+                "hostname_conflicts",
+                &serde_json::to_string(&conflicts)?,
+            )
+            .await?;
         Ok(())
     }
 
