@@ -93,20 +93,31 @@ impl ActorRepo {
         Ok(())
     }
 
-    /// Delete each `service:<name>` key in `names` if and only if its `zpr_addr`
+    /// Release each `service:<name>` key in `names` if and only if its `zpr_addr`
     /// still points at `zpraddr_str`. Names re-claimed by another actor are left
     /// alone (the stale names may actually be valid names on new actors, so the
-    /// owner is checked before deleting). Shared by `clean_up` (actor departure)
-    /// and `try_update_actor` (re-auth / attribute refresh) so the two release
-    /// paths cannot drift apart again (zipline#51). Takes the names rather than
-    /// re-reading the actor's set so the hostname index (H1) can reuse it for
-    /// `host:<NAME>` entries.
+    /// owner is checked before touching the entry). Releasing an owned entry
+    /// promotes another live claimant when one exists (zipline#51 review: with
+    /// refreshes no longer clobbering their way to ownership, deleting the
+    /// owner's entry outright would orphan the name until a survivor's next
+    /// timed refresh) and deletes it only when nobody else claims the name.
+    /// Shared by `clean_up` (actor departure) and `try_update_actor` (re-auth /
+    /// attribute refresh) so the two release paths cannot drift apart again
+    /// (zipline#51). Takes the names rather than re-reading the actor's set so
+    /// the hostname index (H1) can reuse it for `host:<NAME>` entries.
     async fn release_owned_service_entries(
         &self,
         zpraddr_str: &str,
         names: impl IntoIterator<Item = &String>,
     ) -> Result<(), StoreError> {
-        let mut ops = Vec::new();
+        // The releasing actor must never be picked as its own successor; its
+        // services set may still exist at this point on both call paths.
+        let own_services_key = zpraddr_str
+            .parse::<IpAddr>()
+            .map(|addr| actor_services_key_for(&addr))
+            .map_err(|e| {
+                StoreError::InvalidData(format!("invalid ZPR address {zpraddr_str}: {e}"))
+            })?;
         for name in names {
             let svc_key = service_key_for(name);
             let actor_addr_str: Option<String> = self.db.hget(&svc_key, "zpr_addr").await?;
@@ -114,13 +125,65 @@ impl ActorRepo {
                 if actor_addr != zpraddr_str {
                     continue;
                 }
-                ops.push(DbOp::Del(svc_key));
+                match self
+                    .find_surviving_claimant(name, &own_services_key)
+                    .await?
+                {
+                    Some(claimant_addr) => {
+                        debug!(target: DB, "promoting surviving claimant for service: service={name} new_owner={claimant_addr}");
+                        self.db.hset(&svc_key, "zpr_addr", &claimant_addr).await?;
+                    }
+                    None => {
+                        self.db.del(&svc_key).await?;
+                    }
+                }
             }
         }
-        if !ops.is_empty() {
-            self.db.atomic_pipeline(&ops).await?;
-        }
         Ok(())
+    }
+
+    /// Find another live actor still claiming `service_name` in its private
+    /// `actor:<ZADDR>:services` set, skipping `excluded_services_key` (the
+    /// releasing actor's own set). An actor is live when its `actor:<ZADDR>`
+    /// base record still exists. Candidates are sorted by address string so
+    /// the promotion is deterministic. Returns the claimant's `zpr_addr`
+    /// value for the `service:<name>` entry.
+    async fn find_surviving_claimant(
+        &self,
+        service_name: &str,
+        excluded_services_key: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let keys = self
+            .db
+            .scan_match_all(format!("{KEY_ACTOR}:*:services"))
+            .await?;
+        let mut candidates = Vec::new();
+        for key in keys {
+            if key == excluded_services_key {
+                continue;
+            }
+            let Some(zaddr_enc) = key
+                .strip_prefix(&format!("{KEY_ACTOR}:"))
+                .and_then(|s| s.strip_suffix(":services"))
+            else {
+                continue;
+            };
+            if !self.db.sismember(&key, service_name).await? {
+                continue;
+            }
+            // Only a live actor is promotable: its base record must still exist
+            // (a departing actor's base key is deleted before its services set).
+            if !self.db.exists(&format!("{KEY_ACTOR}:{zaddr_enc}")).await? {
+                continue;
+            }
+            let Ok(addr) = IpAddr::try_from(ZAddr::new_from_encoded(zaddr_enc)) else {
+                warn!(target: DB, "unparseable ZPR address in services key, skipping claimant: {key}");
+                continue;
+            };
+            candidates.push(addr.to_string());
+        }
+        candidates.sort();
+        Ok(candidates.into_iter().next())
     }
 
     pub async fn add_actor(&self, actor: &Actor) -> Result<(), StoreError> {
@@ -228,11 +291,20 @@ impl ActorRepo {
         // actor:<ZADDR>:services -> SET[ <service_name> ]
         //
 
-        // Release entries this actor still owns; entries re-claimed by another
-        // actor are left alone (zipline#51 -- an unconditional delete here
-        // destroyed the other actor's live entry on re-auth/refresh).
+        // Release entries the actor stopped advertising and still owns; entries
+        // re-claimed by another actor are left alone (zipline#51 -- an
+        // unconditional delete here destroyed the other actor's live entry on
+        // re-auth/refresh). Only DROPPED names are released: releasing a name
+        // the actor still advertises would promote a co-claimant away from a
+        // perfectly live owner on every timed refresh. Owned entries the actor
+        // keeps advertising are re-asserted by the loop below.
         let existing_services: HashSet<String> = self.db.smembers(&services_key).await?;
-        self.release_owned_service_entries(&zpraddr_str, &existing_services)
+        let current_services: HashSet<String> = actor.services_iter().map(str::to_string).collect();
+        let dropped_services: Vec<&String> = existing_services
+            .iter()
+            .filter(|name| !current_services.contains(*name))
+            .collect();
+        self.release_owned_service_entries(&zpraddr_str, dropped_services)
             .await?;
         self.db.del(&services_key).await?;
 
@@ -997,6 +1069,72 @@ mod test {
         let services: HashSet<String> =
             db.smembers(&actor_services_key_for(&addr_a)).await.unwrap();
         assert!(!services.contains("web"));
+    }
+
+    /// zipline#51 review (Codex P1 on PR #23): when the owner of a shared
+    /// service departs, another live claimant must be promoted. A and B both
+    /// advertise "web"; B owns the live entry (last add wins); B disconnects.
+    /// `clean_up` deletes B's `service:web` key owner-checked, but with the
+    /// refresh no longer clobbering its way to ownership, nothing re-installs
+    /// A until A's next timed refresh -- the service resolves to `None` even
+    /// though A is connected and advertising it. The departure path must
+    /// promote a surviving claimant immediately.
+    #[tokio::test]
+    async fn test_clean_up_promotes_surviving_claimant() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+
+        let actor_a =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::a4", &["web"], "actor-a");
+        let actor_b =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::b4", &["web"], "actor-b");
+
+        repo.add_actor(&actor_a).await.unwrap();
+        // B's add overwrites `service:web` -- B owns the live entry.
+        repo.add_actor(&actor_b).await.unwrap();
+
+        // B departs.
+        let addr_b: IpAddr = "fd5a:5052::b4".parse().unwrap();
+        repo.rm_actor_by_zpr_addr(&addr_b).await.unwrap();
+
+        let addr_a: IpAddr = "fd5a:5052::a4".parse().unwrap();
+        assert_eq!(
+            repo.get_zpr_addr_for_service("web").await.unwrap(),
+            Some(addr_a),
+            "owner departure must promote the surviving claimant, not orphan the service"
+        );
+    }
+
+    /// Same promotion on the refresh path: the OWNER stops advertising a
+    /// service another live actor still claims. The refresh releases the
+    /// owner's `service:<name>` entry and must hand it to the surviving
+    /// claimant rather than leaving the name unresolvable until the
+    /// claimant's own next refresh.
+    #[tokio::test]
+    async fn test_update_actor_drop_promotes_other_claimant() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+
+        let actor_b =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::b5", &["web"], "actor-b");
+        let actor_a =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::a5", &["web"], "actor-a");
+
+        repo.add_actor(&actor_b).await.unwrap();
+        // A added last -- A owns the live entry, B still claims "web" in its set.
+        repo.add_actor(&actor_a).await.unwrap();
+
+        // A's refresh arrives no longer advertising "web".
+        let mut refreshed = actor_a;
+        refreshed.remove_attribute(key::SERVICES);
+        repo.update_actor(&refreshed).await.unwrap();
+
+        let addr_b: IpAddr = "fd5a:5052::b5".parse().unwrap();
+        assert_eq!(
+            repo.get_zpr_addr_for_service("web").await.unwrap(),
+            Some(addr_b),
+            "dropping an owned service must promote the surviving claimant"
+        );
     }
 
     // ------------------------------------------------------------------
