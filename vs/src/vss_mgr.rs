@@ -149,6 +149,14 @@ impl VssMgr {
         self.workers.get(naddr).map(|h| h.clone())
     }
 
+    /// Install a handle whose commands go to a test-owned channel instead of a real
+    /// VSS worker, so tests can answer `VssCmd`s directly (no capnp needed —
+    /// [VssHandle] is just an mpsc sender). Overwrites any existing handle.
+    #[cfg(test)]
+    pub fn insert_test_handle(&self, node_addr: IpAddr, cmd_tx: mpsc::Sender<VssCmd>) {
+        self.workers.insert(node_addr, VssHandle { cmd_tx });
+    }
+
     /// Housekeeping function to remove (presumably stale/not-running) worker.
     /// Called when the worker run loop exists.
     ///
@@ -191,7 +199,6 @@ impl VssHandle {
     }
 
     /// Revoke authorizations present on the node for the given zpr addresses.
-    #[allow(dead_code)]
     pub async fn revoke_auths(&self, addrs: Vec<IpAddr>) -> Result<usize, VssSyncError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VssCmd::RevokeAuthsByZprAddr(addrs, resp_tx);
