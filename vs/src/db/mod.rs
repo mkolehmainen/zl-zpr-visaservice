@@ -58,7 +58,9 @@ pub trait DbConnection: Send + Sync {
     async fn hget(&self, key: &str, field: &str) -> DbResult<Option<String>>;
     async fn hgetall(&self, key: String) -> DbResult<HashMap<String, String>>;
     async fn hset(&self, key: &str, field: &str, value: &str) -> DbResult<()>;
-    async fn hset_nx(&self, key: &str, field: &str, value: &str) -> DbResult<()>;
+    /// Sets `field` only if it is absent. Returns true when this call set it —
+    /// the atomic claim primitive for a uniquely-owned name.
+    async fn hset_nx(&self, key: &str, field: &str, value: &str) -> DbResult<bool>;
     async fn hset_multiple(&self, key: &str, field_values: &[(&str, &str)]) -> DbResult<()>;
     async fn sadd(&self, key: &str, member: &str) -> DbResult<()>;
     async fn incr(&self, key: &str, by: u64) -> DbResult<u64>;

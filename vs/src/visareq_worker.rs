@@ -804,8 +804,14 @@ mod tests {
         let source_actor =
             make_node_actor_defexp("fd5a:5052:3000::1", "source-node", "10.0.0.1:10001");
         let dest_actor = make_node_actor_defexp("fd5a:5052:3000::2", "dest-node", "10.0.0.2:10002");
-        asm.actor_mgr.add_node(&source_actor, false).await.unwrap();
-        asm.actor_mgr.add_node(&dest_actor, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&source_actor, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&dest_actor, false, &Default::default())
+            .await
+            .unwrap();
 
         let arena = tokio::spawn(launch_arena(asm.clone(), vreq_rx, 1));
 
@@ -1120,7 +1126,7 @@ mod tests {
             make_actor_with_services_defexp(ROLE_ADAPTER, dest_zpr, &["svc:auth"], "auth-svc");
         asm_inner
             .actor_mgr
-            .hack_add_adapter_no_node(&auth_actor)
+            .hack_add_adapter_no_node(&auth_actor, &Default::default())
             .await
             .unwrap();
         asm_inner
@@ -1183,7 +1189,7 @@ mod tests {
             make_actor_with_services_defexp(ROLE_ADAPTER, src_zpr, &["svc:auth"], "auth-svc");
         asm_inner
             .actor_mgr
-            .hack_add_adapter_no_node(&auth_actor)
+            .hack_add_adapter_no_node(&auth_actor, &Default::default())
             .await
             .unwrap();
         asm_inner
@@ -1233,8 +1239,14 @@ mod tests {
 
         let node_a = make_node_actor_defexp("fd5a:5052:3000::1", "node-a", "10.0.0.1:1001");
         let node_b = make_node_actor_defexp("fd5a:5052:3000::2", "node-b", "10.0.0.2:1002");
-        asm.actor_mgr.add_node(&node_a, false).await.unwrap();
-        asm.actor_mgr.add_node(&node_b, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&node_a, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&node_b, false, &Default::default())
+            .await
+            .unwrap();
         asm.topo_mgr.add_node(node_a_addr).unwrap();
         asm.topo_mgr.add_node(node_b_addr).unwrap();
 
@@ -1257,7 +1269,7 @@ mod tests {
             "auth-svc",
         );
         asm.actor_mgr
-            .add_adapter_via_node(&auth_adapter, &node_b_addr)
+            .add_adapter_via_node(&auth_adapter, &node_b_addr, &Default::default())
             .await
             .unwrap();
 

@@ -70,7 +70,9 @@ pub(crate) async fn refresh_and_persist_actor(
     let outcome =
         refresh_expired_attributes(&asm.ts_mgr, &policy.lookup_identity_keys(), actor).await;
     if outcome.changed {
-        asm.actor_mgr.update_actor(actor).await?;
+        asm.actor_mgr
+            .update_actor(actor, &asm.policy_service_names())
+            .await?;
     }
 
     // No ZPR address means refresh_expired_attributes did nothing at all (an actor

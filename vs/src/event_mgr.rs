@@ -475,6 +475,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -482,6 +483,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052::2", "node-b", "[fd5a:5052::102]:1234"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -507,6 +509,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -514,6 +517,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052::2", "node-b", "[fd5a:5052::102]:1234"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -549,7 +553,10 @@ mod tests {
                     .value("svc-x"),
             )
             .unwrap();
-        asm.actor_mgr.add_node(&good_actor, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&good_actor, false, &Default::default())
+            .await
+            .unwrap();
         // Node offering a service the policy does not allow → invalid → disconnected.
         let mut bad_actor =
             make_node_actor_defexp("fd5a:5052::2", "node-bad", "[fd5a:5052::102]:1234");
@@ -560,7 +567,10 @@ mod tests {
                     .value("svc-y"),
             )
             .unwrap();
-        asm.actor_mgr.add_node(&bad_actor, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&bad_actor, false, &Default::default())
+            .await
+            .unwrap();
 
         let psnap = asm.policy_mgr.get_current_snapshot();
         let node_addrs = asm.actor_mgr.list_node_addrs().await.unwrap();

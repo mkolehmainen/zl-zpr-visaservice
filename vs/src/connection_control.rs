@@ -1016,7 +1016,9 @@ impl ConnectionControl {
             ));
         }
 
-        asm.actor_mgr.update_actor(&renewed).await?;
+        asm.actor_mgr
+            .update_actor(&renewed, &asm.policy_service_names())
+            .await?;
 
         // The whole renewal succeeded: advance this session's anchors to the
         // fresh token (per actor session — PR #19 review). Recording only on
@@ -2562,9 +2564,12 @@ mod tests {
         let adapter_addr: IpAddr = "fd5a:5052::11".parse().unwrap();
         let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
         let adapter = make_adapter_actor_defexp("fd5a:5052::11", "adapter-1");
-        asm.actor_mgr.add_node(&node, false).await.unwrap();
         asm.actor_mgr
-            .add_adapter_via_node(&adapter, &node_addr)
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -3808,7 +3813,7 @@ mod tests {
             .await
             .expect("fixture connect must authorize");
         asm.actor_mgr
-            .add_adapter_via_node(&actor, &connect_via)
+            .add_adapter_via_node(&actor, &connect_via, &Default::default())
             .await
             .expect("fixture actor must persist");
         (asm, cc, actor, connect_via, iat1)
