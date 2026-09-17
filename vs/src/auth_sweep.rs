@@ -9,6 +9,8 @@
 //! tests. Node actors are out of scope (operator decision on zipline#44):
 //! expired nodes are culled at startup by `actor_mgr::refresh_state`.
 
+use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -31,12 +33,14 @@ pub(crate) struct SweepStats {
     pub deferred: usize,
 }
 
-/// One sweep pass over the connected adapters. For each adapter whose
-/// authentication expiration has passed: resolve its docking node, send a
-/// `revokeAuthentication` for its ZPR address over that node's VSS, and —
-/// **only on a positive ack** — log (with the gate: the credential that drove
-/// the expiry) and remove the actor from the store. A missing VSS handle, an
-/// error, or a timeout leaves the actor untouched for the next pass.
+/// One sweep pass over the connected adapters, in two phases. Phase 1 walks
+/// the adapters and collects every one whose authentication expiration has
+/// passed, grouped by docking node. Phase 2 sends **one batched**
+/// `revokeAuthentication` per docking node (PR #20 review: N expired adapters
+/// behind one unresponsive node cost the pass one RPC timeout, not N), and —
+/// **only on a positive ack** — logs (with the gate: the credential that drove
+/// the expiry) and removes the batch's actors from the store. A missing VSS
+/// handle, an error, or a timeout leaves the batch untouched for the next pass.
 pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
     let mut stats = SweepStats::default();
 
@@ -48,7 +52,16 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
         }
     };
 
+    /// An adapter phase 1 found expired: its snapshot expiry and the gate
+    /// (credential key) that drove it, for logging at removal time.
+    struct Expired {
+        addr: IpAddr,
+        gate: String,
+    }
+
+    // Phase 1: collect expired adapters per docking node.
     let now = SystemTime::now();
+    let mut by_node: BTreeMap<IpAddr, Vec<Expired>> = BTreeMap::new();
     for (addr, _cn) in entries {
         let actor = match asm.actor_mgr.get_actor_by_zpr_addr(&addr).await {
             Ok(Some(actor)) => actor,
@@ -73,29 +86,48 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
             stats.deferred += 1;
             continue;
         };
+        by_node
+            .entry(node_addr)
+            .or_default()
+            .push(Expired { addr, gate });
+    }
+
+    // Phase 2: one batched revoke per docking node; drop the batch's actors
+    // only on a positive ack, so a VSS outage leaves them for the next pass
+    // rather than half-removing them.
+    for (node_addr, expired) in by_node {
         let Some(vss_handle) = asm.vss_mgr.get_handle(&node_addr) else {
-            warn!(target: ACTOR, "auth sweep: no VSS handle for node {node_addr} (actor {addr}); deferring to next pass");
-            stats.deferred += 1;
+            warn!(
+                target: ACTOR,
+                "auth sweep: no VSS handle for node {node_addr} ({} expired actor(s)); deferring to next pass",
+                expired.len()
+            );
+            stats.deferred += expired.len();
             continue;
         };
 
-        // Revoke before drop; drop only on a positive ack, so a VSS outage
-        // leaves the actor for the next pass rather than half-removing it.
-        match vss_handle.revoke_auths(vec![addr]).await {
+        let addrs: Vec<IpAddr> = expired.iter().map(|e| e.addr).collect();
+        match vss_handle.revoke_auths(addrs).await {
             Ok(_processed) => {
-                info!(
-                    target: ACTOR,
-                    "authentication expired for actor {addr} (gate: {gate}); revoked on node {node_addr}, removing actor"
-                );
-                if let Err(e) = asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await {
-                    warn!(target: ACTOR, "auth sweep: revoked {addr} but failed to remove actor: {e}");
-                    continue;
+                for Expired { addr, gate } in expired {
+                    info!(
+                        target: ACTOR,
+                        "authentication expired for actor {addr} (gate: {gate}); revoked on node {node_addr}, removing actor"
+                    );
+                    if let Err(e) = asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await {
+                        warn!(target: ACTOR, "auth sweep: revoked {addr} but failed to remove actor: {e}");
+                        continue;
+                    }
+                    stats.revoked += 1;
                 }
-                stats.revoked += 1;
             }
             Err(e) => {
-                warn!(target: ACTOR, "auth sweep: failed to revoke auths for {addr} on node {node_addr}: {e}; deferring to next pass");
-                stats.deferred += 1;
+                warn!(
+                    target: ACTOR,
+                    "auth sweep: failed to revoke auths for {} actor(s) on node {node_addr}: {e}; deferring to next pass",
+                    expired.len()
+                );
+                stats.deferred += expired.len();
             }
         }
     }
@@ -325,6 +357,46 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Two expired adapters docked at the same node are revoked with ONE
+    /// batched `revokeAuthentication` RPC (PR #20 review): an unresponsive
+    /// node costs the pass one RPC timeout, not one per expired adapter.
+    #[tokio::test]
+    async fn test_sweep_batches_expired_actors_per_node() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter_a: IpAddr = ADAPTER.parse().unwrap();
+        let adapter_b: IpAddr = "fd5a:5052:4000::b".parse().unwrap();
+        add_adapter_with_auth(&asm, ADAPTER, &node, Duration::ZERO).await;
+        add_adapter_with_auth(&asm, "fd5a:5052:4000::b", &node, Duration::ZERO).await;
+        let seen = install_fake_vss(&asm, node, true);
+
+        let stats = sweep_expired_auths(&asm).await;
+
+        assert_eq!(stats.revoked, 2, "both expired actors must be revoked");
+        assert_eq!(stats.deferred, 0);
+        let batches = seen.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "one docking node must see exactly one batched revoke, got {batches:?}"
+        );
+        let mut batch = batches[0].clone();
+        batch.sort();
+        let mut expected = vec![adapter_a, adapter_b];
+        expected.sort();
+        assert_eq!(batch, expected, "the batch must carry both expired addrs");
+        for addr in [adapter_a, adapter_b] {
+            assert!(
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&addr)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "actor {addr} must be gone after the batched ack"
+            );
+        }
     }
 
     /// The spawned periodic task removes an expired actor without any direct
