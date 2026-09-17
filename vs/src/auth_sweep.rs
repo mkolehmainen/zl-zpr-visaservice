@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::assembly::Assembly;
 use crate::db;
+use crate::event_mgr;
 use crate::logging::targets::ACTOR;
 
 /// What one sweep pass did, for logging and tests.
@@ -143,9 +144,22 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
                         target: ACTOR,
                         "authentication expired for actor {addr} (gate: {gate}); revoked on node {node_addr}, removing actor"
                     );
+                    // Mirror the disconnect path (PR #20 review): detect
+                    // whether this actor provides an authentication service
+                    // *while it is still in the DB* — the check needs the
+                    // actor's service list — and record `AuthServiceChange`
+                    // after removal, so nodes re-pull the authorized-services
+                    // list and stop advertising the revoked provider.
+                    let was_auth_provider = matches!(
+                        asm.actor_mgr.has_auth_services(asm.clone(), &addr).await,
+                        Ok(true)
+                    );
                     if let Err(e) = asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await {
                         warn!(target: ACTOR, "auth sweep: revoked {addr} but failed to remove actor: {e}");
                         continue;
+                    }
+                    if was_auth_provider {
+                        event_mgr::record_auth_service_change(asm).await;
                     }
                     stats.revoked += 1;
                 }
@@ -189,17 +203,59 @@ pub(crate) fn spawn_auth_expiry_sweeper(asm: Arc<Assembly>, period: Duration) ->
 mod tests {
     use super::*;
     use crate::assembly::Assembly;
-    use crate::assembly::tests::new_assembly_for_tests;
-    use crate::test_helpers::make_adapter_actor;
+    use crate::assembly::tests::{new_assembly_for_tests, new_assembly_with_event_rx};
+    use crate::config;
+    use crate::event_mgr::VsEvent;
+    use crate::test_helpers::{make_actor_with_services, make_adapter_actor, make_container_bytes};
     use crate::vss::VssCmd;
-    use libeval::attribute::{Attribute, key};
+    use libeval::attribute::{Attribute, ROLE_ADAPTER, key};
     use std::net::IpAddr;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
+    use zpr::policy_types::{JoinPolicy, PFlags, Scope, Service, ServiceType};
+    use zpr::write_to::WriteTo;
 
     const NODE: &str = "fd5a:5052:3000::1";
     const ADAPTER: &str = "fd5a:5052:4000::a";
+
+    /// Policy container bytes declaring one Authentication service with the
+    /// given id (same shape as the visareq_worker test helper).
+    fn make_policy_with_auth_service(service_id: &str) -> Vec<u8> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut policy_bldr = msg.init_root::<zpr::policy::v1::policy::Builder>();
+            policy_bldr.set_created("2024-01-01T00:00:00Z");
+            policy_bldr.set_version(2);
+            policy_bldr.set_metadata("");
+
+            let mut jp_list = policy_bldr.reborrow().init_join_policies(1);
+            let mut jp_bldr = jp_list.reborrow().get(0);
+            let jp = JoinPolicy {
+                conditions: Vec::new(),
+                flags: PFlags::default(),
+                provides: Some(vec![Service {
+                    id: service_id.to_string(),
+                    endpoints: vec![Scope {
+                        protocol: 0,
+                        flag: None,
+                        port: Some(4000),
+                        port_range: None,
+                    }],
+                    kind: ServiceType::Authentication,
+                }]),
+            };
+            jp.write_to(&mut jp_bldr);
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+        make_container_bytes(
+            config::POLICY_MIN_COMPILER_MAJOR,
+            config::POLICY_MIN_COMPILER_MINOR,
+            config::POLICY_MIN_COMPILER_PATCH,
+            &bytes,
+        )
+    }
 
     /// Add an adapter docked at `node` whose device authority expires in
     /// `auth_expires_in` (zero = already expired by sweep time).
@@ -480,6 +536,67 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the renewed actor must survive the sweep"
+        );
+    }
+
+    /// Removing an expired actor that provides an authentication service must
+    /// record `AuthServiceChange` (PR #20 review), mirroring the disconnect
+    /// path: the provider check runs while the actor is still in the DB, the
+    /// event after removal, so nodes re-pull the authorized-services list and
+    /// stop advertising the revoked provider.
+    #[tokio::test]
+    async fn test_sweep_records_auth_service_change_for_expired_provider() {
+        let (asm_inner, mut event_rx) = new_assembly_with_event_rx(None).await;
+        let asm = Arc::new(asm_inner);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter: IpAddr = ADAPTER.parse().unwrap();
+
+        // Policy declares `svc:auth` as an Authentication service...
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_auth_service("svc:auth"))
+            .await
+            .unwrap();
+        // ...and the expired adapter provides it (long-lived identity attr,
+        // expired device authority drives the sweep).
+        let mut actor = make_actor_with_services(
+            ROLE_ADAPTER,
+            ADAPTER,
+            &["svc:auth"],
+            "auth-provider",
+            Duration::from_secs(3600),
+        );
+        actor
+            .add_attribute(
+                Attribute::builder(key::DEVICE_AUTHORITY)
+                    .expires_in(Duration::ZERO)
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, &node)
+            .await
+            .unwrap();
+        let _seen = install_fake_vss(&asm, node, true);
+
+        let stats = sweep_expired_auths(&asm).await;
+
+        assert_eq!(stats.revoked, 1, "the expired provider must be revoked");
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&adapter)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut saw_auth_change = false;
+        while let Ok(evt) = event_rx.try_recv() {
+            if matches!(evt, VsEvent::AuthServiceChange) {
+                saw_auth_change = true;
+            }
+        }
+        assert!(
+            saw_auth_change,
+            "removing an auth-service provider must record AuthServiceChange"
         );
     }
 
