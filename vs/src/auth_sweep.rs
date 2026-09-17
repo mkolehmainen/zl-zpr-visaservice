@@ -53,9 +53,12 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
     };
 
     /// An adapter phase 1 found expired: its snapshot expiry and the gate
-    /// (credential key) that drove it, for logging at removal time.
+    /// (credential key) that drove it. The expiry snapshot is re-checked
+    /// against the store after the revoke ack, so a concurrent renewal wins;
+    /// the gate is for logging at removal time.
     struct Expired {
         addr: IpAddr,
+        expiry: SystemTime,
         gate: String,
     }
 
@@ -89,7 +92,7 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
         by_node
             .entry(node_addr)
             .or_default()
-            .push(Expired { addr, gate });
+            .push(Expired { addr, expiry, gate });
     }
 
     // Phase 2: one batched revoke per docking node; drop the batch's actors
@@ -109,7 +112,33 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
         let addrs: Vec<IpAddr> = expired.iter().map(|e| e.addr).collect();
         match vss_handle.revoke_auths(addrs).await {
             Ok(_processed) => {
-                for Expired { addr, gate } in expired {
+                for Expired { addr, expiry, gate } in expired {
+                    // Serialize against a concurrent reauthorization (PR #20
+                    // review): the expiry decision was made on a pre-RPC
+                    // snapshot, and `reauthorize_actor` may have renewed the
+                    // actor while the revoke ack was in flight. Re-load the
+                    // stored actor and remove it only if its authentication
+                    // expiration still matches the expired snapshot; a renewed
+                    // actor stays, and its (revoked-then-renewed) node-side
+                    // auth is re-established by its own reauth flow.
+                    let stored_expiry = match asm.actor_mgr.get_actor_by_zpr_addr(&addr).await {
+                        Ok(Some(actor)) => actor
+                            .get_authentication_expiration_with_gate()
+                            .map(|(exp, _gate)| exp),
+                        Ok(None) => continue, // Already removed concurrently.
+                        Err(e) => {
+                            warn!(target: ACTOR, "auth sweep: revoked {addr} but failed to re-load actor: {e}; deferring to next pass");
+                            stats.deferred += 1;
+                            continue;
+                        }
+                    };
+                    if stored_expiry != Some(expiry) {
+                        info!(
+                            target: ACTOR,
+                            "auth sweep: actor {addr} was reauthorized while the revoke was in flight (stored expiration changed); keeping actor"
+                        );
+                        continue;
+                    }
                     info!(
                         target: ACTOR,
                         "authentication expired for actor {addr} (gate: {gate}); revoked on node {node_addr}, removing actor"
@@ -397,6 +426,61 @@ mod tests {
                 "actor {addr} must be gone after the batched ack"
             );
         }
+    }
+
+    /// A renewal that lands while the sweep is awaiting the revoke ack wins
+    /// (PR #20 review): the sweep re-checks the stored authentication
+    /// expiration against its pre-RPC snapshot and must NOT remove an actor
+    /// whose authentication was concurrently renewed by `reauthorize_actor`.
+    #[tokio::test]
+    async fn test_sweep_skips_actor_renewed_during_revoke() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter: IpAddr = ADAPTER.parse().unwrap();
+        add_adapter_with_auth(&asm, ADAPTER, &node, Duration::ZERO).await;
+
+        // Fake VSS that renews the actor's device authority *while the sweep
+        // awaits the revoke ack*, then acks OK — the reauthorize race.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VssCmd>(8);
+        asm.vss_mgr.insert_test_handle(node, cmd_tx);
+        let asm_task = asm.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let VssCmd::RevokeAuthsByZprAddr(addrs, resp_tx) = cmd {
+                    let renewed_addr: IpAddr = ADAPTER.parse().unwrap();
+                    let mut actor = asm_task
+                        .actor_mgr
+                        .get_actor_by_zpr_addr(&renewed_addr)
+                        .await
+                        .unwrap()
+                        .expect("actor must still exist during the revoke");
+                    actor
+                        .add_attribute(
+                            Attribute::builder(key::DEVICE_AUTHORITY)
+                                .expires_in(Duration::from_secs(3600))
+                                .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+                        )
+                        .unwrap();
+                    asm_task.actor_mgr.update_actor(&actor).await.unwrap();
+                    let _ = resp_tx.send(Ok(addrs.len()));
+                }
+            }
+        });
+
+        let stats = sweep_expired_auths(&asm).await;
+
+        assert_eq!(
+            stats.revoked, 0,
+            "a concurrently renewed actor must not be counted revoked"
+        );
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&adapter)
+                .await
+                .unwrap()
+                .is_some(),
+            "the renewed actor must survive the sweep"
+        );
     }
 
     /// The spawned periodic task removes an expired actor without any direct
