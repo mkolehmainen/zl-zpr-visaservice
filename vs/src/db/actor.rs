@@ -86,24 +86,39 @@ impl ActorRepo {
 
         if self.db.exists(&services_key).await? {
             let service_names: HashSet<String> = self.db.smembers(&services_key).await?;
-            if !service_names.is_empty() {
-                let mut ops = Vec::new();
-
-                for name in &service_names {
-                    // The stale names may actually be valid names on new actors. So we need to check the
-                    // zaddr value before deleting.
-                    let svc_key = service_key_for(&name);
-                    let actor_addr_str: Option<String> = self.db.hget(&svc_key, "zpr_addr").await?;
-                    if let Some(actor_addr) = actor_addr_str {
-                        if actor_addr != zpraddr_str {
-                            continue;
-                        }
-                        ops.push(DbOp::Del(service_key_for(&name)));
-                    }
-                }
-                self.db.atomic_pipeline(&ops).await?;
-            }
+            self.release_owned_service_entries(&zpraddr_str, &service_names)
+                .await?;
             self.db.del(&services_key).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete each `service:<name>` key in `names` if and only if its `zpr_addr`
+    /// still points at `zpraddr_str`. Names re-claimed by another actor are left
+    /// alone (the stale names may actually be valid names on new actors, so the
+    /// owner is checked before deleting). Shared by `clean_up` (actor departure)
+    /// and `try_update_actor` (re-auth / attribute refresh) so the two release
+    /// paths cannot drift apart again (zipline#51). Takes the names rather than
+    /// re-reading the actor's set so the hostname index (H1) can reuse it for
+    /// `host:<NAME>` entries.
+    async fn release_owned_service_entries(
+        &self,
+        zpraddr_str: &str,
+        names: impl IntoIterator<Item = &String>,
+    ) -> Result<(), StoreError> {
+        let mut ops = Vec::new();
+        for name in names {
+            let svc_key = service_key_for(name);
+            let actor_addr_str: Option<String> = self.db.hget(&svc_key, "zpr_addr").await?;
+            if let Some(actor_addr) = actor_addr_str {
+                if actor_addr != zpraddr_str {
+                    continue;
+                }
+                ops.push(DbOp::Del(svc_key));
+            }
+        }
+        if !ops.is_empty() {
+            self.db.atomic_pipeline(&ops).await?;
         }
         Ok(())
     }
@@ -213,21 +228,32 @@ impl ActorRepo {
         // actor:<ZADDR>:services -> SET[ <service_name> ]
         //
 
-        // Remove existing services.
+        // Release entries this actor still owns; entries re-claimed by another
+        // actor are left alone (zipline#51 -- an unconditional delete here
+        // destroyed the other actor's live entry on re-auth/refresh).
         let existing_services: HashSet<String> = self.db.smembers(&services_key).await?;
-        for service_name in existing_services {
-            let svc_key_str = service_key_for(&service_name);
-            self.db.del(&svc_key_str).await?;
-        }
+        self.release_owned_service_entries(&zpraddr_str, &existing_services)
+            .await?;
         self.db.del(&services_key).await?;
 
-        // Add services back based on what actor actually still has.
+        // Add services back based on what actor actually still has. A refresh
+        // must not steal a `service:<name>` entry another actor holds
+        // (zipline#51): the last-add-wins claim happens at connect
+        // (`try_add_actor`), not on every timed refresh. The name still goes
+        // into this actor's set, so a later refresh re-claims the entry once
+        // the current holder departs.
         for service_name in actor.services_iter() {
             debug!(target: DB, "adding service for actor: addr={zpraddr} service={service_name}");
             let svc_key_str = service_key_for(&service_name);
-            self.db
-                .hset(&svc_key_str, "zpr_addr", &zpraddr.to_string())
-                .await?;
+            let current_owner: Option<String> = self.db.hget(&svc_key_str, "zpr_addr").await?;
+            match current_owner {
+                Some(owner) if owner != zpraddr_str => {
+                    debug!(target: DB, "service entry held by another actor, not overwriting: service={service_name} holder={owner}");
+                }
+                _ => {
+                    self.db.hset(&svc_key_str, "zpr_addr", &zpraddr_str).await?;
+                }
+            }
             self.db.sadd(&services_key, &service_name).await?;
         }
 
@@ -892,6 +918,85 @@ mod test {
         assert!(loaded.attrs_iter().all(|a| a.get_key() != "user.dept"));
         // The rest of the actor survived the rewrite.
         assert_eq!(loaded.get_cn(), Some("drop-node"));
+    }
+
+    /// zipline#51: two actors may advertise the same service name (the add path
+    /// permits it -- the second provider's `hset` simply overwrites
+    /// `service:<name>`, last add wins). A re-authentication or timed attribute
+    /// refresh of the FIRST actor runs `update_actor`
+    /// (actor_attributes.rs:73 -> actor_mgr.rs:156 -> update_actor), which must
+    /// not destroy the SECOND actor's live `service:<name>` entry: the refresh
+    /// releases only entries the refreshing actor still owns, same owner check
+    /// `clean_up` has always done on the departure path.
+    #[tokio::test]
+    async fn test_update_actor_preserves_other_actors_service_entry() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+
+        let actor_a =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::a1", &["web"], "actor-a");
+        let actor_b =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::b1", &["web"], "actor-b");
+
+        repo.add_actor(&actor_a).await.unwrap();
+        // B's add overwrites `service:web` -- B now owns the live entry.
+        repo.add_actor(&actor_b).await.unwrap();
+
+        // A's attribute refresh fires on a timer with A unchanged, still
+        // advertising "web".
+        repo.update_actor(&actor_a).await.unwrap();
+
+        let addr_b: IpAddr = "fd5a:5052::b1".parse().unwrap();
+        assert_eq!(
+            repo.get_zpr_addr_for_service("web").await.unwrap(),
+            Some(addr_b),
+            "actor A's refresh must not clobber actor B's live service entry"
+        );
+    }
+
+    /// The ordinary refresh: a single actor still advertising its service keeps
+    /// its own live entry and its services set through `update_actor`.
+    #[tokio::test]
+    async fn test_update_actor_keeps_own_service_entry() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db.clone());
+
+        let actor_a =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::a2", &["web"], "actor-a");
+        repo.add_actor(&actor_a).await.unwrap();
+        repo.update_actor(&actor_a).await.unwrap();
+
+        let addr_a: IpAddr = "fd5a:5052::a2".parse().unwrap();
+        assert_eq!(
+            repo.get_zpr_addr_for_service("web").await.unwrap(),
+            Some(addr_a)
+        );
+        let services: HashSet<String> =
+            db.smembers(&actor_services_key_for(&addr_a)).await.unwrap();
+        assert!(services.contains("web"));
+    }
+
+    /// A service the actor stopped advertising is released by the refresh: the
+    /// `service:<name>` entry goes away and the name leaves the actor's set.
+    #[tokio::test]
+    async fn test_update_actor_releases_dropped_service() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db.clone());
+
+        let actor_a =
+            make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::a3", &["web"], "actor-a");
+        repo.add_actor(&actor_a).await.unwrap();
+
+        // Same actor, no longer advertising "web".
+        let addr_a: IpAddr = "fd5a:5052::a3".parse().unwrap();
+        let mut refreshed = actor_a;
+        refreshed.remove_attribute(key::SERVICES);
+        repo.update_actor(&refreshed).await.unwrap();
+
+        assert_eq!(repo.get_zpr_addr_for_service("web").await.unwrap(), None);
+        let services: HashSet<String> =
+            db.smembers(&actor_services_key_for(&addr_a)).await.unwrap();
+        assert!(!services.contains("web"));
     }
 
     // ------------------------------------------------------------------
