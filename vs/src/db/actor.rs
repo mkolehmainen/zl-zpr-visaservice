@@ -546,6 +546,9 @@ impl ActorRepo {
 
     /// Given a hostname, look up the ZPR address of the actor holding it in the
     /// `host:<NAME>` index (zipline#53), if any.
+    ///
+    /// No in-crate caller yet: the DNS surface (zipline#54/#55) consumes it.
+    #[allow(dead_code)]
     pub async fn get_zpr_addr_for_hostname(
         &self,
         hostname: &str,
@@ -566,6 +569,9 @@ impl ActorRepo {
 
     /// Get the list of hostnames the actor currently holds in the `host:<NAME>`
     /// index (zipline#53).
+    ///
+    /// No in-crate caller yet: the DNS surface (zipline#54/#55) consumes it.
+    #[allow(dead_code)]
     pub async fn list_hostnames_for_actor(
         &self,
         zpr_addr: &IpAddr,
