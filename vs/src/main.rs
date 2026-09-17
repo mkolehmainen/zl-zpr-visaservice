@@ -412,6 +412,13 @@ async fn main() -> std::process::ExitCode {
         config::MAX_VISA_REQUEST_WORKERS,
     ));
 
+    // Periodic authentication-expiry sweep (zipline#44): notice actors whose
+    // authentication ran out, revoke on the docking node, drop them from the
+    // store. MIN_VISA_LIFETIME is fine-grained enough that a revocation lands
+    // inside the shortest possible visa lifetime.
+    let _auth_sweeper =
+        auth_sweep::spawn_auth_expiry_sweeper(asm.clone(), config::MIN_VISA_LIFETIME);
+
     // perform initial self-authorization
     if let Err(e) = self_authorize(asm.clone(), &cfg.get_vs_addr()).await {
         error!(target: MAIN, "self-authorization failed: {}", e);

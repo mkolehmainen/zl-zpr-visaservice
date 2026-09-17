@@ -10,8 +10,9 @@
 //! expired nodes are culled at startup by `actor_mgr::refresh_state`.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::assembly::Assembly;
@@ -36,8 +37,6 @@ pub(crate) struct SweepStats {
 /// **only on a positive ack** — log (with the gate: the credential that drove
 /// the expiry) and remove the actor from the store. A missing VSS handle, an
 /// error, or a timeout leaves the actor untouched for the next pass.
-// TODO(zipline#44 commit 3): drop the allow once the periodic sweeper spawns this.
-#[allow(dead_code)]
 pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
     let mut stats = SweepStats::default();
 
@@ -109,6 +108,20 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
         );
     }
     stats
+}
+
+/// Run [sweep_expired_auths] every `period` in a background task, mirroring
+/// `KeySource::spawn_refresher` (`oidc/jwks.rs`). A pass never fails as such —
+/// per-actor trouble is logged and deferred inside the sweep — so the loop just
+/// sleeps and sweeps. Callers pass [crate::config::MIN_VISA_LIFETIME]: fine-
+/// grained enough that a revocation lands inside the shortest visa lifetime.
+pub(crate) fn spawn_auth_expiry_sweeper(asm: Arc<Assembly>, period: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(period).await;
+            sweep_expired_auths(&asm).await;
+        }
+    })
 }
 
 #[cfg(test)]
@@ -311,6 +324,41 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// The spawned periodic task removes an expired actor without any direct
+    /// call to the sweep: spawn with a millisecond period against the fake-VSS
+    /// assembly and await removal with a bounded timeout (two-ish periods).
+    #[tokio::test]
+    async fn test_sweeper_task_removes_expired_actor_within_two_periods() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter: IpAddr = ADAPTER.parse().unwrap();
+        add_adapter_with_auth(&asm, ADAPTER, &node, Duration::ZERO).await;
+        let _seen = install_fake_vss(&asm, node, true);
+
+        let handle = spawn_auth_expiry_sweeper(asm.clone(), Duration::from_millis(20));
+
+        let removed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if asm
+                    .actor_mgr
+                    .get_actor_by_zpr_addr(&adapter)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        handle.abort();
+        assert!(
+            removed.is_ok(),
+            "the periodic sweeper must remove the expired actor within the timeout"
         );
     }
 }
