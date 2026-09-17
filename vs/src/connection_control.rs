@@ -2194,14 +2194,25 @@ mod tests {
         ) -> Result<Vec<Attribute>, ServiceError> {
             self.calls.lock().unwrap().push(identities.to_vec());
             if identities.iter().any(|(_, v)| *v == self.known_value) {
-                return Ok(self
-                    .vends
-                    .iter()
-                    .map(|(k, v)| {
+                // Group `vends` by key so a key listed twice becomes ONE
+                // multi-valued attribute: `Actor::add_attribute` replaces per
+                // key, so two single-valued attributes with the same key would
+                // not accumulate on the actor (zipline#50).
+                let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+                for (k, v) in &self.vends {
+                    if let Some((_, vals)) = grouped.iter_mut().find(|(gk, _)| gk == k) {
+                        vals.push(v.clone());
+                    } else {
+                        grouped.push((k.clone(), vec![v.clone()]));
+                    }
+                }
+                return Ok(grouped
+                    .into_iter()
+                    .map(|(k, vals)| {
                         libeval::attribute::AttributeSource::new("capture")
                             .builder(k)
                             .expires_in(Duration::from_secs(600))
-                            .value(v)
+                            .values(vals)
                     })
                     .collect());
             }
@@ -2796,6 +2807,124 @@ mod tests {
         assert!(
             actor.get_attribute("device.role").is_none(),
             "actor must not inherit the claimed device's attributes"
+        );
+    }
+
+    // ---- device.* attributes from a declared trusted service (zipline#50) ----
+
+    /// Test gate for the hostname design (zipline#50, positive): a `device.*`
+    /// attribute vended by a DECLARED trusted service, keyed on the builtin
+    /// authenticated `device.zpr.adapter.cn` lookup identity, lands on the actor
+    /// record — multi-valued, and sourced to the service rather than the peer.
+    /// This pins the vending path the hostname design assumes already works; no
+    /// production change should be needed for it to pass.
+    #[tokio::test]
+    async fn device_attr_from_declared_service_reaches_actor_multivalued() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+
+        // A declared `file` trusted service mapping `h -> device.hostname{}`
+        // (multi-valued). No policy-declared identity attributes: the builtin
+        // `device.zpr.adapter.cn` is the lookup identity, as for an
+        // RSA-authenticated device.
+        let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
+            "capture",
+            "file",
+            Some(3600),
+            &["h -> device.hostname{}"],
+        ));
+        // The store knows the device by CN and vends TWO values for the key.
+        let svc = register_capturing_ts(
+            &asm,
+            "device-1.zpr.org",
+            &[
+                ("device.hostname", "somename"),
+                ("device.hostname", "m-7f3a2b"),
+            ],
+        );
+
+        // As authenticate_zpr_entity_rsa would push after signature verification.
+        let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, vec![svc.clone()]),
+                "device-1.zpr.org",
+                Vec::new(),
+                authd,
+                0,
+            )
+            .await
+            .expect("device connection should authorize");
+
+        // The lookup call was keyed on the authenticated adapter CN.
+        assert_eq!(
+            *svc.calls.lock().unwrap(),
+            vec![vec![(key::CN.to_string(), "device-1.zpr.org".to_string())]]
+        );
+        // The attribute reached the actor with BOTH values...
+        let hostname = actor
+            .get_attribute("device.hostname")
+            .expect("device.hostname vended by the declared service must reach the actor");
+        assert_eq!(
+            hostname.get_value(),
+            ["somename".to_string(), "m-7f3a2b".to_string()]
+        );
+        // ...and it is sourced to the trusted service, not the peer.
+        assert_eq!(hostname.get_source(), "capture");
+    }
+
+    /// zipline#50, negative: a peer-asserted `device.hostname` is an
+    /// unauthenticated claim and must never reach the actor. Only the trusted
+    /// service's value survives — the scrub in `approve_connection` commits
+    /// unauthenticated claims only for `zpr.addr` under a matching join policy,
+    /// never for arbitrary `device.*` keys.
+    #[tokio::test]
+    async fn peer_asserted_device_hostname_is_not_authenticated() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+
+        let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
+            "capture",
+            "file",
+            Some(3600),
+            &["h -> device.hostname{}"],
+        ));
+        // The store vends the fleet-recorded hostname for this device.
+        let svc = register_capturing_ts(
+            &asm,
+            "device-1.zpr.org",
+            &[("device.hostname", "fleet-name")],
+        );
+
+        // Authenticated: the CN. The peer also CLAIMS a hostname of its choosing.
+        let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
+        let unauthd = vec![Attribute::builder("device.hostname").value("evil-name")];
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, vec![svc.clone()]),
+                "device-1.zpr.org",
+                unauthd,
+                authd,
+                0,
+            )
+            .await
+            .expect("device connection should authorize");
+
+        // The actor's hostname is exactly what the trusted service vended --
+        // the peer-asserted value appears nowhere, and the source is the
+        // service, not the peer.
+        let hostname = actor
+            .get_attribute("device.hostname")
+            .expect("the service-vended hostname should reach the actor");
+        assert_eq!(hostname.get_value(), ["fleet-name".to_string()]);
+        assert_eq!(hostname.get_source(), "capture");
+        assert!(
+            !hostname.get_value().iter().any(|v| v == "evil-name"),
+            "peer-asserted hostname must not reach the actor"
         );
     }
 
