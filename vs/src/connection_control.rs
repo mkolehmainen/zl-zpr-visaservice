@@ -806,6 +806,15 @@ impl ConnectionControl {
             return Err(reject());
         }
         let (admitted_auth_time, admitted_iat) = (anchors.auth_time, anchors.iat);
+        // Liveness (PR #19 review): a renewal only extends a LIVE admission.
+        // A recorded session whose admission has lapsed must not be
+        // resurrectable by a fresh token — generic rejection (Q2), the node's
+        // cue to reconnect. (The record's eventual removal is the zipline#44
+        // sweep; this check just refuses to use a stale one.)
+        if anchors.expires <= now {
+            info!(target: CC, "reauth rejected: the recorded admission has expired");
+            return Err(reject());
+        }
 
         // Replay guard: the renewal token must be minted strictly after the
         // one that produced the recorded admission.
@@ -4108,6 +4117,35 @@ mod tests {
             )
             .await,
         );
+        assert_auth_rejected(api);
+    }
+
+    /// PR #19 review (P2): a lapsed admission must not be resurrectable. The
+    /// recorded session's `expires` has passed, the actor record still
+    /// exists — a fresh, otherwise-valid token must be rejected with the
+    /// generic `AuthError` (Q2: passed-ceiling ⇒ generic rejection); the
+    /// node's cue to reconnect. (The expiry SWEEP is zipline#44 — out of
+    /// scope here; this is only the liveness check on the reauth path.)
+    #[tokio::test]
+    async fn test_reauth_expired_admission_rejected() {
+        let (asm, cc, actor, _via, iat1) = reauth_fixture(120).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let svc = psnap
+            .oidc_service_for_issuer(OIDC_ISSUER)
+            .expect("fixture provider");
+        // Overwrite the recorded session with one whose admission expired.
+        let session_id = actor.get_zpr_addr().unwrap().to_string();
+        let anchors = svc.session_anchors(&session_id).expect("recorded session");
+        svc.record_session(
+            &session_id,
+            OIDC_SUB,
+            anchors.auth_time,
+            anchors.iat,
+            SystemTime::now() - Duration::from_secs(1),
+        );
+
+        let blob = oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)));
+        let api = api_err(cc.reauthenticate_oidc_blob(&psnap, &actor, &blob).await);
         assert_auth_rejected(api);
     }
 
