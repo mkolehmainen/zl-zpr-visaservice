@@ -27,19 +27,32 @@ use super::validate::{IdpParams, ValidatedToken};
 /// identity claim this store admits and looks up under.
 const SUB_CLAIM: &str = "sub";
 
-/// One admitted subject's cached record: the mapped attributes, when they
-/// expire, and the dual-clock anchors from the validated token — `auth_time`
-/// (fixed per login: the session ceiling) and `iat` (advances on refresh: the
-/// renewal window). R3 (zipline#43) reads both on re-admission.
+/// One admitted subject's cached record: the mapped attributes and when they
+/// expire (the stamped authority expiry). Renewal anchors do NOT live here —
+/// they are per actor session (see [`OidcTrustedService::record_session`]),
+/// not per subject, so concurrent actors for the same account cannot clobber
+/// each other (PR #19 review).
 pub(crate) struct AdmittedEntry {
     /// The mapped attributes served to lookups.
     pub attrs: Vec<Attribute>,
     /// When this record stops being served (the stamped authority expiry).
     pub expires: SystemTime,
-    /// The token's authentication moment (`auth_time`).
+}
+
+/// One live actor session's dual-clock renewal anchors (zipline#43 R3),
+/// keyed by the actor's session id (its ZPR address): `auth_time` (fixed per
+/// login: the session ceiling) and `iat` (advances on refresh: the renewal
+/// window), plus the admitted subject and the admission expiry the anchors
+/// were recorded under.
+pub(crate) struct SessionAnchors {
+    /// The provider subject this session authenticated as.
+    pub sub: String,
+    /// The login's authentication moment (`auth_time`) — fixed per session.
     pub auth_time: SystemTime,
-    /// The token's mint moment (`iat`).
+    /// The latest admitted token's mint moment (`iat`).
     pub iat: SystemTime,
+    /// The admission expiry the anchors were recorded under.
+    pub expires: SystemTime,
 }
 
 /// An `api = "oidc"` trusted service: a claim cache keyed by the provider's
@@ -57,6 +70,11 @@ pub struct OidcTrustedService {
     keys: Arc<KeySource>,
     /// Admitted claims, keyed by the provider's `sub`.
     admitted: DashMap<String, AdmittedEntry>,
+    /// Live actor sessions' renewal anchors, keyed by the actor's session id
+    /// (its ZPR address). Kept separate from `admitted` so two live actors
+    /// authenticating as the same account cannot clobber each other's
+    /// anchors (PR #19 review).
+    sessions: DashMap<String, SessionAnchors>,
     /// How long admitted attributes live, from the policy record.
     expiration_seconds: u32,
     /// Snapshot revision, from the process-wide trusted-service counter so the
@@ -83,6 +101,7 @@ impl OidcTrustedService {
             },
             keys,
             admitted: DashMap::new(),
+            sessions: DashMap::new(),
             expiration_seconds: record.expiration_seconds,
             revision: AtomicU64::new(next_revision()),
         })
@@ -204,7 +223,8 @@ impl OidcTrustedService {
         // Opportunistic eviction: a subject that disconnects and never returns
         // would otherwise stay cached forever (expiry is only checked on lookup
         // of that exact subject). Sweeping on every admission bounds the cache
-        // to subjects admitted within one expiration window.
+        // to subjects admitted within one expiration window; recorded session
+        // anchors are swept on the same trigger (see [Self::record_session]).
         let now = SystemTime::now();
         self.admitted.retain(|_, entry| entry.expires > now);
         self.admitted.insert(
@@ -212,8 +232,6 @@ impl OidcTrustedService {
             AdmittedEntry {
                 attrs: attrs.clone(),
                 expires,
-                auth_time: token.auth_time,
-                iat: token.iat,
             },
         );
         self.revision.store(next_revision(), Ordering::SeqCst);
@@ -227,6 +245,48 @@ impl OidcTrustedService {
     /// trusted-service lookup can find the admission it just cached.
     pub(crate) fn mapped_sub_key(&self) -> Option<String> {
         self.mapper.map_attribute(SUB_CLAIM).map(|(key, _)| key)
+    }
+
+    /// Record (or advance) the dual-clock renewal anchors for one live actor
+    /// session (zipline#43 R3, scoped per session — PR #19 review). The
+    /// session id is the actor's ZPR address: unique per live actor and
+    /// stable across renewals, so two actors authenticated as the same
+    /// provider account keep independent anchors. Expired records are swept
+    /// on the same opportunistic trigger as [Self::admit].
+    pub(crate) fn record_session(
+        &self,
+        session_id: &str,
+        sub: &str,
+        auth_time: SystemTime,
+        iat: SystemTime,
+        expires: SystemTime,
+    ) {
+        let now = SystemTime::now();
+        self.sessions.retain(|_, s| s.expires > now);
+        self.sessions.insert(
+            session_id.to_string(),
+            SessionAnchors {
+                sub: sub.to_string(),
+                auth_time,
+                iat,
+                expires,
+            },
+        );
+    }
+
+    /// The recorded dual-clock anchors of one live actor session, or `None`
+    /// when this store never recorded that session (or it was swept). R3
+    /// (zipline#43) reads these on re-admission to bind a refreshed token to
+    /// the same login session: same `sub`, unchanged `auth_time`, strictly
+    /// greater `iat`. In-memory only — after a VS restart there is no
+    /// recorded session and reauth fails, so the node reconnects.
+    pub(crate) fn session_anchors(&self, session_id: &str) -> Option<SessionAnchors> {
+        self.sessions.get(session_id).map(|s| SessionAnchors {
+            sub: s.sub.clone(),
+            auth_time: s.auth_time,
+            iat: s.iat,
+            expires: s.expires,
+        })
     }
 }
 
@@ -295,10 +355,12 @@ impl TrustedServiceInterface for OidcTrustedService {
         Ok(merged.into_values().collect())
     }
 
-    /// Drop every admitted record. The next lookup finds nothing until the
-    /// connect path re-admits, which is the OIDC analogue of a data reload.
+    /// Drop every admitted record and recorded session. The next lookup finds
+    /// nothing until the connect path re-admits, which is the OIDC analogue
+    /// of a data reload.
     async fn flush(&self) -> Result<(), ServiceError> {
         self.admitted.clear();
+        self.sessions.clear();
         self.revision.store(next_revision(), Ordering::SeqCst);
         Ok(())
     }
@@ -578,25 +640,59 @@ mod tests {
         assert!(store.admitted.contains_key("s-new"));
     }
 
-    /// T3 (zipline#42): the admitted cache entry carries the token's
-    /// `auth_time` and `iat` alongside the attributes and expiry, so R3
-    /// (re-admission on refresh) can read both dual-clock anchors.
+    /// The admitted cache entry carries the attributes and expiry; renewal
+    /// anchors live in the per-session store instead (PR #19 review), so a
+    /// second admission for the same subject cannot clobber another live
+    /// session's anchors.
     #[tokio::test]
-    async fn test_admitted_entry_carries_auth_time_and_iat() {
+    async fn test_admitted_entry_carries_attrs_and_expiry() {
         let store = make_store(MAPPINGS).await;
-        let auth_time = SystemTime::now() - Duration::from_secs(3600);
-        let iat = SystemTime::now();
         let expires = SystemTime::now() + Duration::from_secs(300);
-        let mut token = make_token("s-123", Some("jane@example.com"));
-        token.auth_time = auth_time;
-        token.iat = iat;
+        let token = make_token("s-123", Some("jane@example.com"));
         store.admit(&token, expires).unwrap();
 
         let entry = store.admitted.get("s-123").expect("admitted entry");
         assert_eq!(entry.expires, expires);
-        assert_eq!(entry.auth_time, auth_time);
-        assert_eq!(entry.iat, iat);
         assert!(!entry.attrs.is_empty());
+    }
+
+    /// R3 (zipline#43, per-session — PR #19 review): `session_anchors`
+    /// returns what `record_session` recorded for that session id, `None`
+    /// for an unknown session, and two sessions for the SAME subject keep
+    /// independent anchors.
+    #[tokio::test]
+    async fn test_session_anchors_scoped_per_session() {
+        let store = make_store(MAPPINGS).await;
+        let auth_time1 = SystemTime::now() - Duration::from_secs(3600);
+        let iat1 = SystemTime::now() - Duration::from_secs(60);
+        let auth_time2 = SystemTime::now() - Duration::from_secs(120);
+        let iat2 = SystemTime::now();
+        let expires = SystemTime::now() + Duration::from_secs(300);
+
+        store.record_session("fd5a::1", "s-123", auth_time1, iat1, expires);
+        store.record_session("fd5a::2", "s-123", auth_time2, iat2, expires);
+
+        let a1 = store
+            .session_anchors("fd5a::1")
+            .expect("session 1 recorded");
+        assert_eq!(a1.sub, "s-123");
+        assert_eq!(a1.auth_time, auth_time1);
+        assert_eq!(a1.iat, iat1);
+        assert_eq!(a1.expires, expires);
+
+        let a2 = store
+            .session_anchors("fd5a::2")
+            .expect("session 2 recorded");
+        assert_eq!((a2.auth_time, a2.iat), (auth_time2, iat2));
+
+        assert!(
+            store.session_anchors("fd5a::dead").is_none(),
+            "an unknown session has no recorded anchors"
+        );
+
+        // flush drops recorded sessions too.
+        store.flush().await.unwrap();
+        assert!(store.session_anchors("fd5a::1").is_none());
     }
 
     /// T3 (zipline#42): `session_ceiling` is `auth_time + max_auth_age_seconds

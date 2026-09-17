@@ -40,7 +40,7 @@ use crate::auth;
 use crate::config;
 use crate::error::ServiceError;
 use crate::logging::targets::CC;
-use crate::oidc::{OidcError, validate_id_token};
+use crate::oidc::{NonceExpectation, OidcError, OidcTrustedService, validate_id_token};
 use crate::policy_mgr::PolicySnapshot;
 use crate::trusted_services::{TrustedServicesMgr, derive_user_authority, lookup_identities};
 
@@ -54,7 +54,7 @@ const ATTR_KEY_VS_IDENT: &str = "zpr.vs.bootstrap.ident";
 /// Identity namespace one auth blob authenticates. A connection may present at most
 /// one blob per namespace (zipline#7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Namespace {
+pub(crate) enum Namespace {
     Device,
     User,
 }
@@ -70,9 +70,40 @@ impl std::fmt::Display for Namespace {
 
 /// What one successfully-validated auth blob contributes to the connection: the
 /// claims it authenticated and the identity namespace it covers (zipline#7).
-struct BlobOutcome {
-    authd: Vec<Attribute>,
-    namespace: Namespace,
+/// An OIDC blob additionally carries the session anchors to record once the
+/// actor's session id (its ZPR address) exists — anchors are per actor
+/// session, not per subject (PR #19 review).
+pub(crate) struct BlobOutcome {
+    pub(crate) authd: Vec<Attribute>,
+    #[allow(dead_code)] // read by the connect path's duplicate-namespace check
+    pub(crate) namespace: Namespace,
+    pub(crate) session: Option<OidcSessionRecord>,
+}
+
+/// The dual-clock renewal anchors one validated OIDC blob yields, pending the
+/// actor's session id. The connect and reauthorize paths call
+/// [OidcSessionRecord::record] once the ZPR address is known (and, on reauth,
+/// only after the whole renewal succeeded, so a failed policy re-run does not
+/// advance the anchors).
+pub(crate) struct OidcSessionRecord {
+    svc: Arc<OidcTrustedService>,
+    sub: String,
+    auth_time: SystemTime,
+    iat: SystemTime,
+    expires: SystemTime,
+}
+
+impl OidcSessionRecord {
+    /// Record these anchors for the actor session behind `zpr_addr`.
+    pub(crate) fn record(&self, zpr_addr: &IpAddr) {
+        self.svc.record_session(
+            &zpr_addr.to_string(),
+            &self.sub,
+            self.auth_time,
+            self.iat,
+            self.expires,
+        );
+    }
 }
 
 /// Dual-clock OIDC credential expiry (zipline#42): the renewal window
@@ -317,6 +348,7 @@ impl ConnectionControl {
         // namespace and yields its authenticated claims; the first error aborts, and
         // a repeated namespace is a protocol error.
         let mut seen_namespaces: Vec<Namespace> = Vec::new();
+        let mut oidc_sessions: Vec<OidcSessionRecord> = Vec::new();
         for blob in &req.blobs {
             let outcome = match blob {
                 AuthBlob::SS(ssb) => match ssb.alg {
@@ -335,6 +367,7 @@ impl ConnectionControl {
                         BlobOutcome {
                             authd,
                             namespace: Namespace::Device,
+                            session: None,
                         }
                     }
                 },
@@ -354,6 +387,9 @@ impl ConnectionControl {
                 )));
             }
             seen_namespaces.push(outcome.namespace);
+            if let Some(session) = outcome.session {
+                oidc_sessions.push(session);
+            }
             authd_claims.extend(outcome.authd);
         }
 
@@ -369,6 +405,14 @@ impl ConnectionControl {
                 req.dock_interface,
             )
             .await?;
+
+        // The actor's session id (its ZPR address) now exists: record the
+        // OIDC session anchors under it, per actor session (PR #19 review).
+        if let Some(addr) = actor.get_zpr_addr() {
+            for session in &oidc_sessions {
+                session.record(addr);
+            }
+        }
 
         let auth_expiration = if endpoint_cn == config::VS_CN {
             config::VS_AUTH_EXPIRATION
@@ -534,7 +578,7 @@ impl ConnectionControl {
             &blob.id_token,
             &svc.keys().current(),
             &svc.params(),
-            &blob.nonce,
+            NonceExpectation::Required(&blob.nonce),
             now,
         );
         if matches!(
@@ -556,7 +600,7 @@ impl ConnectionControl {
                 &blob.id_token,
                 &svc.keys().current(),
                 &svc.params(),
-                &blob.nonce,
+                NonceExpectation::Required(&blob.nonce),
                 now,
             );
         }
@@ -618,7 +662,389 @@ impl ConnectionControl {
         Ok(BlobOutcome {
             authd,
             namespace: Namespace::User,
+            session: Some(OidcSessionRecord {
+                svc: svc.clone(),
+                sub: token.sub.clone(),
+                auth_time: token.auth_time,
+                iat: token.iat,
+                expires,
+            }),
         })
+    }
+
+    /// Renew one OIDC user authentication (zipline#43, R3): validate the
+    /// refreshed `id_token` with the nonce check replaced by session binding.
+    /// A refresh-grant token carries the *original* login nonce (OIDC Core
+    /// §12.2), so it can never match a fresh challenge; the token is instead
+    /// bound to the live session recorded at admission: same provider, same
+    /// `sub`, strictly increasing `iat` (replay guard) and unchanged
+    /// `auth_time` (a different login session must reconnect). Every other
+    /// validation check — signature, `iss`, `aud`, `exp`, `kid`, `alg`, `hd`,
+    /// `email_verified` — runs exactly as on the connect path, including the
+    /// one JWKS refresh-and-retry and the Contract 2 error classification.
+    ///
+    /// Session-binding failures are a clean `AuthError` with the generic
+    /// "authentication rejected" wire message — the node's cue to tear down
+    /// and reconnect, with no internals echoed. Session anchors live in the
+    /// in-memory admission cache, so after a VS restart reauth fails the same
+    /// way and the node reconnects. Token contents are never logged.
+    ///
+    /// On success the mapped claims are re-admitted under the recomputed
+    /// dual-clock expiry and the fresh user-namespace outcome is returned,
+    /// exactly as the connect arm builds it.
+    pub(crate) async fn reauthenticate_oidc_blob(
+        &self,
+        psnap: &PolicySnapshot,
+        actor: &Actor,
+        blob: &OidcBlob,
+    ) -> Result<BlobOutcome, ServiceError> {
+        /// The uniform session-binding rejection: `authError`, generic
+        /// message, nothing echoed (a probing caller learns only "rejected").
+        fn reject() -> ServiceError {
+            ApiResponseError::new_code_msg(ErrorCode::AuthError, "authentication rejected").into()
+        }
+
+        // The provider must be declared by the pinned snapshot AND be the
+        // same trusted service that admitted the actor (its stamped
+        // user.zpr.authority). A renewal presented to any other provider is a
+        // credential rejection, not a parameter error: the blob's issuer is
+        // attacker-supplied bytes and is neither logged nor echoed.
+        let Some(svc) = psnap.oidc_service_for_issuer(&blob.issuer) else {
+            warn!(target: CC, "reauth blob names an issuer with no declared trusted service");
+            return Err(reject());
+        };
+        let vouched_here = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .and_then(|a| a.get_single_value().ok())
+            .is_some_and(|authority| authority == svc.id());
+        if !vouched_here {
+            info!(target: CC, "reauth rejected: provider '{}' did not admit this actor", svc.id());
+            return Err(reject());
+        }
+
+        // Validate under SessionBound: only the nonce equality is skipped —
+        // same JWKS refresh-and-retry and same Contract 2 classification as
+        // the connect path.
+        let now = SystemTime::now();
+        let mut result = validate_id_token(
+            &blob.id_token,
+            &svc.keys().current(),
+            &svc.params(),
+            NonceExpectation::SessionBound,
+            now,
+        );
+        if matches!(
+            result,
+            Err(OidcError::UnknownKid(_)) | Err(OidcError::NoKeys)
+        ) {
+            if let Err(e) = svc.keys().refresh_coalesced().await {
+                warn!(target: CC, "JWKS refresh after validation failure failed for provider '{}': {e}", svc.id());
+            }
+            result = validate_id_token(
+                &blob.id_token,
+                &svc.keys().current(),
+                &svc.params(),
+                NonceExpectation::SessionBound,
+                now,
+            );
+        }
+        let token = match result {
+            Ok(token) => token,
+            Err(err) => {
+                // The OidcError detail carries claim names, never values (C2),
+                // so it is safe to log -- but not to send.
+                info!(target: CC, "reauth token rejected for provider '{}': {err}", svc.id());
+                let api = match err {
+                    OidcError::NoKeys => ApiResponseError::new(
+                        ErrorCode::TemporarilyUnavailable,
+                        "identity provider keys unavailable",
+                        config::OIDC_NO_KEYS_RETRY_SECS,
+                    ),
+                    OidcError::Signature(_) | OidcError::UnknownKid(_) => {
+                        ApiResponseError::new_code_msg(
+                            ErrorCode::InvalidSignature,
+                            "token validation failed",
+                        )
+                    }
+                    OidcError::Rejected(_) => ApiResponseError::new_code_msg(
+                        ErrorCode::AuthError,
+                        "authentication rejected",
+                    ),
+                };
+                return Err(api.into());
+            }
+        };
+
+        // Session binding: the token's subject must be the admitted subject
+        // this actor carries (its mapped sub attribute), with anchors
+        // recorded for THIS actor session (keyed by its ZPR address — per
+        // session, not per subject, PR #19 review).
+        let Some(sub_key) = svc.mapped_sub_key() else {
+            info!(target: CC, "reauth rejected: provider '{}' maps no sub claim", svc.id());
+            return Err(reject());
+        };
+        let sub_matches_actor = actor
+            .get_attribute(&sub_key)
+            .and_then(|a| a.get_single_value().ok())
+            .is_some_and(|actor_sub| actor_sub == token.sub);
+        if !sub_matches_actor {
+            info!(target: CC, "reauth rejected: token sub does not match the actor's admitted sub");
+            return Err(reject());
+        }
+        let Some(session_id) = actor.get_zpr_addr().map(|a| a.to_string()) else {
+            info!(target: CC, "reauth rejected: actor has no session id (zpr address)");
+            return Err(reject());
+        };
+        let Some(anchors) = svc.session_anchors(&session_id) else {
+            info!(target: CC, "reauth rejected: no session recorded for this actor");
+            return Err(reject());
+        };
+        // The recorded session must belong to the token's subject: a session
+        // anchor from a different account never validates another's renewal.
+        if anchors.sub != token.sub {
+            info!(target: CC, "reauth rejected: token sub does not match the recorded session");
+            return Err(reject());
+        }
+        let (admitted_auth_time, admitted_iat) = (anchors.auth_time, anchors.iat);
+        // Liveness (PR #19 review): a renewal only extends a LIVE admission.
+        // A recorded session whose admission has lapsed must not be
+        // resurrectable by a fresh token — generic rejection (Q2), the node's
+        // cue to reconnect. (The record's eventual removal is the zipline#44
+        // sweep; this check just refuses to use a stale one.)
+        if anchors.expires <= now {
+            info!(target: CC, "reauth rejected: the recorded admission has expired");
+            return Err(reject());
+        }
+
+        // Replay guard: the renewal token must be minted strictly after the
+        // one that produced the recorded admission.
+        if token.iat <= admitted_iat {
+            info!(target: CC, "reauth rejected: token iat is not newer than the admitted iat");
+            return Err(reject());
+        }
+        // Same login session: a token from a NEW authentication event is not
+        // a renewal — the endpoint must reconnect.
+        if token.auth_time != admitted_auth_time {
+            info!(target: CC, "reauth rejected: token auth_time differs from the admitted session");
+            return Err(reject());
+        }
+
+        // Dual-clock renewal (zipline#42): the window restarts from the fresh
+        // iat, capped by the fixed per-login session ceiling. A ceiling (or
+        // window) already passed is a clean rejection — the cue to tear down.
+        let expires = compute_authority_expiry(
+            token.iat,
+            svc.session_ceiling(token.auth_time),
+            svc.lifetime(),
+        );
+        if expires <= now {
+            info!(target: CC, "reauth rejected for provider '{}': renewed expiry is not in the future", svc.id());
+            return Err(reject());
+        }
+
+        // Re-admit under the renewed expiry and rebuild the user-namespace
+        // outcome exactly as the connect arm does.
+        let mapped = svc.admit(&token, expires)?;
+        let src = AttributeSource::new(svc.id());
+        let mut authd = vec![
+            src.builder(key::USER_AUTHORITY)
+                .expires(expires)
+                .value(svc.id()),
+        ];
+        if let Some(sub_attr) = mapped.into_iter().find(|a| a.get_key() == sub_key) {
+            authd.push(sub_attr);
+        }
+        Ok(BlobOutcome {
+            authd,
+            namespace: Namespace::User,
+            session: Some(OidcSessionRecord {
+                svc: svc.clone(),
+                sub: token.sub.clone(),
+                auth_time: token.auth_time,
+                iat: token.iat,
+                expires,
+            }),
+        })
+    }
+
+    /// The whole VSAPI `reauthorize` operation (zipline#43): resolve the live
+    /// actor behind `zpr_addr`, renew its OIDC authentication with
+    /// [Self::reauthenticate_oidc_blob], re-run policy under the same pinned
+    /// snapshot, and persist the renewed actor — its ZPR address unchanged.
+    ///
+    /// Request-shape problems (blob count, non-OIDC arm, unknown address,
+    /// wrong calling node) are caller bugs and reject `ParamError` with
+    /// explicit text; credential and session-binding failures come back from
+    /// the blob arm as `AuthError`/Contract-2 codes, deliberately
+    /// indistinguishable to a probing caller.
+    pub(crate) async fn reauthorize_actor(
+        &self,
+        asm: Arc<Assembly>,
+        zpr_addr: IpAddr,
+        blobs: Vec<AuthBlob>,
+        connect_via: &IpAddr,
+    ) -> Result<Actor, ServiceError> {
+        // Exactly one blob, and it must be the OIDC arm: only an IdP-issued
+        // expiring token has renewal semantics today (the SS bootstrap stamp
+        // is VS-chosen and fixed-lifetime; AC is legacy and cannot connect).
+        if blobs.len() != 1 {
+            return Err(ApiResponseError::new_code_msg(
+                ErrorCode::ParamError,
+                format!(
+                    "reauthorize requires exactly one auth blob, got {}",
+                    blobs.len()
+                ),
+            )
+            .into());
+        }
+        let Some(AuthBlob::Oidc(blob)) = blobs.into_iter().next() else {
+            return Err(ApiResponseError::new_code_msg(
+                ErrorCode::ParamError,
+                "reauthorize supports oidc blobs only",
+            )
+            .into());
+        };
+
+        // The renewal target must be a live actor admitted through the
+        // calling node. An unknown address or one behind a different node is
+        // a protocol error, not a credential rejection.
+        let Some(actor) = asm.actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await? else {
+            return Err(ApiResponseError::new_code_msg(
+                ErrorCode::ParamError,
+                "no live actor at the given zpr address",
+            )
+            .into());
+        };
+        let via_matches = actor
+            .get_attribute(key::CONNECT_VIA)
+            .and_then(|a| a.get_single_value().ok())
+            .is_some_and(|via| via == connect_via.to_string());
+        if !via_matches {
+            return Err(ApiResponseError::new_code_msg(
+                ErrorCode::ParamError,
+                "actor is not connected via the calling node",
+            )
+            .into());
+        }
+
+        // One coherent policy view for the whole renewal (PR #6 review):
+        // session validation and re-authorization read this snapshot, so a
+        // concurrent policy update cannot admit a credential under one
+        // revision and authorize it under another.
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let outcome = self.reauthenticate_oidc_blob(&psnap, &actor, &blob).await?;
+        let renewed_session = outcome.session;
+
+        // Rebuild the authenticated claim set: everything the actor already
+        // carries, minus what policy re-stamps ([key::ROLE], [key::SERVICES],
+        // [key::VINST], [key::CONFIG_ID]) and minus EVERY attribute the
+        // provider previously vouched for — not just the keys the renewal
+        // re-asserts (PR #19 review). A refreshed token may omit a formerly
+        // mapped claim (e.g. `email_verified` flips false, so `user.email` is
+        // no longer admitted); the stale source-stamped attribute must not
+        // survive into policy evaluation, and the trusted-service lookup
+        // cannot overwrite a key it no longer returns. Every attribute the
+        // provider vends carries its service id as the source, so the source
+        // is the complete prior set.
+        // The ZPR address rides along as an authenticated claim — the VS
+        // assigned it at connect, and reauth never re-allocates it.
+        let provider_src = outcome
+            .authd
+            .first()
+            .map(|a| a.get_source().to_string())
+            .unwrap_or_default();
+        let policy_stamped = [key::ROLE, key::SERVICES, key::VINST, key::CONFIG_ID];
+        let mut authd_claims: Vec<Attribute> = actor
+            .attrs_iter()
+            .filter(|a| a.get_source() != provider_src && !policy_stamped.contains(&a.get_key()))
+            .cloned()
+            .collect();
+        authd_claims.extend(outcome.authd);
+
+        // Re-run policy under the same snapshot: a policy change since
+        // connect is applied now, exactly as on a fresh connect. An
+        // evaluation denial is "login good, endpoint no longer admitted" and
+        // surfaces as PolicyDenied so the caller can tell it from a
+        // credential rejection; everything else keeps its classification.
+        let endpoint_cn = actor.get_cn().unwrap_or_default().to_string();
+        let mut renewed = self
+            .authorize_connection(
+                asm.clone(),
+                &psnap,
+                &endpoint_cn,
+                Vec::new(),
+                authd_claims,
+                0,
+            )
+            .await
+            .map_err(Self::classify_reauth_policy_error)?;
+
+        // Re-mint the VS identity token with a fresh expiration (PR #19
+        // review): the connect-time token rode through as an authenticated
+        // claim, but keeping it would cap the renewed actor at the ORIGINAL
+        // connect's window — `get_authentication_expiration()` takes the
+        // minimum across identity attributes, so after
+        // `DEFAULT_AUTH_EXPIRATION` an OIDC-only actor could renew its user
+        // authority yet still be denied new visas. Same minting rules as
+        // connect; re-registered as the first identity key, exactly as
+        // connect does.
+        if renewed.get_attribute(ATTR_KEY_VS_IDENT).is_some() {
+            let auth_expiration = if endpoint_cn == config::VS_CN {
+                config::VS_AUTH_EXPIRATION
+            } else {
+                config::DEFAULT_AUTH_EXPIRATION
+            };
+            let actor_jwt = if renewed.is_node() {
+                self.gen_jwt(format!("node/{}", endpoint_cn), auth_expiration)?
+            } else {
+                self.gen_jwt(format!("adapter/{}", endpoint_cn), auth_expiration)?
+            };
+            let _ = renewed.add_attribute(
+                Attribute::builder(ATTR_KEY_VS_IDENT)
+                    .expires(SystemTime::now() + auth_expiration)
+                    .value(actor_jwt),
+            );
+            let _ = renewed.add_identity_key(0, ATTR_KEY_VS_IDENT);
+        }
+
+        // Invariant, not policy: reauth renews credentials in place. The
+        // address was passed through as an authenticated claim, so this can
+        // only trip if authorize_connection changes shape underneath us.
+        if renewed.get_zpr_addr() != Some(&zpr_addr) {
+            return Err(ServiceError::Internal(
+                "reauthorize must not change the actor's zpr address".into(),
+            ));
+        }
+
+        asm.actor_mgr.update_actor(&renewed).await?;
+
+        // The whole renewal succeeded: advance this session's anchors to the
+        // fresh token (per actor session — PR #19 review). Recording only on
+        // success means a failed policy re-run does not consume the token's
+        // strictly-increasing `iat`.
+        if let Some(session) = renewed_session {
+            session.record(&zpr_addr);
+        }
+        Ok(renewed)
+    }
+
+    /// Classify an `authorize_connection` failure on the REAUTH path for the
+    /// wire (zipline#43 acceptance): a policy-evaluation denial means the
+    /// login is still good but the endpoint is no longer admitted, and
+    /// surfaces as `PolicyDenied` so the caller can tell it from a credential
+    /// rejection (`AuthError`). Every other failure — trusted-service
+    /// lookups, stores, internals — passes through with its existing
+    /// classification. The connect path is deliberately not routed through
+    /// this: there a no-join-policy login still connects (#227), so the
+    /// evaluation errors this maps simply do not reach its callers.
+    fn classify_reauth_policy_error(err: ServiceError) -> ServiceError {
+        match err {
+            ServiceError::Eval(e) => {
+                info!(target: CC, "reauth denied by policy evaluation: {e}");
+                ApiResponseError::new_code_msg(ErrorCode::PolicyDenied, "policy denied").into()
+            }
+            other => other,
+        }
     }
 
     /// Preform authentication of an adapter or a node, then run through policy.
@@ -3197,6 +3623,644 @@ mod tests {
                 .get_value(),
             &vec!["google".to_string()],
             "the OIDC authenticator's authority must not be displaced by a decorating store"
+        );
+    }
+
+    // ---- reauthorize: session-bound OIDC renewal (zipline#43, R3) ----
+
+    /// Unwrap any reauth failure into its wire-classified [ApiResponseError].
+    fn api_err<T>(result: Result<T, ServiceError>) -> ApiResponseError {
+        match result {
+            Err(ServiceError::ApiResponse(api)) => api,
+            Err(other) => panic!("expected ApiResponse error, got {other:?}"),
+            Ok(_) => panic!("expected an error, got Ok"),
+        }
+    }
+
+    /// Assert the uniform session-binding rejection: `authError` with the
+    /// generic message, nothing echoed.
+    fn assert_auth_rejected(api: ApiResponseError) {
+        assert!(
+            matches!(api.code, ErrorCode::AuthError),
+            "unexpected code {:?}",
+            api.code
+        );
+        assert_eq!(api.message, "authentication rejected");
+    }
+
+    /// A raw [OidcBlob] for the fixture issuer (the reauth path takes the blob
+    /// directly, not the [AuthBlob] union). The blob-level nonce is unused on
+    /// this path.
+    fn oidc_raw_blob(id_token: String) -> OidcBlob {
+        OidcBlob {
+            issuer: OIDC_ISSUER.to_string(),
+            id_token,
+            nonce: String::new(),
+        }
+    }
+
+    /// Connect an OIDC-only actor whose token was minted `iat` seconds ago and
+    /// persist it behind `connect_via`, returning everything a reauth needs.
+    /// The connect token carries no `auth_time`, so the recorded session
+    /// anchor falls back to `iat` — reauth tokens must assert it explicitly.
+    async fn reauth_fixture(
+        iat_age_secs: u64,
+    ) -> (Arc<Assembly>, ConnectionControl, Actor, IpAddr, u64) {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        let connect_via: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let iat1 = unix_now() - iat_age_secs;
+        let mut claims = oidc_base_claims();
+        claims["iat"] = json!(iat1);
+        let req = make_connect_request(vec![oidc_blob(mint_signed(claims))], "some.cn");
+        let actor = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &connect_via)
+            .await
+            .expect("fixture connect must authorize");
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, &connect_via)
+            .await
+            .expect("fixture actor must persist");
+        (asm, cc, actor, connect_via, iat1)
+    }
+
+    /// A renewal claim set: fresh `iat`, explicit `auth_time`, and a nonce
+    /// that matches no challenge (refresh-grant tokens carry the original
+    /// login nonce — OIDC Core §12.2 — so the reauth path must not check it).
+    fn renewal_claims(iat: u64, auth_time: u64) -> serde_json::Value {
+        let mut c = oidc_base_claims();
+        c["iat"] = json!(iat);
+        c["auth_time"] = json!(auth_time);
+        c["nonce"] = json!("stale-original-login-nonce");
+        c
+    }
+
+    /// Happy path at the blob level: same sub, strictly newer `iat`, unchanged
+    /// `auth_time`, live admission — renews despite the useless nonce, and the
+    /// renewed outcome carries the same authority and subject values.
+    #[tokio::test]
+    async fn test_reauth_session_bound_renews() {
+        let (asm, cc, actor, _via, iat1) = reauth_fixture(120).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let blob = oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)));
+
+        let outcome = cc
+            .reauthenticate_oidc_blob(&psnap, &actor, &blob)
+            .await
+            .expect("session-bound renewal must validate");
+
+        let authority = outcome
+            .authd
+            .iter()
+            .find(|a| a.get_key() == key::USER_AUTHORITY)
+            .expect("renewed outcome must carry the user authority");
+        assert_eq!(authority.get_value(), &vec!["google".to_string()]);
+        let old_expiry = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .unwrap()
+            .get_expires();
+        assert!(
+            authority.get_expires() > old_expiry,
+            "renewed authority expiry must be strictly later (iat-anchored window)"
+        );
+        let sub_attr = outcome
+            .authd
+            .iter()
+            .find(|a| a.get_key() == "user.oidc-subject")
+            .expect("renewed outcome must carry the mapped sub");
+        assert_eq!(sub_attr.get_single_value().unwrap(), OIDC_SUB);
+    }
+
+    /// Table row 1: a token from a provider that did not admit this actor is a
+    /// credential rejection — generic `authError`, nothing echoed.
+    #[tokio::test]
+    async fn test_reauth_unknown_provider_rejected() {
+        let (asm, cc, actor, _via, iat1) = reauth_fixture(120).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let mut blob = oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)));
+        blob.issuer = "https://idp.invalid".to_string();
+
+        let api = api_err(cc.reauthenticate_oidc_blob(&psnap, &actor, &blob).await);
+        assert_auth_rejected(api);
+    }
+
+    /// Table row 2: every non-nonce validation check still runs under
+    /// SessionBound — a token signed by an unknown key fails with the same
+    /// Contract-2 classification as on the connect path.
+    #[tokio::test]
+    async fn test_reauth_bad_signature_contract2_classified() {
+        let (asm, cc, actor, _via, iat1) = reauth_fixture(120).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        // Signed with a key the provider's JWKS does not carry.
+        let (foreign_key, _) = gen_rsa_test_keypair();
+        let pem = foreign_key.private_key_to_pem_pkcs8().unwrap();
+        let signing_key = jwt::EncodingKey::from_rsa_pem(&pem).unwrap();
+        let token = mint_token(
+            renewal_claims(unix_now(), iat1),
+            "not-a-known-kid",
+            jwt::Algorithm::RS256,
+            &signing_key,
+        );
+
+        let api = api_err(
+            cc.reauthenticate_oidc_blob(&psnap, &actor, &oidc_raw_blob(token))
+                .await,
+        );
+        assert!(
+            matches!(api.code, ErrorCode::InvalidSignature),
+            "unexpected code {:?}",
+            api.code
+        );
+    }
+
+    /// Table row 3a: a valid token for a DIFFERENT subject does not renew this
+    /// actor's session.
+    #[tokio::test]
+    async fn test_reauth_sub_mismatch_rejected() {
+        let (asm, cc, actor, _via, iat1) = reauth_fixture(120).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let mut claims = renewal_claims(unix_now(), iat1);
+        claims["sub"] = json!("somebody-else");
+
+        let api = api_err(
+            cc.reauthenticate_oidc_blob(&psnap, &actor, &oidc_raw_blob(mint_signed(claims)))
+                .await,
+        );
+        assert_auth_rejected(api);
+    }
+
+    /// Table row 3b: no admission recorded for the subject — here the actor
+    /// carries the right attributes but the provider store never admitted the
+    /// sub (the VS-restart shape: attributes persisted, in-memory cache gone).
+    /// The node's cue to reconnect.
+    #[tokio::test]
+    async fn test_reauth_no_recorded_admission_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        // An actor that LOOKS admitted (authority + mapped sub) but whose
+        // subject has no record in the provider store.
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::USER_AUTHORITY)
+                    .expires_in(Duration::from_secs(3600))
+                    .value("google"),
+            )
+            .unwrap();
+        actor
+            .add_attribute(
+                Attribute::builder("user.oidc-subject")
+                    .expires_in(Duration::from_secs(3600))
+                    .value(OIDC_SUB),
+            )
+            .unwrap();
+        let iat1 = unix_now() - 120;
+        let blob = oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)));
+
+        let api = api_err(cc.reauthenticate_oidc_blob(&psnap, &actor, &blob).await);
+        assert_auth_rejected(api);
+    }
+
+    /// Table row 4: `iat` must be strictly greater than the recorded one — the
+    /// admitted token itself (or any older one) replayed to reauthorize is
+    /// rejected.
+    #[tokio::test]
+    async fn test_reauth_iat_not_increasing_rejected() {
+        let (asm, cc, actor, _via, iat1) = reauth_fixture(120).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        // Same iat as the admitted token (auth_time defaulted to iat1 there).
+        let blob = oidc_raw_blob(mint_signed(renewal_claims(iat1, iat1)));
+
+        let api = api_err(cc.reauthenticate_oidc_blob(&psnap, &actor, &blob).await);
+        assert_auth_rejected(api);
+    }
+
+    /// Table row 5: a changed `auth_time` is a NEW login session, not a
+    /// renewal of this one — the endpoint must reconnect.
+    #[tokio::test]
+    async fn test_reauth_auth_time_changed_rejected() {
+        let (asm, cc, actor, _via, iat1) = reauth_fixture(120).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let blob = oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1 + 60)));
+
+        let api = api_err(cc.reauthenticate_oidc_blob(&psnap, &actor, &blob).await);
+        assert_auth_rejected(api);
+    }
+
+    /// Table row 6: a renewal whose recomputed expiry is not in the future is
+    /// a clean rejection (open question 2: `authError` + generic message).
+    /// Forced here with a zero-lifetime policy: the dual-clock window closes
+    /// at `iat`, so any real renewal instant is already past it.
+    #[tokio::test]
+    async fn test_reauth_expired_window_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                0, // expiration_seconds: the renewal window is zero-width
+                OIDC_MAPPINGS,
+                &["sub"],
+                make_test_oidc_config(),
+                &[],
+                &[],
+            ))
+            .await
+            .expect("test policy should install");
+        let cc = make_cc("test-vs");
+        let connect_via: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let iat1 = unix_now() - 120;
+        let mut claims = oidc_base_claims();
+        claims["iat"] = json!(iat1);
+        let req = make_connect_request(vec![oidc_blob(mint_signed(claims))], "some.cn");
+        let actor = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &connect_via)
+            .await
+            .expect("connect itself does not require a future expiry");
+
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let blob = oidc_raw_blob(mint_signed(renewal_claims(iat1 + 30, iat1)));
+
+        let api = api_err(cc.reauthenticate_oidc_blob(&psnap, &actor, &blob).await);
+        assert_auth_rejected(api);
+    }
+
+    /// Regression: the connect arm still requires the exact nonce after the
+    /// [NonceExpectation] refactor — a mismatched nonce fails
+    /// `authenticate_oidc_blob` with the Contract-2 signature classification.
+    #[tokio::test]
+    async fn test_connect_arm_still_rejects_wrong_nonce_after_refactor() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let mut claims = oidc_base_claims();
+        claims["nonce"] = json!("not-the-challenge-nonce");
+        let AuthBlob::Oidc(blob) = oidc_blob(mint_signed(claims)) else {
+            unreachable!()
+        };
+
+        let api = api_err(cc.authenticate_oidc_blob(&psnap, &blob).await);
+        assert!(
+            matches!(api.code, ErrorCode::InvalidSignature),
+            "unexpected code {:?}",
+            api.code
+        );
+    }
+
+    // ---- reauthorize_actor: the whole VSAPI operation (zipline#43 step 4) ----
+
+    /// Happy path end to end: the renewed actor keeps its ZPR address and its
+    /// `user.*` attribute VALUES, and its authentication expiry moves strictly
+    /// later; the persisted record reflects the renewal.
+    #[tokio::test]
+    async fn test_reauthorize_actor_renews_in_place() {
+        let (asm, cc, actor, connect_via, iat1) = reauth_fixture(120).await;
+        let addr = *actor.get_zpr_addr().expect("fixture actor has an address");
+        let old_expiry = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .unwrap()
+            .get_expires();
+        let old_sub = actor
+            .get_attribute("user.oidc-subject")
+            .unwrap()
+            .get_single_value()
+            .unwrap()
+            .to_string();
+
+        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
+            unix_now(),
+            iat1,
+        ))))];
+        let renewed = cc
+            .reauthorize_actor(asm.clone(), addr, blobs, &connect_via)
+            .await
+            .expect("reauthorize must succeed");
+
+        assert_eq!(
+            renewed.get_zpr_addr(),
+            Some(&addr),
+            "reauth must never re-allocate the address"
+        );
+        assert_eq!(
+            renewed
+                .get_attribute("user.oidc-subject")
+                .unwrap()
+                .get_single_value()
+                .unwrap(),
+            old_sub,
+            "renewed user.* attributes keep their values"
+        );
+        assert!(
+            renewed
+                .get_attribute(key::USER_AUTHORITY)
+                .unwrap()
+                .get_expires()
+                > old_expiry,
+            "renewed authority expiry must be strictly later"
+        );
+        // And the renewal was persisted, not just returned.
+        let stored = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .expect("renewed actor must still be stored");
+        assert!(
+            stored
+                .get_attribute(key::USER_AUTHORITY)
+                .unwrap()
+                .get_expires()
+                > old_expiry,
+            "the stored record must carry the renewed expiry"
+        );
+    }
+
+    /// PR #19 review (P1): reauthorization must re-mint the VS identity
+    /// token, not carry the connect-time one. `get_authentication_expiration`
+    /// takes the MINIMUM across identity attributes, so a stale
+    /// `zpr.vs.bootstrap.ident` would cap every renewal at the original
+    /// connect's window — after 4 hours an OIDC-only actor could renew its
+    /// user authority yet still be denied new visas.
+    #[tokio::test]
+    async fn test_reauthorize_actor_renews_vs_identity_token() {
+        let (asm, cc, actor, connect_via, iat1) = reauth_fixture(120).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+        let old_ident = actor
+            .get_attribute(ATTR_KEY_VS_IDENT)
+            .expect("connect stamps the VS identity token")
+            .clone();
+
+        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
+            unix_now(),
+            iat1,
+        ))))];
+        let renewed = cc
+            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .await
+            .expect("reauthorize must succeed");
+
+        let new_ident = renewed
+            .get_attribute(ATTR_KEY_VS_IDENT)
+            .expect("the renewed actor must carry a VS identity token");
+        assert_ne!(
+            new_ident.get_single_value().unwrap(),
+            old_ident.get_single_value().unwrap(),
+            "the VS identity token must be re-minted (fresh jti), not carried over"
+        );
+        assert!(
+            new_ident.get_expires() > old_ident.get_expires(),
+            "the re-minted identity token must carry a fresh expiration"
+        );
+        // Still registered as the highest-priority identity key.
+        assert_eq!(
+            renewed.identity_keys_iter().next().map(|k| k.as_str()),
+            Some(ATTR_KEY_VS_IDENT)
+        );
+    }
+
+    /// PR #19 review (P1): a claim the refreshed token no longer admits must
+    /// not survive renewal. The fixture's connect admitted a verified email;
+    /// the renewal token's email is unverified (the C2 validator strips it),
+    /// so the provider no longer vouches `user.email` — the stale
+    /// source-stamped attribute must be dropped before policy evaluation,
+    /// not carried into the renewed actor.
+    #[tokio::test]
+    async fn test_reauthorize_actor_drops_claims_the_renewal_no_longer_admits() {
+        let (asm, cc, actor, connect_via, iat1) = reauth_fixture(120).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+        assert!(
+            actor.get_attribute("user.email").is_some(),
+            "the fixture connect admits the verified email"
+        );
+
+        let mut claims = renewal_claims(unix_now(), iat1);
+        claims["email_verified"] = json!(false);
+        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(claims)))];
+        let renewed = cc
+            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .await
+            .expect("reauthorize must succeed");
+
+        assert!(
+            renewed.get_attribute("user.email").is_none(),
+            "a formerly-mapped claim the refreshed token no longer admits must not survive"
+        );
+        // Claims the renewal still admits come back through the lookup.
+        assert!(
+            renewed.get_attribute("user.domain").is_some(),
+            "claims the refreshed token still admits are re-served"
+        );
+    }
+
+    /// PR #19 review (P1): session anchors must be scoped to the actor
+    /// session, not globally to the OIDC subject. A second live actor
+    /// authenticating as the SAME provider account (a new login session:
+    /// later `auth_time`/`iat`) must not overwrite the first actor's
+    /// recorded anchors — its renewal within its own login session must
+    /// still validate.
+    #[tokio::test]
+    async fn test_reauth_anchors_scoped_per_actor_session() {
+        let (asm, cc, actor1, connect_via, iat1) = reauth_fixture(300).await;
+
+        // Second actor, same subject, NEW login session (fresher iat, and —
+        // via the connect fallback — a different auth_time anchor).
+        let iat2 = unix_now() - 60;
+        let mut claims = oidc_base_claims();
+        claims["iat"] = json!(iat2);
+        let req = make_connect_request(vec![oidc_blob(mint_signed(claims))], "other.cn");
+        let actor2 = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &connect_via)
+            .await
+            .expect("the second connect for the same subject must authorize");
+        assert_ne!(
+            actor1.get_zpr_addr(),
+            actor2.get_zpr_addr(),
+            "two live actors, two addresses"
+        );
+
+        // Actor 1 renews within ITS login session (auth_time = iat1). The
+        // second admission must not have clobbered actor 1's anchors.
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let blob = oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)));
+        cc.reauthenticate_oidc_blob(&psnap, &actor1, &blob)
+            .await
+            .expect("a concurrent session for the same subject must not invalidate this renewal");
+    }
+
+    /// With the anchors advancing on the reauthorize operation itself, a
+    /// renewal token replayed to a SECOND reauthorize is caught by the
+    /// strictly-increasing `iat` guard.
+    #[tokio::test]
+    async fn test_reauthorize_actor_replayed_renewal_token_rejected() {
+        let (asm, cc, actor, connect_via, iat1) = reauth_fixture(120).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+        let token = mint_signed(renewal_claims(unix_now(), iat1));
+
+        cc.reauthorize_actor(
+            asm.clone(),
+            addr,
+            vec![AuthBlob::Oidc(oidc_raw_blob(token.clone()))],
+            &connect_via,
+        )
+        .await
+        .expect("the first renewal must succeed");
+
+        let api = api_err(
+            cc.reauthorize_actor(
+                asm,
+                addr,
+                vec![AuthBlob::Oidc(oidc_raw_blob(token))],
+                &connect_via,
+            )
+            .await,
+        );
+        assert_auth_rejected(api);
+    }
+
+    /// PR #19 review (P2): a lapsed admission must not be resurrectable. The
+    /// recorded session's `expires` has passed, the actor record still
+    /// exists — a fresh, otherwise-valid token must be rejected with the
+    /// generic `AuthError` (Q2: passed-ceiling ⇒ generic rejection); the
+    /// node's cue to reconnect. (The expiry SWEEP is zipline#44 — out of
+    /// scope here; this is only the liveness check on the reauth path.)
+    #[tokio::test]
+    async fn test_reauth_expired_admission_rejected() {
+        let (asm, cc, actor, _via, iat1) = reauth_fixture(120).await;
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let svc = psnap
+            .oidc_service_for_issuer(OIDC_ISSUER)
+            .expect("fixture provider");
+        // Overwrite the recorded session with one whose admission expired.
+        let session_id = actor.get_zpr_addr().unwrap().to_string();
+        let anchors = svc.session_anchors(&session_id).expect("recorded session");
+        svc.record_session(
+            &session_id,
+            OIDC_SUB,
+            anchors.auth_time,
+            anchors.iat,
+            SystemTime::now() - Duration::from_secs(1),
+        );
+
+        let blob = oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)));
+        let api = api_err(cc.reauthenticate_oidc_blob(&psnap, &actor, &blob).await);
+        assert_auth_rejected(api);
+    }
+
+    /// A non-OIDC blob is a caller bug: `paramError` with explicit text, not
+    /// the generic credential rejection (open question 3 / operator Q3).
+    #[tokio::test]
+    async fn test_reauthorize_actor_non_oidc_blob_param_error() {
+        let (asm, cc, actor, connect_via, _iat1) = reauth_fixture(120).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+        let (privkey, _) = gen_rsa_test_keypair();
+        let blobs = vec![make_valid_ss_blob(&privkey, "some.cn")];
+
+        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &connect_via).await);
+        assert!(
+            matches!(api.code, ErrorCode::ParamError),
+            "unexpected code {:?}",
+            api.code
+        );
+        assert_eq!(api.message, "reauthorize supports oidc blobs only");
+    }
+
+    /// Zero blobs (and by the same arm, more than one): `paramError` with the
+    /// count named.
+    #[tokio::test]
+    async fn test_reauthorize_actor_wrong_blob_count_param_error() {
+        let (asm, cc, actor, connect_via, _iat1) = reauth_fixture(120).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+
+        let api = api_err(
+            cc.reauthorize_actor(asm, addr, Vec::new(), &connect_via)
+                .await,
+        );
+        assert!(
+            matches!(api.code, ErrorCode::ParamError),
+            "unexpected code {:?}",
+            api.code
+        );
+        assert_eq!(
+            api.message,
+            "reauthorize requires exactly one auth blob, got 0"
+        );
+    }
+
+    /// An address with no live actor behind it: `paramError` (protocol error,
+    /// not a credential rejection).
+    #[tokio::test]
+    async fn test_reauthorize_actor_unknown_address_param_error() {
+        let (asm, cc, _actor, connect_via, iat1) = reauth_fixture(120).await;
+        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
+            unix_now(),
+            iat1,
+        ))))];
+
+        let api = api_err(
+            cc.reauthorize_actor(asm, "fd5a:5052::dead".parse().unwrap(), blobs, &connect_via)
+                .await,
+        );
+        assert!(
+            matches!(api.code, ErrorCode::ParamError),
+            "unexpected code {:?}",
+            api.code
+        );
+    }
+
+    /// An actor admitted through a DIFFERENT node cannot be reauthorized from
+    /// this one (first table row of the issue).
+    #[tokio::test]
+    async fn test_reauthorize_actor_wrong_node_param_error() {
+        let (asm, cc, actor, _connect_via, iat1) = reauth_fixture(120).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+        let other_node: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
+            unix_now(),
+            iat1,
+        ))))];
+
+        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &other_node).await);
+        assert!(
+            matches!(api.code, ErrorCode::ParamError),
+            "unexpected code {:?}",
+            api.code
+        );
+    }
+
+    /// A policy-evaluation denial from `authorize_connection` on the reauth
+    /// path surfaces as `PolicyDenied` on the wire (issue acceptance): the
+    /// login is still good — the endpoint is no longer admitted — so the
+    /// caller must be able to tell it from a credential rejection. Everything
+    /// else passes through with its existing classification. Note an
+    /// end-to-end denial is unreachable for adapters today: a validated login
+    /// matching no join policy still connects (#227, recorded as superseded
+    /// in docs/OIDC.md), so this exercises the classification arm directly.
+    #[test]
+    fn test_reauth_policy_denial_maps_to_policy_denied() {
+        use libeval::error::EvalError;
+
+        let denied =
+            ConnectionControl::classify_reauth_policy_error(ServiceError::Eval(EvalError::NoMatch));
+        let api = match denied {
+            ServiceError::ApiResponse(api) => api,
+            other => panic!("expected ApiResponse, got {other:?}"),
+        };
+        assert!(
+            matches!(api.code, ErrorCode::PolicyDenied),
+            "unexpected code {:?}",
+            api.code
+        );
+        assert_eq!(api.message, "policy denied");
+
+        // Non-evaluation failures keep their existing classification.
+        let passthrough =
+            ConnectionControl::classify_reauth_policy_error(ServiceError::Internal("x".into()));
+        assert!(
+            matches!(passthrough, ServiceError::Internal(_)),
+            "non-eval errors must pass through unchanged"
         );
     }
 }

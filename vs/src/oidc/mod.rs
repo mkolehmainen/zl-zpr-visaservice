@@ -19,7 +19,7 @@ pub use jwks::{KeySource, ProxyFuture, ProxyResolver, static_proxy};
 #[allow(unused_imports)]
 pub use store::OidcTrustedService;
 #[allow(unused_imports)]
-pub use validate::{IdpParams, OidcError, ValidatedToken, validate_id_token};
+pub use validate::{IdpParams, NonceExpectation, OidcError, ValidatedToken, validate_id_token};
 
 // The C2 test-only token minter, shared with the connect-path tests (C5).
 #[cfg(test)]
