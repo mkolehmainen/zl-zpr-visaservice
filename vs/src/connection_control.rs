@@ -874,7 +874,10 @@ impl ConnectionControl {
         authd_claims.extend(outcome.authd);
 
         // Re-run policy under the same snapshot: a policy change since
-        // connect is applied now, exactly as on a fresh connect.
+        // connect is applied now, exactly as on a fresh connect. An
+        // evaluation denial is "login good, endpoint no longer admitted" and
+        // surfaces as PolicyDenied so the caller can tell it from a
+        // credential rejection; everything else keeps its classification.
         let endpoint_cn = actor.get_cn().unwrap_or_default().to_string();
         let mut renewed = self
             .authorize_connection(
@@ -885,7 +888,8 @@ impl ConnectionControl {
                 authd_claims,
                 0,
             )
-            .await?;
+            .await
+            .map_err(Self::classify_reauth_policy_error)?;
 
         // The VS identity token from connect survives as an attribute; keep
         // it registered as the first identity key, exactly as connect does.
@@ -904,6 +908,25 @@ impl ConnectionControl {
 
         asm.actor_mgr.update_actor(&renewed).await?;
         Ok(renewed)
+    }
+
+    /// Classify an `authorize_connection` failure on the REAUTH path for the
+    /// wire (zipline#43 acceptance): a policy-evaluation denial means the
+    /// login is still good but the endpoint is no longer admitted, and
+    /// surfaces as `PolicyDenied` so the caller can tell it from a credential
+    /// rejection (`AuthError`). Every other failure — trusted-service
+    /// lookups, stores, internals — passes through with its existing
+    /// classification. The connect path is deliberately not routed through
+    /// this: there a no-join-policy login still connects (#227), so the
+    /// evaluation errors this maps simply do not reach its callers.
+    fn classify_reauth_policy_error(err: ServiceError) -> ServiceError {
+        match err {
+            ServiceError::Eval(e) => {
+                info!(target: CC, "reauth denied by policy evaluation: {e}");
+                ApiResponseError::new_code_msg(ErrorCode::PolicyDenied, "policy denied").into()
+            }
+            other => other,
+        }
     }
 
     /// Preform authentication of an adapter or a node, then run through policy.
@@ -3915,6 +3938,40 @@ mod tests {
             matches!(api.code, ErrorCode::ParamError),
             "unexpected code {:?}",
             api.code
+        );
+    }
+
+    /// A policy-evaluation denial from `authorize_connection` on the reauth
+    /// path surfaces as `PolicyDenied` on the wire (issue acceptance): the
+    /// login is still good — the endpoint is no longer admitted — so the
+    /// caller must be able to tell it from a credential rejection. Everything
+    /// else passes through with its existing classification. Note an
+    /// end-to-end denial is unreachable for adapters today: a validated login
+    /// matching no join policy still connects (#227, recorded as superseded
+    /// in docs/OIDC.md), so this exercises the classification arm directly.
+    #[test]
+    fn test_reauth_policy_denial_maps_to_policy_denied() {
+        use libeval::error::EvalError;
+
+        let denied =
+            ConnectionControl::classify_reauth_policy_error(ServiceError::Eval(EvalError::NoMatch));
+        let api = match denied {
+            ServiceError::ApiResponse(api) => api,
+            other => panic!("expected ApiResponse, got {other:?}"),
+        };
+        assert!(
+            matches!(api.code, ErrorCode::PolicyDenied),
+            "unexpected code {:?}",
+            api.code
+        );
+        assert_eq!(api.message, "policy denied");
+
+        // Non-evaluation failures keep their existing classification.
+        let passthrough =
+            ConnectionControl::classify_reauth_policy_error(ServiceError::Internal("x".into()));
+        assert!(
+            matches!(passthrough, ServiceError::Internal(_)),
+            "non-eval errors must pass through unchanged"
         );
     }
 }
