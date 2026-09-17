@@ -891,9 +891,31 @@ impl ConnectionControl {
             .await
             .map_err(Self::classify_reauth_policy_error)?;
 
-        // The VS identity token from connect survives as an attribute; keep
-        // it registered as the first identity key, exactly as connect does.
+        // Re-mint the VS identity token with a fresh expiration (PR #19
+        // review): the connect-time token rode through as an authenticated
+        // claim, but keeping it would cap the renewed actor at the ORIGINAL
+        // connect's window — `get_authentication_expiration()` takes the
+        // minimum across identity attributes, so after
+        // `DEFAULT_AUTH_EXPIRATION` an OIDC-only actor could renew its user
+        // authority yet still be denied new visas. Same minting rules as
+        // connect; re-registered as the first identity key, exactly as
+        // connect does.
         if renewed.get_attribute(ATTR_KEY_VS_IDENT).is_some() {
+            let auth_expiration = if endpoint_cn == config::VS_CN {
+                config::VS_AUTH_EXPIRATION
+            } else {
+                config::DEFAULT_AUTH_EXPIRATION
+            };
+            let actor_jwt = if renewed.is_node() {
+                self.gen_jwt(format!("node/{}", endpoint_cn), auth_expiration)?
+            } else {
+                self.gen_jwt(format!("adapter/{}", endpoint_cn), auth_expiration)?
+            };
+            let _ = renewed.add_attribute(
+                Attribute::builder(ATTR_KEY_VS_IDENT)
+                    .expires(SystemTime::now() + auth_expiration)
+                    .value(actor_jwt),
+            );
             let _ = renewed.add_identity_key(0, ATTR_KEY_VS_IDENT);
         }
 
@@ -3857,6 +3879,49 @@ mod tests {
                 .get_expires()
                 > old_expiry,
             "the stored record must carry the renewed expiry"
+        );
+    }
+
+    /// PR #19 review (P1): reauthorization must re-mint the VS identity
+    /// token, not carry the connect-time one. `get_authentication_expiration`
+    /// takes the MINIMUM across identity attributes, so a stale
+    /// `zpr.vs.bootstrap.ident` would cap every renewal at the original
+    /// connect's window — after 4 hours an OIDC-only actor could renew its
+    /// user authority yet still be denied new visas.
+    #[tokio::test]
+    async fn test_reauthorize_actor_renews_vs_identity_token() {
+        let (asm, cc, actor, connect_via, iat1) = reauth_fixture(120).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+        let old_ident = actor
+            .get_attribute(ATTR_KEY_VS_IDENT)
+            .expect("connect stamps the VS identity token")
+            .clone();
+
+        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
+            unix_now(),
+            iat1,
+        ))))];
+        let renewed = cc
+            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .await
+            .expect("reauthorize must succeed");
+
+        let new_ident = renewed
+            .get_attribute(ATTR_KEY_VS_IDENT)
+            .expect("the renewed actor must carry a VS identity token");
+        assert_ne!(
+            new_ident.get_single_value().unwrap(),
+            old_ident.get_single_value().unwrap(),
+            "the VS identity token must be re-minted (fresh jti), not carried over"
+        );
+        assert!(
+            new_ident.get_expires() > old_ident.get_expires(),
+            "the re-minted identity token must carry a fresh expiration"
+        );
+        // Still registered as the highest-priority identity key.
+        assert_eq!(
+            renewed.identity_keys_iter().next().map(|k| k.as_str()),
+            Some(ATTR_KEY_VS_IDENT)
         );
     }
 
