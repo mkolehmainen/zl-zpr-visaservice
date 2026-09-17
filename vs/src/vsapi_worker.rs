@@ -15,8 +15,8 @@ use ::zpr::vsapi::v1 as vsapi;
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
 use zpr::vsapi_types::{
-    ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, PublicKey, SockAddr,
-    VSConnectRequest, VisaOp, pname,
+    AuthBlob, ConnectRequest, ConnectType, Connection, PacketDesc, Param, ParamValue, PublicKey,
+    SockAddr, VSConnectRequest, VisaOp, pname,
 };
 use zpr::write_to::WriteTo;
 
@@ -1383,13 +1383,72 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
 
     async fn reauthorize(
         self: Rc<Self>,
-        _: vsapi::v_s_handle::ReauthorizeParams,
-        _: vsapi::v_s_handle::ReauthorizeResults,
+        params: vsapi::v_s_handle::ReauthorizeParams,
+        mut results: vsapi::v_s_handle::ReauthorizeResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "reauthorize from {:?}", self.node.get_cn());
-        Err(capnp::Error::unimplemented(
-            "method v_s_handle::Server::reauthorize not implemented".to_string(),
-        ))
+
+        // Parse the request inline with the existing vsapi_types conversions
+        // (a ReauthRequest wrapper in zl-zpr-common is zipline#48).
+        let req_rdr = params.get()?.get_req()?;
+        let zpr_addr = ipaddr_from_capnp(req_rdr.get_zpr_addr()?)?;
+        let mut blobs: Vec<AuthBlob> = Vec::new();
+        for blob_rdr in req_rdr.get_blobs()? {
+            blobs.push(AuthBlob::try_from(blob_rdr).map_err(|e| {
+                capnp::Error::failed(format!("failed to parse ReauthRequest blob: {}", e))
+            })?);
+        }
+
+        let connect_via = self.node.get_zpr_addr().unwrap();
+        self.update_last_seen_time(connect_via).await;
+
+        let actor = match self
+            .asm
+            .cc
+            .reauthorize_actor(self.asm.clone(), zpr_addr, blobs, connect_via)
+            .await
+        {
+            Ok(actor) => actor,
+            Err(e) => {
+                info!(target: API, "reauthorize failed for actor {zpr_addr} via node {:?}: {}", self.node.get_cn(), e);
+                let mut err_builder = results.get().init_resp().init_error();
+                // Same wire discipline as authorize_connect: an error the
+                // reauth path already classified carries its exact code and
+                // retry hint; everything else stays a blanket authError.
+                // Neither branch echoes internal detail.
+                match e {
+                    ServiceError::ApiResponse(api) => {
+                        err_builder.set_code(api.code.into());
+                        err_builder.set_message(&api.message);
+                        err_builder.set_retry_in(api.retry_in);
+                    }
+                    _ => write_error(
+                        &mut err_builder,
+                        vsapi::ErrorCode::AuthError,
+                        "reauthorization failed",
+                    ),
+                }
+                return Ok(());
+            }
+        };
+
+        let auth_expires = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .map(|a| a.get_expires())
+            .unwrap_or(UNIX_EPOCH);
+        {
+            let dt: DateTime<Utc> = auth_expires.into();
+            info!(
+                target: API,
+                "reauthorized adapter {:?} at address {zpr_addr} (expires {})",
+                actor.get_cn(),
+                dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            );
+        }
+        let zpr_con = Connection::new(zpr_addr, auth_expires);
+        let mut resp_builder = results.get().init_resp().init_ok();
+        zpr_con.write_to(&mut resp_builder);
+        Ok(())
     }
 
     async fn notify_disconnect(
