@@ -174,24 +174,23 @@ impl Actor {
     ///
     /// If there are no identity keys we assume there is no authentication and return None.
     pub fn get_authentication_expiration(&self) -> Option<SystemTime> {
-        let authority_expiration = [key::DEVICE_AUTHORITY, key::USER_AUTHORITY]
-            .iter()
-            .filter_map(|key| self.get_attribute(key))
-            .map(|attr| attr.get_expires())
-            .min();
-        let identity_expiration = self
-            .identity_keys
-            .iter()
-            .filter_map(|key| self.get_attribute(key))
-            .map(|attr| attr.get_expires())
-            .min();
+        self.get_authentication_expiration_with_gate()
+            .map(|(expiry, _gate)| expiry)
+    }
 
-        match (authority_expiration, identity_expiration) {
-            (Some(a), Some(i)) => Some(a.min(i)),
-            (Some(a), None) => Some(a),
-            (None, Some(i)) => Some(i),
-            (None, None) => None,
-        }
+    /// As [Actor::get_authentication_expiration], but also names the *gate* — the
+    /// attribute key whose expiration drives the result — so callers acting on an
+    /// expiry (e.g. the auth-expiry sweep) can log which credential ran out.
+    pub fn get_authentication_expiration_with_gate(&self) -> Option<(SystemTime, String)> {
+        [key::DEVICE_AUTHORITY, key::USER_AUTHORITY]
+            .iter()
+            .copied()
+            .chain(self.identity_keys.iter().map(|k| k.as_str()))
+            .filter_map(|key| {
+                self.get_attribute(key)
+                    .map(|attr| (attr.get_expires(), key.to_string()))
+            })
+            .min_by_key(|(expiry, _key)| *expiry)
     }
 
     pub fn is_provider(&self) -> bool {
@@ -295,6 +294,72 @@ mod tests {
     fn test_expiration_none_without_authority_or_identity() {
         let actor = Actor::new();
         assert_eq!(actor.get_authentication_expiration(), None);
+    }
+
+    /// The gate variant names the credential that drives the expiry: with
+    /// device.zpr.authority expiring soonest, the gate is that key; when an
+    /// identity attribute expires soonest instead, the gate is the identity key.
+    #[test]
+    fn test_auth_expiration_gate_names_driving_credential() {
+        // Device authority expires soonest.
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::DEVICE_AUTHORITY)
+                    .expires_in(Duration::from_secs(60))
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+        actor
+            .add_attribute(
+                Attribute::builder(key::USER_AUTHORITY)
+                    .expires_in(Duration::from_secs(7200))
+                    .value("some-oidc-issuer"),
+            )
+            .unwrap();
+        let device_expiry = actor
+            .get_attribute(key::DEVICE_AUTHORITY)
+            .unwrap()
+            .get_expires();
+        assert_eq!(
+            actor.get_authentication_expiration_with_gate(),
+            Some((device_expiry, key::DEVICE_AUTHORITY.to_string())),
+            "gate must be the authority attribute that expires soonest"
+        );
+        // The plain accessor must agree with the gated one.
+        assert_eq!(actor.get_authentication_expiration(), Some(device_expiry));
+
+        // An identity attribute expiring sooner than every authority wins.
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::USER_AUTHORITY)
+                    .expires_in(Duration::from_secs(7200))
+                    .value("some-oidc-issuer"),
+            )
+            .unwrap();
+        actor
+            .add_attribute(
+                Attribute::builder("user.oidc-subject")
+                    .expires_in(Duration::from_secs(30))
+                    .value("someone@example.com"),
+            )
+            .unwrap();
+        actor
+            .add_identity_key(usize::MAX, "user.oidc-subject")
+            .unwrap();
+        let identity_expiry = actor
+            .get_attribute("user.oidc-subject")
+            .unwrap()
+            .get_expires();
+        assert_eq!(
+            actor.get_authentication_expiration_with_gate(),
+            Some((identity_expiry, "user.oidc-subject".to_string())),
+            "gate must be the identity attribute when it expires soonest"
+        );
+
+        // No credentials at all: no expiration, no gate.
+        assert_eq!(Actor::new().get_authentication_expiration_with_gate(), None);
     }
 
     #[test]

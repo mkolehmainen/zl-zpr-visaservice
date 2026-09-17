@@ -160,8 +160,8 @@ pub async fn vss_worker_loop(
                                 asm.counters.incr(CounterType::VssErrors);
                             }
                         }
-                        VssCmd::RevokeAuthsByZprAddr(_zpr_addr, resp_tx) => {
-                            if let Err(e) = resp_tx.send(Err(VssSyncError::Internal("revoke-auths not implemented".to_string()))) {
+                        VssCmd::RevokeAuthsByZprAddr(zpr_addrs, resp_tx) => {
+                            if let Err(e) = resp_tx.send(vss_do_revoke_auths(&vss_handle, &zpr_addrs).await) {
                                 error!(target: VSS, "failed to send response for revoke-auths command: {:?}", e);
                                 asm.counters.incr(CounterType::VssErrors);
                             }
@@ -641,6 +641,45 @@ async fn vss_do_revoke_visas(
     vss_do_visa_ops(vss_handle, &ops).await
 }
 
+/// Revoke authentications on the node for the given ZPR addresses via the
+/// `revokeAuthentication` RPC, returning the number positively ack'd. The ack
+/// handling mirrors [vss_do_visa_ops]: ok with a short count logs the partial
+/// success, `ok = false` maps the carried error.
+async fn vss_do_revoke_auths(
+    vss_handle: &v1::v_s_s_handle::Client,
+    addrs: &[IpAddr],
+) -> Result<usize, VssSyncError> {
+    let mut req = vss_handle.revoke_authentication_request();
+    let req_builder = req.get();
+    let mut addrs_list_builder = req_builder.init_addrs(addrs.len() as u32);
+    for (i, addr) in addrs.iter().enumerate() {
+        let mut addr_builder = addrs_list_builder.reborrow().get(i as u32);
+        addr.write_to(&mut addr_builder);
+    }
+
+    let revoke_response_rdr =
+        rpc_with_timeout("revoke-auths", DEFAULT_RPC_TIMEOUT, req.send().promise).await?;
+
+    let ack_response = revoke_response_rdr.get()?.get_ack()?;
+    if ack_response.get_ok() {
+        // At least one revocation was processed. Return the number processed and
+        // log the error (if any) for a partial success.
+        let processed = ack_response.get_processed() as usize;
+        if processed < addrs.len() {
+            let err_rdr = ack_response.get_error()?;
+            let err_obj = ApiResponseError::try_from(err_rdr)?;
+            error!(target: VSS, "revoke-auths partially succeeded: {} of {} processed, error code={:?} msg={}",
+            processed, addrs.len(), err_obj.code, err_obj.message);
+        }
+        Ok(processed)
+    } else {
+        // No revocations were processed.
+        let err_rdr = ack_response.get_error()?;
+        let err_obj = ApiResponseError::try_from(err_rdr)?;
+        Err(err_obj.into())
+    }
+}
+
 async fn vss_do_set_services(
     vss_handle: &v1::v_s_s_handle::Client,
     services: Vec<ServiceDescriptor>,
@@ -761,4 +800,137 @@ async fn vss_do_set_topology(
         rpc_with_timeout("set-topology", DEFAULT_RPC_TIMEOUT, req.send().promise).await?;
     let set_response_ok_or_err = set_response_rdr.get()?;
     check_ok_or_error(set_response_ok_or_err.get_res().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// In-process capnp `VSSHandle` server whose `revoke_authentication` records
+    /// the received addresses and answers with a configurable `Ack` — the same
+    /// local-stub spirit as `oidc/jwks.rs` `test_support`.
+    struct StubVss {
+        seen: Rc<RefCell<Vec<IpAddr>>>,
+        ack_ok: bool,
+        processed: u32,
+        error_msg: Option<String>,
+    }
+
+    impl v1::v_s_s_handle::Server for StubVss {
+        async fn revoke_authentication(
+            self: Rc<Self>,
+            params: v1::v_s_s_handle::RevokeAuthenticationParams,
+            mut results: v1::v_s_s_handle::RevokeAuthenticationResults,
+        ) -> Result<(), capnp::Error> {
+            let addrs_rdr = params.get()?.get_addrs()?;
+            for addr_rdr in addrs_rdr.iter() {
+                let addr = IpAddr::try_from(addr_rdr)
+                    .map_err(|e| capnp::Error::failed(format!("bad addr: {e}")))?;
+                self.seen.borrow_mut().push(addr);
+            }
+            let mut ack = results.get().init_ack();
+            ack.set_ok(self.ack_ok);
+            ack.set_processed(self.processed);
+            if let Some(msg) = &self.error_msg {
+                let mut err = ack.init_error();
+                err.set_code(v1::ErrorCode::Internal);
+                err.set_message(msg);
+            }
+            Ok(())
+        }
+    }
+
+    /// Wire a [StubVss] to a `VSSHandle` client over an in-memory duplex pipe
+    /// (twoparty RPC both ways). Must run inside a `LocalSet`.
+    fn start_stub(stub: StubVss) -> v1::v_s_s_handle::Client {
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+
+        // Server vat.
+        let (sr, sw) = tokio::io::split(server_side);
+        let server_network = capnp_rpc::twoparty::VatNetwork::new(
+            tokio::io::BufReader::new(sr).compat(),
+            tokio::io::BufWriter::new(sw).compat_write(),
+            capnp_rpc::rpc_twoparty_capnp::Side::Server,
+            capnp::message::ReaderOptions::new(),
+        );
+        let server_client: v1::v_s_s_handle::Client = capnp_rpc::new_client(stub);
+        let server_rpc =
+            capnp_rpc::RpcSystem::new(Box::new(server_network), Some(server_client.clone().client));
+        tokio::task::spawn_local(server_rpc);
+
+        // Client vat.
+        let (cr, cw) = tokio::io::split(client_side);
+        let client_network = capnp_rpc::twoparty::VatNetwork::new(
+            tokio::io::BufReader::new(cr).compat(),
+            tokio::io::BufWriter::new(cw).compat_write(),
+            capnp_rpc::rpc_twoparty_capnp::Side::Client,
+            capnp::message::ReaderOptions::new(),
+        );
+        let mut client_rpc = capnp_rpc::RpcSystem::new(Box::new(client_network), None);
+        let handle: v1::v_s_s_handle::Client =
+            client_rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+        tokio::task::spawn_local(client_rpc);
+
+        handle
+    }
+
+    /// An ok ack with `processed = n` maps to `Ok(n)`, and the node saw exactly
+    /// the addresses we sent, in order.
+    #[tokio::test]
+    async fn test_revoke_auths_sends_addrs_and_returns_processed_count() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let seen = Rc::new(RefCell::new(Vec::new()));
+                let handle = start_stub(StubVss {
+                    seen: seen.clone(),
+                    ack_ok: true,
+                    processed: 2,
+                    error_msg: None,
+                });
+
+                let addrs: Vec<IpAddr> = vec![
+                    "fd5a:5052:4000::a".parse().unwrap(),
+                    "10.1.2.3".parse().unwrap(),
+                ];
+                let n = vss_do_revoke_auths(&handle, &addrs)
+                    .await
+                    .expect("revoke-auths should succeed on an ok ack");
+                assert_eq!(n, 2, "processed count must come from the ack");
+                assert_eq!(
+                    *seen.borrow(),
+                    addrs,
+                    "node must see exactly the sent addrs"
+                );
+            })
+            .await;
+    }
+
+    /// An `ok = false` ack with an error maps to `Err(VssSyncError)`.
+    #[tokio::test]
+    async fn test_revoke_auths_error_ack_maps_to_err() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let seen = Rc::new(RefCell::new(Vec::new()));
+                let handle = start_stub(StubVss {
+                    seen: seen.clone(),
+                    ack_ok: false,
+                    processed: 0,
+                    error_msg: Some("revocation rejected".to_string()),
+                });
+
+                let addrs: Vec<IpAddr> = vec!["fd5a:5052:4000::a".parse().unwrap()];
+                let res = vss_do_revoke_auths(&handle, &addrs).await;
+                match res {
+                    Err(VssSyncError::ApiResponse(_, msg, _)) => {
+                        assert!(msg.contains("revocation rejected"), "unexpected msg: {msg}");
+                    }
+                    other => panic!("expected ApiResponse error, got {other:?}"),
+                }
+            })
+            .await;
+    }
 }
