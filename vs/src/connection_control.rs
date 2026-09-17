@@ -858,16 +858,27 @@ impl ConnectionControl {
 
         // Rebuild the authenticated claim set: everything the actor already
         // carries, minus what policy re-stamps ([key::ROLE], [key::SERVICES],
-        // [key::VINST], [key::CONFIG_ID]) and minus the user-namespace
-        // attributes the renewal just replaced (same values, later expiry).
+        // [key::VINST], [key::CONFIG_ID]) and minus EVERY attribute the
+        // provider previously vouched for — not just the keys the renewal
+        // re-asserts (PR #19 review). A refreshed token may omit a formerly
+        // mapped claim (e.g. `email_verified` flips false, so `user.email` is
+        // no longer admitted); the stale source-stamped attribute must not
+        // survive into policy evaluation, and the trusted-service lookup
+        // cannot overwrite a key it no longer returns. Every attribute the
+        // provider vends carries its service id as the source, so the source
+        // is the complete prior set.
         // The ZPR address rides along as an authenticated claim — the VS
         // assigned it at connect, and reauth never re-allocates it.
-        let renewed_keys: Vec<&str> = outcome.authd.iter().map(|a| a.get_key()).collect();
+        let provider_src = outcome
+            .authd
+            .first()
+            .map(|a| a.get_source().to_string())
+            .unwrap_or_default();
         let policy_stamped = [key::ROLE, key::SERVICES, key::VINST, key::CONFIG_ID];
         let mut authd_claims: Vec<Attribute> = actor
             .attrs_iter()
             .filter(|a| {
-                !renewed_keys.contains(&a.get_key()) && !policy_stamped.contains(&a.get_key())
+                a.get_source() != provider_src && !policy_stamped.contains(&a.get_key())
             })
             .cloned()
             .collect();
@@ -3922,6 +3933,40 @@ mod tests {
         assert_eq!(
             renewed.identity_keys_iter().next().map(|k| k.as_str()),
             Some(ATTR_KEY_VS_IDENT)
+        );
+    }
+
+    /// PR #19 review (P1): a claim the refreshed token no longer admits must
+    /// not survive renewal. The fixture's connect admitted a verified email;
+    /// the renewal token's email is unverified (the C2 validator strips it),
+    /// so the provider no longer vouches `user.email` — the stale
+    /// source-stamped attribute must be dropped before policy evaluation,
+    /// not carried into the renewed actor.
+    #[tokio::test]
+    async fn test_reauthorize_actor_drops_claims_the_renewal_no_longer_admits() {
+        let (asm, cc, actor, connect_via, iat1) = reauth_fixture(120).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+        assert!(
+            actor.get_attribute("user.email").is_some(),
+            "the fixture connect admits the verified email"
+        );
+
+        let mut claims = renewal_claims(unix_now(), iat1);
+        claims["email_verified"] = json!(false);
+        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(claims)))];
+        let renewed = cc
+            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .await
+            .expect("reauthorize must succeed");
+
+        assert!(
+            renewed.get_attribute("user.email").is_none(),
+            "a formerly-mapped claim the refreshed token no longer admits must not survive"
+        );
+        // Claims the renewal still admits come back through the lookup.
+        assert!(
+            renewed.get_attribute("user.domain").is_some(),
+            "claims the refreshed token still admits are re-served"
         );
     }
 
