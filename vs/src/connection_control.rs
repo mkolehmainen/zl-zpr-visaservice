@@ -674,8 +674,10 @@ impl ConnectionControl {
 
     /// Renew one OIDC user authentication (zipline#43, R3): validate the
     /// refreshed `id_token` with the nonce check replaced by session binding.
-    /// A refresh-grant token carries the *original* login nonce (OIDC Core
-    /// §12.2), so it can never match a fresh challenge; the token is instead
+    /// A refresh-grant token SHOULD NOT carry a `nonce` claim, and one it
+    /// does carry MUST equal the *original* login nonce (OIDC Core
+    /// §12.2) — absent or original, never fresh — so it can never match a
+    /// fresh challenge; the token is instead
     /// bound to the live session recorded at admission: same provider, same
     /// `sub`, strictly increasing `iat` (replay guard) and unchanged
     /// `auth_time` (a different login session must reconnect). Every other
@@ -3820,8 +3822,9 @@ mod tests {
     }
 
     /// A renewal claim set: fresh `iat`, explicit `auth_time`, and a nonce
-    /// that matches no challenge (refresh-grant tokens carry the original
-    /// login nonce — OIDC Core §12.2 — so the reauth path must not check it).
+    /// that matches no challenge (a refresh-grant token SHOULD NOT carry a
+    /// nonce, and one it does carry is the original login nonce, never a
+    /// fresh one — OIDC Core §12.2 — so the reauth path must not check it).
     fn renewal_claims(iat: u64, auth_time: u64) -> serde_json::Value {
         let mut c = oidc_base_claims();
         c["iat"] = json!(iat);
