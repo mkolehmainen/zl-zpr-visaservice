@@ -952,15 +952,20 @@ async fn get_host(
         Ok(Some(addr)) => addr,
     };
 
-    // The holder's CN is a display label and may legitimately be absent.
+    // A hit in the hostname index whose holder no longer loads is a departing
+    // actor observed mid-`clean_up`: the base record is deleted before the
+    // `host:<NAME>` entries are released (see `ActorRepo::clean_up`), so the
+    // index can briefly name a holder that is already gone. That window is a
+    // miss — same 404 as an unclaimed name — never a 200 carrying a dead ZPR
+    // address. A *present* actor's CN is a display label and may legitimately
+    // be absent; only that case yields an empty `actor_cn`.
     let actor_cn = match rstate.asm.actor_mgr.get_actor_by_zpr_addr(&addr).await {
         Err(e) => {
             error!(target: ADMIN, "error loading actor {} for hostname {}: {}", addr, host_name, e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-        Ok(opt_a) => opt_a
-            .and_then(|a| a.get_cn().map(str::to_string))
-            .unwrap_or_default(),
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Ok(Some(a)) => a.get_cn().map(str::to_string).unwrap_or_default(),
     };
 
     Ok(Json(HostDescriptor {
@@ -3059,6 +3064,51 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "for {path}");
         }
+    }
+
+    /// GET /admin/hosts/{name} while the holder is departing (PR #26 review):
+    /// `ActorRepo::clean_up` deletes the actor's base record before releasing
+    /// its `host:<NAME>` entries, so the hostname index can name a holder
+    /// whose record is already gone. That window must read as a miss — 404,
+    /// the same answer as an unclaimed name — never a 200 carrying a dead
+    /// ZPR address and an empty `actor_cn`.
+    #[tokio::test]
+    async fn test_get_host_missing_holder_is_not_found() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_resolve_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let mut adapter = make_adapter_actor_defexp("fd5a:5052::3", "host-cn-1");
+        adapter
+            .add_attribute(Attribute::builder("device.hostname").values(&["somename"]))
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap(), &Default::default())
+            .await
+            .unwrap();
+
+        // Reproduce the mid-departure window: the base record is deleted
+        // (clean_up's first pipeline) while the host:<NAME> entry is still
+        // in the index (released later in clean_up).
+        asm.state_db.del("actor:fd5a-5052--3").await.unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/hosts/somename")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// GET /admin/hosts/{name} sits on the resolve surface (zipline#54): like
