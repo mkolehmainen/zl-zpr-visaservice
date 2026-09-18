@@ -70,9 +70,11 @@ pub enum NonceExpectation<'a> {
     /// Connect path: the token must carry exactly this nonce. Missing and
     /// mismatched are the same failure; the expected value is never echoed.
     Required(&'a str),
-    /// Reauth path (zipline#43): a refresh-grant `id_token` carries the
-    /// *original* login nonce (OIDC Core §12.2), so it can never match a
-    /// fresh challenge. The caller binds the token to the live session
+    /// Reauth path (zipline#43): a refresh-grant `id_token` SHOULD NOT
+    /// carry a `nonce` claim, and if one is present it MUST equal the
+    /// *original* login nonce (OIDC Core §12.2) — absent or original,
+    /// never fresh — so it can never match a fresh challenge. The caller
+    /// binds the token to the live session
     /// (same `sub`, increasing `iat`, unchanged `auth_time`) instead; only
     /// the nonce equality is skipped — every other check runs unchanged.
     SessionBound,
@@ -507,7 +509,8 @@ mod tests {
 
     // zipline#43 (R3): under SessionBound the nonce equality — and only it —
     // is skipped: a token whose nonce matches no fresh challenge (a refresh
-    // grant carries the original login nonce, OIDC Core §12.2) validates,
+    // grant SHOULD NOT carry a nonce, and one it does carry is the original
+    // login nonce — never a fresh one; OIDC Core §12.2) validates,
     // and a token with no nonce at all validates too. Every other check
     // stays live, e.g. a wrong audience still fails.
     #[test]
