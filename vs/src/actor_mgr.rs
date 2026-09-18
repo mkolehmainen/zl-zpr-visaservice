@@ -175,6 +175,21 @@ impl ActorMgr {
         Ok(())
     }
 
+    /// Rebuild the `host:<NAME>` hostname-claim index from persisted actor
+    /// attributes against `policy_service_names` (zipline#53, PR #24 review).
+    /// Called at startup (backfill for actors persisted before the index
+    /// existed) and on policy install (a new policy service name evicts a
+    /// matching held hostname).
+    pub async fn reconcile_hostname_claims(
+        &self,
+        policy_service_names: &HashSet<String>,
+    ) -> Result<(), ServiceError> {
+        self.actor_db
+            .reconcile_hostname_claims(policy_service_names, &self.counters)
+            .await?;
+        Ok(())
+    }
+
     /// Use [ActorMgr::remove_actor_by_zpr_addr] to remove actor records which apply to both nodes and adapters.
     /// Use this function here in addition to remove node state.
     ///

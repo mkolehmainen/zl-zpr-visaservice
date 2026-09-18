@@ -490,6 +490,24 @@ impl ActorRepo {
         Ok(())
     }
 
+    /// Rebuild the `host:<NAME>` claim index from persisted actor attributes
+    /// (zipline#53, PR #24 review): run the claim pass over every persisted
+    /// actor. Idempotent — re-claiming a held name is a no-op — so it serves
+    /// both callers: startup (backfill for actors persisted before the index
+    /// existed, satisfying the no-migration invariant by reconstruction
+    /// rather than migration) and policy install (a new policy service name
+    /// evicts a matching held hostname, because [Self::claim_hostnames_for_actor]
+    /// treats a policy-name match as a drop). A per-actor load failure is
+    /// logged and skipped — one bad record must not abort the whole pass.
+    pub async fn reconcile_hostname_claims(
+        &self,
+        _policy_service_names: &HashSet<String>,
+        _counters: &Counters,
+    ) -> Result<(), StoreError> {
+        // RED stub (zipline#53 PR #24 review): implemented in the GREEN commit.
+        Ok(())
+    }
+
     /// Get a list of all the connected services -- what they are called and where
     /// they are connected.
     pub async fn list_services(&self) -> Result<Vec<ServiceEntry>, StoreError> {
@@ -1894,5 +1912,121 @@ mod test {
         assert!(!is_valid_hostname_label("-x"));
         assert!(!is_valid_hostname_label("x-"));
         assert!(!is_valid_hostname_label("a b"));
+    }
+
+    // ------------------------------------------------------------------
+    // zipline#53, PR #24 review: reconcile_hostname_claims.
+    // ------------------------------------------------------------------
+
+    /// PR #24 review finding 1 (backfill): an actor persisted BEFORE the
+    /// `host:<NAME>` index existed has `device.hostname` under
+    /// `actor:<ZADDR>:attrs` but no `host:<NAME>` or `actor:<ZADDR>:hostnames`
+    /// entries. A reconciliation pass over persisted actors must rebuild both
+    /// from the attributes — and running it again must be a no-op (idempotent,
+    /// no rejections counted for names the actor already holds).
+    #[tokio::test]
+    async fn test_reconcile_backfills_missing_host_index() {
+        let db: Arc<FakeDb> = Arc::new(FakeDb::new());
+        let repo1 = ActorRepo::new(db.clone());
+        let counters = Counters::default();
+        let actor =
+            make_actor_with_hostnames("fd5a:5052::d1", "backfill-cn", &["somename", "m-7f3a2b"]);
+        let addr: IpAddr = "fd5a:5052::d1".parse().unwrap();
+        repo1
+            .add_actor(&actor, &no_services(), &counters)
+            .await
+            .unwrap();
+
+        // Simulate pre-index persisted state: the attrs hash still carries
+        // device.hostname, but no host:<NAME> entry or hostnames set exists.
+        db.del(&host_key_for("somename")).await.unwrap();
+        db.del(&host_key_for("m-7f3a2b")).await.unwrap();
+        db.del(&actor_hostnames_key_for(&addr)).await.unwrap();
+        assert_eq!(
+            repo1.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            None,
+            "precondition: the index entry is gone"
+        );
+
+        // A fresh repo over the same store (the restart case) reconciles.
+        let repo2 = ActorRepo::new(db);
+        repo2
+            .reconcile_hostname_claims(&no_services(), &counters)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo2.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            Some(addr),
+            "reconcile must rebuild host:<NAME> from persisted attributes"
+        );
+        assert_eq!(
+            repo2.get_zpr_addr_for_hostname("m-7f3a2b").await.unwrap(),
+            Some(addr)
+        );
+        let mut names = repo2.list_hostnames_for_actor(&addr).await.unwrap();
+        names.sort();
+        assert_eq!(names, vec!["m-7f3a2b".to_string(), "somename".to_string()]);
+
+        // Idempotent: a second pass changes nothing and rejects nothing.
+        repo2
+            .reconcile_hostname_claims(&no_services(), &counters)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo2.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            Some(addr)
+        );
+        assert_eq!(
+            counters.counters[CounterType::HostnameClaimRejected].get_count(),
+            0,
+            "re-claiming names the actor already holds is not a rejection"
+        );
+    }
+
+    /// PR #24 review finding 2 (policy services win, retroactively): an actor
+    /// holds `host:<name>`; a newly installed policy then introduces a service
+    /// with that name. Reconciling against the new service-name set must
+    /// release the claim (counted as a rejection, recorded in
+    /// `hostname_conflicts`) while leaving the actor's other names held.
+    #[tokio::test]
+    async fn test_reconcile_evicts_hostname_matching_new_policy_service() {
+        let db: Arc<FakeDb> = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let counters = Counters::default();
+        let actor = make_actor_with_hostnames("fd5a:5052::d2", "evict-cn", &["web", "ok-name"]);
+        let addr: IpAddr = "fd5a:5052::d2".parse().unwrap();
+
+        // At claim time nothing collides: both names are held.
+        repo.add_actor(&actor, &no_services(), &counters)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("web").await.unwrap(),
+            Some(addr)
+        );
+
+        // A new policy introduces service "web": reconcile against it.
+        let policy_services: HashSet<String> = ["web".to_string()].into_iter().collect();
+        repo.reconcile_hostname_claims(&policy_services, &counters)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("web").await.unwrap(),
+            None,
+            "a held hostname matching a new policy service must be released"
+        );
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("ok-name").await.unwrap(),
+            Some(addr),
+            "losing one name to policy must not cost the others"
+        );
+        let names = repo.list_hostnames_for_actor(&addr).await.unwrap();
+        assert_eq!(names, vec!["ok-name".to_string()]);
+        assert_eq!(
+            counters.counters[CounterType::HostnameClaimRejected].get_count(),
+            1
+        );
     }
 }
