@@ -501,10 +501,24 @@ impl ActorRepo {
     /// logged and skipped — one bad record must not abort the whole pass.
     pub async fn reconcile_hostname_claims(
         &self,
-        _policy_service_names: &HashSet<String>,
-        _counters: &Counters,
+        policy_service_names: &HashSet<String>,
+        counters: &Counters,
     ) -> Result<(), StoreError> {
-        // RED stub (zipline#53 PR #24 review): implemented in the GREEN commit.
+        for (zpr_addr, _cn) in self.list_actors(None).await? {
+            let actor = match self.get_actor_by_zpr_addr(&zpr_addr).await {
+                Ok(actor) => actor,
+                Err(e) => {
+                    warn!(target: DB, "hostname reconcile: failed to load actor {zpr_addr}, skipping: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = self
+                .claim_hostnames_for_actor(&actor, policy_service_names, counters)
+                .await
+            {
+                warn!(target: DB, "hostname reconcile: claim pass failed for actor {zpr_addr}, skipping: {e}");
+            }
+        }
         Ok(())
     }
 
