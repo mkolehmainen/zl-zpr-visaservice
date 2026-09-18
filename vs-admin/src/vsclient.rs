@@ -7,8 +7,8 @@ use reqwest::tls::Certificate;
 use zpr::policy_types::PolicyBundle;
 
 use admin_api_types::{
-    ActorDescriptor, ActorEntry, AuthRevokeDescriptor, DenyRecord, ListEntry, NamedListEntry,
-    NetworkDetails, Revokes, ServiceDescriptor, Stats, VisaDescriptor,
+    ActorDescriptor, ActorEntry, AuthRevokeDescriptor, DenyRecord, HostDescriptor, ListEntry,
+    NamedListEntry, NetworkDetails, Revokes, ServiceDescriptor, Stats, VisaDescriptor,
 };
 
 use crate::error::VsaError;
@@ -209,6 +209,15 @@ impl VsClient {
         requrl.path_segments_mut().unwrap().push(id);
         let resp = self.ht_get(requrl.as_str())?;
         let entry: ServiceDescriptor = resp.json()?;
+        Ok(entry)
+    }
+
+    /// `GET <api_url>/admin/hosts/<name>` (zipline#54)
+    pub fn get_host(&self, name: &str) -> Result<HostDescriptor, VsaError> {
+        let mut requrl = reqwest::Url::parse(&format!("{}/admin/hosts", self.api_url))?;
+        requrl.path_segments_mut().unwrap().push(name);
+        let resp = self.ht_get(requrl.as_str())?;
+        let entry: HostDescriptor = resp.json()?;
         Ok(entry)
     }
 

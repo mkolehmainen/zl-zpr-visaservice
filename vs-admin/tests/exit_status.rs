@@ -95,3 +95,33 @@ fn help_exits_zero() {
         .expect("failed to spawn vs-admin");
     assert!(out.status.success());
 }
+
+/// `hosts <NAME>` exists as a subcommand (zipline#54): against an unreachable
+/// service it must get past argument parsing (no "unrecognized subcommand")
+/// and fail at the connection attempt with a nonzero exit.
+#[test]
+fn hosts_subcommand_parses_and_failed_request_exits_nonzero() {
+    let out = vs_admin()
+        .args([
+            "--svc-url",
+            "https://[::1]:1", // nothing listens on port 1
+            "--ca-cert",
+            CA_CERT,
+            "--api-key",
+            "test-key",
+            "hosts",
+            "somename",
+        ])
+        .output()
+        .expect("failed to spawn vs-admin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unrecognized subcommand"),
+        "hosts must be a known subcommand, stderr: {stderr}"
+    );
+    assert!(
+        !out.status.success(),
+        "a failed hosts request must exit nonzero, got {:?}\nstderr: {stderr}",
+        out.status
+    );
+}

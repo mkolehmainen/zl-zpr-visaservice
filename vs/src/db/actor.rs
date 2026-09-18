@@ -579,8 +579,8 @@ impl ActorRepo {
     /// Given a hostname, look up the ZPR address of the actor holding it in the
     /// `host:<NAME>` index (zipline#53), if any.
     ///
-    /// No in-crate caller yet: the DNS surface (zipline#54/#55) consumes it.
-    #[allow(dead_code)]
+    /// Consumed by `GET /admin/hosts/{name}` (zipline#54); the CoreDNS surface
+    /// (zipline#55) resolves through the same call.
     pub async fn get_zpr_addr_for_hostname(
         &self,
         hostname: &str,
@@ -611,6 +611,21 @@ impl ActorRepo {
         let hostnames_key = actor_hostnames_key_for(&zpr_addr);
         let names: HashSet<String> = self.db.smembers(&hostnames_key).await?;
         Ok(names.into_iter().collect())
+    }
+
+    /// Read the actor's `hostname_conflicts` display field (zipline#54): the
+    /// claim values refused because another actor or a policy service already
+    /// held them, written by [Self::claim_hostnames_for_actor]. Display data
+    /// only — a missing or unparseable field is an empty list, never an error.
+    pub async fn get_hostname_conflicts(
+        &self,
+        zpr_addr: &IpAddr,
+    ) -> Result<Vec<String>, StoreError> {
+        let base_key = actor_key_for(zpr_addr);
+        let Some(json) = self.db.hget(&base_key, "hostname_conflicts").await? else {
+            return Ok(Vec::new());
+        };
+        Ok(serde_json::from_str(&json).unwrap_or_default())
     }
 
     /// Load specific attributes by name from the actor datastructure. Only found attributes are returned.

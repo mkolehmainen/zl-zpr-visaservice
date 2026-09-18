@@ -75,6 +75,8 @@ fn main() {
 
         Some(SubCmd::Services { id, flush }) => exec.do_cmd_services(id, flush),
 
+        Some(SubCmd::Hosts { name }) => exec.do_cmd_hosts(&name),
+
         // The historical commented-out Install arm, now live: POST the compiled
         // policy container to /admin/policies via the Executor like every other
         // subcommand (first real use of the hot-install path — zipline#38).

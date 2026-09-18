@@ -107,6 +107,16 @@ pub enum SubCmd {
         flush: bool,
     },
 
+    /// Resolve a claimed hostname to its holder (zipline#54). One name in, one
+    /// address out — there is deliberately no hosts listing (resolve keys gain
+    /// no actor visibility), so the name is required.
+    #[command()]
+    Hosts {
+        /// The hostname to resolve
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+
     /// Commands related to auth revokes, provide no additional arguments to see list of IDs of all auth revokes
     #[command()]
     AuthRevoke {
