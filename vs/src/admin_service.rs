@@ -618,6 +618,7 @@ async fn get_actor(
                     attrs,
                     auth_exp,
                     node_details,
+                    hostname_conflicts: vec![],
                 };
                 return Ok(Json(descriptor));
             }

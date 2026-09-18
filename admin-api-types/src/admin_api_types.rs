@@ -108,6 +108,11 @@ pub struct ActorDescriptor {
     #[serde_as(as = "Option<TimestampSeconds<i64>>")]
     pub auth_exp: Option<SystemTime>,
     pub node_details: Option<NodeRecordBrief>,
+    /// Hostname values this actor claimed that were refused because another actor
+    /// or a policy service already held them. Empty in the normal case (zipline#54).
+    /// Display data only; `#[serde(default)]` keeps pre-#54 payloads parseable.
+    #[serde(default)]
+    pub hostname_conflicts: Vec<String>,
 }
 
 // Wire-side actor identity is the ZPR address, not the CN: CNs may be shared or
@@ -138,6 +143,17 @@ pub struct ApiAttribute {
     pub value: Vec<String>,
     #[serde_as(as = "TimestampSeconds<i64>")]
     pub expires_at: SystemTime,
+}
+
+/// One resolvable hostname from the `host:<NAME>` claim index (zipline#54).
+/// Returned by `GET /admin/hosts/{name}`.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct HostDescriptor {
+    pub hostname: String,
+    /// ZPR address of the actor holding the name.
+    pub zpr_addr: String,
+    /// Display label of the owning actor; may be empty.
+    pub actor_cn: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq)]
@@ -487,11 +503,58 @@ mod tests {
             attrs: vec![],
             auth_exp: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7000)),
             node_details: None,
+            hostname_conflicts: vec![],
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&ad).unwrap()).unwrap();
         assert_eq!(v["created"].as_i64().unwrap(), 5000);
         assert_eq!(v["auth_exp"].as_i64().unwrap(), 7000);
+    }
+
+    /// zipline#54: a pre-#54 payload without `hostname_conflicts` still parses
+    /// (the field is `#[serde(default)]`), and it defaults to empty.
+    #[test]
+    fn actor_descriptor_parses_payload_without_hostname_conflicts() {
+        let json = r#"{
+            "cn": "test.cn", "created": 5000, "ident": "id", "node": false,
+            "zpr_addr": "fd5a::1", "attrs": [], "auth_exp": null, "node_details": null
+        }"#;
+        let ad: ActorDescriptor = serde_json::from_str(json).unwrap();
+        assert!(ad.hostname_conflicts.is_empty());
+    }
+
+    /// zipline#54: `hostname_conflicts` round-trips through JSON.
+    #[test]
+    fn actor_descriptor_hostname_conflicts_roundtrips() {
+        let ad = ActorDescriptor {
+            cn: Some("test.cn".to_string()),
+            ctime: SystemTime::UNIX_EPOCH,
+            ident: "ident".to_string(),
+            node: false,
+            zpr_addr: "fd5a::1".to_string(),
+            attrs: vec![],
+            auth_exp: None,
+            node_details: None,
+            hostname_conflicts: vec!["taken-name".to_string()],
+        };
+        let json = serde_json::to_string(&ad).unwrap();
+        let decoded: ActorDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.hostname_conflicts, vec!["taken-name".to_string()]);
+    }
+
+    /// zipline#54: `HostDescriptor` round-trips through JSON.
+    #[test]
+    fn host_descriptor_roundtrips_through_json() {
+        let hd = HostDescriptor {
+            hostname: "somename".to_string(),
+            zpr_addr: "fd5a:5052::c1".to_string(),
+            actor_cn: "".to_string(),
+        };
+        let json = serde_json::to_string(&hd).unwrap();
+        let decoded: HostDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.hostname, "somename");
+        assert_eq!(decoded.zpr_addr, "fd5a:5052::c1");
+        assert_eq!(decoded.actor_cn, "");
     }
 
     #[test]
@@ -505,6 +568,7 @@ mod tests {
             attrs: vec![],
             auth_exp: None,
             node_details: None,
+            hostname_conflicts: vec![],
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&ad).unwrap()).unwrap();
