@@ -6,6 +6,7 @@ license.workspace = true
 description = "Command line tool for interacting with the visa service evaluator library"
 
 [dependencies]
+build-info = { path = "../build-info" }
 bytes.workspace = true
 capnp.workspace = true
 chrono.workspace = true

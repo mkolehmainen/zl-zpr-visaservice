@@ -84,7 +84,7 @@ const DEFAULT_CONFIG_PATH: &str = "vs.toml";
 /// vs - ZPR visa service
 #[derive(Parser, Debug)]
 #[command(name = "vs")]
-#[command(version, verbatim_doc_comment)]
+#[command(version = build_info::BUILD_VERSION, verbatim_doc_comment)]
 struct Cli {
     /// Initial policy file (.bin2 format). If not specified we will load the current policy set in the database.
     /// If there is no policy in the database the visa service will fail to start.
@@ -137,7 +137,7 @@ async fn main() -> std::process::ExitCode {
         logging::Verbosity::NotVerbose
     };
     enable_logging(verbosity);
-    info!(target: MAIN, "vs version {}", env!("CARGO_PKG_VERSION"));
+    info!(target: MAIN, "vs version {}", build_info::BUILD_VERSION);
     let cfg = match load_config(cli.config.as_deref()) {
         Ok(c) => c,
         Err(e) => {

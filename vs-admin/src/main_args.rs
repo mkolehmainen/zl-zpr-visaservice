@@ -11,7 +11,7 @@ pub enum OutputFormat {
 }
 
 #[derive(Parser)]
-#[command(version, about = "Visa Service Admin Tool", long_about = None)]
+#[command(version = build_info::BUILD_VERSION, about = "Visa Service Admin Tool", long_about = None)]
 pub struct Cmd {
     #[command(subcommand)]
     pub command: Option<SubCmd>,

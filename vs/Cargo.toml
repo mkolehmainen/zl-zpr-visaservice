@@ -9,6 +9,7 @@ name = "vsapikey"
 path = "src/bin/vsapikey.rs"
 
 [dependencies]
+build-info = { path = "../build-info" }
 admin-api-types = { path = "../admin-api-types" }
 arc-swap = "1.7.1"
 async-trait = "0.1.89"
