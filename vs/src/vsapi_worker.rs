@@ -769,7 +769,12 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
                     "internal error during open",
                 );
             }
-            if let Err(e) = self.asm.actor_mgr.update_actor(&existing_actor).await {
+            if let Err(e) = self
+                .asm
+                .actor_mgr
+                .update_actor(&existing_actor, &self.asm.policy_service_names())
+                .await
+            {
                 error!(target: API, "failed to persist substrate addr claim for {}: {}", vs_connect_request.cn, e);
                 return self.ok_with_open_error(
                     results,
@@ -1010,7 +1015,11 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         if let Err(e) = self
             .asm
             .actor_mgr
-            .add_node(&node_actor, self.reconnect)
+            .add_node(
+                &node_actor,
+                self.reconnect,
+                &self.asm.policy_service_names(),
+            )
             .await
         {
             error!(target: API, "failed to add authenticated node {:?} to actor db: {}", &node_cn, e);
@@ -1317,7 +1326,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             if let Err(e) = self
                 .asm
                 .actor_mgr
-                .add_adapter_via_node(&actor, &connect_via)
+                .add_adapter_via_node(&actor, &connect_via, &self.asm.policy_service_names())
                 .await
             {
                 error!(target: API, "failed to add authenticated adapter {:?} to actor db: {}", actor.get_cn(), e);
@@ -1839,7 +1848,10 @@ mod tests {
         // Both A and B are authenticated nodes in the router; C is not connected at all.
         for (addr, cn) in [(a, "node-a"), (b, "node-b")] {
             let actor = make_node_actor_defexp(&addr.to_string(), cn, "[fd5a:5052::100]:1234");
-            asm.actor_mgr.add_node(&actor, false).await.unwrap();
+            asm.actor_mgr
+                .add_node(&actor, false, &Default::default())
+                .await
+                .unwrap();
             asm.topo_mgr.add_node(addr).unwrap();
         }
         let actor_b = make_node_actor_defexp(&b.to_string(), "node-b", "[fd5a:5052::100]:1234");
@@ -1930,7 +1942,10 @@ mod tests {
             let actor =
                 make_node_actor_defexp("fd5a:5052:90de:1::2", "test-node", "[fd5a:5052::100]:1234");
 
-            asm.actor_mgr.add_node(&actor, false).await.unwrap();
+            asm.actor_mgr
+                .add_node(&actor, false, &Default::default())
+                .await
+                .unwrap();
 
             let mut undo = AuthenticateUndo::default();
             undo.added_node_to_actor_mgr(&addr);
@@ -1950,7 +1965,10 @@ mod tests {
             let actor =
                 make_node_actor_defexp(&addr.to_string(), "test-node-2", "[fd5a:5052::101]:1234");
 
-            asm.actor_mgr.add_node(&actor, false).await.unwrap();
+            asm.actor_mgr
+                .add_node(&actor, false, &Default::default())
+                .await
+                .unwrap();
 
             let mut undo = AuthenticateUndo::default();
             undo.took_zpr_addr(&addr);

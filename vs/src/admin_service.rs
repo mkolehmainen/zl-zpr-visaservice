@@ -1790,7 +1790,10 @@ mod tests {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_r_key(&asm);
         let actor = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
-        asm.actor_mgr.add_node(&actor, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&actor, false, &Default::default())
+            .await
+            .unwrap();
 
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
         let app = admin_app(shared_state);
@@ -1830,9 +1833,16 @@ mod tests {
         let node_actor =
             make_node_actor_defexp("fd5a:5052::30", "node-f1", "[fd5a:5052::130]:1234");
         let cn_less_adapter = make_oidc_only_adapter_defexp("fd5a:5052::31");
-        asm.actor_mgr.add_node(&node_actor, false).await.unwrap();
         asm.actor_mgr
-            .add_adapter_via_node(&cn_less_adapter, node_actor.get_zpr_addr().unwrap())
+            .add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &cn_less_adapter,
+                node_actor.get_zpr_addr().unwrap(),
+                &Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1882,9 +1892,18 @@ mod tests {
         let actor1 = make_node_actor_defexp("fd5a:5052::12", "node-2", "[fd5a:5052::102]:1234");
         let actor2 = make_node_actor_defexp("fd5a:5052::13", "node-3", "[fd5a:5052::103]:1234");
 
-        asm.actor_mgr.add_node(&actor0, false).await.unwrap();
-        asm.actor_mgr.add_node(&actor1, false).await.unwrap();
-        asm.actor_mgr.add_node(&actor2, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&actor0, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&actor1, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&actor2, false, &Default::default())
+            .await
+            .unwrap();
 
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
         let app = admin_app(shared_state);
@@ -1924,9 +1943,16 @@ mod tests {
         let node_actor = make_node_actor_defexp("fd5a:5052::20", "node-1", "[fd5a:5052::120]:1234");
         let adapter_actor = make_adapter_actor_defexp("fd5a:5052::21", "adapter-1");
 
-        asm.actor_mgr.add_node(&node_actor, false).await.unwrap();
         asm.actor_mgr
-            .add_adapter_via_node(&adapter_actor, node_actor.get_zpr_addr().unwrap())
+            .add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &adapter_actor,
+                node_actor.get_zpr_addr().unwrap(),
+                &Default::default(),
+            )
             .await
             .unwrap();
 
@@ -2263,8 +2289,14 @@ mod tests {
 
         let actor_a = make_node_actor_defexp("fd5a:5052::10", "node-a", "[fd5a:5052::100]:1234");
         let actor_b = make_node_actor_defexp("fd5a:5052::11", "node-b", "[fd5a:5052::101]:1234");
-        asm.actor_mgr.add_node(&actor_a, false).await.unwrap();
-        asm.actor_mgr.add_node(&actor_b, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&actor_a, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&actor_b, false, &Default::default())
+            .await
+            .unwrap();
         asm.topo_mgr.add_node(addr_a).unwrap();
         asm.topo_mgr.add_node(addr_b).unwrap();
         asm.topo_mgr
@@ -2292,8 +2324,14 @@ mod tests {
         // Note: no policy peering installed, so this link is undeclared.
         let actor_a = make_node_actor_defexp("fd5a:5052::10", "node-a", "[fd5a:5052::100]:1234");
         let actor_b = make_node_actor_defexp("fd5a:5052::11", "node-b", "[fd5a:5052::101]:1234");
-        asm.actor_mgr.add_node(&actor_a, false).await.unwrap();
-        asm.actor_mgr.add_node(&actor_b, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&actor_a, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&actor_b, false, &Default::default())
+            .await
+            .unwrap();
         asm.topo_mgr.add_node(addr_a).unwrap();
         asm.topo_mgr.add_node(addr_b).unwrap();
         asm.topo_mgr
@@ -2366,7 +2404,10 @@ mod tests {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_r_key(&asm);
         let node = make_node_actor_defexp("fd5a:5052::30", "node-1", "[fd5a:5052::130]:1234");
-        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
 
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
         let app = admin_app(shared_state);
@@ -2395,9 +2436,12 @@ mod tests {
         let api_key = setup_test_api_r_key(&asm);
         let node = make_node_actor_defexp("fd5a:5052::31", "node-1", "[fd5a:5052::131]:1234");
         let adapter = make_adapter_actor_defexp("fd5a:5052::32", "adapter-1");
-        asm.actor_mgr.add_node(&node, false).await.unwrap();
         asm.actor_mgr
-            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap())
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap(), &Default::default())
             .await
             .unwrap();
 
@@ -2563,7 +2607,10 @@ mod tests {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_r_key(&asm);
         let node = make_node_actor_defexp("fd5a:5052::40", "node-detail", "[fd5a:5052::140]:1234");
-        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
 
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
         let app = admin_app(shared_state);
@@ -2599,9 +2646,12 @@ mod tests {
         let api_key = setup_test_api_r_key(&asm);
         let node = make_node_actor_defexp("fd5a:5052::41", "node-x", "[fd5a:5052::141]:1234");
         let cn_less = make_oidc_only_adapter_defexp("fd5a:5052::42");
-        asm.actor_mgr.add_node(&node, false).await.unwrap();
         asm.actor_mgr
-            .add_adapter_via_node(&cn_less, node.get_zpr_addr().unwrap())
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&cn_less, node.get_zpr_addr().unwrap(), &Default::default())
             .await
             .unwrap();
 
@@ -2636,9 +2686,12 @@ mod tests {
         let api_key = setup_test_api_r_key(&asm);
         let node = make_node_actor_defexp("fd5a:5052::43", "node-brief", "[fd5a:5052::143]:1234");
         let cn_less = make_oidc_only_adapter_defexp("fd5a:5052::44");
-        asm.actor_mgr.add_node(&node, false).await.unwrap();
         asm.actor_mgr
-            .add_adapter_via_node(&cn_less, node.get_zpr_addr().unwrap())
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&cn_less, node.get_zpr_addr().unwrap(), &Default::default())
             .await
             .unwrap();
 
@@ -2703,7 +2756,10 @@ mod tests {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_rw_key(&asm);
         let node = make_node_actor_defexp("fd5a:5052::45", "node-rvk", "[fd5a:5052::145]:1234");
-        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
 
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
         let app = admin_app(shared_state);
@@ -2795,11 +2851,14 @@ mod tests {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_resolve_key(&asm);
         let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
-        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
         let adapter =
             make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::3", &["svc:one"], "actor-1");
         asm.actor_mgr
-            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap())
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap(), &Default::default())
             .await
             .unwrap();
 
@@ -2832,11 +2891,14 @@ mod tests {
         let asm = Arc::new(new_assembly_for_tests(None).await);
         let api_key = setup_test_api_resolve_key(&asm);
         let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
-        asm.actor_mgr.add_node(&node, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
         let adapter =
             make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::3", &["svc:one"], "actor-1");
         asm.actor_mgr
-            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap())
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap(), &Default::default())
             .await
             .unwrap();
 
@@ -3090,6 +3152,7 @@ mod e2e_actor_guard {
             .add_node(
                 &make_node_actor_defexp(NODE_ADDR, "node-a", "10.0.0.1:1"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -3131,7 +3194,7 @@ mod e2e_actor_guard {
         );
         // Store it exactly the way vsapi_worker::authorize_connect does.
         asm.actor_mgr
-            .add_adapter_via_node(&actor, &node_addr)
+            .add_adapter_via_node(&actor, &node_addr, &Default::default())
             .await
             .unwrap();
         *actor

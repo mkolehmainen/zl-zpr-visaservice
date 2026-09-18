@@ -566,6 +566,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp(&peer.to_string(), "peer-node", "10.0.0.2:5001"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -599,7 +600,10 @@ mod tests {
         let asm = build_bootstrap_test_asm(via_node, peer).await;
         // The peer is connected now, so it has an actor.
         let peer_actor = make_node_actor_defexp(&peer.to_string(), "peer-node", "10.0.0.7:5001");
-        asm.actor_mgr.add_node(&peer_actor, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&peer_actor, false, &Default::default())
+            .await
+            .unwrap();
         let asm = Arc::new(asm);
         let (syn_pkt, _reply_pkt) = bootstrap_flow_packets(&asm, &peer);
 

@@ -584,6 +584,7 @@ pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
         .add_node(
             &make_node_actor_defexp("fd5a:5052:3000::1", "na", "10.0.0.1:1"),
             false,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -591,6 +592,7 @@ pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
         .add_node(
             &make_node_actor_defexp("fd5a:5052:3000::2", "nb", "10.0.0.2:2"),
             false,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -605,6 +607,7 @@ pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
         .add_adapter_via_node(
             &make_adapter_actor_defexp("fd5a:5052:4000::a", "src"),
             &node_a,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -612,6 +615,7 @@ pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
         .add_adapter_via_node(
             &make_adapter_actor_defexp("fd5a:5052:4000::b", "dst"),
             &node_b,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -730,7 +734,10 @@ pub async fn seed_source_attr(asm: &Arc<Assembly>, zpr_addr: &str, ts_key: &str,
                 .value(value),
         )
         .unwrap();
-    asm.actor_mgr.update_actor(&actor).await.unwrap();
+    asm.actor_mgr
+        .update_actor(&actor, &Default::default())
+        .await
+        .unwrap();
 }
 
 /// The stored actor's attribute values for `key`, if any.

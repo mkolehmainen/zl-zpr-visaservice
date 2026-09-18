@@ -1022,7 +1022,10 @@ mod tests {
             &[service],
             &format!("cn-{zpr_addr}"),
         );
-        actor_repo.add_actor(&actor).await.unwrap();
+        actor_repo
+            .add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
     }
 
     /// A proxied OIDC provider refreshes through the ActorDb-backed resolver

@@ -308,7 +308,16 @@ async fn main() -> std::process::ExitCode {
     let net_mgr = NetMgr::new_v6().expect("failed to create NetMgr");
 
     if !cli.clear_state {
-        if let Err(e) = synchronize_state(&actor_mgr, &net_mgr).await {
+        // The policy's service-name set gates hostname-claim reconciliation
+        // (zipline#53): a persisted claim colliding with a policy service is
+        // released rather than rebuilt.
+        let policy_service_names: std::collections::HashSet<String> = policy_mgr
+            .get_current()
+            .list_services()
+            .iter()
+            .map(|svc| svc.id.clone())
+            .collect();
+        if let Err(e) = synchronize_state(&actor_mgr, &net_mgr, &policy_service_names).await {
             error!(target: MAIN, "error during state synchronization: {}", e);
             // For now treat this as a fail.  Force user to reset state.
             return std::process::ExitCode::FAILURE;
@@ -492,7 +501,9 @@ async fn self_authorize(asm: Arc<Assembly>, vs_addr: &IpAddr) -> Result<(), Serv
         .authenticate_visa_service(asm.clone(), claims)
         .await?;
 
-    asm.actor_mgr.hack_add_adapter_no_node(&actor).await?;
+    asm.actor_mgr
+        .hack_add_adapter_no_node(&actor, &asm.policy_service_names())
+        .await?;
 
     let evt = VsEvent::ActorJoins(vs_addr.clone());
     if let Err(e) = asm.event_mgr.record_event(evt).await {
@@ -558,8 +569,22 @@ fn initialize_identity(
 ///
 /// TODO: If we have state in the db, and we are loading a policy that differs from
 /// the saved "curent" policy, we may have visas that are not longer valid.
-async fn synchronize_state(actor_mgr: &ActorMgr, net_mgr: &NetMgr) -> Result<(), ServiceError> {
+async fn synchronize_state(
+    actor_mgr: &ActorMgr,
+    net_mgr: &NetMgr,
+    policy_service_names: &std::collections::HashSet<String>,
+) -> Result<(), ServiceError> {
     actor_mgr.refresh_state().await?;
+
+    // Rebuild the `host:<NAME>` hostname-claim index from persisted actor
+    // attributes (zipline#53, PR #24 review): actors persisted before the
+    // index existed carry `device.hostname` in `actor:<ZADDR>:attrs` but no
+    // index entries, and neither claim write path runs at startup. The pass
+    // is idempotent, so running it on every start is a reconstruction, not a
+    // migration (project invariant: no database migration burden).
+    actor_mgr
+        .reconcile_hostname_claims(policy_service_names)
+        .await?;
 
     // Grab all the adapter addresses we have handed out already so that we do not try
     // to hand out the same address to a new adapter. A bad per-actor record does not

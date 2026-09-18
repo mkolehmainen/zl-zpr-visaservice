@@ -274,7 +274,7 @@ mod tests {
             )
             .unwrap();
         asm.actor_mgr
-            .add_adapter_via_node(&actor, node)
+            .add_adapter_via_node(&actor, node, &Default::default())
             .await
             .unwrap();
     }
@@ -425,7 +425,7 @@ mod tests {
         // Plain adapter: role/CN/zpr-addr only — get_authentication_expiration() is None.
         let actor = make_adapter_actor(ADAPTER, "no-auth", Duration::ZERO);
         asm.actor_mgr
-            .add_adapter_via_node(&actor, &node)
+            .add_adapter_via_node(&actor, &node, &Default::default())
             .await
             .unwrap();
         let seen = install_fake_vss(&asm, node, true);
@@ -517,7 +517,11 @@ mod tests {
                                 .value(key::AUTHORITY_METHOD_BOOTSTRAP),
                         )
                         .unwrap();
-                    asm_task.actor_mgr.update_actor(&actor).await.unwrap();
+                    asm_task
+                        .actor_mgr
+                        .update_actor(&actor, &Default::default())
+                        .await
+                        .unwrap();
                     let _ = resp_tx.send(Ok(addrs.len()));
                 }
             }
@@ -573,7 +577,7 @@ mod tests {
             )
             .unwrap();
         asm.actor_mgr
-            .add_adapter_via_node(&actor, &node)
+            .add_adapter_via_node(&actor, &node, &Default::default())
             .await
             .unwrap();
         let _seen = install_fake_vss(&asm, node, true);

@@ -43,6 +43,18 @@ impl Assembly {
         std::time::Instant::now().duration_since(self.system_start_time)
     }
 
+    /// The current policy's service-name set, passed into the actor write
+    /// paths for the hostname claim (zipline#53): a `device.hostname` value
+    /// equal to a policy service name loses to the service.
+    pub fn policy_service_names(&self) -> std::collections::HashSet<String> {
+        self.policy_mgr
+            .get_current()
+            .list_services()
+            .iter()
+            .map(|svc| svc.id.clone())
+            .collect()
+    }
+
     /// Graceful shutdown routine.  Not guaranteed to be called
     pub async fn shutdown(self: &Arc<Self>) {
         if let Err(e) = self.state_db.shutdown_cleanup().await {

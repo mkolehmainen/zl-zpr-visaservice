@@ -1856,7 +1856,11 @@ mod tests {
             (MH_DST_ADAPTER, dst, "mh-dst-adapter"),
         ] {
             asm.actor_mgr
-                .add_adapter_via_node(&make_adapter_actor_defexp(adapter, cn), &node)
+                .add_adapter_via_node(
+                    &make_adapter_actor_defexp(adapter, cn),
+                    &node,
+                    &Default::default(),
+                )
                 .await
                 .unwrap();
         }
@@ -2072,7 +2076,7 @@ mod tests {
             )
             .unwrap();
         asm.actor_mgr
-            .hack_add_adapter_no_node(&actor)
+            .hack_add_adapter_no_node(&actor, &Default::default())
             .await
             .unwrap();
     }
@@ -2254,6 +2258,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052:3000::1", "na", "10.0.0.1:1"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -2261,6 +2266,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052:3000::2", "nb", "10.0.0.2:2"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -2271,11 +2277,11 @@ mod tests {
         let src_adapter = make_adapter_actor_defexp("fd5a:5052:4000::a", "src");
         let dst_adapter = make_adapter_actor_defexp("fd5a:5052:4000::b", "dst");
         asm.actor_mgr
-            .add_adapter_via_node(&src_adapter, &node_a)
+            .add_adapter_via_node(&src_adapter, &node_a, &Default::default())
             .await
             .unwrap();
         asm.actor_mgr
-            .add_adapter_via_node(&dst_adapter, &node_b)
+            .add_adapter_via_node(&dst_adapter, &node_b, &Default::default())
             .await
             .unwrap();
 
@@ -2331,6 +2337,7 @@ mod tests {
                 .add_node(
                     &make_node_actor_defexp(&addr.to_string(), cn, "10.0.0.1:10001"),
                     false,
+                    &Default::default(),
                 )
                 .await
                 .unwrap();
@@ -2349,6 +2356,7 @@ mod tests {
             .add_adapter_via_node(
                 &make_adapter_actor_defexp(&adapter_on_c.to_string(), "adapter-c"),
                 &c,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -2389,6 +2397,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp(&d.to_string(), "node-d", "10.0.0.4:10001"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();

@@ -129,10 +129,12 @@ impl DbConnection for RedisDb {
         Ok(())
     }
 
-    async fn hset_nx(&self, key: &str, field: &str, value: &str) -> DbResult<()> {
+    async fn hset_nx(&self, key: &str, field: &str, value: &str) -> DbResult<bool> {
         let mut conn = self.mgr.clone();
-        let _: () = conn.hset_nx(key, field, value).await?;
-        Ok(())
+        // Redis HSETNX returns 1 when the field was set by this call, 0 when it
+        // already existed; surface that as the claim result.
+        let set: bool = conn.hset_nx(key, field, value).await?;
+        Ok(set)
     }
 
     async fn hset_multiple(&self, key: &str, field_values: &[(&str, &str)]) -> DbResult<()> {

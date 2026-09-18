@@ -7,7 +7,9 @@
 //! - actor:<ZADDR>                - a hash for each connected actor
 //! - actor:<ZADDR>:attrs          - a hash of attributes for each actor maps attribute keys to Attribug in JSON.
 //! - actor:<ZADDR>:services       - a set of service names offered by the actor.
+//! - actor:<ZADDR>:hostnames      - a set of hostnames the actor has claimed (zipline#53).
 //! - service:<MUNGED_SERVICENAME> - a hash. Includes key 'zpr_addr' with the ZPR address (string) of the actor providing the service.
+//! - host:<MUNGED_HOSTNAME>       - a hash. Includes key 'zpr_addr' with the ZPR address (string) of the actor holding the hostname.
 //! - nodes                        - set of IP addresses  of all connected nodes.
 //! - adapters                     - set of IP addresses  of all connected adapters.
 
@@ -21,14 +23,22 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 use zpr::vsapi_types::PublicKey;
 
+use crate::counters::{CounterType, Counters};
 use crate::db::{DbConnection, DbOp, KeyString, ZAddr, gen_timestamp};
 use crate::error::StoreError;
 use crate::logging::targets::DB;
 
 const KEY_ACTOR: &str = "actor";
 const KEY_SERVICE: &str = "service";
+const KEY_HOST: &str = "host";
 const KEY_NODES: &str = "nodes";
 const KEY_ADAPTERS: &str = "adapters";
+
+/// The operator-namespace attribute whose values are claimed into the
+/// `host:<NAME>` index (zipline#53). Deliberately NOT a `key::` constant in
+/// `libeval/src/attribute.rs`: it is operator-namespace, not ZPR-owned, and
+/// naming it there invites someone to add it to a reserved-namespace check.
+const ATTR_DEVICE_HOSTNAME: &str = "device.hostname";
 
 pub enum Role {
     Node,
@@ -89,6 +99,38 @@ impl ActorRepo {
             self.release_owned_service_entries(&zpraddr_str, &service_names)
                 .await?;
             self.db.del(&services_key).await?;
+        }
+
+        // host:<NAME> entries follow the actor record (zipline#53): release the
+        // names this actor holds, owner-checked, when the record goes away.
+        let hostnames_key = actor_hostnames_key_for(&zpraddr);
+        if self.db.exists(&hostnames_key).await? {
+            let host_names: HashSet<String> = self.db.smembers(&hostnames_key).await?;
+            self.release_owned_host_entries(&zpraddr_str, &host_names)
+                .await?;
+            self.db.del(&hostnames_key).await?;
+        }
+        Ok(())
+    }
+
+    /// Release each `host:<name>` entry in `names` if and only if its `zpr_addr`
+    /// still points at `zpraddr_str` — the owner check from zipline#31, restated
+    /// for hostnames: a non-holder's departure must never destroy the holder's
+    /// live entry. Unlike [Self::release_owned_service_entries] there is
+    /// deliberately NO promotion of a surviving claimant: a hostname lost to
+    /// first-claim-wins is only re-claimed by the loser's next normal attribute
+    /// refresh (zipline#53 — no re-claim on release).
+    async fn release_owned_host_entries(
+        &self,
+        zpraddr_str: &str,
+        names: impl IntoIterator<Item = &String>,
+    ) -> Result<(), StoreError> {
+        for name in names {
+            let host_key = host_key_for(name);
+            let owner: Option<String> = self.db.hget(&host_key, "zpr_addr").await?;
+            if owner.as_deref() == Some(zpraddr_str) {
+                self.db.del(&host_key).await?;
+            }
         }
         Ok(())
     }
@@ -186,8 +228,21 @@ impl ActorRepo {
         Ok(candidates.into_iter().next())
     }
 
-    pub async fn add_actor(&self, actor: &Actor) -> Result<(), StoreError> {
-        match self.try_add_actor(actor).await {
+    /// Add an actor and claim its `device.hostname` values (zipline#53).
+    /// `policy_service_names` is the current policy's service-name set — a
+    /// hostname claim colliding with one is rejected ("policy services win");
+    /// passed as a parameter so this layer stays testable against `FakeDb`
+    /// with no global state. Claim rejections are counted on `counters`.
+    pub async fn add_actor(
+        &self,
+        actor: &Actor,
+        policy_service_names: &HashSet<String>,
+        counters: &Counters,
+    ) -> Result<(), StoreError> {
+        match self
+            .try_add_actor(actor, policy_service_names, counters)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => {
                 // Attempt to clean up after ourselves...
@@ -208,7 +263,16 @@ impl ActorRepo {
     /// Update existing actor data. The passed actor is authoritative: attributes it no
     /// longer carries are dropped from the store (an attribute refresh can remove
     /// attributes, and a stale copy left behind would resurface on the next load).
-    pub async fn update_actor(&self, actor: &Actor) -> Result<(), StoreError> {
+    ///
+    /// Re-claims the actor's `device.hostname` values into the `host:<NAME>`
+    /// index (zipline#53) — idempotent for names it already holds; see
+    /// [Self::add_actor] for the `policy_service_names` / `counters` contract.
+    pub async fn update_actor(
+        &self,
+        actor: &Actor,
+        policy_service_names: &HashSet<String>,
+        counters: &Counters,
+    ) -> Result<(), StoreError> {
         let zpraddr = match actor.get_zpr_addr() {
             Some(addr) => addr.clone(),
             None => {
@@ -329,7 +393,132 @@ impl ActorRepo {
             self.db.sadd(&services_key, &service_name).await?;
         }
 
+        // Reconcile and claim `device.hostname` values (zipline#53).
+        self.claim_hostnames_for_actor(actor, policy_service_names, counters)
+            .await?;
+
         debug!(target: DB, "update actor in DB: addr={zpraddr} cn={:?} node?={}", actor.get_cn(), actor.is_node());
+        Ok(())
+    }
+
+    /// Claim the actor's `device.hostname` values into the `host:<NAME>` index
+    /// (zipline#53). Shared by both write paths (`try_add_actor` and
+    /// `update_actor`) so claim semantics cannot drift apart. Per value:
+    /// first claim wins (atomic via [DbConnection::hset_nx]), a re-claim of a
+    /// name the actor already holds is idempotent, invalid values are rejected
+    /// and logged (never transformed), and a value equal to a policy service
+    /// name is rejected. Names the actor stopped claiming are released
+    /// owner-checked. Rejections are counted and the losing names are rewritten
+    /// into the actor's `hostname_conflicts` field (display data for #54,
+    /// never an input to a decision).
+    async fn claim_hostnames_for_actor(
+        &self,
+        actor: &Actor,
+        policy_service_names: &HashSet<String>,
+        counters: &Counters,
+    ) -> Result<(), StoreError> {
+        let Some(zpraddr) = actor.get_zpr_addr() else {
+            // Both callers require an address before reaching this point.
+            return Ok(());
+        };
+        let zpraddr_str = zpraddr.to_string();
+        let hostnames_key = actor_hostnames_key_for(zpraddr);
+        let base_key = actor_key_for(zpraddr);
+
+        // The names this actor may claim: validated values of the attribute,
+        // minus policy service names ("policy services win"). Invalid values
+        // are rejected and logged, never transformed.
+        let mut desired: Vec<&str> = Vec::new();
+        let mut conflicts: Vec<String> = Vec::new();
+        if let Some(attr) = actor.get_attribute(ATTR_DEVICE_HOSTNAME) {
+            for value in attr.get_value() {
+                if !is_valid_hostname_label(value) {
+                    error!(target: DB, "invalid {ATTR_DEVICE_HOSTNAME} value rejected (not a lowercase DNS label): actor={zpraddr} value={value:?}");
+                    continue;
+                }
+                if policy_service_names.contains(value.as_str()) {
+                    error!(target: DB, "{ATTR_DEVICE_HOSTNAME} claim rejected, name is a policy service: actor={zpraddr} name={value}");
+                    counters.incr(CounterType::HostnameClaimRejected);
+                    conflicts.push(value.clone());
+                    continue;
+                }
+                desired.push(value);
+            }
+        }
+
+        // Release names the actor stopped claiming — owner-checked, so a name
+        // lost to another actor is left alone. The set is rebuilt below from
+        // the claims that actually hold.
+        let existing: HashSet<String> = self.db.smembers(&hostnames_key).await?;
+        let dropped: Vec<&String> = existing
+            .iter()
+            .filter(|name| !desired.iter().any(|d| *d == name.as_str()))
+            .collect();
+        self.release_owned_host_entries(&zpraddr_str, dropped)
+            .await?;
+        self.db.del(&hostnames_key).await?;
+
+        // Claim each value independently: losing one never costs the others.
+        for name in desired {
+            let host_key = host_key_for(name);
+            let claimed = self.db.hset_nx(&host_key, "zpr_addr", &zpraddr_str).await?;
+            if claimed {
+                debug!(target: DB, "claimed hostname for actor: addr={zpraddr} name={name}");
+                self.db.sadd(&hostnames_key, name).await?;
+                continue;
+            }
+            // Not set by this call: the claim test is "unset, or already mine".
+            let owner: Option<String> = self.db.hget(&host_key, "zpr_addr").await?;
+            if owner.as_deref() == Some(zpraddr_str.as_str()) {
+                self.db.sadd(&hostnames_key, name).await?;
+            } else {
+                error!(target: DB, "{ATTR_DEVICE_HOSTNAME} claim rejected, name held by another actor: actor={zpraddr} name={name} holder={owner:?}");
+                counters.incr(CounterType::HostnameClaimRejected);
+                conflicts.push(name.to_string());
+            }
+        }
+
+        // Display data for #54: rewritten on every claim attempt, never an
+        // input to a decision.
+        self.db
+            .hset(
+                &base_key,
+                "hostname_conflicts",
+                &serde_json::to_string(&conflicts)?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Rebuild the `host:<NAME>` claim index from persisted actor attributes
+    /// (zipline#53, PR #24 review): run the claim pass over every persisted
+    /// actor. Idempotent — re-claiming a held name is a no-op — so it serves
+    /// both callers: startup (backfill for actors persisted before the index
+    /// existed, satisfying the no-migration invariant by reconstruction
+    /// rather than migration) and policy install (a new policy service name
+    /// evicts a matching held hostname, because [Self::claim_hostnames_for_actor]
+    /// treats a policy-name match as a drop). A per-actor load failure is
+    /// logged and skipped — one bad record must not abort the whole pass.
+    pub async fn reconcile_hostname_claims(
+        &self,
+        policy_service_names: &HashSet<String>,
+        counters: &Counters,
+    ) -> Result<(), StoreError> {
+        for (zpr_addr, _cn) in self.list_actors(None).await? {
+            let actor = match self.get_actor_by_zpr_addr(&zpr_addr).await {
+                Ok(actor) => actor,
+                Err(e) => {
+                    warn!(target: DB, "hostname reconcile: failed to load actor {zpr_addr}, skipping: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = self
+                .claim_hostnames_for_actor(&actor, policy_service_names, counters)
+                .await
+            {
+                warn!(target: DB, "hostname reconcile: claim pass failed for actor {zpr_addr}, skipping: {e}");
+            }
+        }
         Ok(())
     }
 
@@ -387,6 +576,43 @@ impl ActorRepo {
         }
     }
 
+    /// Given a hostname, look up the ZPR address of the actor holding it in the
+    /// `host:<NAME>` index (zipline#53), if any.
+    ///
+    /// No in-crate caller yet: the DNS surface (zipline#54/#55) consumes it.
+    #[allow(dead_code)]
+    pub async fn get_zpr_addr_for_hostname(
+        &self,
+        hostname: &str,
+    ) -> Result<Option<IpAddr>, StoreError> {
+        let host_key = host_key_for(hostname);
+        if let Some(addr_str) = self.db.hget(&host_key, "zpr_addr").await? {
+            let addr: IpAddr = addr_str.parse().map_err(|e| {
+                StoreError::InvalidData(format!(
+                    "invalid zpr_addr in host entry {}: {}",
+                    host_key, e
+                ))
+            })?;
+            Ok(Some(addr))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get the list of hostnames the actor currently holds in the `host:<NAME>`
+    /// index (zipline#53).
+    ///
+    /// No in-crate caller yet: the DNS surface (zipline#54/#55) consumes it.
+    #[allow(dead_code)]
+    pub async fn list_hostnames_for_actor(
+        &self,
+        zpr_addr: &IpAddr,
+    ) -> Result<Vec<String>, StoreError> {
+        let hostnames_key = actor_hostnames_key_for(&zpr_addr);
+        let names: HashSet<String> = self.db.smembers(&hostnames_key).await?;
+        Ok(names.into_iter().collect())
+    }
+
     /// Load specific attributes by name from the actor datastructure. Only found attributes are returned.
     pub async fn get_actor_attrs(
         &self,
@@ -438,7 +664,12 @@ impl ActorRepo {
     /// Add an actor record which must only be called after initial authentication (there
     /// will likely be changes to an actor later from trusted services or re-authentication,
     /// but the updates should use a different function.)
-    async fn try_add_actor(&self, actor: &Actor) -> Result<(), StoreError> {
+    async fn try_add_actor(
+        &self,
+        actor: &Actor,
+        policy_service_names: &HashSet<String>,
+        counters: &Counters,
+    ) -> Result<(), StoreError> {
         let zpraddr = match actor.get_zpr_addr() {
             Some(addr) => addr.clone(),
             None => {
@@ -507,6 +738,10 @@ impl ActorRepo {
                 .await?;
             self.db.sadd(&services_key, &service_name).await?;
         }
+
+        // Claim `device.hostname` values into the host:<NAME> index (zipline#53).
+        self.claim_hostnames_for_actor(actor, policy_service_names, counters)
+            .await?;
 
         //
         // One of:
@@ -648,15 +883,46 @@ fn service_key_for(service_name: &str) -> String {
     format!("{KEY_SERVICE}:{}", svc_name_clean.as_str())
 }
 
+/// returns 'host:<MUNGED_HOSTNAME>'
+///
+/// `<NAME>` is percent-encoded through [KeyString] exactly like
+/// [service_key_for] — a no-op for any name that passed validation, kept so
+/// the key layer never depends on the validator (zipline#53).
+fn host_key_for(hostname: &str) -> String {
+    let host_name_clean = KeyString::from(hostname);
+    format!("{KEY_HOST}:{}", host_name_clean.as_str())
+}
+
 /// returns 'actor:<ZADDR>:services'
 fn actor_services_key_for(zpr_addr: &IpAddr) -> String {
     let zaddr: ZAddr = zpr_addr.into();
     format!("{KEY_ACTOR}:{zaddr}:services")
 }
 
+/// returns 'actor:<ZADDR>:hostnames'
+fn actor_hostnames_key_for(zpr_addr: &IpAddr) -> String {
+    let zaddr: ZAddr = zpr_addr.into();
+    format!("{KEY_ACTOR}:{zaddr}:hostnames")
+}
+
+/// Validate one `device.hostname` value as a single lowercase DNS label
+/// (zipline#53): `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, 1–63 bytes. Invalid values
+/// are rejected by the claim path and logged — never transformed into valid
+/// ones.
+fn is_valid_hostname_label(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    let inner = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
+    let edge = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    edge(bytes[0]) && edge(bytes[bytes.len() - 1]) && bytes.iter().all(|&b| inner(b))
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::counters::CounterType;
     use crate::db::DbConnection;
     use crate::db::db_fake::FakeDb;
     use crate::test_helpers::{
@@ -677,7 +943,9 @@ mod test {
         );
         let zpr_addr: IpAddr = "fd5a:5052::1".parse().unwrap();
 
-        repo.add_actor(&actor).await.unwrap();
+        repo.add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
         let loaded = repo.get_actor_by_zpr_addr(&zpr_addr).await.unwrap();
 
         assert!(loaded.is_node());
@@ -700,7 +968,9 @@ mod test {
         );
         let zpr_addr: IpAddr = "fd5a:5052::2".parse().unwrap();
 
-        repo.add_actor(&actor).await.unwrap();
+        repo.add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
         let mut services = repo.list_services().await.unwrap();
         services.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -719,7 +989,9 @@ mod test {
             make_actor_with_services_defexp(ROLE_NODE, "fd5a:5052::3", &["svc:one"], "actor-1");
         let zpr_addr: IpAddr = "fd5a:5052::3".parse().unwrap();
 
-        repo.add_actor(&actor).await.unwrap();
+        repo.add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
         repo.rm_actor_by_zpr_addr(&zpr_addr).await.unwrap();
 
         let base_key = actor_key_for(&zpr_addr);
@@ -750,8 +1022,12 @@ mod test {
             "adapter-cn",
         );
 
-        repo.add_actor(&node_actor).await.unwrap();
-        repo.add_actor(&adapter_actor).await.unwrap();
+        repo.add_actor(&node_actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        repo.add_actor(&adapter_actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
         let adapter_addr: IpAddr = "fd5a:5052::20".parse().unwrap();
@@ -787,12 +1063,20 @@ mod test {
         let db = Arc::new(FakeDb::new());
         let repo = ActorRepo::new(db.clone());
 
-        repo.add_actor(&make_adapter_actor_defexp("fd5a:5052::41", "good-cn"))
-            .await
-            .unwrap();
-        repo.add_actor(&make_adapter_actor_defexp("fd5a:5052::42", "bad-cn"))
-            .await
-            .unwrap();
+        repo.add_actor(
+            &make_adapter_actor_defexp("fd5a:5052::41", "good-cn"),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        repo.add_actor(
+            &make_adapter_actor_defexp("fd5a:5052::42", "bad-cn"),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         // Corrupt one actor's persisted CN attribute JSON in place.
         let bad_addr: IpAddr = "fd5a:5052::42".parse().unwrap();
@@ -818,7 +1102,9 @@ mod test {
             make_actor_with_services_defexp(ROLE_NODE, "fd5a:5052::30", &["svc:one"], "actor-1");
         let zpr_addr: IpAddr = "fd5a:5052::30".parse().unwrap();
 
-        repo.add_actor(&actor).await.unwrap();
+        repo.add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let found = repo.get_zpr_addr_for_service("svc:one").await.unwrap();
         assert_eq!(found, Some(zpr_addr));
@@ -853,7 +1139,9 @@ mod test {
         ]);
         let zpr_addr: IpAddr = "fd5a:5052::40".parse().unwrap();
 
-        repo.add_actor(&actor).await.unwrap();
+        repo.add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let attrs = repo
             .get_actor_attrs(&zpr_addr, &[key::CN, "missing.key", key::ROLE])
@@ -875,7 +1163,9 @@ mod test {
         let actor = make_actor_for_pubkey_test("fd5a:5052::60", "no-key", None);
         let zpr_addr: IpAddr = "fd5a:5052::60".parse().unwrap();
 
-        repo.add_actor(&actor).await.unwrap();
+        repo.add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let pubkey = repo.get_a2a_dh_pubkey_by_zpr_addr(&zpr_addr).await.unwrap();
         assert!(pubkey.is_none());
@@ -893,7 +1183,9 @@ mod test {
         );
         let zpr_addr: IpAddr = "fd5a:5052::61".parse().unwrap();
 
-        repo.add_actor(&actor).await.unwrap();
+        repo.add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let pubkey = repo
             .get_a2a_dh_pubkey_by_zpr_addr(&zpr_addr)
@@ -910,7 +1202,9 @@ mod test {
         let actor = make_actor_for_pubkey_test("fd5a:5052::62", "bad-key", Some("ZprKF99:AAEC"));
         let zpr_addr: IpAddr = "fd5a:5052::62".parse().unwrap();
 
-        repo.add_actor(&actor).await.unwrap();
+        repo.add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let err = repo
             .get_a2a_dh_pubkey_by_zpr_addr(&zpr_addr)
@@ -948,8 +1242,12 @@ mod test {
         let adapter_actor =
             make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::40", &["svc:three"], "cn.2");
 
-        repo.add_actor(&node_actor).await.unwrap();
-        repo.add_actor(&adapter_actor).await.unwrap();
+        repo.add_actor(&node_actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        repo.add_actor(&adapter_actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let node_addr: IpAddr = "fd5a:5052::30".parse().unwrap();
         let mut node_services = repo.list_services_for_actor(&node_addr).await.unwrap();
@@ -980,10 +1278,14 @@ mod test {
             (key::ZPR_ADDR, "fd5a:5052::10"),
             ("user.dept", "sales"),
         ]);
-        repo.add_actor(&actor).await.unwrap();
+        repo.add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         actor.remove_attribute("user.dept");
-        repo.update_actor(&actor).await.unwrap();
+        repo.update_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
         let loaded = repo.get_actor_by_zpr_addr(&addr).await.unwrap();
@@ -1010,13 +1312,19 @@ mod test {
         let actor_b =
             make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::b1", &["web"], "actor-b");
 
-        repo.add_actor(&actor_a).await.unwrap();
+        repo.add_actor(&actor_a, &Default::default(), &Default::default())
+            .await
+            .unwrap();
         // B's add overwrites `service:web` -- B now owns the live entry.
-        repo.add_actor(&actor_b).await.unwrap();
+        repo.add_actor(&actor_b, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         // A's attribute refresh fires on a timer with A unchanged, still
         // advertising "web".
-        repo.update_actor(&actor_a).await.unwrap();
+        repo.update_actor(&actor_a, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let addr_b: IpAddr = "fd5a:5052::b1".parse().unwrap();
         assert_eq!(
@@ -1035,8 +1343,12 @@ mod test {
 
         let actor_a =
             make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::a2", &["web"], "actor-a");
-        repo.add_actor(&actor_a).await.unwrap();
-        repo.update_actor(&actor_a).await.unwrap();
+        repo.add_actor(&actor_a, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        repo.update_actor(&actor_a, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let addr_a: IpAddr = "fd5a:5052::a2".parse().unwrap();
         assert_eq!(
@@ -1057,13 +1369,17 @@ mod test {
 
         let actor_a =
             make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::a3", &["web"], "actor-a");
-        repo.add_actor(&actor_a).await.unwrap();
+        repo.add_actor(&actor_a, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         // Same actor, no longer advertising "web".
         let addr_a: IpAddr = "fd5a:5052::a3".parse().unwrap();
         let mut refreshed = actor_a;
         refreshed.remove_attribute(key::SERVICES);
-        repo.update_actor(&refreshed).await.unwrap();
+        repo.update_actor(&refreshed, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         assert_eq!(repo.get_zpr_addr_for_service("web").await.unwrap(), None);
         let services: HashSet<String> =
@@ -1089,9 +1405,13 @@ mod test {
         let actor_b =
             make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::b4", &["web"], "actor-b");
 
-        repo.add_actor(&actor_a).await.unwrap();
+        repo.add_actor(&actor_a, &Default::default(), &Default::default())
+            .await
+            .unwrap();
         // B's add overwrites `service:web` -- B owns the live entry.
-        repo.add_actor(&actor_b).await.unwrap();
+        repo.add_actor(&actor_b, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         // B departs.
         let addr_b: IpAddr = "fd5a:5052::b4".parse().unwrap();
@@ -1120,14 +1440,20 @@ mod test {
         let actor_a =
             make_actor_with_services_defexp(ROLE_ADAPTER, "fd5a:5052::a5", &["web"], "actor-a");
 
-        repo.add_actor(&actor_b).await.unwrap();
+        repo.add_actor(&actor_b, &Default::default(), &Default::default())
+            .await
+            .unwrap();
         // A added last -- A owns the live entry, B still claims "web" in its set.
-        repo.add_actor(&actor_a).await.unwrap();
+        repo.add_actor(&actor_a, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         // A's refresh arrives no longer advertising "web".
         let mut refreshed = actor_a;
         refreshed.remove_attribute(key::SERVICES);
-        repo.update_actor(&refreshed).await.unwrap();
+        repo.update_actor(&refreshed, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         let addr_b: IpAddr = "fd5a:5052::b5".parse().unwrap();
         assert_eq!(
@@ -1158,8 +1484,12 @@ mod test {
         let cn_less = make_oidc_only_adapter_defexp("fd5a:5052::71");
         let normal = make_adapter_actor_defexp("fd5a:5052::72", "adapter-with-cn");
 
-        repo.add_actor(&cn_less).await.unwrap();
-        repo.add_actor(&normal).await.unwrap();
+        repo.add_actor(&cn_less, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        repo.add_actor(&normal, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         // Both connected actors must be represented -- the CN-less one must not be
         // skipped; it is listed by its address with no CN label.
@@ -1198,8 +1528,12 @@ mod test {
         let repo = ActorRepo::new(Arc::new(FakeDb::new()));
         let actor_a = make_adapter_actor_defexp("fd5a:5052::81", "shared-cn");
         let actor_b = make_adapter_actor_defexp("fd5a:5052::82", "shared-cn");
-        repo.add_actor(&actor_a).await.unwrap();
-        repo.add_actor(&actor_b).await.unwrap();
+        repo.add_actor(&actor_a, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        repo.add_actor(&actor_b, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         // Both actors are connected: two distinct entries carrying the shared CN,
         // each reachable by its own address.
@@ -1235,8 +1569,12 @@ mod test {
         let repo = ActorRepo::new(Arc::new(FakeDb::new()));
         let actor_a = make_adapter_actor_defexp("fd5a:5052::81", "shared-cn");
         let actor_b = make_adapter_actor_defexp("fd5a:5052::82", "shared-cn");
-        repo.add_actor(&actor_a).await.unwrap();
-        repo.add_actor(&actor_b).await.unwrap();
+        repo.add_actor(&actor_a, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        repo.add_actor(&actor_b, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         repo.rm_actor_by_zpr_addr(&addr_a).await.unwrap();
         let survivor = repo
@@ -1268,7 +1606,10 @@ mod test {
         // Repo #1 populates the store.
         let repo1 = ActorRepo::new(db.clone());
         let actor = make_adapter_actor_defexp("fd5a:5052::91", "persisted-cn");
-        repo1.add_actor(&actor).await.unwrap();
+        repo1
+            .add_actor(&actor, &Default::default(), &Default::default())
+            .await
+            .unwrap();
 
         // Repo #2 over the SAME backing store: an ActorRepo that never saw
         // add_actor for this actor -- the restart-against-persisted-state case.
@@ -1288,5 +1629,418 @@ mod test {
                 .expect("a fresh repo must fetch every actor it lists");
             assert_eq!(loaded.get_zpr_addr(), Some(listed_addr));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // zipline#53: `device.hostname` -> `host:<NAME>` claim index.
+    // ------------------------------------------------------------------
+
+    /// Build an adapter actor at `zpr_addr` carrying a multi-valued
+    /// `device.hostname` attribute with the given values.
+    fn make_actor_with_hostnames(zpr_addr: &str, cn: &str, hostnames: &[&str]) -> Actor {
+        let mut actor = make_adapter_actor_defexp(zpr_addr, cn);
+        actor
+            .add_attribute(Attribute::builder(ATTR_DEVICE_HOSTNAME).values(hostnames))
+            .unwrap();
+        actor
+    }
+
+    fn no_services() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// Contract 1 (zipline#53): every value of the multi-valued attribute is
+    /// claimed — both names resolve to the actor's address, and
+    /// `list_hostnames_for_actor` returns both.
+    #[tokio::test]
+    async fn test_hostname_multi_value_claim() {
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
+        let counters = Counters::default();
+        let actor =
+            make_actor_with_hostnames("fd5a:5052::c1", "host-cn-1", &["somename", "m-7f3a2b"]);
+        let addr: IpAddr = "fd5a:5052::c1".parse().unwrap();
+
+        repo.add_actor(&actor, &no_services(), &counters)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            Some(addr)
+        );
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("m-7f3a2b").await.unwrap(),
+            Some(addr)
+        );
+        let mut names = repo.list_hostnames_for_actor(&addr).await.unwrap();
+        names.sort();
+        assert_eq!(names, vec!["m-7f3a2b".to_string(), "somename".to_string()]);
+    }
+
+    /// Contract 2 (zipline#53): first claim wins, PER VALUE. A second actor
+    /// claiming `["somename", "other"]` loses `somename` to the first actor
+    /// but still claims `other` — losing one value never costs the others.
+    /// The rejection is counted and recorded in the loser's
+    /// `hostname_conflicts` field (display data for #54).
+    #[tokio::test]
+    async fn test_hostname_first_claim_wins_per_value() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db.clone());
+        let counters = Counters::default();
+        let actor_1 = make_actor_with_hostnames("fd5a:5052::c2", "host-cn-1", &["somename"]);
+        let actor_2 =
+            make_actor_with_hostnames("fd5a:5052::c3", "host-cn-2", &["somename", "other"]);
+        let addr_1: IpAddr = "fd5a:5052::c2".parse().unwrap();
+        let addr_2: IpAddr = "fd5a:5052::c3".parse().unwrap();
+
+        repo.add_actor(&actor_1, &no_services(), &counters)
+            .await
+            .unwrap();
+        repo.add_actor(&actor_2, &no_services(), &counters)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            Some(addr_1),
+            "first claim must win: somename stays with actor 1"
+        );
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("other").await.unwrap(),
+            Some(addr_2),
+            "losing somename must not cost actor 2 its other claim"
+        );
+        assert_eq!(
+            counters.counters[CounterType::HostnameClaimRejected].get_count(),
+            1
+        );
+        // The losing name is recorded in actor 2's hostname_conflicts (JSON).
+        let conflicts_json: Option<String> = db
+            .hget(&actor_key_for(&addr_2), "hostname_conflicts")
+            .await
+            .unwrap();
+        let conflicts: Vec<String> =
+            serde_json::from_str(&conflicts_json.expect("hostname_conflicts field")).unwrap();
+        assert_eq!(conflicts, vec!["somename".to_string()]);
+    }
+
+    /// Contract 3 (zipline#53): idempotence. `update_actor` on the holder must
+    /// keep both claims — the claim test is "unset, or already mine", so
+    /// re-auth and attribute refresh do not self-collide.
+    #[tokio::test]
+    async fn test_hostname_update_actor_idempotent() {
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
+        let counters = Counters::default();
+        let actor =
+            make_actor_with_hostnames("fd5a:5052::c4", "host-cn-1", &["somename", "m-7f3a2b"]);
+        let addr: IpAddr = "fd5a:5052::c4".parse().unwrap();
+
+        repo.add_actor(&actor, &no_services(), &counters)
+            .await
+            .unwrap();
+        repo.update_actor(&actor, &no_services(), &counters)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            Some(addr)
+        );
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("m-7f3a2b").await.unwrap(),
+            Some(addr)
+        );
+        assert_eq!(
+            counters.counters[CounterType::HostnameClaimRejected].get_count(),
+            0,
+            "re-claiming a name the actor already holds is not a rejection"
+        );
+    }
+
+    /// Contract 4 (zipline#53): release on disconnect. When the holder is
+    /// removed, its names are freed — and the previous loser does NOT inherit
+    /// them automatically (no re-claim on release; the loser re-claims on its
+    /// next normal attribute refresh).
+    #[tokio::test]
+    async fn test_hostname_release_on_disconnect_no_auto_reclaim() {
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
+        let counters = Counters::default();
+        let holder = make_actor_with_hostnames("fd5a:5052::c5", "holder", &["somename"]);
+        let loser = make_actor_with_hostnames("fd5a:5052::c6", "loser", &["somename"]);
+        let holder_addr: IpAddr = "fd5a:5052::c5".parse().unwrap();
+
+        repo.add_actor(&holder, &no_services(), &counters)
+            .await
+            .unwrap();
+        repo.add_actor(&loser, &no_services(), &counters)
+            .await
+            .unwrap();
+
+        repo.rm_actor_by_zpr_addr(&holder_addr).await.unwrap();
+
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            None,
+            "release must free the name; the loser does not inherit it automatically"
+        );
+    }
+
+    /// Contract 5 (zipline#53, zipline#31 regression restated for hostnames):
+    /// a NON-holder's disconnect must not destroy the holder's live `host:`
+    /// entry — the release is owner-checked, reusing #51's pattern.
+    #[tokio::test]
+    async fn test_hostname_owner_checked_release() {
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
+        let counters = Counters::default();
+        let holder = make_actor_with_hostnames("fd5a:5052::c7", "holder", &["somename"]);
+        let loser = make_actor_with_hostnames("fd5a:5052::c8", "loser", &["somename"]);
+        let holder_addr: IpAddr = "fd5a:5052::c7".parse().unwrap();
+        let loser_addr: IpAddr = "fd5a:5052::c8".parse().unwrap();
+
+        repo.add_actor(&holder, &no_services(), &counters)
+            .await
+            .unwrap();
+        repo.add_actor(&loser, &no_services(), &counters)
+            .await
+            .unwrap();
+
+        // The non-holder departs.
+        repo.rm_actor_by_zpr_addr(&loser_addr).await.unwrap();
+
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            Some(holder_addr),
+            "a non-holder's disconnect must not destroy the holder's entry"
+        );
+    }
+
+    /// Contract 6 (zipline#53): validation. Invalid values are rejected and
+    /// never transformed; valid siblings in the same attribute still claim.
+    /// Grammar: `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, 1–63 bytes.
+    #[tokio::test]
+    async fn test_hostname_validation_rejects_invalid_keeps_valid_siblings() {
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
+        let counters = Counters::default();
+        let long_label = "x".repeat(64);
+        let invalid = ["Some.Name", long_label.as_str(), "", "_x", "-x", "x-"];
+        let mut values: Vec<&str> = invalid.to_vec();
+        values.push("valid-name");
+        let actor = make_actor_with_hostnames("fd5a:5052::c9", "host-cn-v", &values);
+        let addr: IpAddr = "fd5a:5052::c9".parse().unwrap();
+
+        repo.add_actor(&actor, &no_services(), &counters)
+            .await
+            .unwrap();
+
+        // The valid sibling claimed.
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("valid-name").await.unwrap(),
+            Some(addr)
+        );
+        // No invalid value claimed anything, under its own name or transformed.
+        for name in invalid {
+            if name.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                repo.get_zpr_addr_for_hostname(name).await.unwrap(),
+                None,
+                "invalid value {name:?} must not be claimed"
+            );
+        }
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("some.name").await.unwrap(),
+            None,
+            "invalid values must never be transformed into valid ones"
+        );
+        let names = repo.list_hostnames_for_actor(&addr).await.unwrap();
+        assert_eq!(names, vec!["valid-name".to_string()]);
+    }
+
+    /// Contract 7 (zipline#53): policy services win. A value equal to a policy
+    /// service name is rejected and counted.
+    #[tokio::test]
+    async fn test_hostname_policy_service_name_wins() {
+        let repo = ActorRepo::new(Arc::new(FakeDb::new()));
+        let counters = Counters::default();
+        let actor = make_actor_with_hostnames("fd5a:5052::ca", "host-cn-p", &["web", "ok-name"]);
+        let addr: IpAddr = "fd5a:5052::ca".parse().unwrap();
+        let policy_services: HashSet<String> = ["web".to_string()].into_iter().collect();
+
+        repo.add_actor(&actor, &policy_services, &counters)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("web").await.unwrap(),
+            None,
+            "a value equal to a policy service name must be rejected"
+        );
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("ok-name").await.unwrap(),
+            Some(addr)
+        );
+        assert_eq!(
+            counters.counters[CounterType::HostnameClaimRejected].get_count(),
+            1
+        );
+    }
+
+    /// Contract 8 (zipline#53): the `hset_nx` claim primitive returns `true`
+    /// only for the call that set the field. (Redis HSETNX returns the same;
+    /// this pins the `FakeDb` mirror of that contract.)
+    #[tokio::test]
+    async fn test_hset_nx_returns_true_only_for_setting_call() {
+        let db = FakeDb::new();
+        assert!(
+            db.hset_nx("host:x", "zpr_addr", "fd5a:5052::1")
+                .await
+                .unwrap(),
+            "first hset_nx must report it set the field"
+        );
+        assert!(
+            !db.hset_nx("host:x", "zpr_addr", "fd5a:5052::2")
+                .await
+                .unwrap(),
+            "second hset_nx must report the field already existed"
+        );
+        assert_eq!(
+            db.hget("host:x", "zpr_addr").await.unwrap(),
+            Some("fd5a:5052::1".to_string()),
+            "the losing call must not overwrite the value"
+        );
+    }
+
+    /// The label validator itself, edge cases pinned.
+    #[test]
+    fn test_is_valid_hostname_label() {
+        assert!(is_valid_hostname_label("a"));
+        assert!(is_valid_hostname_label("m-7f3a2b"));
+        assert!(is_valid_hostname_label("0name9"));
+        assert!(is_valid_hostname_label(&"x".repeat(63)));
+        assert!(!is_valid_hostname_label(""));
+        assert!(!is_valid_hostname_label(&"x".repeat(64)));
+        assert!(!is_valid_hostname_label("Some.Name"));
+        assert!(!is_valid_hostname_label("UPPER"));
+        assert!(!is_valid_hostname_label("_x"));
+        assert!(!is_valid_hostname_label("-x"));
+        assert!(!is_valid_hostname_label("x-"));
+        assert!(!is_valid_hostname_label("a b"));
+    }
+
+    // ------------------------------------------------------------------
+    // zipline#53, PR #24 review: reconcile_hostname_claims.
+    // ------------------------------------------------------------------
+
+    /// PR #24 review finding 1 (backfill): an actor persisted BEFORE the
+    /// `host:<NAME>` index existed has `device.hostname` under
+    /// `actor:<ZADDR>:attrs` but no `host:<NAME>` or `actor:<ZADDR>:hostnames`
+    /// entries. A reconciliation pass over persisted actors must rebuild both
+    /// from the attributes — and running it again must be a no-op (idempotent,
+    /// no rejections counted for names the actor already holds).
+    #[tokio::test]
+    async fn test_reconcile_backfills_missing_host_index() {
+        let db: Arc<FakeDb> = Arc::new(FakeDb::new());
+        let repo1 = ActorRepo::new(db.clone());
+        let counters = Counters::default();
+        let actor =
+            make_actor_with_hostnames("fd5a:5052::d1", "backfill-cn", &["somename", "m-7f3a2b"]);
+        let addr: IpAddr = "fd5a:5052::d1".parse().unwrap();
+        repo1
+            .add_actor(&actor, &no_services(), &counters)
+            .await
+            .unwrap();
+
+        // Simulate pre-index persisted state: the attrs hash still carries
+        // device.hostname, but no host:<NAME> entry or hostnames set exists.
+        db.del(&host_key_for("somename")).await.unwrap();
+        db.del(&host_key_for("m-7f3a2b")).await.unwrap();
+        db.del(&actor_hostnames_key_for(&addr)).await.unwrap();
+        assert_eq!(
+            repo1.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            None,
+            "precondition: the index entry is gone"
+        );
+
+        // A fresh repo over the same store (the restart case) reconciles.
+        let repo2 = ActorRepo::new(db);
+        repo2
+            .reconcile_hostname_claims(&no_services(), &counters)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo2.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            Some(addr),
+            "reconcile must rebuild host:<NAME> from persisted attributes"
+        );
+        assert_eq!(
+            repo2.get_zpr_addr_for_hostname("m-7f3a2b").await.unwrap(),
+            Some(addr)
+        );
+        let mut names = repo2.list_hostnames_for_actor(&addr).await.unwrap();
+        names.sort();
+        assert_eq!(names, vec!["m-7f3a2b".to_string(), "somename".to_string()]);
+
+        // Idempotent: a second pass changes nothing and rejects nothing.
+        repo2
+            .reconcile_hostname_claims(&no_services(), &counters)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo2.get_zpr_addr_for_hostname("somename").await.unwrap(),
+            Some(addr)
+        );
+        assert_eq!(
+            counters.counters[CounterType::HostnameClaimRejected].get_count(),
+            0,
+            "re-claiming names the actor already holds is not a rejection"
+        );
+    }
+
+    /// PR #24 review finding 2 (policy services win, retroactively): an actor
+    /// holds `host:<name>`; a newly installed policy then introduces a service
+    /// with that name. Reconciling against the new service-name set must
+    /// release the claim (counted as a rejection, recorded in
+    /// `hostname_conflicts`) while leaving the actor's other names held.
+    #[tokio::test]
+    async fn test_reconcile_evicts_hostname_matching_new_policy_service() {
+        let db: Arc<FakeDb> = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let counters = Counters::default();
+        let actor = make_actor_with_hostnames("fd5a:5052::d2", "evict-cn", &["web", "ok-name"]);
+        let addr: IpAddr = "fd5a:5052::d2".parse().unwrap();
+
+        // At claim time nothing collides: both names are held.
+        repo.add_actor(&actor, &no_services(), &counters)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("web").await.unwrap(),
+            Some(addr)
+        );
+
+        // A new policy introduces service "web": reconcile against it.
+        let policy_services: HashSet<String> = ["web".to_string()].into_iter().collect();
+        repo.reconcile_hostname_claims(&policy_services, &counters)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("web").await.unwrap(),
+            None,
+            "a held hostname matching a new policy service must be released"
+        );
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("ok-name").await.unwrap(),
+            Some(addr),
+            "losing one name to policy must not cost the others"
+        );
+        let names = repo.list_hostnames_for_actor(&addr).await.unwrap();
+        assert_eq!(names, vec!["ok-name".to_string()]);
+        assert_eq!(
+            counters.counters[CounterType::HostnameClaimRejected].get_count(),
+            1
+        );
     }
 }

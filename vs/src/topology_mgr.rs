@@ -158,7 +158,16 @@ impl TopologyMgr {
             if let Err(e) = self.router.add_node(new_node_addr.clone()) {
                 return Err(AddLinkedNodeError::NewNodeFailed(e.into()));
             }
-            if let Err(e) = actor_mgr.add_node(actor, false).await {
+            let policy_service_names: std::collections::HashSet<String> = snapshot
+                .policy_arc()
+                .list_services()
+                .iter()
+                .map(|svc| svc.id.clone())
+                .collect();
+            if let Err(e) = actor_mgr
+                .add_node(actor, false, &policy_service_names)
+                .await
+            {
                 warn!(target: TOPO, "failed to add node to actor_mgr: {}", e);
                 self.router.remove_node(new_node_addr);
                 return Err(AddLinkedNodeError::NewNodeFailed(e.into()));

@@ -411,7 +411,8 @@ impl DbConnection for FakeDb {
     }
 
     /// Set the hash field only if the field with that name does not already exist.
-    async fn hset_nx(&self, key: &str, field: &str, value: &str) -> DbResult<()> {
+    /// Returns true when this call set it (mirrors redis HSETNX).
+    async fn hset_nx(&self, key: &str, field: &str, value: &str) -> DbResult<bool> {
         let _rlock = self.lock.read().await;
         let entry = self
             .store
@@ -419,9 +420,12 @@ impl DbConnection for FakeDb {
             .or_insert_with(|| Entry::new(FakeDbValue::Hash(DashMap::new())));
         match &entry.value {
             FakeDbValue::Hash(h) => {
-                h.entry(field.to_string())
-                    .or_insert_with(|| value.to_string());
-                Ok(())
+                let mut set_by_this_call = false;
+                h.entry(field.to_string()).or_insert_with(|| {
+                    set_by_this_call = true;
+                    value.to_string()
+                });
+                Ok(set_by_this_call)
             }
             _ => Err(redis::RedisError::from((
                 redis::ErrorKind::UnexpectedReturnType,

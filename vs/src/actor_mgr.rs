@@ -113,7 +113,12 @@ impl ActorMgr {
         Ok(())
     }
 
-    pub async fn add_node(&self, actor: &Actor, reconnect: bool) -> Result<(), ServiceError> {
+    pub async fn add_node(
+        &self,
+        actor: &Actor,
+        reconnect: bool,
+        policy_service_names: &HashSet<String>,
+    ) -> Result<(), ServiceError> {
         if !actor.is_node() {
             return Err(ServiceError::Internal(
                 "attempt to add non-node actor as node".into(),
@@ -126,10 +131,16 @@ impl ActorMgr {
                 .await?;
             self.counters
                 .remove_node_info(actor.get_zpr_addr().unwrap());
-            self.actor_db.add_actor(actor).await?;
+            self.actor_db
+                .add_actor(actor, policy_service_names, &self.counters)
+                .await?;
         } else {
             // Is a reconnect...
-            if let Err(e) = self.actor_db.update_actor(actor).await {
+            if let Err(e) = self
+                .actor_db
+                .update_actor(actor, policy_service_names, &self.counters)
+                .await
+            {
                 // Update failed? Make the node try a fresh connect.
                 if let Err(ee) = self
                     .node_db
@@ -153,8 +164,29 @@ impl ActorMgr {
     // TODO: This probably updates too much ... all we really need is to update the attributes.
     // Only called from refresh_and_persist_actor, after an attribute refresh: from the
     // visa request path and from the attribute reconcile sweep in event_mgr.
-    pub async fn update_actor(&self, actor: &Actor) -> Result<(), ServiceError> {
-        self.actor_db.update_actor(actor).await?;
+    pub async fn update_actor(
+        &self,
+        actor: &Actor,
+        policy_service_names: &HashSet<String>,
+    ) -> Result<(), ServiceError> {
+        self.actor_db
+            .update_actor(actor, policy_service_names, &self.counters)
+            .await?;
+        Ok(())
+    }
+
+    /// Rebuild the `host:<NAME>` hostname-claim index from persisted actor
+    /// attributes against `policy_service_names` (zipline#53, PR #24 review).
+    /// Called at startup (backfill for actors persisted before the index
+    /// existed) and on policy install (a new policy service name evicts a
+    /// matching held hostname).
+    pub async fn reconcile_hostname_claims(
+        &self,
+        policy_service_names: &HashSet<String>,
+    ) -> Result<(), ServiceError> {
+        self.actor_db
+            .reconcile_hostname_claims(policy_service_names, &self.counters)
+            .await?;
         Ok(())
     }
 
@@ -218,6 +250,7 @@ impl ActorMgr {
         &self,
         actor: &Actor,
         connected_to_node: &IpAddr,
+        policy_service_names: &HashSet<String>,
     ) -> Result<(), ServiceError> {
         if actor.is_node() {
             return Err(ServiceError::Internal(
@@ -232,7 +265,9 @@ impl ActorMgr {
             )));
         };
 
-        self.actor_db.add_actor(actor).await?;
+        self.actor_db
+            .add_actor(actor, policy_service_names, &self.counters)
+            .await?;
         self.node_db
             .add_connected_adater(connected_to_node, adapter_addr)
             .await?;
@@ -247,13 +282,19 @@ impl ActorMgr {
     /// We don't know what node it is attached to yet.
     ///
     /// See https://github.com/org-zpr/zpr-visaservice/issues/195
-    pub async fn hack_add_adapter_no_node(&self, actor: &Actor) -> Result<(), ServiceError> {
+    pub async fn hack_add_adapter_no_node(
+        &self,
+        actor: &Actor,
+        policy_service_names: &HashSet<String>,
+    ) -> Result<(), ServiceError> {
         if actor.is_node() {
             return Err(ServiceError::Internal(
                 "attempt to add node actor as adapter".into(),
             ));
         }
-        self.actor_db.add_actor(actor).await?;
+        self.actor_db
+            .add_actor(actor, policy_service_names, &self.counters)
+            .await?;
         Ok(())
     }
 
@@ -696,7 +737,9 @@ mod test {
         let actor = make_node_actor_defexp("fd5a:5052::1", "node-1", "[fd5a:5052::100]:1234");
         let node_addr: IpAddr = "fd5a:5052::1".parse().unwrap();
 
-        mgr.add_node(&actor, false).await.unwrap();
+        mgr.add_node(&actor, false, &Default::default())
+            .await
+            .unwrap();
         let loaded = mgr.get_actor_by_zpr_addr(&node_addr).await.unwrap();
         assert!(matches!(loaded, Some(a) if a.is_node()));
 
@@ -709,7 +752,10 @@ mod test {
         let mgr = make_mgr();
         let actor = make_adapter_actor_defexp("fd5a:5052::2", "adapter-1");
 
-        let err = mgr.add_node(&actor, false).await.unwrap_err();
+        let err = mgr
+            .add_node(&actor, false, &Default::default())
+            .await
+            .unwrap_err();
         match err {
             ServiceError::Internal(_) => {}
             other => panic!("unexpected error: {:?}", other),
@@ -733,8 +779,10 @@ mod test {
         let node_addr: IpAddr = "fd5a:5052::4".parse().unwrap();
         let adapter_addr: IpAddr = "fd5a:5052::5".parse().unwrap();
 
-        mgr.add_node(&node_actor, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter_actor, &node_addr)
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_actor, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -756,8 +804,10 @@ mod test {
         let node_addr: IpAddr = "fd5a:5052::6".parse().unwrap();
         let adapter_addr: IpAddr = "fd5a:5052::7".parse().unwrap();
 
-        mgr.add_node(&node_actor, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter_actor, &node_addr)
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_actor, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -868,7 +918,9 @@ mod test {
             &["svc:auth", "svc:regular", "svc:unknown"],
             "adapter-auth",
         );
-        mgr.hack_add_adapter_no_node(&actor).await.unwrap();
+        mgr.hack_add_adapter_no_node(&actor, &Default::default())
+            .await
+            .unwrap();
 
         let auth_service = Service {
             id: "svc:auth".to_string(),
@@ -922,7 +974,9 @@ mod test {
             &["svc:auth"],
             "adapter-regular",
         );
-        mgr.hack_add_adapter_no_node(&actor).await.unwrap();
+        mgr.hack_add_adapter_no_node(&actor, &Default::default())
+            .await
+            .unwrap();
 
         let regular_service = Service {
             id: "svc:auth".to_string(),
@@ -998,8 +1052,10 @@ mod test {
         let adapter_actor = make_adapter_actor_defexp("fd5a:5052::21", "adapter-cn-1");
         let node_addr: IpAddr = "fd5a:5052::20".parse().unwrap();
 
-        mgr.add_node(&node_actor, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter_actor, &node_addr)
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_actor, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -1027,11 +1083,13 @@ mod test {
         let normal_adapter = make_adapter_actor_defexp("fd5a:5052::62", "adapter-cn-f2");
         let node_addr: IpAddr = "fd5a:5052::60".parse().unwrap();
 
-        mgr.add_node(&node_actor, false).await.unwrap();
-        mgr.add_adapter_via_node(&cn_less_adapter, &node_addr)
+        mgr.add_node(&node_actor, false, &Default::default())
             .await
             .unwrap();
-        mgr.add_adapter_via_node(&normal_adapter, &node_addr)
+        mgr.add_adapter_via_node(&cn_less_adapter, &node_addr, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&normal_adapter, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -1062,14 +1120,16 @@ mod test {
         let adapter3 = make_adapter_actor_defexp("fd5a:5052::23", "adapter-3");
         let node_addr: IpAddr = "fd5a:5052::20".parse().unwrap();
 
-        mgr.add_node(&node_actor, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter1, &node_addr)
+        mgr.add_node(&node_actor, false, &Default::default())
             .await
             .unwrap();
-        mgr.add_adapter_via_node(&adapter2, &node_addr)
+        mgr.add_adapter_via_node(&adapter1, &node_addr, &Default::default())
             .await
             .unwrap();
-        mgr.add_adapter_via_node(&adapter3, &node_addr)
+        mgr.add_adapter_via_node(&adapter2, &node_addr, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter3, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -1095,7 +1155,9 @@ mod test {
             make_node_actor_defexp("fd5a:5052::20", "node-cn", "[fd5a:5052::120]:1234");
         let node_addr: IpAddr = "fd5a:5052::20".parse().unwrap();
 
-        mgr.add_node(&node_actor, false).await.unwrap();
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
 
         let addrs = mgr
             .get_adapters_connected_to_node(&node_addr)
@@ -1116,12 +1178,16 @@ mod test {
         let node_a_addr: IpAddr = "fd5a:5052::20".parse().unwrap();
         let node_b_addr: IpAddr = "fd5a:5052::21".parse().unwrap();
 
-        mgr.add_node(&node_a, false).await.unwrap();
-        mgr.add_node(&node_b, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter_on_a, &node_a_addr)
+        mgr.add_node(&node_a, false, &Default::default())
             .await
             .unwrap();
-        mgr.add_adapter_via_node(&adapter_on_b, &node_b_addr)
+        mgr.add_node(&node_b, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_on_a, &node_a_addr, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_on_b, &node_b_addr, &Default::default())
             .await
             .unwrap();
 
@@ -1153,11 +1219,13 @@ mod test {
         let node_addr: IpAddr = "fd5a:5052::20".parse().unwrap();
         let remove_addr: IpAddr = "fd5a:5052::22".parse().unwrap();
 
-        mgr.add_node(&node_actor, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter1, &node_addr)
+        mgr.add_node(&node_actor, false, &Default::default())
             .await
             .unwrap();
-        mgr.add_adapter_via_node(&adapter2, &node_addr)
+        mgr.add_adapter_via_node(&adapter1, &node_addr, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter2, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -1219,7 +1287,9 @@ mod test {
         let node_actor =
             make_node_actor_defexp("fd5a:5052::30", "node-self", "[fd5a:5052::130]:1234");
 
-        mgr.add_node(&node_actor, false).await.unwrap();
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
 
         let docking = mgr.get_docking_node_for_actor(&node_actor);
         assert_eq!(docking, Some(node_addr));
@@ -1233,8 +1303,10 @@ mod test {
             make_node_actor_defexp("fd5a:5052::31", "node-dock", "[fd5a:5052::131]:1234");
         let adapter_actor = make_adapter_actor_defexp("fd5a:5052::32", "adapter-dock");
 
-        mgr.add_node(&node_actor, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter_actor, &node_addr)
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_actor, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -1247,7 +1319,9 @@ mod test {
         let mgr = make_mgr();
         // Adapter added to actor DB but NOT via a node (so no connection_table entry).
         let adapter_actor = make_adapter_actor_defexp("fd5a:5052::33", "adapter-orphan");
-        mgr.hack_add_adapter_no_node(&adapter_actor).await.unwrap();
+        mgr.hack_add_adapter_no_node(&adapter_actor, &Default::default())
+            .await
+            .unwrap();
 
         let docking = mgr.get_docking_node_for_actor(&adapter_actor);
         assert_eq!(docking, None);
@@ -1278,8 +1352,10 @@ mod test {
             make_node_actor_defexp("fd5a:5052::34", "node-rm-ct", "[fd5a:5052::134]:1234");
         let adapter_actor = make_adapter_actor_defexp("fd5a:5052::35", "adapter-rm-ct");
 
-        mgr.add_node(&node_actor, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter_actor, &node_addr)
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_actor, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -1304,11 +1380,13 @@ mod test {
         let adapter1 = make_adapter_actor_defexp("fd5a:5052::37", "adapter-rm-1");
         let adapter2 = make_adapter_actor_defexp("fd5a:5052::38", "adapter-rm-2");
 
-        mgr.add_node(&node_actor, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter1, &node_addr)
+        mgr.add_node(&node_actor, false, &Default::default())
             .await
             .unwrap();
-        mgr.add_adapter_via_node(&adapter2, &node_addr)
+        mgr.add_adapter_via_node(&adapter1, &node_addr, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter2, &node_addr, &Default::default())
             .await
             .unwrap();
 
@@ -1332,12 +1410,16 @@ mod test {
         let adapter_a = make_adapter_actor_defexp("fd5a:5052::41", "adapter-on-a");
         let adapter_b = make_adapter_actor_defexp("fd5a:5052::42", "adapter-on-b");
 
-        mgr.add_node(&node_a, false).await.unwrap();
-        mgr.add_node(&node_b, false).await.unwrap();
-        mgr.add_adapter_via_node(&adapter_a, &node_a_addr)
+        mgr.add_node(&node_a, false, &Default::default())
             .await
             .unwrap();
-        mgr.add_adapter_via_node(&adapter_b, &node_b_addr)
+        mgr.add_node(&node_b, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_a, &node_a_addr, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_b, &node_b_addr, &Default::default())
             .await
             .unwrap();
 
@@ -1359,7 +1441,9 @@ mod test {
             make_node_actor_defexp("fd5a:5052::43", "node-vs-hack", "[fd5a:5052::143]:1234");
         let vs_addr = IpAddr::V6(crate::config::VS_ZPR_ADDR);
 
-        mgr.add_node(&node_actor, false).await.unwrap();
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
         mgr.hack_set_vs_docking_node(&node_addr).await.unwrap();
 
         // The VS adapter should now resolve to node_addr in the connection table.
@@ -1389,8 +1473,10 @@ mod test {
             make_node_actor_defexp("fd5a:5052::44", "node-refresh", "[fd5a:5052::144]:1234");
         let adapter_actor = make_adapter_actor_defexp("fd5a:5052::45", "adapter-refresh");
 
-        mgr1.add_node(&node_actor, false).await.unwrap();
-        mgr1.add_adapter_via_node(&adapter_actor, &node_addr)
+        mgr1.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr1.add_adapter_via_node(&adapter_actor, &node_addr, &Default::default())
             .await
             .unwrap();
 

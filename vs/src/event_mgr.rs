@@ -227,6 +227,26 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         "policy updated vinst={vinst}: actors refreshed={refreshed} unresolved={unresolved} failed={failed}"
     );
 
+    // Reconcile hostname claims against the new policy's service-name set
+    // (zipline#53, PR #24 review): a newly named policy service evicts a
+    // matching held `host:<name>` claim. The attribute refresh above cannot
+    // cover this — it only persists actors whose trusted attributes changed,
+    // and a hostname/service collision changes no attribute. The set comes
+    // from the same snapshot the rest of this pass reconciles against.
+    let policy_service_names: HashSet<String> = psnap
+        .policy_arc()
+        .list_services()
+        .iter()
+        .map(|svc| svc.id.clone())
+        .collect();
+    if let Err(e) = asm
+        .actor_mgr
+        .reconcile_hostname_claims(&policy_service_names)
+        .await
+    {
+        error!(target: EVENT, "failed to reconcile hostname claims after policy update: {e}");
+    }
+
     // The new policy may invalidate some existing nodes.
     let (valid_node_addrs, invalid_node_addrs) =
         revalidate_nodes(asm, &psnap, connected_node_addrs).await;
@@ -475,6 +495,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -482,6 +503,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052::2", "node-b", "[fd5a:5052::102]:1234"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -507,6 +529,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052::1", "node-a", "[fd5a:5052::101]:1234"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -514,6 +537,7 @@ mod tests {
             .add_node(
                 &make_node_actor_defexp("fd5a:5052::2", "node-b", "[fd5a:5052::102]:1234"),
                 false,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -549,7 +573,10 @@ mod tests {
                     .value("svc-x"),
             )
             .unwrap();
-        asm.actor_mgr.add_node(&good_actor, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&good_actor, false, &Default::default())
+            .await
+            .unwrap();
         // Node offering a service the policy does not allow → invalid → disconnected.
         let mut bad_actor =
             make_node_actor_defexp("fd5a:5052::2", "node-bad", "[fd5a:5052::102]:1234");
@@ -560,7 +587,10 @@ mod tests {
                     .value("svc-y"),
             )
             .unwrap();
-        asm.actor_mgr.add_node(&bad_actor, false).await.unwrap();
+        asm.actor_mgr
+            .add_node(&bad_actor, false, &Default::default())
+            .await
+            .unwrap();
 
         let psnap = asm.policy_mgr.get_current_snapshot();
         let node_addrs = asm.actor_mgr.list_node_addrs().await.unwrap();
@@ -700,6 +730,60 @@ mod tests {
         assert_eq!(
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
             Some("sales".to_string())
+        );
+    }
+
+    /// zipline#53 (PR #24 review, finding 2): installing a policy that
+    /// introduces a service ID matching an already-held hostname must
+    /// reconcile the claim — `host:<name>` is released (policy services win,
+    /// retroactively) while the actor's other names stay held. The
+    /// attribute-refresh pass alone cannot do this: it only persists actors
+    /// whose trusted attributes changed, and this actor's did not.
+    #[tokio::test]
+    async fn test_policy_update_reconciles_hostname_claims() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let addr: IpAddr = "fd5a:5052::7".parse().unwrap();
+
+        // A node whose device.hostname claims "svc-x" before any policy names it.
+        let mut actor = make_node_actor_defexp("fd5a:5052::7", "node-h", "[fd5a:5052::107]:1234");
+        actor
+            .add_attribute(
+                Attribute::builder("device.hostname")
+                    .expires_in(Duration::from_secs(3600))
+                    .values(&["svc-x", "keep-name"]),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&actor, false, &Default::default())
+            .await
+            .unwrap();
+        asm.topo_mgr.add_node(addr).unwrap();
+
+        let repo = crate::db::ActorRepo::new(asm.state_db.clone());
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("svc-x").await.unwrap(),
+            Some(addr),
+            "precondition: the hostname is held before the policy names it"
+        );
+
+        // Install a policy introducing service "svc-x" (the node offers no
+        // services, so it remains valid) and run the update handler.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_node_join_policy(Some(vec![svc("svc-x")])))
+            .await
+            .unwrap();
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        handle_policy_updated(&asm, vinst).await.unwrap();
+
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("svc-x").await.unwrap(),
+            None,
+            "policy install must release a held hostname matching a new policy service"
+        );
+        assert_eq!(
+            repo.get_zpr_addr_for_hostname("keep-name").await.unwrap(),
+            Some(addr),
+            "reconciliation must not cost the actor its other names"
         );
     }
 }

@@ -108,6 +108,11 @@ pub enum CounterType {
     /// A policy-declared link could not be installed during a VSAPI join. The node is
     /// connected but has no route over that link until an endpoint reconnects.
     LinkInstallFailed,
+
+    /// A `device.hostname` value could not be claimed into the `host:<NAME>`
+    /// index: the name is live under another actor, or it collides with a
+    /// policy service name (zipline#53, first-claim-wins per value).
+    HostnameClaimRejected,
 }
 
 impl CounterType {
