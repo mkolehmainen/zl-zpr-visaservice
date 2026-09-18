@@ -1,4 +1,4 @@
-Admin HTTP API  - Current as of 9/15/2026
+Admin HTTP API  - Current as of 9/18/2026
 -----------------------------------------
 
 This document describes the admin HTTPS API implemented by the server and
@@ -24,8 +24,9 @@ API KEY
   Every request requires passing the api key in the `X-API-Key` header.
   A missing, malformed, or unknown key gets a 401 (not listed per endpoint).
   Keys carry one of three permission levels: resolve, read, or read/write.
-  GET /admin/services and GET /admin/services/{name} accept any active key,
-  including a resolve key. All other read endpoints require read; write
+  GET /admin/services, GET /admin/services/{name} and GET /admin/hosts/{name}
+  accept any active key, including a resolve key — a resolve key reaches
+  exactly those three endpoints. All other read endpoints require read; write
   endpoints (POST/DELETE) require read/write, else 403.
 
 Notes
@@ -76,7 +77,17 @@ Common Types
 |                 |   "node": boolean, "zpr_addr": string,                   |
 |                 |   "attrs": ApiAttribute[],                               |
 |                 |   "auth_exp": number | null,                             |
-|                 |   "node_details": NodeRecordBrief | null }               |
+|                 |   "node_details": NodeRecordBrief | null,                |
+|                 |   "hostname_conflicts": string[] }                       |
+|                 |   hostname_conflicts lists device.hostname values this   |
+|                 |   actor claimed that were refused (held by another actor |
+|                 |   or matching a policy service name); empty in the       |
+|                 |   normal case. Display data only.                        |
+|                 |                                                          |
+| HostDescriptor  | { "hostname": string, "zpr_addr": string,                |
+|                 |   "actor_cn": string }                                   |
+|                 |   actor_cn is the holder's display label; "" when the    |
+|                 |   actor has no CN.                                       |
 |                 |                                                          |
 | ApiAttribute    | { "key": string, "value": string[],                      |
 |                 |   "expires_at": number }                                 |
@@ -171,6 +182,8 @@ GET /admin/actors/{zpr_addr}
     created is currently 0 (actor create time not tracked yet).
     node_details is populated for node actors and null for adapters.
     cn is null for actors without a CN (e.g. an OIDC-only connect).
+    hostname_conflicts lists the actor's refused device.hostname claims
+    (first-claim-wins; see GET /admin/hosts/{name}). Empty in the normal case.
 
 DELETE /admin/actors/{zpr_addr}
 -------------------------------
@@ -266,6 +279,33 @@ DELETE /admin/services/{id}/cache
     Actors with no live visa are not touched here -- they refresh on their next
     visa request.
     Note that passed {id} must be url path encoded.
+
+GET /admin/hosts/{name}
+-----------------------
+  Summary
+    Resolves a claimed hostname to the actor holding it (zipline#54).
+  Request
+    (none)
+  Response
+    200: HostDescriptor
+    403: permission denied
+    404: no such hostname (unclaimed, or never claimable)
+    500: server error
+  Notes
+    Accepts any active key, including a resolve key — this endpoint sits on
+    the resolve surface with the two service-resolution endpoints. A resolve
+    key reaches exactly those three; in particular it cannot read actors, so
+    resolving grants no actor visibility beyond the one name asked for. There
+    is deliberately no GET /admin/hosts listing.
+    Names enter the index via the device.hostname attribute claim
+    (first-claim-wins per value; policy service names always win). The claim
+    side stores the caller's value without transformation, and this lookup
+    queries the same way — no mangling on either side — so the name must be
+    spelled exactly as claimed: a single lowercase DNS label. An invalid label
+    is simply never in the index and reports the same 404 as an unclaimed one.
+    Refused claims are visible on the losing actor's ActorDescriptor
+    hostname_conflicts field (read-gated).
+    Note that passed {name} must be url path encoded.
 
 GET /admin/visas
 ----------------
