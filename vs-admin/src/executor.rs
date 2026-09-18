@@ -127,6 +127,13 @@ impl Executor {
         Ok(())
     }
 
+    /// `hosts <NAME>` — resolve a claimed hostname via GET /admin/hosts/{name}
+    /// (zipline#54). Mirrors `services get` end to end.
+    pub fn do_cmd_hosts(&self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let host = self.vs_cli.get_host(name)?;
+        self.print_json(&host)
+    }
+
     /// `install <POLICY_FILE>` — hot-install a compiled policy container and
     /// make it current. Same wire path as `policies --path`.
     pub fn do_cmd_install(&self, policy: &Path) -> Result<(), Box<dyn std::error::Error>> {
