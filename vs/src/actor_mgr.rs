@@ -504,6 +504,26 @@ impl ActorMgr {
         Ok(actors)
     }
 
+    /// Given a hostname, the ZPR address of the actor holding it in the
+    /// `host:<NAME>` claim index (zipline#53), if any. Query-side spelling
+    /// matches claim-side exactly — no mangling of the caller's input.
+    pub async fn get_zpr_addr_for_hostname(
+        &self,
+        hostname: &str,
+    ) -> Result<Option<IpAddr>, ServiceError> {
+        Ok(self.actor_db.get_zpr_addr_for_hostname(hostname).await?)
+    }
+
+    /// The actor's `hostname_conflicts` display field (zipline#54): claim
+    /// values refused because another actor or a policy service held them.
+    /// Missing or unparseable data is an empty list, never an error.
+    pub async fn get_hostname_conflicts(
+        &self,
+        zpr_addr: &IpAddr,
+    ) -> Result<Vec<String>, ServiceError> {
+        Ok(self.actor_db.get_hostname_conflicts(zpr_addr).await?)
+    }
+
     /// Get the service details for the named service.
     pub async fn get_service_detail(
         &self,

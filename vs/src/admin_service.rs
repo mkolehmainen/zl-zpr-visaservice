@@ -50,8 +50,8 @@ use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 
 use admin_api_types::{
     ActorDescriptor, ActorEntry, ApiAttribute, ApiKeyFormat, ApiKeySet, ConnectionType, DenyRecord,
-    ListEntry, NamedListEntry, NetworkDetails, NodeConnection, NodeRecordBrief, Revokes,
-    ServiceDescriptor, Stats, VisaDescriptor,
+    HostDescriptor, ListEntry, NamedListEntry, NetworkDetails, NodeConnection, NodeRecordBrief,
+    Revokes, ServiceDescriptor, Stats, VisaDescriptor,
 };
 
 // Must use tokio RwLock here becuase we need state to be Send.
@@ -187,6 +187,7 @@ fn admin_app(state: SharedState) -> Router {
             "/admin/services/{capture}/cache",
             delete(flush_service_cache),
         )
+        .route("/admin/hosts/{capture}", get(get_host))
         .route("/admin/authrevoke", get(get_revokes))
         .route("/admin/authrevoke/{capture}", get(get_revoke))
         .route("/admin/authrevoke/{capture}", post(add_revoke))
@@ -607,6 +608,15 @@ async fn get_actor(
                     false => None,
                 };
 
+                // Display data (zipline#54): refused hostname claims, read from
+                // the field #53 writes. Missing or unreadable is empty, never
+                // an error.
+                let hostname_conflicts = asm
+                    .actor_mgr
+                    .get_hostname_conflicts(&zpr_addr)
+                    .await
+                    .unwrap_or_default();
+
                 let descriptor = ActorDescriptor {
                     // The path no longer carries a name: the CN comes from the
                     // actor record itself, and may legitimately be absent.
@@ -618,7 +628,7 @@ async fn get_actor(
                     attrs,
                     auth_exp,
                     node_details,
-                    hostname_conflicts: vec![],
+                    hostname_conflicts,
                 };
                 return Ok(Json(descriptor));
             }
@@ -907,6 +917,57 @@ async fn get_service(
             }
         }
     }
+}
+
+/// GET /admin/hosts/{name} — resolve one claimed hostname to its holder
+/// (zipline#54). Gated by the existing `can_resolve()`, alongside the two
+/// service-resolution endpoints — a `resolve` key reaches exactly these three.
+/// The lookup goes through the same `host:<NAME>` index the claim side writes
+/// (zipline#53), so query-side spelling matches claim-side exactly: no
+/// mangling of the caller's input. An unclaimed or invalid name is the same
+/// "not in the index" 404 — no new error surface.
+async fn get_host(
+    Extension(perm): Extension<Permission>,
+    State(state): State<SharedState>,
+    EPath(host_name): EPath<String>,
+) -> Result<Json<HostDescriptor>, StatusCode> {
+    if !perm.can_resolve() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    debug!(target: ADMIN, "GET /admin/hosts name={}", host_name);
+    let rstate = state.read().await;
+
+    let addr = match rstate
+        .asm
+        .actor_mgr
+        .get_zpr_addr_for_hostname(&host_name)
+        .await
+    {
+        Err(e) => {
+            error!(target: ADMIN, "error resolving hostname {}: {}", host_name, e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Ok(Some(addr)) => addr,
+    };
+
+    // The holder's CN is a display label and may legitimately be absent.
+    let actor_cn = match rstate.asm.actor_mgr.get_actor_by_zpr_addr(&addr).await {
+        Err(e) => {
+            error!(target: ADMIN, "error loading actor {} for hostname {}: {}", addr, host_name, e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Ok(opt_a) => opt_a
+            .and_then(|a| a.get_cn().map(str::to_string))
+            .unwrap_or_default(),
+    };
+
+    Ok(Json(HostDescriptor {
+        hostname: host_name,
+        zpr_addr: addr.to_string(),
+        actor_cn,
+    }))
 }
 
 /// DELETE /admin/services/{id}/cache — reload a trusted service's attribute data and
@@ -2938,8 +2999,174 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// GET /admin/hosts/{name} with a resolve-only key (zipline#54): 200 with
+    /// a HostDescriptor for a claimed name, 404 for an unclaimed one, and 404
+    /// for an invalid label (never claimable — #53 rejects it at claim time,
+    /// so it is the same "not in the index" answer, no new error surface).
+    #[tokio::test]
+    async fn test_get_host_resolve_key_ok_and_unknown_not_found() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_resolve_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let mut adapter = make_adapter_actor_defexp("fd5a:5052::3", "host-cn-1");
+        adapter
+            .add_attribute(Attribute::builder("device.hostname").values(&["somename"]))
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap(), &Default::default())
+            .await
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/hosts/somename")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let hd: HostDescriptor = serde_json::from_slice(&body).unwrap();
+        assert_eq!(hd.hostname, "somename");
+        assert_eq!(hd.zpr_addr, "fd5a:5052::3");
+        assert_eq!(hd.actor_cn, "host-cn-1");
+
+        // Unclaimed and invalid labels get the same "not in the index" 404.
+        for path in ["/admin/hosts/unclaimed", "/admin/hosts/Not_A_Label"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header("X-API-Key", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "for {path}");
+        }
+    }
+
+    /// GET /admin/hosts/{name} sits on the resolve surface (zipline#54): like
+    /// the two service-resolution endpoints it is gated by the existing
+    /// `can_resolve()`, which admits ANY active key — so a read key gets the
+    /// endpoint's normal behavior (200), exactly as it does on /admin/services.
+    ///
+    /// NOTE: the approved plan's RED list said "read key -> 403" here, but that
+    /// contradicts the same plan's GREEN step (and the issue), both of which
+    /// mandate the existing `can_resolve()` (admin_apikeys.rs) — a gate that
+    /// returns true for every active key. The mechanism wins; deviation
+    /// recorded on the issue and in the PR.
+    #[tokio::test]
+    async fn test_get_host_read_key_allowed() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let mut adapter = make_adapter_actor_defexp("fd5a:5052::3", "host-cn-1");
+        adapter
+            .add_attribute(Attribute::builder("device.hostname").values(&["somename"]))
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&adapter, node.get_zpr_addr().unwrap(), &Default::default())
+            .await
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/hosts/somename")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let hd: HostDescriptor = serde_json::from_slice(&body).unwrap();
+        assert_eq!(hd.zpr_addr, "fd5a:5052::3");
+    }
+
+    /// GET /admin/actors/{addr} surfaces hostname_conflicts (zipline#54):
+    /// after two actors claim the same name, the loser's descriptor carries
+    /// the refused value and the winner's carries an empty vector.
+    #[tokio::test]
+    async fn test_get_actor_hostname_conflicts() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234");
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let mut winner = make_adapter_actor_defexp("fd5a:5052::3", "winner");
+        winner
+            .add_attribute(Attribute::builder("device.hostname").values(&["somename"]))
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&winner, node.get_zpr_addr().unwrap(), &Default::default())
+            .await
+            .unwrap();
+        let mut loser = make_adapter_actor_defexp("fd5a:5052::4", "loser");
+        loser
+            .add_attribute(Attribute::builder("device.hostname").values(&["somename"]))
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&loser, node.get_zpr_addr().unwrap(), &Default::default())
+            .await
+            .unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        for (addr, expected) in [
+            ("fd5a:5052::3", Vec::<String>::new()),
+            ("fd5a:5052::4", vec!["somename".to_string()]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/admin/actors/{addr}"))
+                        .header("X-API-Key", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "for {addr}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let descriptor: ActorDescriptor = serde_json::from_slice(&body).unwrap();
+            assert_eq!(descriptor.hostname_conflicts, expected, "for {addr}");
+        }
+    }
+
     /// A resolve-only key is least-privilege (zipline#36): every read
-    /// endpoint other than the two service-resolution endpoints stays 403.
+    /// endpoint other than the resolve surface stays 403. The list includes
+    /// the per-item reads (zipline#54): the perm gate runs before any path
+    /// parsing, so even a malformed address is a 403 for this key.
     #[tokio::test]
     async fn test_read_endpoints_resolve_key_forbidden() {
         let asm = Arc::new(new_assembly_for_tests(None).await);
@@ -2949,7 +3176,13 @@ mod tests {
 
         for path in [
             "/admin/visas",
+            "/admin/visas/denies",
+            "/admin/visas/1",
             "/admin/actors",
+            "/admin/actors/fd5a:5052::10",
+            "/admin/actors/fd5a:5052::10/visas",
+            "/admin/nodes/fd5a:5052::10/visas",
+            "/admin/policies",
             "/admin/policies/curr",
             "/admin/network",
             "/admin/stats",
