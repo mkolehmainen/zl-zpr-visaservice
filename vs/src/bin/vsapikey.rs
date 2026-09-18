@@ -58,7 +58,7 @@ fn parse_permission(perms: &str) -> Result<Permission, String> {
 }
 
 #[derive(Parser)]
-#[command(name = "vsapikey", about = "Manage VS API keys")]
+#[command(name = "vsapikey", version = build_info::BUILD_VERSION, about = "Manage VS API keys")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -25,7 +25,7 @@ use error::ZptError;
 /// ZPT instructions.
 #[derive(Parser, Debug)]
 #[command(name = "zpt")]
-#[command(version, verbatim_doc_comment)]
+#[command(version = build_info::BUILD_VERSION, verbatim_doc_comment)]
 struct Cli {
     /// Path to a ZPT instructions file (use '-' for stdin)
     #[arg(short, long, value_name = "INSTRUCTIONS")]

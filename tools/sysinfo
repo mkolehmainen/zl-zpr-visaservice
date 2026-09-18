@@ -46,6 +46,16 @@ if command -v rustup &>/dev/null; then
 fi
 echo
 
+echo "-- Source --"
+if command -v git &>/dev/null && GIT_DESC=$(git -c safe.directory="$PWD" describe --always --dirty --tags 2>/dev/null); then
+	echo "describe:     ${GIT_DESC}"
+	echo "commit:       $(git -c safe.directory="$PWD" rev-parse HEAD 2>/dev/null || echo unknown)"
+else
+	echo "describe:     unknown"
+	echo "commit:       unknown"
+fi
+echo
+
 echo "-- Key tools --"
 tool_version() {
 	local tool=$1 flag=${2:---version}

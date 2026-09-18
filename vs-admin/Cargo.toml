@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+build-info = { path = "../build-info" }
 admin-api-types = { path = "../admin-api-types" }
 base64.workspace = true
 chrono.workspace = true
