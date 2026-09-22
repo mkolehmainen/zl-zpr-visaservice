@@ -1,7 +1,7 @@
 # zpr-visaservice
 [workspace]
 resolver = "3"
-members = ["vs", "libeval", "zpt", "vs-admin", "admin-api-types", "build-info"]
+members = ["vs", "libeval", "zpt", "vs-admin", "admin-api-types", "build-info", "zpr-attr-server"]
 
 [workspace.package]
 version = "0.20.0"

@@ -1,0 +1,239 @@
+# VENDORED COPY — source of truth: zl-zpr-dev-context/docs/zpr-attr-v1.openapi.yaml
+# Do not edit here; re-copy when the source changes (zipline#80).
+# Machine-readable rendering of the zpr-attr/1 attribute-service protocol.
+#
+# NON-NORMATIVE. docs/ATTRIBUTE_SERVICE.md ("The wire protocol") is the
+# specification; this file follows it. If the two disagree, fix this file.
+# The reference server's contract tests (zl-zpr-visaservice/zpr-attr-server)
+# validate every exchange against both.
+#
+# The change-notification callback the attribute service makes INTO the visa
+# service (POST /admin/services/{id}/changed) is part of the visa service admin
+# API, documented in zl-zpr-visaservice/admin-http-api.txt, not here.
+
+openapi: 3.1.0
+info:
+  title: ZPR attribute service (zpr-attr/1)
+  version: "1"
+  description: >
+    The protocol a ZPR visa service uses to fetch actor attributes from a
+    networked attribute source declared in policy as `api = "zpr-attr/1"`.
+    The server never authenticates actors; it decorates actors already
+    identified by other trusted services. Every error path is fail-closed on
+    the visa-service side: anything but a 200 with a well-formed body denies
+    the pending visa.
+
+servers:
+  - url: "{policyUrl}"
+    description: The `url` property of the trusted-service declaration in the .zplc.
+    variables:
+      policyUrl:
+        default: https://attrs.example.invalid/tenant
+
+security:
+  - bearer: []
+
+paths:
+  /query:
+    post:
+      operationId: query
+      summary: Attributes for one actor, named by its identity set
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+            example:
+              identities:
+                user.sub: "10769150350006150715113082367"
+                user.zpr.authority: google
+                device.zpr.adapter.cn: laptop.zpr.org
+              attributes: [dept, roles, contractor]
+      responses:
+        "200":
+          description: >
+            Answer. An unknown actor is `{"attributes": {}}`, a success, not
+            an error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+              example:
+                attributes:
+                  dept: { values: [eng] }
+                  roles: { values: [a, b], expires_at: "2026-09-22T15:00:00Z" }
+                  contractor: { values: [] }
+        "400": { description: Malformed request. }
+        "401": { description: Missing or unknown bearer token. }
+        "403": { description: Token valid but not permitted to query. }
+        "409":
+          description: >
+            Conflict. The identities resolve to records that disagree on an
+            attribute's value. The server MUST NOT pick a winner.
+        "5XX": { description: Server failure. }
+
+  /schema:
+    get:
+      operationId: schema
+      summary: The attribute vocabulary this service can return
+      description: >
+        `attributes` holds SCIM 2.0 attribute definitions (RFC 7643 section 7).
+        The envelope (`identityKeys`) is ZPR's. Read by policy editors, and
+        once by the visa service at policy install, where a mismatch with the
+        policy's `returns_attributes` is logged and never fails the install.
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SchemaResponse"
+              example:
+                identityKeys: [user.sub, device.zpr.adapter.cn]
+                attributes:
+                  - name: dept
+                    type: string
+                    multiValued: false
+                    description: Cost centre
+                    canonicalValues: [eng, sales, ops]
+                  - name: roles
+                    type: string
+                    multiValued: true
+                  - name: contractor
+                    type: boolean
+                    description: Not an employee
+          description: The vocabulary.
+        "401": { description: Missing or unknown bearer token. }
+        "404":
+          description: >
+            Not implemented by this service. The visa service logs one info
+            line and proceeds.
+
+  # Reserved paths. Not specified in zpr-attr/1; a visa service never calls
+  # them. Named so no implementer uses them for something else.
+  /stream:
+    get:
+      operationId: stream
+      summary: RESERVED — server-sent change subscription (future revision)
+      responses:
+        "501": { description: Reserved in zpr-attr/1. }
+  /satisfies:
+    post:
+      operationId: satisfies
+      summary: RESERVED — identities satisfying an attribute expression (future revision)
+      responses:
+        "501": { description: Reserved in zpr-attr/1. }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: >
+        Per-service token held by the visa service (vs.toml `ts_secrets_dir`,
+        file `<service-id>.token`). Identifies the caller and, for a hosted
+        multi-tenant service, the tenant. The protocol carries no tenant
+        parameter.
+
+  schemas:
+    QueryRequest:
+      type: object
+      required: [identities, attributes]
+      additionalProperties: false
+      properties:
+        identities:
+          description: >
+            The actor's lookup-identity set as ZPR key names — every
+            policy-declared identity attribute the actor carries plus
+            `user.zpr.authority` when present. Same shape as the top two
+            levels of a `file` store's JSON.
+          type: object
+          minProperties: 1
+          additionalProperties:
+            type: string
+          examples:
+            - user.sub: "10769150350006150715113082367"
+              user.zpr.authority: google
+        attributes:
+          description: >
+            Service-side names from policy's `returns_attributes` — the only
+            names the visa service will keep. A hint the server MAY use to
+            prune and MAY ignore.
+          type: array
+          items: { type: string }
+
+    QueryResponse:
+      type: object
+      required: [attributes]
+      additionalProperties: false
+      properties:
+        attributes:
+          description: >
+            Keyed by service-side attribute name. Names not in the policy
+            mapping are ignored by the visa service. Empty for an unknown
+            actor.
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AttributeValue"
+
+    AttributeValue:
+      type: object
+      required: [values]
+      additionalProperties: false
+      properties:
+        values:
+          description: >
+            Exactly one element for a single-valued mapping (more is an error
+            for the whole response); any number for a multi-valued mapping;
+            ignored for a tag, whose presence is the value. Empty on a
+            non-tag means "no value" and the attribute is pruned.
+          type: array
+          items: { type: string }
+        expires_at:
+          description: >
+            RFC 3339. The visa service uses
+            min(expires_at, now + policy expiration_seconds): policy may
+            shorten a lifetime, never extend one. A past value makes the
+            attribute absent.
+          type: string
+          format: date-time
+
+    SchemaResponse:
+      type: object
+      required: [attributes]
+      properties:
+        identityKeys:
+          description: >
+            ZPR's, not SCIM's. The ZPR identity keys this service can look up
+            on. Empty or absent means unspecified.
+          type: array
+          items: { type: string }
+        attributes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScimAttributeDefinition"
+
+    ScimAttributeDefinition:
+      description: >
+        A SCIM 2.0 attribute definition (RFC 7643 section 7). Only the fields
+        listed are interpreted; any other SCIM field (`required`, `caseExact`,
+        `mutability`, `returned`, `uniqueness`, `referenceTypes`) may be
+        present and is ignored. `complex` is not supported. Correspondence to
+        a policy mapping — single: any type but boolean/complex,
+        multiValued false; multi: any type but boolean/complex, multiValued
+        true; tag: boolean, multiValued false.
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string }
+        type:
+          type: string
+          enum: [string, boolean, integer, decimal, dateTime, reference, binary, complex]
+        multiValued:
+          type: boolean
+          default: false
+        description: { type: string }
+        canonicalValues:
+          description: The values the service will ever return for this attribute. For editors.
+          type: array
+          items: { type: string }
