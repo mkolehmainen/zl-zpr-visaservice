@@ -16,6 +16,7 @@
 //!   carries it.
 
 use serde::Deserialize;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 use thiserror::Error;
@@ -50,7 +51,7 @@ pub struct Conflict {
 
 /// One stored attribute entry: the `file` store's bare value array, or the
 /// extended object form carrying an `expires_at` to pass through.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum StoredEntry {
     /// The `file` store's native spelling: `["red"]`.
@@ -86,7 +87,7 @@ impl StoredEntry {
 }
 
 /// One actor entry's attributes: service-side name -> stored entry.
-type AttrMap = BTreeMap<String, StoredEntry>;
+pub type AttrMap = BTreeMap<String, StoredEntry>;
 
 /// The loaded data set: the file-store map plus the optional `_schema`.
 #[derive(Debug, Clone)]
@@ -94,7 +95,7 @@ pub struct AttrData {
     /// identity key -> identity value -> attribute name -> entry.
     entries: BTreeMap<String, BTreeMap<String, AttrMap>>,
     /// SCIM definitions from `_schema`, verbatim, when present.
-    schema: Option<serde_json::Value>,
+    schema: Option<Value>,
 }
 
 impl AttrData {
@@ -104,15 +105,21 @@ impl AttrData {
         Self::from_json_str(&contents)
     }
 
-    /// Decode a data set from its JSON text.
+    /// Decode a data set from its JSON text: split off the reserved
+    /// `_schema` key, then decode the rest as the file-store map.
     pub fn from_json_str(contents: &str) -> Result<Self, DataError> {
-        // Stub (zipline#80 step 1): parses nothing, serves nothing. The
-        // contract tests define the behavior; step 2 implements it.
-        let _ = contents;
-        Ok(AttrData {
-            entries: BTreeMap::new(),
-            schema: None,
-        })
+        let parsed: Value = serde_json::from_str(contents)?;
+        let Value::Object(mut top) = parsed else {
+            return Err(DataError::NotAnObject);
+        };
+        let schema = match top.remove(SCHEMA_KEY) {
+            None => None,
+            Some(defs @ Value::Array(_)) => Some(defs),
+            Some(_) => return Err(DataError::SchemaNotAnArray),
+        };
+        let entries: BTreeMap<String, BTreeMap<String, AttrMap>> =
+            serde_json::from_value(Value::Object(top))?;
+        Ok(AttrData { entries, schema })
     }
 
     /// Look up every identity pair and return the UNION of the matched
@@ -120,18 +127,117 @@ impl AttrData {
     /// disagreeing on an attribute's values is a [Conflict] — the same
     /// fail-closed rule as the visa service `file` store, moved to the side
     /// that can see the records. An unknown identity matches nothing and is
-    /// not an error.
+    /// not an error. Agreement is on the values (and any `expires_at`):
+    /// equal entries collapse to one answer, per the file store's union
+    /// rule.
     pub fn lookup(&self, identities: &BTreeMap<String, String>) -> Result<AttrMap, Conflict> {
-        let _ = identities;
-        Ok(BTreeMap::new())
+        let mut merged: AttrMap = BTreeMap::new();
+        for (ident_key, ident_value) in identities {
+            let Some(attributes) = self
+                .entries
+                .get(ident_key)
+                .and_then(|by_value| by_value.get(ident_value))
+            else {
+                continue; // unknown identity: matches nothing, not an error
+            };
+            for (name, entry) in attributes {
+                match merged.get(name) {
+                    None => {
+                        merged.insert(name.clone(), entry.clone());
+                    }
+                    Some(first) if first.values() != entry.values() => {
+                        return Err(Conflict { name: name.clone() });
+                    }
+                    Some(_) => {} // same name, same values: one answer
+                }
+            }
+        }
+        Ok(merged)
     }
 
     /// The `GET /schema` response body: `identityKeys` from the data's
-    /// top-level identity keys, and the SCIM definitions from `_schema` —
-    /// or, when absent, definitions derived from the data (`string`,
-    /// `multiValued` when any entry has more than one value), sorted by
-    /// name.
-    pub fn schema_response(&self) -> serde_json::Value {
-        serde_json::Value::Null
+    /// top-level identity keys (sorted — a BTreeMap's order — and never the
+    /// reserved `_schema` key), and the SCIM definitions from `_schema`
+    /// verbatim — or, when absent, definitions derived from the data:
+    /// every attribute name seen anywhere in the file, `type: string`,
+    /// `multiValued: true` exactly when some entry holds more than one
+    /// value, sorted by name.
+    pub fn schema_response(&self) -> Value {
+        let identity_keys: Vec<&String> = self.entries.keys().collect();
+        let attributes = match &self.schema {
+            Some(defs) => defs.clone(),
+            None => self.derived_definitions(),
+        };
+        json!({
+            "identityKeys": identity_keys,
+            "attributes": attributes,
+        })
+    }
+
+    /// Definitions derived from the data when the file has no `_schema`:
+    /// name -> multiValued (true when any entry holds more than one value),
+    /// every type `string`. BTreeMap keeps the list sorted by name.
+    fn derived_definitions(&self) -> Value {
+        let mut multi_by_name: BTreeMap<&str, bool> = BTreeMap::new();
+        for by_value in self.entries.values() {
+            for attrs in by_value.values() {
+                for (name, entry) in attrs {
+                    let multi = multi_by_name.entry(name).or_insert(false);
+                    *multi = *multi || entry.values().len() > 1;
+                }
+            }
+        }
+        Value::Array(
+            multi_by_name
+                .into_iter()
+                .map(
+                    |(name, multi)| json!({ "name": name, "type": "string", "multiValued": multi }),
+                )
+                .collect(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both entry spellings decode, and expires_at surfaces only from the
+    /// object spelling.
+    #[test]
+    fn test_entry_spellings() {
+        let data = AttrData::from_json_str(
+            r#"{"user.sub": {"s": {
+                "plain": ["x"],
+                "stamped": {"values": ["y"], "expires_at": "2027-01-01T00:00:00Z"}
+            }}}"#,
+        )
+        .unwrap();
+        let matched = data
+            .lookup(&[("user.sub".to_string(), "s".to_string())].into())
+            .unwrap();
+        assert_eq!(matched["plain"].values(), ["x".to_string()]);
+        assert_eq!(matched["plain"].expires_at(), None);
+        assert_eq!(
+            matched["stamped"].expires_at(),
+            Some("2027-01-01T00:00:00Z")
+        );
+    }
+
+    /// A non-object top level and a non-array `_schema` are load errors.
+    #[test]
+    fn test_bad_shapes_rejected() {
+        assert!(matches!(
+            AttrData::from_json_str("[1, 2]"),
+            Err(DataError::NotAnObject)
+        ));
+        assert!(matches!(
+            AttrData::from_json_str(r#"{"_schema": {"not": "an array"}}"#),
+            Err(DataError::SchemaNotAnArray)
+        ));
+        assert!(matches!(
+            AttrData::from_json_str("not json"),
+            Err(DataError::Parse(_))
+        ));
     }
 }
