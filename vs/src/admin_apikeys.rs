@@ -153,18 +153,12 @@ impl ReloadableApiKeys {
         }
     }
 
-    /// Check the key given by ID is present and active, and then confirm that the passed
-    /// secret matches the stored hash. If all that is good, return the permission associated with the key.
-    /// If not, return None (ie, no permission).
-    pub fn lookup_permission(&self, apikey: &ApiKey) -> Result<Option<Permission>, ServiceError> {
-        Ok(self
-            .lookup_permission_and_service(apikey)?
-            .map(|(perm, _)| perm))
-    }
-
-    /// As [Self::lookup_permission], but also returns the key's service
-    /// binding (zipline#79) so the notification endpoint can enforce that a
-    /// notify key only names its bound service.
+    /// Check the key given by ID is present and active, and then confirm that
+    /// the passed secret matches the stored hash. If all that is good, return
+    /// the permission associated with the key and its service binding
+    /// (zipline#79: `Some(id)` for a notify key, `None` otherwise) so the
+    /// notification endpoint can enforce that a notify key only names its
+    /// bound service. If not, return None (ie, no permission).
     pub fn lookup_permission_and_service(
         &self,
         apikey: &ApiKey,
