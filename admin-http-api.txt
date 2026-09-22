@@ -298,8 +298,8 @@ POST /admin/services/{id}/changed
                                               listed identity pair changed
   Response
     202: accepted (reconciliation queued)
-    400: malformed body (non-JSON, unknown fields, or an empty identity
-         object)
+    400: malformed body (non-JSON, unknown fields, an empty identity
+         object, or an explicit null identities field)
     403: permission denied (key without notify rights, or a notify key bound
          to a different service id)
     404: no such trusted service

@@ -1044,10 +1044,28 @@ async fn flush_service_cache(
 /// `identities` list targets the connected actors carrying any listed
 /// identity pair. Unknown fields are rejected: a misspelled `identities`
 /// silently meaning "flush everything" would be a nasty surprise.
+///
+/// The double `Option` distinguishes an absent field (outer `None` via
+/// `#[serde(default)]`) from an explicit `"identities": null` (outer `Some`,
+/// inner `None`) — the documented full-change form is an ABSENT field, so an
+/// explicit null is malformed and must be 400, not a global flush (PR #29
+/// review, P2).
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct ServiceChangedBody {
-    identities: Option<Vec<HashMap<String, String>>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    identities: Option<Option<Vec<HashMap<String, String>>>>,
+}
+
+/// Wrap any present value in `Some`, so `#[serde(default)]` (outer `None`) is
+/// reached only when the field is absent and an explicit `null` becomes
+/// `Some(None)`. The standard serde double-Option pattern.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// POST /admin/services/{id}/changed — a trusted service reports that its data
@@ -1089,13 +1107,25 @@ async fn service_changed(
             return StatusCode::BAD_REQUEST;
         }
     };
-    if let Some(identities) = &body.identities {
-        // An empty identity object matches nothing it could mean; reject it
-        // rather than guess.
-        if identities.iter().any(|pairs| pairs.is_empty()) {
+    let identities = match body.identities {
+        // Absent field: the documented "everything changed" form.
+        None => None,
+        // Explicit `"identities": null` is malformed (PR #29 review, P2): the
+        // full-change form is an ABSENT field, and a client emitting null for
+        // an unavailable target list must not trigger a global flush.
+        Some(None) => {
+            debug!(target: ADMIN, "explicit null identities in change notification for {}", svc_id);
             return StatusCode::BAD_REQUEST;
         }
-    }
+        Some(Some(identities)) => {
+            // An empty identity object matches nothing it could mean; reject it
+            // rather than guess.
+            if identities.iter().any(|pairs| pairs.is_empty()) {
+                return StatusCode::BAD_REQUEST;
+            }
+            Some(identities)
+        }
+    };
 
     // Clone the Arcs and drop the read guard before awaiting.
     let (ts_mgr, event_mgr, actor_mgr) = {
@@ -1111,7 +1141,7 @@ async fn service_changed(
         return StatusCode::NOT_FOUND;
     }
 
-    match body.identities {
+    match identities {
         // "Everything changed": same effect as DELETE .../cache.
         None => match ts_mgr.flush_one(&svc_id).await {
             Ok(()) => {
@@ -3015,7 +3045,15 @@ mod tests {
         let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
         let app = admin_app(shared_state);
 
-        for body in ["not json", r#"{"bogus":1}"#, r#"{"identities":[{}]}"#] {
+        // `{"identities":null}` is in this list deliberately (PR #29 review,
+        // P2): the documented full-change form is an ABSENT field, and an
+        // explicit null must not silently trigger a global flush.
+        for body in [
+            "not json",
+            r#"{"bogus":1}"#,
+            r#"{"identities":[{}]}"#,
+            r#"{"identities":null}"#,
+        ] {
             assert_eq!(
                 post_service_changed(app.clone(), &api_key, FLUSH_TS_ID, body).await,
                 StatusCode::BAD_REQUEST,
