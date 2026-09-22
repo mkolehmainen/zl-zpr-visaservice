@@ -15,6 +15,7 @@
 //!   emits one — the spec requires `expires_at` only when the entry
 //!   carries it.
 
+use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -89,6 +90,27 @@ impl StoredEntry {
 /// One actor entry's attributes: service-side name -> stored entry.
 pub type AttrMap = BTreeMap<String, StoredEntry>;
 
+/// Whether `challenger` carries the strictly earlier — more conservative —
+/// expiry than `held`, for merging entries that agree on values. `None`
+/// when the two stamps differ but cannot both be parsed as RFC 3339, so no
+/// conservative choice exists (the caller conflicts). A stated expiry is
+/// always more conservative than an absent one: absent means the policy
+/// default, which a stamp can only shorten (spec, `expires_at`).
+fn earlier_expiry(held: &StoredEntry, challenger: &StoredEntry) -> Option<bool> {
+    match (held.expires_at(), challenger.expires_at()) {
+        (_, None) => Some(false),      // nothing stated: held is no less strict
+        (None, Some(_)) => Some(true), // stated beats absent
+        (Some(held_at), Some(challenger_at)) => {
+            if held_at == challenger_at {
+                return Some(false); // identical stamps: nothing to choose
+            }
+            let held_time = DateTime::parse_from_rfc3339(held_at).ok()?;
+            let challenger_time = DateTime::parse_from_rfc3339(challenger_at).ok()?;
+            Some(challenger_time < held_time)
+        }
+    }
+}
+
 /// The loaded data set: the file-store map plus the optional `_schema`.
 #[derive(Debug, Clone)]
 pub struct AttrData {
@@ -127,9 +149,12 @@ impl AttrData {
     /// disagreeing on an attribute's values is a [Conflict] — the same
     /// fail-closed rule as the visa service `file` store, moved to the side
     /// that can see the records. An unknown identity matches nothing and is
-    /// not an error. Agreement is on the values (and any `expires_at`):
-    /// equal entries collapse to one answer, per the file store's union
-    /// rule.
+    /// not an error. Entries agreeing on values but differing on
+    /// `expires_at` merge conservatively: the earliest expiry survives, and
+    /// a stated expiry beats an absent one (absent means the policy
+    /// default, which a stamp can only shorten — spec, `expires_at`).
+    /// Differing stamps that cannot both be parsed cannot be ordered, so
+    /// they conflict rather than letting iteration order pick.
     pub fn lookup(&self, identities: &BTreeMap<String, String>) -> Result<AttrMap, Conflict> {
         let mut merged: AttrMap = BTreeMap::new();
         for (ident_key, ident_value) in identities {
@@ -148,7 +173,15 @@ impl AttrData {
                     Some(first) if first.values() != entry.values() => {
                         return Err(Conflict { name: name.clone() });
                     }
-                    Some(_) => {} // same name, same values: one answer
+                    Some(first) => {
+                        // Same name, same values: one answer, carrying the
+                        // most conservative expiry of the two.
+                        if earlier_expiry(first, entry)
+                            .ok_or_else(|| Conflict { name: name.clone() })?
+                        {
+                            merged.insert(name.clone(), entry.clone());
+                        }
+                    }
                 }
             }
         }
@@ -239,5 +272,87 @@ mod tests {
             AttrData::from_json_str("not json"),
             Err(DataError::Parse(_))
         ));
+    }
+
+    /// Two matched identities agreeing on values but not on `expires_at`
+    /// merge conservatively: the earliest expiry survives, regardless of
+    /// which identity was iterated first, and a stated expiry beats an
+    /// absent one (absent means the policy default, which a stamp can only
+    /// shorten — ATTRIBUTE_SERVICE.md, `expires_at`).
+    #[test]
+    fn test_agreeing_values_keep_earliest_expiry() {
+        // "a.key" iterates before "b.key" (sorted-key order). The earlier
+        // `role` expiry and the only `team` expiry both sit under "b.key",
+        // so a first-encountered-wins merge would discard them.
+        let data = AttrData::from_json_str(
+            r#"{
+                "a.key": {"v": {
+                    "role": {"values": ["x"], "expires_at": "2027-06-01T00:00:00Z"},
+                    "team": ["t"]
+                }},
+                "b.key": {"v": {
+                    "role": {"values": ["x"], "expires_at": "2027-01-01T00:00:00Z"},
+                    "team": {"values": ["t"], "expires_at": "2027-03-01T00:00:00Z"}
+                }}
+            }"#,
+        )
+        .unwrap();
+        let matched = data
+            .lookup(
+                &[
+                    ("a.key".to_string(), "v".to_string()),
+                    ("b.key".to_string(), "v".to_string()),
+                ]
+                .into(),
+            )
+            .unwrap();
+        assert_eq!(matched["role"].expires_at(), Some("2027-01-01T00:00:00Z"));
+        assert_eq!(matched["team"].expires_at(), Some("2027-03-01T00:00:00Z"));
+    }
+
+    /// The earliest-expiry rule orders instants, not strings: two spellings
+    /// of the same instant agree, and the first is kept.
+    #[test]
+    fn test_agreeing_values_same_instant_different_spelling() {
+        let data = AttrData::from_json_str(
+            r#"{
+                "a.key": {"v": {"role": {"values": ["x"], "expires_at": "2027-01-01T00:00:00Z"}}},
+                "b.key": {"v": {"role": {"values": ["x"], "expires_at": "2027-01-01T01:00:00+01:00"}}}
+            }"#,
+        )
+        .unwrap();
+        let matched = data
+            .lookup(
+                &[
+                    ("a.key".to_string(), "v".to_string()),
+                    ("b.key".to_string(), "v".to_string()),
+                ]
+                .into(),
+            )
+            .unwrap();
+        assert_eq!(matched["role"].expires_at(), Some("2027-01-01T00:00:00Z"));
+    }
+
+    /// Two DIFFERING `expires_at` stamps that cannot both be parsed cannot
+    /// be ordered, so the merge cannot pick the conservative one: that is a
+    /// conflict (fail closed), not a coin flip.
+    #[test]
+    fn test_agreeing_values_unorderable_expiry_is_conflict() {
+        let data = AttrData::from_json_str(
+            r#"{
+                "a.key": {"v": {"role": {"values": ["x"], "expires_at": "not a timestamp"}}},
+                "b.key": {"v": {"role": {"values": ["x"], "expires_at": "2027-01-01T00:00:00Z"}}}
+            }"#,
+        )
+        .unwrap();
+        let result = data.lookup(
+            &[
+                ("a.key".to_string(), "v".to_string()),
+                ("b.key".to_string(), "v".to_string()),
+            ]
+            .into(),
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().name, "role");
     }
 }

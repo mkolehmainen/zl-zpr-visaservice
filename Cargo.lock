@@ -4591,6 +4591,7 @@ name = "zpr-attr-server"
 version = "0.20.0"
 dependencies = [
  "axum",
+ "chrono",
  "clap",
  "http-body-util",
  "hyper",
