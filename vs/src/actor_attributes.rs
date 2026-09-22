@@ -1144,7 +1144,10 @@ mod attr_query_integration {
         let server = spawn_tls_attr_server(
             Arc::new(move |_req| {
                 if calls_in_responder.fetch_add(1, Ordering::SeqCst) == 0 {
-                    (200, r#"{"attributes": {"dept": {"values": ["eng"]}}}"#.to_string())
+                    (
+                        200,
+                        r#"{"attributes": {"dept": {"values": ["eng"]}}}"#.to_string(),
+                    )
                 } else {
                     (500, "down".to_string())
                 }
@@ -1188,7 +1191,10 @@ mod attr_query_integration {
         let server = spawn_tls_attr_server(
             Arc::new(move |_req| {
                 if calls_in_responder.fetch_add(1, Ordering::SeqCst) == 0 {
-                    (200, r#"{"attributes": {"dept": {"values": ["eng"]}}}"#.to_string())
+                    (
+                        200,
+                        r#"{"attributes": {"dept": {"values": ["eng"]}}}"#.to_string(),
+                    )
                 } else {
                     // The record changed: dept is gone.
                     (200, r#"{"attributes": {}}"#.to_string())

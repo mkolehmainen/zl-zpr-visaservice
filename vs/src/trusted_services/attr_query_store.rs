@@ -188,7 +188,11 @@ impl AttrQueryStore {
     /// mismatch under the spec's correspondence table (including `complex`),
     /// and one when a non-empty `identityKeys` shares nothing with the
     /// policy's lookup-identity keys. Pure, so each warning is testable.
-    fn schema_findings(&self, schema: &SchemaResponse, lookup_identity_keys: &[&str]) -> Vec<String> {
+    fn schema_findings(
+        &self,
+        schema: &SchemaResponse,
+        lookup_identity_keys: &[&str],
+    ) -> Vec<String> {
         let mut findings = Vec::new();
         let defs: BTreeMap<&str, &SchemaAttrDef> = schema
             .attributes
@@ -564,8 +568,7 @@ mod tests {
         let store = make_store(&server, &dir);
 
         let attrs = store.get_attributes_for_actor(&identities()).await.unwrap();
-        let by_key: BTreeMap<&str, &Attribute> =
-            attrs.iter().map(|a| (a.get_key(), a)).collect();
+        let by_key: BTreeMap<&str, &Attribute> = attrs.iter().map(|a| (a.get_key(), a)).collect();
         assert_eq!(attrs.len(), 3, "unmapped names must be dropped: {attrs:?}");
         assert_eq!(
             by_key["user.color"].get_single_value().unwrap(),
@@ -588,7 +591,12 @@ mod tests {
         assert_eq!(requests[0].bearer.as_deref(), Some("sekrit-token"));
         let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
         assert_eq!(body["identities"]["user.sub"], "s-123");
-        assert!(body["attributes"].as_array().unwrap().contains(&"color".into()));
+        assert!(
+            body["attributes"]
+                .as_array()
+                .unwrap()
+                .contains(&"color".into())
+        );
     }
 
     /// Expiry clamping, both directions (spec rule 5): an `expires_at` beyond
@@ -612,8 +620,7 @@ mod tests {
         let before = SystemTime::now();
         let attrs = store.get_attributes_for_actor(&identities()).await.unwrap();
         let ceiling = SystemTime::now() + Duration::from_secs(3600);
-        let by_key: BTreeMap<&str, &Attribute> =
-            attrs.iter().map(|a| (a.get_key(), a)).collect();
+        let by_key: BTreeMap<&str, &Attribute> = attrs.iter().map(|a| (a.get_key(), a)).collect();
 
         // Far-future expires_at: policy shortens, never extends.
         let color = by_key["user.color"];
@@ -667,15 +674,24 @@ mod tests {
             (409, r#"{"error": "conflict"}"#),
             (500, "oops"),
             (200, "not json at all"),
-            (200, r#"{"attributes": {"color": {"values": ["red", "blue"]}}}"#),
-            (200, r#"{"attributes": {"color": {"values": ["red"], "expires_at": "bogus"}}}"#),
+            (
+                200,
+                r#"{"attributes": {"color": {"values": ["red", "blue"]}}}"#,
+            ),
+            (
+                200,
+                r#"{"attributes": {"color": {"values": ["red"], "expires_at": "bogus"}}}"#,
+            ),
         ];
         for (status, body) in cases {
             let server = spawn_tls_attr_server(fixed(status, body), None).await;
             let dir = secrets_dir(&[("attrs", "t")]);
             let store = make_store(&server, &dir);
             let result = store.get_attributes_for_actor(&identities()).await;
-            assert!(result.is_err(), "status={status} body={body} must fail closed");
+            assert!(
+                result.is_err(),
+                "status={status} body={body} must fail closed"
+            );
         }
     }
 
@@ -683,10 +699,16 @@ mod tests {
     /// so a server that stalls longer than it yields Err, not a hang.
     #[tokio::test]
     async fn test_fail_closed_on_timeout() {
-        let server =
-            spawn_tls_attr_server(fixed(200, r#"{"attributes": {}}"#), Some(3)).await;
+        let server = spawn_tls_attr_server(fixed(200, r#"{"attributes": {}}"#), Some(3)).await;
         let dir = secrets_dir(&[("attrs", "t")]);
-        let record = make_record_with("attrs", &server.url, Some(&server.cert_pem), MAPPINGS, 3600, 1);
+        let record = make_record_with(
+            "attrs",
+            &server.url,
+            Some(&server.cert_pem),
+            MAPPINGS,
+            3600,
+            1,
+        );
         let store = AttrQueryStore::new(&record, dir.path()).unwrap();
         let result = store.get_attributes_for_actor(&identities()).await;
         assert!(result.is_err(), "a stalled server must time out into Err");
@@ -756,10 +778,7 @@ mod tests {
         let record = make_record("attrs", &server.url, Some(&server.cert_pem));
 
         let missing = AttrQueryStore::new(&record, empty_dir.path());
-        assert!(matches!(
-            missing,
-            Err(ServiceError::TrustedServiceInit(_))
-        ));
+        assert!(matches!(missing, Err(ServiceError::TrustedServiceInit(_))));
 
         let dir = secrets_dir(&[("attrs", "  \n")]);
         let empty = AttrQueryStore::new(&record, dir.path());
@@ -800,7 +819,10 @@ mod tests {
         )
         .unwrap();
 
-        let from_parent = parent.get_attributes_for_actor(&identities()).await.unwrap();
+        let from_parent = parent
+            .get_attributes_for_actor(&identities())
+            .await
+            .unwrap();
         let from_delegate = delegate
             .get_attributes_for_actor(&identities())
             .await
@@ -895,30 +917,49 @@ mod tests {
         let (_server, _dir, store) = findings_store().await;
 
         // Missing name.
-        let s = schema(r#"{"attributes": [{"name": "roles", "type": "string", "multiValued": true}, {"name": "contractor", "type": "boolean"}]}"#);
+        let s = schema(
+            r#"{"attributes": [{"name": "roles", "type": "string", "multiValued": true}, {"name": "contractor", "type": "boolean"}]}"#,
+        );
         let f = store.schema_findings(&s, &["user.sub"]);
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].contains("'color'") && f[0].contains("not in the service schema"));
 
         // Single-valued mapped to a multiValued definition.
-        let s = schema(r#"{"attributes": [{"name": "color", "type": "string", "multiValued": true}]}"#);
+        let s =
+            schema(r#"{"attributes": [{"name": "color", "type": "string", "multiValued": true}]}"#);
         let f = store.schema_findings(&s, &["user.sub"]);
-        assert!(f.iter().any(|w| w.contains("'color'") && w.contains("disagrees")), "{f:?}");
+        assert!(
+            f.iter()
+                .any(|w| w.contains("'color'") && w.contains("disagrees")),
+            "{f:?}"
+        );
 
         // Multi-valued mapped to a single-valued definition.
         let s = schema(r#"{"attributes": [{"name": "roles", "type": "string"}]}"#);
         let f = store.schema_findings(&s, &["user.sub"]);
-        assert!(f.iter().any(|w| w.contains("'roles'") && w.contains("disagrees")), "{f:?}");
+        assert!(
+            f.iter()
+                .any(|w| w.contains("'roles'") && w.contains("disagrees")),
+            "{f:?}"
+        );
 
         // Tag mapped to a non-boolean definition.
         let s = schema(r#"{"attributes": [{"name": "contractor", "type": "string"}]}"#);
         let f = store.schema_findings(&s, &["user.sub"]);
-        assert!(f.iter().any(|w| w.contains("'contractor'") && w.contains("disagrees")), "{f:?}");
+        assert!(
+            f.iter()
+                .any(|w| w.contains("'contractor'") && w.contains("disagrees")),
+            "{f:?}"
+        );
 
         // complex is never a match, whatever the spelling.
         let s = schema(r#"{"attributes": [{"name": "color", "type": "complex"}]}"#);
         let f = store.schema_findings(&s, &["user.sub"]);
-        assert!(f.iter().any(|w| w.contains("'color'") && w.contains("disagrees")), "{f:?}");
+        assert!(
+            f.iter()
+                .any(|w| w.contains("'color'") && w.contains("disagrees")),
+            "{f:?}"
+        );
 
         // identityKeys disjoint from the policy's lookup keys.
         let s = schema(r#"{"identityKeys": ["user.email"], "attributes": []}"#);

@@ -345,16 +345,15 @@ impl PolicyMgr {
         // stored as the current policy. build_state borrows `loaded`, leaving it
         // available for the post-resolution persist below. Refreshers are spawned
         // by commit only after the persist succeeds, so a failed write leaves no task.
-        let candidate =
-            Self::build_state(
-                &resolver,
-                &loaded,
-                &file_ts_dir,
-                &ts_secrets_dir,
-                &actor_repo,
-                None,
-            )
-            .await?;
+        let candidate = Self::build_state(
+            &resolver,
+            &loaded,
+            &file_ts_dir,
+            &ts_secrets_dir,
+            &actor_repo,
+            None,
+        )
+        .await?;
         repo.set_current_policy(&loaded, false).await?;
         let state = candidate.commit(None, oidc_refresh);
 
@@ -403,16 +402,15 @@ impl PolicyMgr {
         let resolver = PolicyResolver::new(resolver);
         // A trusted service the policy declares but that cannot be configured (e.g. its
         // attribute file is missing) fails startup; the error names the service and file.
-        let candidate =
-            Self::build_state(
-                &resolver,
-                &loaded,
-                &file_ts_dir,
-                &ts_secrets_dir,
-                &actor_repo,
-                None,
-            )
-            .await?;
+        let candidate = Self::build_state(
+            &resolver,
+            &loaded,
+            &file_ts_dir,
+            &ts_secrets_dir,
+            &actor_repo,
+            None,
+        )
+        .await?;
         let state = candidate.commit(None, oidc_refresh);
 
         debug!(target: MAIN, "policy manager initialized successfully");

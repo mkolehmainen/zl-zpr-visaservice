@@ -475,7 +475,12 @@ mod attr_query_tests {
 
     /// A `zpr-attr/1` spec over `url`, with (`with_record`) or without its
     /// attr_query record.
-    fn attr_spec<'a>(id: &'a str, url: &'a str, pem: &'a str, with_record: bool) -> TrustedServiceSpec<'a> {
+    fn attr_spec<'a>(
+        id: &'a str,
+        url: &'a str,
+        pem: &'a str,
+        with_record: bool,
+    ) -> TrustedServiceSpec<'a> {
         TrustedServiceSpec {
             id,
             api: "zpr-attr/1",
@@ -498,7 +503,10 @@ mod attr_query_tests {
     async fn test_attr_query_definition_builds_store() {
         let server = spawn_tls_attr_server(
             std::sync::Arc::new(|_req| {
-                (200, r#"{"attributes": {"color": {"values": ["red"]}}}"#.to_string())
+                (
+                    200,
+                    r#"{"attributes": {"color": {"values": ["red"]}}}"#.to_string(),
+                )
             }),
             None,
         )
@@ -624,7 +632,10 @@ mod attr_query_tests {
             Err(e) => e,
             Ok(_) => panic!("a missing token file must fail the build"),
         };
-        assert!(matches!(err, ServiceError::TrustedServiceInit(_)), "{err:?}");
+        assert!(
+            matches!(err, ServiceError::TrustedServiceInit(_)),
+            "{err:?}"
+        );
     }
 
     /// A schema endpoint that does not exist never fails the build: the
