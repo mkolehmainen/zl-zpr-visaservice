@@ -1077,3 +1077,151 @@ mod tests {
         }
     }
 }
+
+/// Manager-path integration for the `zpr-attr/1` store (zipline#78 step 7):
+/// a REAL `AttrQueryStore` over the in-process TLS mock, driven through
+/// `TrustedServicesMgr` + `refresh_expired_attributes` exactly as the visa
+/// request path drives it.
+#[cfg(test)]
+mod attr_query_integration {
+    use super::*;
+    use crate::trusted_services::TrustedServicesMgr;
+    use crate::trusted_services::attr_query_store::AttrQueryStore;
+    use crate::trusted_services::test_support::{AttrMockServer, spawn_tls_attr_server};
+    use libeval::attribute::Attribute;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use zpr::policy_types::{AttrQueryConfig, TrustedService, parse_attribute_mapping};
+
+    const ADDR: &str = "fd5a:5052::7f";
+
+    /// An actor carrying a `user.sub` identity and a ZPR address.
+    fn actor_with_sub(sub: &str) -> Actor {
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder("user.sub")
+                    .expires_in(std::time::Duration::from_secs(600))
+                    .value(sub),
+            )
+            .unwrap();
+        actor
+            .add_attribute(Attribute::builder(key::ZPR_ADDR).value(ADDR))
+            .unwrap();
+        actor
+    }
+
+    /// A store named `attrs` over the mock, its token on disk, mapped
+    /// `dept -> user.dept`.
+    fn make_store(server: &AttrMockServer, dir: &tempfile::TempDir) -> AttrQueryStore {
+        std::fs::write(dir.path().join("attrs.token"), "tok").unwrap();
+        AttrQueryStore::new(
+            &TrustedService {
+                service_id: "attrs".to_string(),
+                expiration_seconds: 3600,
+                returns_attrs: vec![parse_attribute_mapping("dept -> user.dept").unwrap()],
+                identity_attrs: vec![],
+                oidc: None,
+                attr_query: Some(AttrQueryConfig {
+                    url: server.url.clone(),
+                    ca_cert_pem: Some(server.cert_pem.clone()),
+                    timeout_seconds: 5,
+                }),
+            },
+            dir.path(),
+        )
+        .unwrap()
+    }
+
+    /// A store `Err` on the request path makes the actor indeterminate and
+    /// strips the source's attributes (fail closed), exactly as a failing
+    /// file store does: the mock answers the first query 200 and every later
+    /// one 500.
+    #[tokio::test]
+    async fn test_query_error_makes_actor_indeterminate_and_pruned() {
+        let calls = Arc::new(AtomicU16::new(0));
+        let calls_in_responder = calls.clone();
+        let server = spawn_tls_attr_server(
+            Arc::new(move |_req| {
+                if calls_in_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (200, r#"{"attributes": {"dept": {"values": ["eng"]}}}"#.to_string())
+                } else {
+                    (500, "down".to_string())
+                }
+            }),
+            None,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = TrustedServicesMgr::new();
+        mgr.update_services(vec![Arc::new(make_store(&server, &dir))]);
+        let mut actor = actor_with_sub("s-1");
+        let addr: IpAddr = ADDR.parse().unwrap();
+
+        // First refresh: the store answers, the mapped attribute lands.
+        let outcome = refresh_expired_attributes(&mgr, &["user.sub"], &mut actor).await;
+        assert!(outcome.indeterminate.is_empty());
+        outcome.commit_revisions(&mgr, &addr);
+        assert_eq!(
+            actor.get_attribute("user.dept").unwrap().get_value(),
+            ["eng".to_string()]
+        );
+
+        // The service goes down and the source becomes revision-stale (an
+        // admin flush): the failed re-query strips the source's attributes
+        // and reports it indeterminate — the caller must deny, not evaluate.
+        mgr.flush_one("attrs").await.unwrap();
+        let outcome = refresh_expired_attributes(&mgr, &["user.sub"], &mut actor).await;
+        assert_eq!(outcome.indeterminate, vec!["attrs".to_string()]);
+        assert!(actor.get_attribute("user.dept").is_none());
+        // The identity attribute (another source's) is untouched.
+        assert!(actor.get_attribute("user.sub").is_some());
+    }
+
+    /// A revision bump (flush / `changed` notification) re-queries the
+    /// service for the actor even though nothing expired, and prunes what
+    /// the service stopped vending.
+    #[tokio::test]
+    async fn test_revision_bump_requeries_and_prunes() {
+        let calls = Arc::new(AtomicU16::new(0));
+        let calls_in_responder = calls.clone();
+        let server = spawn_tls_attr_server(
+            Arc::new(move |_req| {
+                if calls_in_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (200, r#"{"attributes": {"dept": {"values": ["eng"]}}}"#.to_string())
+                } else {
+                    // The record changed: dept is gone.
+                    (200, r#"{"attributes": {}}"#.to_string())
+                }
+            }),
+            None,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = TrustedServicesMgr::new();
+        mgr.update_services(vec![Arc::new(make_store(&server, &dir))]);
+        let mut actor = actor_with_sub("s-1");
+        let addr: IpAddr = ADDR.parse().unwrap();
+
+        let outcome = refresh_expired_attributes(&mgr, &["user.sub"], &mut actor).await;
+        outcome.commit_revisions(&mgr, &addr);
+        assert!(actor.get_attribute("user.dept").is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Current revision recorded: another refresh does not touch the wire.
+        let outcome = refresh_expired_attributes(&mgr, &["user.sub"], &mut actor).await;
+        assert!(!outcome.changed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Revision bump: the source is stale for the actor, so the next
+        // refresh re-queries, and the now-missing attribute is pruned (a
+        // successful lookup is authoritative for its source).
+        mgr.flush_one("attrs").await.unwrap();
+        let outcome = refresh_expired_attributes(&mgr, &["user.sub"], &mut actor).await;
+        assert!(outcome.changed);
+        assert!(outcome.indeterminate.is_empty());
+        outcome.commit_revisions(&mgr, &addr);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(actor.get_attribute("user.dept").is_none());
+    }
+}
