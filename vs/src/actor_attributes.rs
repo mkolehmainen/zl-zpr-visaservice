@@ -29,8 +29,11 @@ use crate::trusted_services::{
 struct RefreshOutcome {
     /// The actor was modified and needs writing back.
     changed: bool,
-    /// Source revisions to record once that write succeeds.
-    revisions: Vec<(String, u64)>,
+    /// Source revisions to record once that write succeeds, each with the
+    /// (actor, source) invalidation generation observed BEFORE the source was
+    /// queried — the commit is conditional on it (PR #29 review, P1), so a
+    /// targeted notification landing mid-pass wins over this pass's read.
+    revisions: Vec<(String, u64, u64)>,
     /// Revision-stale sources that could not be reached. Their attributes have been
     /// stripped, so the actor's claim set is incomplete and must not be evaluated.
     indeterminate: Vec<String>,
@@ -41,9 +44,20 @@ impl RefreshOutcome {
     /// actor's ZPR address. Deliberately not done during the refresh itself: a revision
     /// must never say "current" for an actor whose refreshed attributes did not reach
     /// the database, or the next request would trust the stale copy it loads.
+    ///
+    /// Each commit is conditional on the invalidation generation observed when
+    /// the pass started (PR #29 review, P1): a targeted change notification
+    /// that arrived mid-pass bumps the generation, the commit is dropped, and
+    /// the source stays stale so the queued reconcile re-queries the actor.
     fn commit_revisions(&self, ts_mgr: &TrustedServicesMgr, zpr_addr: &IpAddr) {
-        for (source, revision) in &self.revisions {
-            ts_mgr.record_revision(zpr_addr, source, *revision);
+        for (source, revision, generation) in &self.revisions {
+            if !ts_mgr.record_revision_at_generation(zpr_addr, source, *revision, *generation) {
+                debug!(
+                    target: VREQ,
+                    "not recording revision {revision} of source '{source}' for actor {zpr_addr}: \
+                     invalidated while the refresh was in flight"
+                );
+            }
         }
     }
 }
@@ -140,11 +154,18 @@ async fn refresh_expired_attributes(
         }
     }
 
-    // Sources whose snapshot revision the actor has not caught up with, and the
-    // revision to record once a refresh from them succeeds.
-    let stale: HashMap<String, u64> = ts_mgr
+    // Sources whose snapshot revision the actor has not caught up with, the revision
+    // to record once a refresh from them succeeds, and the invalidation generation
+    // observed now — BEFORE any source is queried — so the commit can detect a
+    // targeted notification that lands while the queries below are in flight
+    // (PR #29 review, P1).
+    let stale: HashMap<String, (u64, u64)> = ts_mgr
         .stale_sources_for_actor(&zpr_addr)
         .into_iter()
+        .map(|(source, rev)| {
+            let generation = ts_mgr.invalidation_generation(&zpr_addr, &source);
+            (source, (rev, generation))
+        })
         .collect();
     sources.extend(stale.keys().cloned());
 
@@ -200,14 +221,14 @@ async fn refresh_expired_attributes(
                             outcome.changed = true;
                         }
                     }
-                    if let Some(&rev) = stale_rev {
+                    if let Some(&(rev, generation)) = stale_rev {
                         // Revision refresh: the old snapshot's data is invalid, so drop
                         // everything the service did not just return. Queue the
                         // revision even when zero attributes came back — that is what
                         // detects both removed and newly added attributes.
                         outcome.changed |=
                             prune_from_source(actor, source, |a| !returned.contains(a.get_key()));
-                        outcome.revisions.push((source.clone(), rev));
+                        outcome.revisions.push((source.clone(), rev, generation));
                     } else {
                         // TTL refresh: whatever the service did not just set for this
                         // source is gone; drop the leftovers rather than carry a
@@ -217,7 +238,7 @@ async fn refresh_expired_attributes(
                 }
                 Err(e) => {
                     warn!(target: VREQ, "ts service attr lookup failed for actor {}: {}", zpr_addr, e);
-                    if stale_rev.is_some() {
+                    if let Some(&(_, generation)) = stale_rev {
                         // Stale-revision attributes must never satisfy an allow policy
                         // just because their TTL has not run out, so strip them -- but
                         // the strip alone is not fail-closed, hence the indeterminate
@@ -225,7 +246,9 @@ async fn refresh_expired_attributes(
                         // request retries (the strip would otherwise leave nothing
                         // marking it relevant).
                         outcome.changed |= prune_from_source(actor, source, |_| true);
-                        outcome.revisions.push((source.clone(), REVISION_NEVER));
+                        outcome
+                            .revisions
+                            .push((source.clone(), REVISION_NEVER, generation));
                         outcome.indeterminate.push(source.clone());
                     }
                 }
@@ -466,6 +489,33 @@ mod tests {
         // The revision was recorded, so the next pass is a no-op.
         assert!(!refresh_and_commit(&mgr, &mut actor).await);
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    }
+
+    /// A targeted change notification ([TrustedServicesMgr::forget_source_revision])
+    /// that lands while a refresh pass is in flight must survive that pass's
+    /// commit (PR #29 review, P1): the in-flight refresh read the service's
+    /// pre-notification state, so letting it record "current" would make the
+    /// queued reconcile skip the actor and leave stale attributes until TTL.
+    #[tokio::test]
+    async fn test_targeted_invalidation_not_lost_to_inflight_refresh() {
+        let (mgr, _fake) = ts_mgr_with_fake();
+        let mut actor = actor_with_cn("someone.zpr.org");
+
+        // The refresh pass has read the service state but not yet committed --
+        // the window a slow trusted-service query holds open.
+        let outcome = refresh_expired_attributes(&mgr, &[key::CN], &mut actor).await;
+
+        // A targeted change notification lands inside the window.
+        mgr.forget_source_revision(&test_addr(), FAKE_SOURCE);
+
+        // The in-flight pass commits what it read before the notification.
+        outcome.commit_revisions(&mgr, &test_addr());
+
+        // The invalidation must win: the source is still stale for the actor.
+        assert!(
+            !mgr.stale_sources_for_actor(&test_addr()).is_empty(),
+            "in-flight refresh must not overwrite a newer targeted invalidation"
+        );
     }
 
     /// #310 regression: a user-only actor (no CN at all, identified by a policy-declared
@@ -712,7 +762,7 @@ mod tests {
         let outcome = refresh_expired_attributes(&mgr, &[key::CN], &mut actor).await;
         assert_eq!(
             outcome.revisions,
-            vec![(FAKE_SOURCE.to_string(), fake.current_revision())]
+            vec![(FAKE_SOURCE.to_string(), fake.current_revision(), 0)]
         );
         // Uncommitted: the source is still stale, so a dropped write costs a re-fetch
         // rather than a silently skipped one.

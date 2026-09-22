@@ -23,10 +23,27 @@ pub struct TrustedServicesMgr {
     /// also in `services`; both lists are replaced together on policy install.
     oidc_services: ArcSwap<Vec<Arc<OidcTrustedService>>>,
     /// Per actor (keyed by ZPR address) and source, the revision from which attributes
-    /// were last refreshed. ZPR addresses are recycled from a pool, so entries MUST be
+    /// were last refreshed plus its invalidation generation ([RevisionRecord]). ZPR
+    /// addresses are recycled from a pool, so entries MUST be
     /// purged on disconnect ([TrustedServicesMgr::forget_actor_revisions]) before the
     /// address can be reassigned.
-    actor_revisions: DashMap<IpAddr, HashMap<String, u64>>,
+    actor_revisions: DashMap<IpAddr, HashMap<String, RevisionRecord>>,
+}
+
+/// Per-source refresh record for one actor: the source revision the actor's
+/// attributes were last refreshed from (`None` after a targeted invalidation),
+/// and a monotonic invalidation generation (PR #29 review, P1). A refresh pass
+/// captures the generation BEFORE it queries the source
+/// ([TrustedServicesMgr::invalidation_generation]) and commits conditionally on
+/// it ([TrustedServicesMgr::record_revision]), so a pass that read the
+/// source's pre-notification state can never record "current" over a targeted
+/// invalidation that landed while it was in flight — the bumped generation
+/// drops the stale commit and the source stays stale until a
+/// post-notification pass commits.
+#[derive(Clone, Copy, Default)]
+struct RevisionRecord {
+    revision: Option<u64>,
+    generation: u64,
 }
 
 impl TrustedServicesMgr {
@@ -54,7 +71,8 @@ impl TrustedServicesMgr {
                 let source_id = service.get_source_id();
                 let recorded_revision = recorded
                     .as_ref()
-                    .and_then(|revisions| revisions.value().get(source_id).copied());
+                    .and_then(|revisions| revisions.value().get(source_id))
+                    .and_then(|record| record.revision);
                 let current_revision = service.current_revision();
                 (recorded_revision != Some(current_revision))
                     .then(|| (source_id.to_string(), current_revision))
@@ -62,12 +80,51 @@ impl TrustedServicesMgr {
             .collect()
     }
 
-    /// Record the source revision used to refresh the attributes of the actor at `zpr_addr`.
+    /// Record the source revision used to refresh the attributes of the actor at
+    /// `zpr_addr`, unconditionally. Test-only shorthand for catch-up setup where no
+    /// refresh pass can be in flight; the production commit path is
+    /// [Self::record_revision_at_generation], which cannot overwrite a targeted
+    /// invalidation that landed mid-pass.
+    #[cfg(test)]
     pub fn record_revision(&self, zpr_addr: &IpAddr, source: &str, revision: u64) {
         self.actor_revisions
             .entry(*zpr_addr)
             .or_default()
-            .insert(source.to_string(), revision);
+            .entry(source.to_string())
+            .or_default()
+            .revision = Some(revision);
+    }
+
+    /// The current invalidation generation for (actor, source); 0 when there is no
+    /// record. A refresh pass captures this BEFORE querying the source and passes it
+    /// to [Self::record_revision_at_generation] at commit time.
+    pub fn invalidation_generation(&self, zpr_addr: &IpAddr, source: &str) -> u64 {
+        self.actor_revisions
+            .get(zpr_addr)
+            .and_then(|revisions| revisions.get(source).map(|record| record.generation))
+            .unwrap_or(0)
+    }
+
+    /// Record the source revision only if the (actor, source) invalidation generation
+    /// still equals `observed_generation` (PR #29 review, P1). Returns whether the
+    /// commit landed. A mismatch means a targeted change notification
+    /// ([Self::forget_source_revision]) arrived after the caller captured the
+    /// generation — the caller's data may predate the notification, so the record
+    /// stays stale and the next refresh pass re-queries.
+    pub fn record_revision_at_generation(
+        &self,
+        zpr_addr: &IpAddr,
+        source: &str,
+        revision: u64,
+        observed_generation: u64,
+    ) -> bool {
+        let mut revisions = self.actor_revisions.entry(*zpr_addr).or_default();
+        let record = revisions.entry(source.to_string()).or_default();
+        if record.generation != observed_generation {
+            return false;
+        }
+        record.revision = Some(revision);
+        true
     }
 
     /// Drop all recorded per-source revisions for the actor at `zpr_addr`. Call before
@@ -80,13 +137,21 @@ impl TrustedServicesMgr {
     /// (zipline#79): a targeted change notification names the actors whose
     /// data changed at one source, so only that record may go stale — the
     /// actor's other sources and every other actor keep their records. The
-    /// missing record makes the source stale for the actor
+    /// cleared revision makes the source stale for the actor
     /// ([Self::stale_sources_for_actor]), forcing a re-query on the next
     /// refresh pass.
+    ///
+    /// Also bumps the pair's invalidation generation, and creates the record
+    /// when none exists, so a refresh pass already in flight cannot commit
+    /// state it read before this notification (PR #29 review, P1; see
+    /// [Self::record_revision_at_generation]). Callers pass only connected
+    /// actors' addresses; disconnect purges the entry
+    /// ([Self::forget_actor_revisions]), so a created record cannot leak.
     pub fn forget_source_revision(&self, zpr_addr: &IpAddr, source: &str) {
-        if let Some(mut revisions) = self.actor_revisions.get_mut(zpr_addr) {
-            revisions.remove(source);
-        }
+        let mut revisions = self.actor_revisions.entry(*zpr_addr).or_default();
+        let record = revisions.entry(source.to_string()).or_default();
+        record.revision = None;
+        record.generation += 1;
     }
 
     /// Atomically replace the entire trusted-service list. The typed OIDC list
