@@ -17,6 +17,7 @@ check:
 	$(MAKE) -C libeval $@
 	$(MAKE) -C vs-admin $@
 	$(MAKE) -C zpt $@
+	$(MAKE) -C zpr-attr-server $@
 
 build: build-rs build-go
 
@@ -45,6 +46,7 @@ release:
 	cp ./target/release/vs $(RELEASE_DIR)
 	cp ./target/release/vsapikey $(RELEASE_DIR)
 	cp ./target/release/vs-admin $(RELEASE_DIR)
+	cp ./target/release/zpr-attr-server $(RELEASE_DIR)
 	cp ./zpr-dashboard/bin/zpr-dashboard $(RELEASE_DIR)
 	cd $(RELEASE_DIR) && tar zcvf ../$(RELEASE_TGZ) .
 
