@@ -36,7 +36,7 @@ pub(super) fn write_fixture(name: &str, contents: &str) -> PathBuf {
 /// assertions: the method and path, the bearer token presented in the
 /// `Authorization` header, and the raw request body.
 #[derive(Debug, Clone)]
-pub(super) struct RecordedRequest {
+pub(crate) struct RecordedRequest {
     pub method: String,
     pub path: String,
     pub bearer: Option<String>,
@@ -44,12 +44,12 @@ pub(super) struct RecordedRequest {
 }
 
 /// Chooses the mock server's answer to one request: `(status, JSON body)`.
-pub(super) type AttrResponder = Arc<dyn Fn(&RecordedRequest) -> (u16, String) + Send + Sync>;
+pub(crate) type AttrResponder = Arc<dyn Fn(&RecordedRequest) -> (u16, String) + Send + Sync>;
 
 /// A running in-process TLS `zpr-attr/1` mock (the `spawn_tls_jwks_server`
 /// pattern): its base `url`, the self-signed certificate PEM a client must
 /// pin to reach it, and every request it has served, in order.
-pub(super) struct AttrMockServer {
+pub(crate) struct AttrMockServer {
     pub url: String,
     pub cert_pem: String,
     pub requests: Arc<Mutex<Vec<RecordedRequest>>>,
@@ -59,7 +59,7 @@ pub(super) struct AttrMockServer {
 /// (method, path, bearer, body), recorded, optionally delayed by
 /// `delay_secs` (to exercise the client timeout), and answered by
 /// `respond`. The task ends with the test runtime.
-pub(super) async fn spawn_tls_attr_server(
+pub(crate) async fn spawn_tls_attr_server(
     respond: AttrResponder,
     delay_secs: Option<u64>,
 ) -> AttrMockServer {

@@ -7,7 +7,7 @@ use libeval::attribute::{Attribute, AttributeSource, key};
 
 use crate::error::ServiceError;
 
-mod attr_query_store;
+pub(crate) mod attr_query_store;
 mod attribute_mapper;
 mod factory;
 mod file_attribute_store;
@@ -16,7 +16,7 @@ mod manager;
 pub(crate) use attribute_mapper::{AttrHint, AttributeMapper};
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 pub use factory::{
     TS_API_OIDC, TrustedServiceDefinition, build_services, trusted_service_definitions,
