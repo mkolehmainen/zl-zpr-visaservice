@@ -30,6 +30,7 @@ mod db_worker;
 mod deny_log;
 mod error;
 mod event_mgr;
+mod http_util;
 mod loaded_policy;
 mod logging;
 mod net_mgr;
