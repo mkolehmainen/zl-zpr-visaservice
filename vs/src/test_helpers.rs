@@ -326,6 +326,7 @@ pub fn make_oidc_connect_policy(
             .collect(),
         identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
         oidc: Some(oidc),
+        attr_query: None,
     };
 
     let mut msg = capnp::message::Builder::new_default();
@@ -377,6 +378,7 @@ fn make_trusted_service_policy_full(
         mappings,
         identity,
         oidc,
+        attr_query: None,
     }])
 }
 
@@ -389,6 +391,8 @@ pub struct TrustedServiceSpec<'a> {
     pub mappings: &'a [&'a str],
     pub identity: &'a [&'a str],
     pub oidc: Option<OidcConfig>,
+    /// `Some` gives an `api = "zpr-attr/1"` declaration its pinned config record.
+    pub attr_query: Option<zpr::policy_types::AttrQueryConfig>,
 }
 
 /// Build a policy container declaring several trusted services at once: one join
@@ -430,6 +434,7 @@ pub fn make_trusted_services_policy(specs: &[TrustedServiceSpec]) -> Vec<u8> {
                         .collect(),
                     identity_attrs: spec.identity.iter().map(|s| s.to_string()).collect(),
                     oidc: spec.oidc.clone(),
+                    attr_query: spec.attr_query.clone(),
                 })
             })
             .collect();
@@ -491,6 +496,7 @@ pub fn make_oidc_policy_with_proxy_service(
         returns_attrs: vec![parse_attribute_mapping("sub -> user.oidc-subject").unwrap()],
         identity_attrs: vec!["sub".to_string()],
         oidc: Some(oidc),
+        attr_query: None,
     };
 
     let mut msg = capnp::message::Builder::new_default();

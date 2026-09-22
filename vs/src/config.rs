@@ -27,7 +27,7 @@ pub const EVENT_QUEUE_DEPTH: usize = 1024;
 
 // We only load policy files built by this version or later.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 18;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 19;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 0;
 
 /// Retry hint (seconds) sent with `temporarilyUnavailable` when an OIDC
@@ -154,6 +154,13 @@ pub struct CoreSection {
     /// Directory holding the `<service-id>.json` attribute files for `api=file` trusted services.
     pub file_ts_dir: Option<PathBuf>,
 
+    /// Directory holding the `<service-id>.token` bearer-token files for
+    /// `api = "zpr-attr/1"` trusted services. The token authenticates the visa
+    /// service to the attribute service and deliberately never lives in the
+    /// signed policy (docs/ATTRIBUTE_SERVICE.md, *Configuration*). Relative
+    /// paths anchor at the config file's directory, like `file_ts_dir`.
+    pub ts_secrets_dir: Option<PathBuf>,
+
     /// Period, in seconds, between JWKS refreshes for `api=oidc` trusted
     /// services. Unset or 0 disables the periodic refresher — the policy
     /// manager warns per provider, and key rotation is then picked up only
@@ -182,6 +189,7 @@ impl Default for CoreSection {
             identity: Some(String::new()),
             api_keys: Some(PathBuf::from(DEFAULT_API_KEYS_FILE)),
             file_ts_dir: Some(PathBuf::from(".")),
+            ts_secrets_dir: Some(PathBuf::from(".")),
             oidc_refresh_seconds: None,
         }
     }
@@ -216,6 +224,9 @@ impl VSConfig {
             rebase(base, p);
         }
         if let Some(p) = self.core.file_ts_dir.as_mut() {
+            rebase(base, p);
+        }
+        if let Some(p) = self.core.ts_secrets_dir.as_mut() {
             rebase(base, p);
         }
     }
@@ -351,6 +362,7 @@ mod test {
         admin_key = "certs/key.pem"
         api_keys = "keys.toml"
         file_ts_dir = "include"
+        ts_secrets_dir = "secrets"
         "#,
         );
         let base = dir.path();
@@ -358,6 +370,7 @@ mod test {
         assert_eq!(cfg.core.admin_key, base.join("certs/key.pem"));
         assert_eq!(cfg.core.api_keys, Some(base.join("keys.toml")));
         assert_eq!(cfg.core.file_ts_dir, Some(base.join("include")));
+        assert_eq!(cfg.core.ts_secrets_dir, Some(base.join("secrets")));
     }
 
     // Absolute path fields must be left exactly as written; anchoring only
@@ -369,10 +382,15 @@ mod test {
         [core]
         admin_cert = "/etc/zpr/cert.pem"
         api_keys = "/etc/zpr/keys.toml"
+        ts_secrets_dir = "/etc/zpr/secrets"
         "#,
         );
         assert_eq!(cfg.core.admin_cert, PathBuf::from("/etc/zpr/cert.pem"));
         assert_eq!(cfg.core.api_keys, Some(PathBuf::from("/etc/zpr/keys.toml")));
+        assert_eq!(
+            cfg.core.ts_secrets_dir,
+            Some(PathBuf::from("/etc/zpr/secrets"))
+        );
     }
 
     #[test]
@@ -390,6 +408,7 @@ mod test {
         assert_eq!(cfg.core.admin_key, base.join("admin-tls-key.pem"));
         assert_eq!(cfg.core.api_keys, Some(base.join(DEFAULT_API_KEYS_FILE)));
         assert_eq!(cfg.core.file_ts_dir, Some(base.join(".")));
+        assert_eq!(cfg.core.ts_secrets_dir, Some(base.join(".")));
     }
 
     #[test]

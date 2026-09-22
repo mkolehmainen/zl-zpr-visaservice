@@ -30,6 +30,7 @@ mod db_worker;
 mod deny_log;
 mod error;
 mod event_mgr;
+mod http_util;
 mod loaded_policy;
 mod logging;
 mod net_mgr;
@@ -255,6 +256,12 @@ async fn main() -> std::process::ExitCode {
         .file_ts_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
+    // Bearer-token directory for `api = "zpr-attr/1"` trusted services.
+    let ts_secrets_dir = cfg
+        .core
+        .ts_secrets_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
 
     // JWKS refresh period for OIDC trusted services: 0 or unset disables the
     // periodic refresher (the policy manager warns per provider; connect-path
@@ -279,6 +286,7 @@ async fn main() -> std::process::ExitCode {
                     Arc::new(SystemResolver),
                     ts_mgr.clone(),
                     file_ts_dir,
+                    ts_secrets_dir,
                     actor_repo,
                     oidc_refresh,
                 )
@@ -290,6 +298,7 @@ async fn main() -> std::process::ExitCode {
                     Arc::new(SystemResolver),
                     ts_mgr.clone(),
                     file_ts_dir,
+                    ts_secrets_dir,
                     actor_repo,
                     oidc_refresh,
                 )

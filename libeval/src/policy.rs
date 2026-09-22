@@ -780,6 +780,7 @@ mod test {
             returns_attrs: vec![parse_attribute_mapping("color -> user.color").unwrap()],
             identity_attrs: vec![],
             oidc: None,
+            attr_query: None,
         };
         let policy =
             Policy::new_from_policy_bytes(policy_bytes_with_trusted_services(&[ts])).unwrap();
@@ -801,6 +802,7 @@ mod test {
             returns_attrs: vec![],
             identity_attrs: vec![],
             oidc: None,
+            attr_query: None,
         };
         let result =
             Policy::new_from_policy_bytes(policy_bytes_with_trusted_services(&[ts.clone(), ts]));
@@ -819,6 +821,7 @@ mod test {
                 .collect(),
             identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
             oidc: None,
+            attr_query: None,
         }
     }
 

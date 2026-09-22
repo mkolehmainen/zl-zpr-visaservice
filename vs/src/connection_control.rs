@@ -1509,6 +1509,7 @@ mod tests {
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
             PathBuf::from("."),
+            PathBuf::from("."),
             Arc::new(crate::db::ActorRepo::new(asm.state_db.clone())),
             None,
         )
@@ -3711,6 +3712,7 @@ mod tests {
                 mappings: &["sub -> user.sub"],
                 identity: &["sub"],
                 oidc: Some(make_test_oidc_config()),
+                attr_query: None,
             },
             crate::test_helpers::TrustedServiceSpec {
                 id: "happyfile",
@@ -3719,6 +3721,7 @@ mod tests {
                 mappings: &["lazy -> #user.lazy"],
                 identity: &[],
                 oidc: None,
+                attr_query: None,
             },
         ]));
         // happyfile's file-store mapping `lazy -> #user.lazy` produces the ZPR key

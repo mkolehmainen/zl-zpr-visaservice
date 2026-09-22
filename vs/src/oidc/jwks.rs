@@ -41,11 +41,6 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// recovery prompt. Matches `config::OIDC_NO_KEYS_RETRY_SECS`.
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// Hard cap on a JWKS response body. Real provider key sets are a few
-/// kilobytes; anything approaching this is hostile or broken, and reading
-/// it unbounded would let a compromised endpoint balloon memory.
-const MAX_JWKS_BYTES: usize = 1024 * 1024; // 1 MiB
-
 /// Future yielded by one [`ProxyResolver`] invocation.
 pub type ProxyFuture = Pin<Box<dyn Future<Output = Option<Url>> + Send>>;
 
@@ -177,7 +172,7 @@ impl KeySource {
     /// The proxy is re-resolved on every call (providers come and go);
     /// redirects are never followed (a redirect off HTTPS would leak the
     /// fetch, and a redirect anywhere else changes the pinned policy URL);
-    /// and the body is read under [`MAX_JWKS_BYTES`].
+    /// and the body is read under [`crate::http_util::MAX_RESPONSE_BYTES`].
     pub async fn refresh(&self) -> Result<(), OidcError> {
         if self.cfg.jwks_uri.trim().is_empty() {
             return Err(OidcError::Rejected("no jwks_uri to refresh from".into()));
@@ -233,19 +228,9 @@ impl KeySource {
 
         // Read the body under an explicit cap: a hostile or broken provider
         // must not be able to balloon memory with an unbounded response.
-        let mut body: Vec<u8> = Vec::new();
-        while let Some(chunk) = resp
-            .chunk()
+        let body = crate::http_util::read_body_capped(&mut resp, "JWKS response")
             .await
-            .map_err(|e| OidcError::Rejected(format!("JWKS fetch failed: {e}")))?
-        {
-            if body.len() + chunk.len() > MAX_JWKS_BYTES {
-                return Err(OidcError::Rejected(format!(
-                    "JWKS response too large (over {MAX_JWKS_BYTES} bytes)"
-                )));
-            }
-            body.extend_from_slice(&chunk);
-        }
+            .map_err(|e| OidcError::Rejected(e.to_string()))?;
 
         // Parse failures and an empty set are fetch failures, not
         // replacements — a provider serving garbage must not wipe the keys.

@@ -11,6 +11,7 @@ use crate::error::ServiceError;
 use crate::oidc::{KeySource, OidcTrustedService, ProxyResolver};
 
 use super::TrustedServiceInterface;
+use super::attr_query_store::AttrQueryStore;
 use super::attribute_mapper::AttributeMapper;
 use super::file_attribute_store::FileAttributeStore;
 
@@ -19,6 +20,9 @@ const TS_API_FILE: &str = "file";
 
 /// API name used by OIDC identity-provider trusted services.
 pub const TS_API_OIDC: &str = "oidc";
+
+/// API name used by `zpr-attr/1` attribute services (zipline#72 / #78).
+pub const TS_API_ATTR_QUERY: &str = "zpr-attr/1";
 
 /// One policy-declared trusted service, reduced to the inputs that determine its store
 /// instance. Comparing these across policies tells us whether the live stores are still
@@ -96,14 +100,17 @@ pub fn trusted_service_definitions(
         let ServiceType::Trusted(api) = &service.kind else {
             continue;
         };
-        if api != TS_API_FILE && api != TS_API_OIDC {
+        if api != TS_API_FILE && api != TS_API_OIDC && api != TS_API_ATTR_QUERY {
             return Err(ServiceError::Param(format!(
                 "trusted service '{}': unsupported api '{api}'",
                 service.id
             )));
         }
-        // File stores resolve `<id>.json` on disk, so the id must be a plain filename.
-        if api == TS_API_FILE && (service.id.contains('/') || service.id.contains("..")) {
+        // File stores resolve `<id>.json` on disk and attr-query stores
+        // resolve `<id>.token`, so those ids must be plain filenames.
+        if (api == TS_API_FILE || api == TS_API_ATTR_QUERY)
+            && (service.id.contains('/') || service.id.contains(".."))
+        {
             return Err(ServiceError::Param(format!(
                 "trusted service '{}': id is not a plain filename",
                 service.id
@@ -139,6 +146,18 @@ pub fn trusted_service_definitions(
             }
         }
 
+        if api == TS_API_ATTR_QUERY && trusted_service.attr_query.is_none() {
+            return Err(ServiceError::Param(format!(
+                "trusted service '{}': api 'zpr-attr/1' requires an attr_query config \
+                 in the policy record",
+                service.id
+            )));
+        }
+        // NOTE: two `zpr-attr/1` declarations may share one `url` under
+        // different ids and tokens — that is the delegation shape
+        // (docs/ATTRIBUTE_SERVICE.md, *Configuration*), so no duplicate-url
+        // check here, unlike the OIDC duplicate-issuer rule above.
+
         let jwks_proxy_port = trusted_service
             .oidc
             .as_ref()
@@ -157,9 +176,13 @@ pub fn trusted_service_definitions(
 }
 
 /// Build one store per declaration. File stores load their initial attribute
-/// snapshot from `file_ts_dir`; OIDC stores build their JWKS key source from the
-/// policy config, with `proxy_for(service_id)` supplying the CONNECT-proxy
-/// resolver each refresh consults (see `crate::oidc::ProxyResolver`).
+/// snapshot from `file_ts_dir`; attr-query stores read their bearer token
+/// from `<ts_secrets_dir>/<id>.token` and run the advisory schema check
+/// against `lookup_identity_keys` (the policy's, see
+/// `Policy::lookup_identity_keys`); OIDC stores build their JWKS key source
+/// from the policy config, with `proxy_for(service_id)` supplying the
+/// CONNECT-proxy resolver each refresh consults (see
+/// `crate::oidc::ProxyResolver`).
 ///
 /// Returns the full `dyn` store list plus its typed OIDC subset (each OIDC
 /// store appears in both), so `TrustedServicesMgr` can serve
@@ -167,6 +190,8 @@ pub fn trusted_service_definitions(
 pub async fn build_services(
     definitions: &[TrustedServiceDefinition],
     file_ts_dir: &Path,
+    ts_secrets_dir: &Path,
+    lookup_identity_keys: &[&str],
     proxy_for: &(dyn Fn(&str) -> ProxyResolver + Sync),
 ) -> Result<
     (
@@ -199,6 +224,14 @@ pub async fn build_services(
                 let store = Arc::new(OidcTrustedService::new(&definition.record, Arc::new(keys))?);
                 oidc_services.push(store.clone());
                 services.push(store);
+            }
+            TS_API_ATTR_QUERY => {
+                let store = AttrQueryStore::new(&definition.record, ts_secrets_dir)?;
+                // Advisory only, once per store build: a schema disagreement
+                // warns and an unreachable endpoint logs one info line —
+                // never a failed install (docs/ATTRIBUTE_SERVICE.md).
+                store.check_schema(lookup_identity_keys).await;
+                services.push(Arc::new(store));
             }
             _ => {
                 let store = FileAttributeStore::new(
@@ -243,9 +276,15 @@ mod tests {
         policy: &Policy,
         dir: &std::path::Path,
     ) -> Result<Vec<Arc<dyn TrustedServiceInterface>>, ServiceError> {
-        build_services(&trusted_service_definitions(policy)?, dir, &|_id| {
-            static_proxy(None)
-        })
+        // Tests keep attribute files and token files in the same directory,
+        // and use the policy's own lookup-identity keys as PolicyMgr does.
+        build_services(
+            &trusted_service_definitions(policy)?,
+            dir,
+            dir,
+            &policy.lookup_identity_keys(),
+            &|_id| static_proxy(None),
+        )
         .await
         .map(|(services, _oidc)| services)
     }
@@ -375,6 +414,7 @@ mod tests {
             mappings: &["sub -> user.oidc-subject"],
             identity: &["sub"],
             oidc: Some(make_test_oidc_config()), // same issuer both times
+            attr_query: None,
         };
         let policy = policy_from_container(make_trusted_services_policy(&[
             spec("idp-a"),
@@ -410,5 +450,228 @@ mod tests {
         assert!(matches!(err, ServiceError::Param(_)), "{err:?}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod attr_query_tests {
+    use super::*;
+    use crate::test_helpers::{TrustedServiceSpec, make_trusted_services_policy};
+    use crate::trusted_services::test_support::spawn_tls_attr_server;
+    use zpr::policy_types::{AttrQueryConfig, PolicyContainerBytes};
+
+    use crate::loaded_policy::LoadedPolicy;
+    use crate::oidc::static_proxy;
+
+    /// Decode a test policy container into its policy representation.
+    fn policy_from_container(container_bytes: Vec<u8>) -> Arc<Policy> {
+        let loaded = LoadedPolicy::from_container(
+            PolicyContainerBytes::from(container_bytes),
+            &crate::config::POLICY_MIN_VERSION,
+        )
+        .unwrap();
+        loaded.policy()
+    }
+
+    /// A `zpr-attr/1` spec over `url`, with (`with_record`) or without its
+    /// attr_query record.
+    fn attr_spec<'a>(
+        id: &'a str,
+        url: &'a str,
+        pem: &'a str,
+        with_record: bool,
+    ) -> TrustedServiceSpec<'a> {
+        TrustedServiceSpec {
+            id,
+            api: "zpr-attr/1",
+            expiration_seconds: Some(3600),
+            mappings: &["color -> user.color"],
+            identity: &[],
+            oidc: None,
+            attr_query: with_record.then(|| AttrQueryConfig {
+                url: url.to_string(),
+                ca_cert_pem: Some(pem.to_string()),
+                timeout_seconds: 5,
+            }),
+        }
+    }
+
+    /// An `api = "zpr-attr/1"` declaration builds an AttrQueryStore through
+    /// the factory, reading its token from ts_secrets_dir, and the built
+    /// store answers a query against the mock.
+    #[tokio::test]
+    async fn test_attr_query_definition_builds_store() {
+        let server = spawn_tls_attr_server(
+            std::sync::Arc::new(|_req| {
+                (
+                    200,
+                    r#"{"attributes": {"color": {"values": ["red"]}}}"#.to_string(),
+                )
+            }),
+            None,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("attrs.token"), "tok").unwrap();
+
+        let policy = policy_from_container(make_trusted_services_policy(&[attr_spec(
+            "attrs",
+            &server.url,
+            &server.cert_pem,
+            true,
+        )]));
+        let (stores, oidc) = build_services(
+            &trusted_service_definitions(&policy).unwrap(),
+            dir.path(),
+            dir.path(),
+            &policy.lookup_identity_keys(),
+            &|_id| static_proxy(None),
+        )
+        .await
+        .unwrap();
+        assert!(oidc.is_empty());
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].get_source_id(), "attrs");
+
+        let attrs = stores[0]
+            .get_attributes_for_actor(&[("user.sub".to_string(), "s-1".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].get_key(), "user.color");
+    }
+
+    /// `api = "zpr-attr/1"` without an attr_query record in the policy is
+    /// rejected at definition time.
+    #[test]
+    fn test_attr_query_without_record_rejected() {
+        let policy = policy_from_container(make_trusted_services_policy(&[attr_spec(
+            "attrs",
+            "https://example.invalid",
+            "",
+            false,
+        )]));
+        let err = trusted_service_definitions(&policy).unwrap_err();
+        assert!(matches!(err, ServiceError::Param(_)), "{err:?}");
+        assert!(format!("{err}").contains("attr_query"), "{err}");
+    }
+
+    /// The id resolves `<id>.token` on disk, so a path-shaped id is rejected.
+    #[test]
+    fn test_attr_query_id_must_be_plain_filename() {
+        for id in ["../escape", "a/b"] {
+            let policy = policy_from_container(make_trusted_services_policy(&[attr_spec(
+                id,
+                "https://example.invalid",
+                "",
+                true,
+            )]));
+            let err = trusted_service_definitions(&policy).unwrap_err();
+            assert!(matches!(err, ServiceError::Param(_)), "id={id}: {err:?}");
+        }
+    }
+
+    /// Two declarations naming the SAME url under different ids are legal —
+    /// the delegation shape — so definitions must NOT reject the pair (unlike
+    /// the OIDC duplicate-issuer rule), and both stores build with their own
+    /// tokens.
+    #[tokio::test]
+    async fn test_two_ids_one_url_is_legal_delegation() {
+        let server = spawn_tls_attr_server(
+            std::sync::Arc::new(|_req| (200, r#"{"attributes": {}}"#.to_string())),
+            None,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("parent.token"), "pt").unwrap();
+        std::fs::write(dir.path().join("delegate.token"), "dt").unwrap();
+
+        let policy = policy_from_container(make_trusted_services_policy(&[
+            attr_spec("parent", &server.url, &server.cert_pem, true),
+            attr_spec("delegate", &server.url, &server.cert_pem, true),
+        ]));
+        let definitions = trusted_service_definitions(&policy).unwrap();
+        assert_eq!(definitions.len(), 2);
+        let (stores, _oidc) = build_services(
+            &definitions,
+            dir.path(),
+            dir.path(),
+            &policy.lookup_identity_keys(),
+            &|_id| static_proxy(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stores.len(), 2);
+    }
+
+    /// A missing token file fails the whole build (and thereby the install).
+    #[tokio::test]
+    async fn test_missing_token_fails_build() {
+        let server = spawn_tls_attr_server(
+            std::sync::Arc::new(|_req| (200, r#"{"attributes": {}}"#.to_string())),
+            None,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap(); // no attrs.token
+
+        let policy = policy_from_container(make_trusted_services_policy(&[attr_spec(
+            "attrs",
+            &server.url,
+            &server.cert_pem,
+            true,
+        )]));
+        let result = build_services(
+            &trusted_service_definitions(&policy).unwrap(),
+            dir.path(),
+            dir.path(),
+            &policy.lookup_identity_keys(),
+            &|_id| static_proxy(None),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a missing token file must fail the build"),
+        };
+        assert!(
+            matches!(err, ServiceError::TrustedServiceInit(_)),
+            "{err:?}"
+        );
+    }
+
+    /// A schema endpoint that does not exist never fails the build: the
+    /// check is advisory (the mock 404s /schema here, and the build - which
+    /// runs the check - still succeeds).
+    #[tokio::test]
+    async fn test_schema_endpoint_absent_install_succeeds() {
+        let server = spawn_tls_attr_server(
+            std::sync::Arc::new(|req| {
+                if req.path == "/schema" {
+                    (404, "no schema here".to_string())
+                } else {
+                    (200, r#"{"attributes": {}}"#.to_string())
+                }
+            }),
+            None,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("attrs.token"), "tok").unwrap();
+
+        let policy = policy_from_container(make_trusted_services_policy(&[attr_spec(
+            "attrs",
+            &server.url,
+            &server.cert_pem,
+            true,
+        )]));
+        let (stores, _oidc) = build_services(
+            &trusted_service_definitions(&policy).unwrap(),
+            dir.path(),
+            dir.path(),
+            &policy.lookup_identity_keys(),
+            &|_id| static_proxy(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stores.len(), 1);
     }
 }
