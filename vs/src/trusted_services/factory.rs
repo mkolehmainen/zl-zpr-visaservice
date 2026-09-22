@@ -11,6 +11,7 @@ use crate::error::ServiceError;
 use crate::oidc::{KeySource, OidcTrustedService, ProxyResolver};
 
 use super::TrustedServiceInterface;
+use super::attr_query_store::AttrQueryStore;
 use super::attribute_mapper::AttributeMapper;
 use super::file_attribute_store::FileAttributeStore;
 
@@ -19,6 +20,9 @@ const TS_API_FILE: &str = "file";
 
 /// API name used by OIDC identity-provider trusted services.
 pub const TS_API_OIDC: &str = "oidc";
+
+/// API name used by `zpr-attr/1` attribute services (zipline#72 / #78).
+pub const TS_API_ATTR_QUERY: &str = "zpr-attr/1";
 
 /// One policy-declared trusted service, reduced to the inputs that determine its store
 /// instance. Comparing these across policies tells us whether the live stores are still
@@ -96,14 +100,17 @@ pub fn trusted_service_definitions(
         let ServiceType::Trusted(api) = &service.kind else {
             continue;
         };
-        if api != TS_API_FILE && api != TS_API_OIDC {
+        if api != TS_API_FILE && api != TS_API_OIDC && api != TS_API_ATTR_QUERY {
             return Err(ServiceError::Param(format!(
                 "trusted service '{}': unsupported api '{api}'",
                 service.id
             )));
         }
-        // File stores resolve `<id>.json` on disk, so the id must be a plain filename.
-        if api == TS_API_FILE && (service.id.contains('/') || service.id.contains("..")) {
+        // File stores resolve `<id>.json` on disk and attr-query stores
+        // resolve `<id>.token`, so those ids must be plain filenames.
+        if (api == TS_API_FILE || api == TS_API_ATTR_QUERY)
+            && (service.id.contains('/') || service.id.contains(".."))
+        {
             return Err(ServiceError::Param(format!(
                 "trusted service '{}': id is not a plain filename",
                 service.id
@@ -139,6 +146,18 @@ pub fn trusted_service_definitions(
             }
         }
 
+        if api == TS_API_ATTR_QUERY && trusted_service.attr_query.is_none() {
+            return Err(ServiceError::Param(format!(
+                "trusted service '{}': api 'zpr-attr/1' requires an attr_query config \
+                 in the policy record",
+                service.id
+            )));
+        }
+        // NOTE: two `zpr-attr/1` declarations may share one `url` under
+        // different ids and tokens — that is the delegation shape
+        // (docs/ATTRIBUTE_SERVICE.md, *Configuration*), so no duplicate-url
+        // check here, unlike the OIDC duplicate-issuer rule above.
+
         let jwks_proxy_port = trusted_service
             .oidc
             .as_ref()
@@ -157,9 +176,13 @@ pub fn trusted_service_definitions(
 }
 
 /// Build one store per declaration. File stores load their initial attribute
-/// snapshot from `file_ts_dir`; OIDC stores build their JWKS key source from the
-/// policy config, with `proxy_for(service_id)` supplying the CONNECT-proxy
-/// resolver each refresh consults (see `crate::oidc::ProxyResolver`).
+/// snapshot from `file_ts_dir`; attr-query stores read their bearer token
+/// from `<ts_secrets_dir>/<id>.token` and run the advisory schema check
+/// against `lookup_identity_keys` (the policy's, see
+/// `Policy::lookup_identity_keys`); OIDC stores build their JWKS key source
+/// from the policy config, with `proxy_for(service_id)` supplying the
+/// CONNECT-proxy resolver each refresh consults (see
+/// `crate::oidc::ProxyResolver`).
 ///
 /// Returns the full `dyn` store list plus its typed OIDC subset (each OIDC
 /// store appears in both), so `TrustedServicesMgr` can serve
@@ -167,6 +190,8 @@ pub fn trusted_service_definitions(
 pub async fn build_services(
     definitions: &[TrustedServiceDefinition],
     file_ts_dir: &Path,
+    ts_secrets_dir: &Path,
+    lookup_identity_keys: &[&str],
     proxy_for: &(dyn Fn(&str) -> ProxyResolver + Sync),
 ) -> Result<
     (
@@ -199,6 +224,14 @@ pub async fn build_services(
                 let store = Arc::new(OidcTrustedService::new(&definition.record, Arc::new(keys))?);
                 oidc_services.push(store.clone());
                 services.push(store);
+            }
+            TS_API_ATTR_QUERY => {
+                let store = AttrQueryStore::new(&definition.record, ts_secrets_dir)?;
+                // Advisory only, once per store build: a schema disagreement
+                // warns and an unreachable endpoint logs one info line —
+                // never a failed install (docs/ATTRIBUTE_SERVICE.md).
+                store.check_schema(lookup_identity_keys).await;
+                services.push(Arc::new(store));
             }
             _ => {
                 let store = FileAttributeStore::new(
@@ -243,9 +276,15 @@ mod tests {
         policy: &Policy,
         dir: &std::path::Path,
     ) -> Result<Vec<Arc<dyn TrustedServiceInterface>>, ServiceError> {
-        build_services(&trusted_service_definitions(policy)?, dir, &|_id| {
-            static_proxy(None)
-        })
+        // Tests keep attribute files and token files in the same directory,
+        // and use the policy's own lookup-identity keys as PolicyMgr does.
+        build_services(
+            &trusted_service_definitions(policy)?,
+            dir,
+            dir,
+            &policy.lookup_identity_keys(),
+            &|_id| static_proxy(None),
+        )
         .await
         .map(|(services, _oidc)| services)
     }

@@ -159,6 +159,7 @@ pub mod tests {
                 Arc::new(FakeResolver::ip_only()),
                 ts_mgr.clone(),
                 PathBuf::from("."),
+                PathBuf::from("."),
                 Arc::new(ActorRepo::new(db_handle.clone())),
                 None,
             )

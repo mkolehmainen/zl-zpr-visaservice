@@ -7,6 +7,7 @@ use libeval::attribute::{Attribute, AttributeSource, key};
 
 use crate::error::ServiceError;
 
+mod attr_query_store;
 mod attribute_mapper;
 mod factory;
 mod file_attribute_store;

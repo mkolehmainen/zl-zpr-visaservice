@@ -163,6 +163,9 @@ pub struct PolicyMgr {
     ts_mgr: Arc<TrustedServicesMgr>,
     /// Directory holding the `<service-id>.json` files for `api=file` trusted services.
     file_ts_dir: PathBuf,
+    /// Directory holding the `<service-id>.token` bearer-token files for
+    /// `api = "zpr-attr/1"` trusted services (config `ts_secrets_dir`).
+    ts_secrets_dir: PathBuf,
     /// Actor database handle backing the JWKS proxy resolver: each proxied
     /// refresh re-resolves the actor currently providing the policy-named
     /// `jwks_proxy_service` (zipline#19).
@@ -310,6 +313,7 @@ impl PolicyMgr {
         resolver: Arc<dyn DnsResolver>,
         ts_mgr: Arc<TrustedServicesMgr>,
         file_ts_dir: PathBuf,
+        ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
     ) -> Result<Self, ServiceError> {
@@ -342,7 +346,15 @@ impl PolicyMgr {
         // available for the post-resolution persist below. Refreshers are spawned
         // by commit only after the persist succeeds, so a failed write leaves no task.
         let candidate =
-            Self::build_state(&resolver, &loaded, &file_ts_dir, &actor_repo, None).await?;
+            Self::build_state(
+                &resolver,
+                &loaded,
+                &file_ts_dir,
+                &ts_secrets_dir,
+                &actor_repo,
+                None,
+            )
+            .await?;
         repo.set_current_policy(&loaded, false).await?;
         let state = candidate.commit(None, oidc_refresh);
 
@@ -353,6 +365,7 @@ impl PolicyMgr {
             resolver,
             ts_mgr,
             file_ts_dir,
+            ts_secrets_dir,
             actor_repo,
             oidc_refresh,
         ))
@@ -371,6 +384,7 @@ impl PolicyMgr {
         resolver: Arc<dyn DnsResolver>,
         ts_mgr: Arc<TrustedServicesMgr>,
         file_ts_dir: PathBuf,
+        ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
     ) -> Result<Self, ServiceError> {
@@ -390,7 +404,15 @@ impl PolicyMgr {
         // A trusted service the policy declares but that cannot be configured (e.g. its
         // attribute file is missing) fails startup; the error names the service and file.
         let candidate =
-            Self::build_state(&resolver, &loaded, &file_ts_dir, &actor_repo, None).await?;
+            Self::build_state(
+                &resolver,
+                &loaded,
+                &file_ts_dir,
+                &ts_secrets_dir,
+                &actor_repo,
+                None,
+            )
+            .await?;
         let state = candidate.commit(None, oidc_refresh);
 
         debug!(target: MAIN, "policy manager initialized successfully");
@@ -400,6 +422,7 @@ impl PolicyMgr {
             resolver,
             ts_mgr,
             file_ts_dir,
+            ts_secrets_dir,
             actor_repo,
             oidc_refresh,
         ))
@@ -437,6 +460,7 @@ impl PolicyMgr {
         resolver: &PolicyResolver,
         loaded: &LoadedPolicy,
         file_ts_dir: &Path,
+        ts_secrets_dir: &Path,
         actor_repo: &Arc<db::ActorRepo>,
         previous: Option<&PolicyState>,
     ) -> Result<CandidateState, ServiceError> {
@@ -499,8 +523,12 @@ impl PolicyMgr {
                     trusted_services.push(store);
                 }
                 None => {
-                    let (mut built, built_oidc) =
-                        build_services(std::slice::from_ref(definition), file_ts_dir, &|_id| {
+                    let (mut built, built_oidc) = build_services(
+                        std::slice::from_ref(definition),
+                        file_ts_dir,
+                        ts_secrets_dir,
+                        &policy.lookup_identity_keys(),
+                        &|_id| {
                             proxy_resolver_for(
                                 actor_repo.clone(),
                                 definition
@@ -508,8 +536,9 @@ impl PolicyMgr {
                                     .and_then(|cfg| cfg.jwks_proxy_service.as_deref()),
                                 definition.jwks_proxy_port(),
                             )
-                        })
-                        .await?;
+                        },
+                    )
+                    .await?;
                     // Refresher spawning is deferred to commit: a definition
                     // that fails AFTER this store built must not leave a task
                     // fetching a rejected policy's JWKS endpoint (PR #7
@@ -545,6 +574,7 @@ impl PolicyMgr {
         resolver: PolicyResolver,
         ts_mgr: Arc<TrustedServicesMgr>,
         file_ts_dir: PathBuf,
+        ts_secrets_dir: PathBuf,
         actor_repo: Arc<db::ActorRepo>,
         oidc_refresh: Option<Duration>,
     ) -> Self {
@@ -557,6 +587,7 @@ impl PolicyMgr {
             resolver,
             ts_mgr,
             file_ts_dir,
+            ts_secrets_dir,
             actor_repo,
             oidc_refresh,
         }
@@ -606,6 +637,7 @@ impl PolicyMgr {
             &self.resolver,
             &loaded,
             &self.file_ts_dir,
+            &self.ts_secrets_dir,
             &self.actor_repo,
             Some(&previous),
         )
@@ -816,6 +848,7 @@ mod tests {
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
             PathBuf::from("."),
+            PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
         )
@@ -836,6 +869,7 @@ mod tests {
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
             ts_mgr,
+            dir.to_path_buf(),
             dir.to_path_buf(),
             Arc::new(db::ActorRepo::new(db)),
             None,
@@ -1006,6 +1040,7 @@ mod tests {
             PolicyRepo::new(db),
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
             PathBuf::from("."),
             actor_repo.clone(),
             oidc_refresh,
@@ -1547,6 +1582,7 @@ mod tests {
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
             PathBuf::from("."),
+            PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
         )
@@ -1792,6 +1828,7 @@ mod tests {
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
             PathBuf::from("."),
+            PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
         )
@@ -1807,6 +1844,7 @@ mod tests {
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
@@ -1829,6 +1867,7 @@ mod tests {
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
             PathBuf::from("."),
+            PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
         )
@@ -1842,6 +1881,7 @@ mod tests {
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
@@ -1857,6 +1897,7 @@ mod tests {
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,
@@ -1879,6 +1920,7 @@ mod tests {
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
             PathBuf::from("."),
+            PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db.clone())),
             None,
         )
@@ -1892,6 +1934,7 @@ mod tests {
             PolicyRepo::new(db.clone()),
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
+            PathBuf::from("."),
             PathBuf::from("."),
             Arc::new(db::ActorRepo::new(db)),
             None,

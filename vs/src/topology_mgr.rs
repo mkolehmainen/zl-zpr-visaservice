@@ -663,6 +663,7 @@ mod tests {
             Arc::new(FakeResolver::ip_only()),
             Arc::new(TrustedServicesMgr::new()),
             PathBuf::from("."),
+            PathBuf::from("."),
             Arc::new(crate::db::ActorRepo::new(db)),
             None,
         )
