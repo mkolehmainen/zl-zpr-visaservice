@@ -131,14 +131,22 @@ fn rustls_tls_acceptor(key_file: &Path, cert_file: &Path) -> TlsAcceptor {
     TlsAcceptor::from(Arc::new(cfg))
 }
 
-/// Check the passed API key.
-async fn validate_api_key(state: &SharedState, api_key: &str) -> Result<Permission, StatusCode> {
+/// Check the passed API key. Returns the key's permission level and, for
+/// notify keys (zipline#79), its bound trusted-service id.
+async fn validate_api_key(
+    state: &SharedState,
+    api_key: &str,
+) -> Result<(Permission, Option<String>), StatusCode> {
     let rstate = state.read().await;
 
     let apikey = ApiKey::parse(api_key).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    match rstate.asm.admin_api_keys.lookup_permission(&apikey) {
-        Ok(Some(perm)) => Ok(perm),
+    match rstate
+        .asm
+        .admin_api_keys
+        .lookup_permission_and_service(&apikey)
+    {
+        Ok(Some((perm, service))) => Ok((perm, service)),
         Ok(None) => Err(StatusCode::UNAUTHORIZED),
         Err(e) => {
             error!(target: ADMIN, "error validating API key {}: {}", apikey.key_id_hex(), e);
@@ -147,7 +155,14 @@ async fn validate_api_key(state: &SharedState, api_key: &str) -> Result<Permissi
     }
 }
 
-// Check the API key and if all good inserts a Permission as a request extension.
+/// The service binding of the presented API key (zipline#79): `Some(id)` for a
+/// notify key, `None` otherwise. Inserted by [require_api_key] beside the
+/// [Permission] extension; only the notification endpoint reads it.
+#[derive(Clone)]
+struct ApiKeyServiceBinding(Option<String>);
+
+// Check the API key and if all good inserts a Permission (and the key's
+// service binding) as request extensions.
 async fn require_api_key(
     State(state): State<SharedState>,
     mut req: Request,
@@ -161,8 +176,9 @@ async fn require_api_key(
 
     // TODO: Add exponential backoff on unauthorizied requests.
 
-    let perm = validate_api_key(&state, api_key).await?;
+    let (perm, service) = validate_api_key(&state, api_key).await?;
     req.extensions_mut().insert(perm);
+    req.extensions_mut().insert(ApiKeyServiceBinding(service));
     Ok(next.run(req).await)
 }
 
@@ -186,6 +202,10 @@ fn admin_app(state: SharedState) -> Router {
         .route(
             "/admin/services/{capture}/cache",
             delete(flush_service_cache),
+        )
+        .route(
+            "/admin/services/{capture}/changed",
+            post(service_changed).with_state(state.clone()),
         )
         .route("/admin/hosts/{capture}", get(get_host))
         .route("/admin/authrevoke", get(get_revokes))
@@ -1018,6 +1038,175 @@ async fn flush_service_cache(
     }
 }
 
+/// Request body of `POST /admin/services/{id}/changed` (zipline#79).
+///
+/// `{}` (no `identities` key) means "everything changed". A present
+/// `identities` list targets the connected actors carrying any listed
+/// identity pair. Unknown fields are rejected: a misspelled `identities`
+/// silently meaning "flush everything" would be a nasty surprise.
+///
+/// The double `Option` distinguishes an absent field (outer `None` via
+/// `#[serde(default)]`) from an explicit `"identities": null` (outer `Some`,
+/// inner `None`) — the documented full-change form is an ABSENT field, so an
+/// explicit null is malformed and must be 400, not a global flush (PR #29
+/// review, P2).
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct ServiceChangedBody {
+    #[serde(default, deserialize_with = "deserialize_some")]
+    identities: Option<Option<Vec<HashMap<String, String>>>>,
+}
+
+/// Wrap any present value in `Some`, so `#[serde(default)]` (outer `None`) is
+/// reached only when the field is absent and an explicit `null` becomes
+/// `Some(None)`. The standard serde double-Option pattern.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// POST /admin/services/{id}/changed — a trusted service reports that its data
+/// changed (zipline#79, spec ATTRIBUTE_SERVICE.md contract 4).
+///
+/// Body `{}`: everything changed — same effect as `DELETE .../cache`
+/// ([flush_service_cache]): reload the service and queue the reconcile.
+///
+/// Body `{"identities": [{"<zpr key>": "<value>"}, ...]}`: only the actors
+/// carrying a listed identity pair changed — forget those actors' recorded
+/// revision for this source ([crate::trusted_services::TrustedServicesMgr::forget_source_revision])
+/// and queue the reconcile; the service's own snapshot is NOT flushed (an
+/// attribute service pushing a notification vends current data already).
+///
+/// Auth: `can_notify()` (notify and readwrite). A notify key is bound to one
+/// service id; a mismatch is 403 checked BEFORE the 404 existence check, so a
+/// bound key cannot probe which ids exist.
+async fn service_changed(
+    Extension(perm): Extension<Permission>,
+    Extension(binding): Extension<ApiKeyServiceBinding>,
+    State(state): State<SharedState>,
+    EPath(svc_id): EPath<String>,
+    body: axum::body::Bytes,
+) -> StatusCode {
+    if !perm.can_notify() {
+        return StatusCode::FORBIDDEN;
+    }
+    // The notify key's service binding gates BEFORE existence: a key bound to
+    // `a` posting to any other id — real or not — sees the same 403.
+    if perm == Permission::Notify && binding.0.as_deref() != Some(svc_id.as_str()) {
+        return StatusCode::FORBIDDEN;
+    }
+    debug!(target: ADMIN, "POST /admin/services/{}/changed", svc_id);
+
+    let body: ServiceChangedBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            debug!(target: ADMIN, "malformed change notification for {}: {}", svc_id, e);
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    let identities = match body.identities {
+        // Absent field: the documented "everything changed" form.
+        None => None,
+        // Explicit `"identities": null` is malformed (PR #29 review, P2): the
+        // full-change form is an ABSENT field, and a client emitting null for
+        // an unavailable target list must not trigger a global flush.
+        Some(None) => {
+            debug!(target: ADMIN, "explicit null identities in change notification for {}", svc_id);
+            return StatusCode::BAD_REQUEST;
+        }
+        Some(Some(identities)) => {
+            // An empty identity object matches nothing it could mean; reject it
+            // rather than guess.
+            if identities.iter().any(|pairs| pairs.is_empty()) {
+                return StatusCode::BAD_REQUEST;
+            }
+            Some(identities)
+        }
+    };
+
+    // Clone the Arcs and drop the read guard before awaiting.
+    let (ts_mgr, event_mgr, actor_mgr) = {
+        let rstate = state.read().await;
+        (
+            rstate.asm.ts_mgr.clone(),
+            rstate.asm.event_mgr.clone(),
+            rstate.asm.actor_mgr.clone(),
+        )
+    };
+
+    if !ts_mgr.has_source(&svc_id) {
+        return StatusCode::NOT_FOUND;
+    }
+
+    match identities {
+        // "Everything changed": same effect as DELETE .../cache.
+        None => match ts_mgr.flush_one(&svc_id).await {
+            Ok(()) => {
+                info!(target: ADMIN, "trusted service {} reported change, flushed, queueing revalidation", svc_id);
+            }
+            Err(ServiceError::TrustedServiceNotFound(_)) => return StatusCode::NOT_FOUND,
+            Err(e) => {
+                error!(target: ADMIN, "error flushing trusted service {}: {}", svc_id, e);
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+        },
+        // Targeted: forget the revision for each connected actor carrying a
+        // listed pair, so the reconcile re-queries exactly those actors.
+        Some(identities) => {
+            let actors = match actor_mgr.list_actors(None).await {
+                Ok(actors) => actors,
+                Err(e) => {
+                    error!(target: ADMIN, "error listing actors for change notification: {}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR;
+                }
+            };
+            let mut forgotten = 0usize;
+            for (zpr_addr, _cn) in actors {
+                let actor = match actor_mgr.get_actor_by_zpr_addr(&zpr_addr).await {
+                    Ok(Some(actor)) => actor,
+                    // Departed mid-listing, or a load error: skip — a missed
+                    // actor stays lazily protected by the TTL refresh.
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!(target: ADMIN, "error loading actor {} for change notification: {}", zpr_addr, e);
+                        continue;
+                    }
+                };
+                // The actor "carries" a listed pair when its stored attributes
+                // contain that exact key=value.
+                let carries = actor.attrs_iter().any(|attr| {
+                    identities.iter().any(|pairs| {
+                        pairs
+                            .get(attr.get_key())
+                            .is_some_and(|v| attr.get_value().iter().any(|av| av == v))
+                    })
+                });
+                if carries {
+                    ts_mgr.forget_source_revision(&zpr_addr, &svc_id);
+                    forgotten += 1;
+                }
+            }
+            info!(
+                target: ADMIN,
+                "trusted service {} reported change for {} identity pair(s); {} actor(s) marked stale, queueing revalidation",
+                svc_id,
+                identities.len(),
+                forgotten
+            );
+        }
+    }
+
+    // Same failure posture as flush_service_cache: losing the event loses only
+    // the sweep of existing visas; new decisions still hit the revision check.
+    if let Err(e) = event_mgr.record_event(VsEvent::TrustedServiceChange).await {
+        error!(target: ADMIN, "trusted service {} change recorded but could not queue revalidation: {}", svc_id, e);
+    }
+    StatusCode::ACCEPTED
+}
+
 fn service_endpoints_to_string(endpoints: &[Scope]) -> String {
     let mut ep_strs: Vec<String> = Vec::new();
     for ep in endpoints {
@@ -1290,8 +1479,27 @@ mod tests {
     /// Insert a test key with the given permission into the assembly's key store
     /// and return the key string to use in the X-API-Key header.
     fn setup_test_api_key_with_perm(asm: &Arc<Assembly>, permission: Permission) -> String {
+        setup_test_api_key_full(asm, permission, None, 0xaabbccdd)
+    }
+
+    /// Insert a notify test key bound to `service` (zipline#79) and return the
+    /// key string. `key_id` must differ between keys inserted into the same
+    /// assembly.
+    fn setup_test_api_notify_key(asm: &Arc<Assembly>, service: &str, key_id: u32) -> String {
+        setup_test_api_key_full(asm, Permission::Notify, Some(service.to_string()), key_id)
+    }
+
+    /// Insert a test key with the given permission, service binding and key id
+    /// into the assembly's key store and return the key string to use in the
+    /// X-API-Key header.
+    fn setup_test_api_key_full(
+        asm: &Arc<Assembly>,
+        permission: Permission,
+        service: Option<String>,
+        key_id: u32,
+    ) -> String {
         let secret_bytes: [u8; 32] = (0u8..32).collect::<Vec<_>>().try_into().unwrap();
-        let apikey = ApiKey::new(0xaabbccdd, secret_bytes);
+        let apikey = ApiKey::new(key_id, secret_bytes);
         let record = ApiKeyRecord {
             owner: "test".to_string(),
             permission,
@@ -1299,6 +1507,7 @@ mod tests {
             created: "2026-01-01".to_string(),
             secret_hash: apikey.secret_hash().unwrap(),
             description: "test key".to_string(),
+            service,
         };
         asm.admin_api_keys
             .insert_for_test(apikey.key_id_hex(), record);
@@ -2667,6 +2876,194 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// POST /admin/services/{id}/changed with the given key and body
+    /// (zipline#79); returns the response status.
+    async fn post_service_changed(
+        app: Router,
+        api_key: &str,
+        svc_id: &str,
+        body: &str,
+    ) -> StatusCode {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/services/{svc_id}/changed"))
+                    .header("X-API-Key", api_key)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response.status()
+    }
+
+    /// The notification endpoint's permission matrix (zipline#79):
+    /// read/resolve keys never notify; a readwrite key notifies any id (404
+    /// on an unknown one); a notify key notifies exactly its bound id, and a
+    /// mismatch is 403 BEFORE the 404 existence check so a bound key cannot
+    /// probe which ids exist.
+    #[tokio::test]
+    async fn test_service_changed_permission_matrix() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        register_flush_counting_service(&asm);
+        let rw_key = setup_test_api_key_full(&asm, Permission::ReadWrite, None, 0x0000_0001);
+        let r_key = setup_test_api_key_full(&asm, Permission::Read, None, 0x0000_0002);
+        let resolve_key = setup_test_api_key_full(&asm, Permission::Resolve, None, 0x0000_0003);
+        let notify_bound = setup_test_api_notify_key(&asm, FLUSH_TS_ID, 0x0000_0004);
+        let notify_other = setup_test_api_notify_key(&asm, "other-svc", 0x0000_0005);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        // Keys without can_notify are refused outright.
+        assert_eq!(
+            post_service_changed(app.clone(), &r_key, FLUSH_TS_ID, "{}").await,
+            StatusCode::FORBIDDEN,
+            "read key must not notify"
+        );
+        assert_eq!(
+            post_service_changed(app.clone(), &resolve_key, FLUSH_TS_ID, "{}").await,
+            StatusCode::FORBIDDEN,
+            "resolve key must not notify"
+        );
+        // A readwrite key notifies any id; unknown ids are 404.
+        assert_eq!(
+            post_service_changed(app.clone(), &rw_key, FLUSH_TS_ID, "{}").await,
+            StatusCode::ACCEPTED,
+            "readwrite key notifies any service"
+        );
+        assert_eq!(
+            post_service_changed(app.clone(), &rw_key, "does-not-exist", "{}").await,
+            StatusCode::NOT_FOUND,
+            "readwrite key on unknown id sees the 404"
+        );
+        // A notify key works exactly on its bound id.
+        assert_eq!(
+            post_service_changed(app.clone(), &notify_bound, FLUSH_TS_ID, "{}").await,
+            StatusCode::ACCEPTED,
+            "notify key bound to the id notifies it"
+        );
+        assert_eq!(
+            post_service_changed(app.clone(), &notify_other, FLUSH_TS_ID, "{}").await,
+            StatusCode::FORBIDDEN,
+            "notify key bound elsewhere is refused"
+        );
+        // Binding mismatch beats existence: 403, not 404 — no id probing.
+        assert_eq!(
+            post_service_changed(app.clone(), &notify_other, "does-not-exist", "{}").await,
+            StatusCode::FORBIDDEN,
+            "bound notify key must get 403 before the 404 existence check"
+        );
+    }
+
+    /// `{}` means "everything changed": same effect as DELETE .../cache —
+    /// the service is flushed and the unscoped revalidation is queued
+    /// (zipline#79).
+    #[tokio::test]
+    async fn test_service_changed_empty_body_flushes_and_queues_event() {
+        let (asm, mut event_rx) = new_assembly_with_event_rx(None).await;
+        let asm = Arc::new(asm);
+        let svc = register_flush_counting_service(&asm);
+        let api_key = setup_test_api_rw_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        let status = post_service_changed(app, &api_key, FLUSH_TS_ID, "{}").await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        match event_rx.try_recv() {
+            Ok(VsEvent::TrustedServiceChange) => {}
+            other => panic!("expected TrustedServiceChange event, got {other:?}"),
+        }
+    }
+
+    /// A targeted body forgets the listed actor's revision for this source
+    /// and leaves an unlisted actor's record intact (zipline#79); the
+    /// reconcile event is still queued.
+    #[tokio::test]
+    async fn test_service_changed_targeted_forgets_listed_actor_only() {
+        let (asm, mut event_rx) = new_assembly_with_event_rx(None).await;
+        let asm = Arc::new(asm);
+        let svc = register_flush_counting_service(&asm);
+        let api_key = setup_test_api_rw_key(&asm);
+
+        // Two connected actors, both fully caught up on the source.
+        let alice = make_node_actor_defexp("fd5a:5052::61", "alice", "[fd5a:5052::161]:1234");
+        let bob = make_node_actor_defexp("fd5a:5052::62", "bob", "[fd5a:5052::162]:1234");
+        asm.actor_mgr
+            .add_node(&alice, false, &Default::default())
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&bob, false, &Default::default())
+            .await
+            .unwrap();
+        let alice_addr: IpAddr = "fd5a:5052::61".parse().unwrap();
+        let bob_addr: IpAddr = "fd5a:5052::62".parse().unwrap();
+        let rev = {
+            use crate::trusted_services::TrustedServiceInterface;
+            svc.current_revision()
+        };
+        asm.ts_mgr.record_revision(&alice_addr, FLUSH_TS_ID, rev);
+        asm.ts_mgr.record_revision(&bob_addr, FLUSH_TS_ID, rev);
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let body = r#"{"identities":[{"device.zpr.adapter.cn":"alice"}]}"#;
+        let status = post_service_changed(app, &api_key, FLUSH_TS_ID, body).await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        // Alice's record for this source is gone (source now stale for her)...
+        assert_eq!(
+            asm.ts_mgr.stale_sources_for_actor(&alice_addr),
+            vec![(FLUSH_TS_ID.to_string(), rev)],
+            "listed actor's revision for this source must be forgotten"
+        );
+        // ...Bob's is intact.
+        assert!(
+            asm.ts_mgr.stale_sources_for_actor(&bob_addr).is_empty(),
+            "unlisted actor's revision must be left alone"
+        );
+        // Targeted notification does NOT flush the whole service.
+        assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        match event_rx.try_recv() {
+            Ok(VsEvent::TrustedServiceChange) => {}
+            other => panic!("expected TrustedServiceChange event, got {other:?}"),
+        }
+    }
+
+    /// Malformed bodies are 400 (zipline#79): non-JSON, an unknown field, and
+    /// an empty identity object. Nothing is flushed and no event is queued.
+    #[tokio::test]
+    async fn test_service_changed_malformed_body_bad_request() {
+        let (asm, mut event_rx) = new_assembly_with_event_rx(None).await;
+        let asm = Arc::new(asm);
+        let svc = register_flush_counting_service(&asm);
+        let api_key = setup_test_api_rw_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        // `{"identities":null}` is in this list deliberately (PR #29 review,
+        // P2): the documented full-change form is an ABSENT field, and an
+        // explicit null must not silently trigger a global flush.
+        for body in [
+            "not json",
+            r#"{"bogus":1}"#,
+            r#"{"identities":[{}]}"#,
+            r#"{"identities":null}"#,
+        ] {
+            assert_eq!(
+                post_service_changed(app.clone(), &api_key, FLUSH_TS_ID, body).await,
+                StatusCode::BAD_REQUEST,
+                "body {body:?} must be rejected"
+            );
+        }
+        assert_eq!(svc.flushes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(event_rx.try_recv().is_err());
+    }
+
     /// GET /admin/actors/{addr} returns the actor's descriptor, keyed on the
     /// address, with the CN read from the actor record (not echoed from the path).
     #[tokio::test]
@@ -3400,6 +3797,7 @@ mod e2e_actor_guard {
             created: "2026-09-15".to_string(),
             secret_hash: sha256_hex(&secret_bytes).unwrap(),
             description: "zipline#33 e2e guard".to_string(),
+            service: None,
         };
         let mut keys = HashMap::new();
         keys.insert(key_id_hex, record);

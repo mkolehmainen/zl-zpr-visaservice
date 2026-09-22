@@ -418,8 +418,8 @@ mod tests {
     use crate::assembly::tests::new_assembly_for_tests;
     use crate::config;
     use crate::test_helpers::{
-        TS_KEY, build_sweep_asm, create_sweep_visa, make_container_bytes, make_node_actor_defexp,
-        register_ts, seed_source_attr, stored_attr,
+        TS_KEY, TS_SOURCE, build_sweep_asm, create_sweep_visa, make_container_bytes,
+        make_node_actor_defexp, register_ts, seed_source_attr, stored_attr,
     };
     use libeval::attribute::{Attribute, key};
     use std::time::Duration;
@@ -713,6 +713,51 @@ mod tests {
             stored_attr(&asm, "fd5a:5052:3000::1", TS_KEY).await,
             Some("engineering".to_string()),
             "policy update must reconcile connected nodes before revalidating them"
+        );
+    }
+
+    /// End-to-end for the targeted change notification (zipline#79): after
+    /// `forget_source_revision(listed_actor, source)` — what
+    /// `POST /admin/services/{id}/changed` with an identities body does — the
+    /// event handler re-queries exactly the listed actor from the source,
+    /// while an unlisted actor (whose recorded revision still matches) keeps
+    /// its stored data untouched.
+    #[tokio::test]
+    async fn test_trusted_service_change_requeries_only_forgotten_actor() {
+        let (asm, node_a) = build_sweep_asm(false).await;
+        // A visa whose five-tuple covers both adapters, so BOTH are in the
+        // handler's refresh set — what distinguishes them below is revision
+        // staleness alone.
+        create_sweep_visa(&asm, &node_a, 0).await;
+        let svc = register_ts(&asm, &[(TS_KEY, "engineering")]);
+        // Both actors hold unexpired data from the source's previous state.
+        seed_source_attr(&asm, "fd5a:5052:4000::a", TS_KEY, "sales").await;
+        seed_source_attr(&asm, "fd5a:5052:4000::b", TS_KEY, "sales").await;
+        // Both are fully caught up on the source's current revision.
+        let rev = {
+            use crate::trusted_services::TrustedServiceInterface;
+            svc.current_revision()
+        };
+        let listed: IpAddr = "fd5a:5052:4000::a".parse().unwrap();
+        let unlisted: IpAddr = "fd5a:5052:4000::b".parse().unwrap();
+        asm.ts_mgr.record_revision(&listed, TS_SOURCE, rev);
+        asm.ts_mgr.record_revision(&unlisted, TS_SOURCE, rev);
+
+        // The notification endpoint's targeted body does exactly this for
+        // every connected actor carrying a listed identity pair.
+        asm.ts_mgr.forget_source_revision(&listed, TS_SOURCE);
+
+        handle_trusted_service_change(&asm).await;
+
+        assert_eq!(
+            stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
+            Some("engineering".to_string()),
+            "listed actor must be re-queried from the source"
+        );
+        assert_eq!(
+            stored_attr(&asm, "fd5a:5052:4000::b", TS_KEY).await,
+            Some("sales".to_string()),
+            "unlisted actor must not be re-queried"
         );
     }
 
