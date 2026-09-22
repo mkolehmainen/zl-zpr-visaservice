@@ -1,0 +1,30 @@
+[package]
+name = "zpr-attr-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference implementation of the zpr-attr/1 attribute-service protocol (development and test tool)"
+
+[dependencies]
+axum = "0.8.6"
+chrono = { workspace = true }
+clap = { workspace = true }
+hyper = "1.7.0"
+hyper-util = "0.1.17"
+percent-encoding = "2.3.2"
+reqwest = { workspace = true, features = ["json"] }
+rustls = "0.23.36"
+rustls-pemfile = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-rustls = "0.26.4"
+tower-service = "0.3.3"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+http-body-util = "0.1.3"
+serde_yaml = "0.9"
+tower = "0.5.3"

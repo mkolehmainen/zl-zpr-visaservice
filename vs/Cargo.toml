@@ -62,3 +62,4 @@ zpr.workspace = true
 [dev-dependencies]
 tempfile = "3"
 tower = "0.5.3"
+zpr-attr-server = { path = "../zpr-attr-server" }
