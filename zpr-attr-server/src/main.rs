@@ -25,6 +25,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -114,6 +115,28 @@ fn notify_body(pairs: &[(String, String)]) -> Value {
     json!({ "identities": identities })
 }
 
+/// The `changed` notification URL: `<base>/admin/services/<id>/changed`.
+/// The admin API contract requires `{id}` to be URL-path encoded, and the
+/// attr-query service-id validation only rejects `/` and `..` — so the id
+/// is percent-encoded as one path segment here. The set is strict RFC 3986:
+/// everything but unreserved characters (alphanumerics and `-._~`), which
+/// keeps ordinary ids readable and makes reserved characters like `#`, `?`
+/// and `%` inert.
+fn notify_url(vs_url: &str, service: &str) -> String {
+    /// Unreserved characters (RFC 3986 §2.3) pass through; everything else
+    /// is encoded.
+    const PATH_SEGMENT: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let encoded = utf8_percent_encode(service, PATH_SEGMENT);
+    format!(
+        "{}/admin/services/{encoded}/changed",
+        vs_url.trim_end_matches('/')
+    )
+}
+
 /// Read a secret file trimmed of surrounding whitespace; empty is an error.
 fn read_secret(path: &Path, what: &str) -> Result<String, String> {
     let contents = std::fs::read_to_string(path)
@@ -176,10 +199,7 @@ async fn notify(args: &Args, pairs: &[(String, String)]) -> Result<(), String> {
         .build()
         .map_err(|error| format!("failed to build HTTP client: {error}"))?;
 
-    let url = format!(
-        "{}/admin/services/{service}/changed",
-        vs_url.trim_end_matches('/')
-    );
+    let url = notify_url(vs_url, service);
     let response = client
         .post(&url)
         .header("X-API-Key", api_key)
@@ -346,6 +366,38 @@ mod tests {
         assert!(parse_identity_pair("no-equals").is_err());
         assert!(parse_identity_pair("=value").is_err());
         assert!(parse_identity_pair("key=").is_err());
+    }
+
+    /// The service id is one path segment of the notification URL, and the
+    /// admin API contract requires `{id}` to be URL-path encoded: reserved
+    /// characters like `#` and `?` must not change the parsed URL, and a
+    /// plain id must pass through readable. (Codex review, PR #30.)
+    #[test]
+    fn test_notify_url_percent_encodes_service_id() {
+        // A plain id is untouched, and a trailing '/' on the base is eaten.
+        assert_eq!(
+            notify_url("https://vs:8021/", "zipline"),
+            "https://vs:8021/admin/services/zipline/changed"
+        );
+        // '#' would start a fragment and '?' a query: both must be encoded
+        // so the '/changed' suffix stays part of the path.
+        assert_eq!(
+            notify_url("https://vs:8021", "svc#1"),
+            "https://vs:8021/admin/services/svc%231/changed"
+        );
+        assert_eq!(
+            notify_url("https://vs:8021", "svc?x=1"),
+            "https://vs:8021/admin/services/svc%3Fx%3D1/changed"
+        );
+        // '/' would add a path segment; '%' must round-trip decodable.
+        assert_eq!(
+            notify_url("https://vs:8021", "a/b"),
+            "https://vs:8021/admin/services/a%2Fb/changed"
+        );
+        assert_eq!(
+            notify_url("https://vs:8021", "100%"),
+            "https://vs:8021/admin/services/100%25/changed"
+        );
     }
 
     /// The notify body matches the admin API contract: `{}` for everything,

@@ -4596,6 +4596,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "percent-encoding",
  "reqwest",
  "rustls",
  "rustls-pemfile",
