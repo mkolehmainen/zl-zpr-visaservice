@@ -45,15 +45,33 @@ fn pick_new_id(keys: &HashMap<String, ApiKeyRecord>) -> Result<u32, String> {
 }
 
 /// Parse a permission level given on the command line. Lowercase only, and the
-/// rejection message names all three accepted levels.
+/// rejection message names all four accepted levels.
 fn parse_permission(perms: &str) -> Result<Permission, String> {
     match perms {
         "resolve" => Ok(Permission::Resolve),
         "read" => Ok(Permission::Read),
         "readwrite" => Ok(Permission::ReadWrite),
+        "notify" => Ok(Permission::Notify),
         other => Err(format!(
-            "invalid permission '{other}': must be resolve, read or readwrite"
+            "invalid permission '{other}': must be resolve, read, readwrite or notify"
         )),
+    }
+}
+
+/// Enforce the --service/permission pairing (zipline#79): a notify key must
+/// be bound to exactly one trusted-service id, and --service on any other
+/// level is rejected as a probable mistake rather than silently ignored.
+fn validate_service_binding(permission: &Permission, service: Option<&str>) -> Result<(), String> {
+    match (permission, service) {
+        (Permission::Notify, None) => {
+            Err("a notify key must be bound to a service: pass --service <id>".to_string())
+        }
+        (Permission::Notify, Some(_)) => Ok(()),
+        (_, Some(_)) => Err(
+            "--service only applies to notify keys; remove it or use permission 'notify'"
+                .to_string(),
+        ),
+        (_, None) => Ok(()),
     }
 }
 
@@ -86,6 +104,10 @@ enum Commands {
         /// Created date YYYY-MM-DD (default: today)
         #[arg(long)]
         created: Option<String>,
+        /// Trusted-service id to bind a notify key to (required for notify,
+        /// rejected otherwise)
+        #[arg(long)]
+        service: Option<String>,
     },
     /// Revoke an existing API key
     Revoke {
@@ -104,8 +126,10 @@ fn cmd_create(
     desc: Option<&str>,
     status: Option<&str>,
     created: Option<&str>,
+    service: Option<&str>,
 ) -> Result<(), String> {
     let permission = parse_permission(perms)?;
+    validate_service_binding(&permission, service)?;
 
     let key_status = match status.unwrap_or("active") {
         "active" => KeyStatus::Active,
@@ -151,6 +175,7 @@ fn cmd_create(
         created: created_date,
         secret_hash,
         description: desc.unwrap_or("").to_string(),
+        service: service.map(str::to_string),
     };
 
     kf.keys.insert(apikey.key_id_hex(), record);
@@ -197,6 +222,7 @@ fn main() {
             desc,
             status,
             created,
+            service,
         } => {
             let p = path
                 .clone()
@@ -209,6 +235,7 @@ fn main() {
                 desc.as_deref(),
                 status.as_deref(),
                 created.as_deref(),
+                service.as_deref(),
             )
         }
         Commands::Revoke { keyid, path } => {
@@ -229,25 +256,98 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// The permission parser accepts all three levels, lowercase (zipline#36).
+    /// The permission parser accepts all four levels, lowercase
+    /// (zipline#36, zipline#79).
     #[test]
-    fn test_parse_permission_accepts_all_three_levels() {
+    fn test_parse_permission_accepts_all_four_levels() {
         assert_eq!(parse_permission("resolve").unwrap(), Permission::Resolve);
         assert_eq!(parse_permission("read").unwrap(), Permission::Read);
         assert_eq!(
             parse_permission("readwrite").unwrap(),
             Permission::ReadWrite
         );
+        assert_eq!(parse_permission("notify").unwrap(), Permission::Notify);
     }
 
-    /// The rejection message for an invalid value names all three levels
-    /// (zipline#36), so users learn about `resolve` from the error itself.
+    /// The rejection message for an invalid value names all four levels
+    /// (zipline#36, zipline#79), so users learn about `resolve` and `notify`
+    /// from the error itself.
     #[test]
     fn test_parse_permission_rejects_invalid_naming_all_levels() {
         let err = parse_permission("bogus").unwrap_err();
         assert_eq!(
             err,
-            "invalid permission 'bogus': must be resolve, read or readwrite"
+            "invalid permission 'bogus': must be resolve, read, readwrite or notify"
+        );
+    }
+
+    /// A notify key requires --service at mint time (zipline#79): the
+    /// file-load side rejects an unbound notify key, and the CLI catches the
+    /// mistake before writing anything.
+    #[test]
+    fn test_validate_service_binding_notify_requires_service() {
+        let err = validate_service_binding(&Permission::Notify, None).unwrap_err();
+        assert!(
+            err.contains("--service"),
+            "error should name the missing flag, got: {err}"
+        );
+        assert!(validate_service_binding(&Permission::Notify, Some("hr")).is_ok());
+    }
+
+    /// --service with a non-notify permission is rejected as an error rather
+    /// than silently ignored (zipline#79 plan Q1): the load side ignores the
+    /// field, but the CLI catching the mistake is cheap.
+    #[test]
+    fn test_validate_service_binding_rejected_for_non_notify() {
+        for perm in [Permission::Resolve, Permission::Read, Permission::ReadWrite] {
+            let err = validate_service_binding(&perm, Some("hr")).unwrap_err();
+            assert!(
+                err.contains("notify"),
+                "error should say --service is notify-only, got: {err}"
+            );
+            assert!(validate_service_binding(&perm, None).is_ok());
+        }
+    }
+
+    /// Minting a notify key writes the service binding into the record, and
+    /// it round-trips through the TOML file (zipline#79).
+    #[test]
+    fn test_create_notify_key_round_trips_service() {
+        let path = std::env::temp_dir().join("vsapikey-test-notify-roundtrip.toml");
+        let _ = fs::remove_file(&path);
+        cmd_create(
+            "notify",
+            "hr-connector",
+            &path,
+            true,
+            Some("notify key for hr"),
+            None,
+            None,
+            Some("hr"),
+        )
+        .unwrap();
+        let kf = read_keys_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(kf.keys.len(), 1);
+        let record = kf.keys.values().next().unwrap();
+        assert_eq!(record.permission, Permission::Notify);
+        assert_eq!(record.service, Some("hr".to_string()));
+    }
+
+    /// Minting a read key leaves the binding absent — no stray `service`
+    /// key in the written TOML.
+    #[test]
+    fn test_create_read_key_has_no_service() {
+        let path = std::env::temp_dir().join("vsapikey-test-read-noservice.toml");
+        let _ = fs::remove_file(&path);
+        cmd_create("read", "reader", &path, true, None, None, None, None).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let kf = read_keys_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(kf.keys.values().next().unwrap().service, None);
+        assert!(
+            !content.contains("service"),
+            "read key TOML must not carry a service key:\n{content}"
         );
     }
 }
