@@ -1299,6 +1299,7 @@ mod tests {
             created: "2026-01-01".to_string(),
             secret_hash: apikey.secret_hash().unwrap(),
             description: "test key".to_string(),
+            service: None,
         };
         asm.admin_api_keys
             .insert_for_test(apikey.key_id_hex(), record);
@@ -3400,6 +3401,7 @@ mod e2e_actor_guard {
             created: "2026-09-15".to_string(),
             secret_hash: sha256_hex(&secret_bytes).unwrap(),
             description: "zipline#33 e2e guard".to_string(),
+            service: None,
         };
         let mut keys = HashMap::new();
         keys.insert(key_id_hex, record);
