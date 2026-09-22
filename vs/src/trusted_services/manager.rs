@@ -76,6 +76,19 @@ impl TrustedServicesMgr {
         self.actor_revisions.remove(zpr_addr);
     }
 
+    /// Drop the recorded revision for exactly one (actor, source) pair
+    /// (zipline#79): a targeted change notification names the actors whose
+    /// data changed at one source, so only that record may go stale — the
+    /// actor's other sources and every other actor keep their records. The
+    /// missing record makes the source stale for the actor
+    /// ([Self::stale_sources_for_actor]), forcing a re-query on the next
+    /// refresh pass.
+    pub fn forget_source_revision(&self, zpr_addr: &IpAddr, source: &str) {
+        if let Some(mut revisions) = self.actor_revisions.get_mut(zpr_addr) {
+            revisions.remove(source);
+        }
+    }
+
     /// Atomically replace the entire trusted-service list. The typed OIDC list
     /// is cleared. Production code publishes via [Self::update_services_with_oidc];
     /// this shorthand serves the many tests that register plain stores.
@@ -270,5 +283,70 @@ mod tests {
         );
 
         fs::remove_file(&fp).unwrap();
+    }
+
+    /// Forgetting one (actor, source) revision record makes exactly that
+    /// source stale for exactly that actor (zipline#79): the targeted
+    /// change-notification path must not disturb the actor's other sources or
+    /// any other actor's records.
+    #[tokio::test]
+    async fn test_forget_source_revision_scopes_to_one_actor_and_source() {
+        let fp1 = write_fixture(
+            "vs-fas-forget-s1.json",
+            r#"{"device.zpr.adapter.cn": {"alice": {"color": ["red"]}}}"#,
+        );
+        let fp2 = write_fixture(
+            "vs-fas-forget-s2.json",
+            r#"{"device.zpr.adapter.cn": {"alice": {"shape": ["round"]}}}"#,
+        );
+        let manager = TrustedServicesMgr::new();
+        let s1 = Arc::new(
+            FileAttributeStore::new(
+                "s1".to_string(),
+                test_mapper(),
+                Duration::from_secs(3600),
+                &fp1,
+            )
+            .unwrap(),
+        );
+        let s2 = Arc::new(
+            FileAttributeStore::new(
+                "s2".to_string(),
+                test_mapper(),
+                Duration::from_secs(3600),
+                &fp2,
+            )
+            .unwrap(),
+        );
+        manager.update_services(vec![s1.clone(), s2.clone()]);
+
+        let actor_a: IpAddr = "fd5a:5052::a1".parse().unwrap();
+        let actor_b: IpAddr = "fd5a:5052::b1".parse().unwrap();
+        // Both actors fully caught up on every source.
+        manager.record_revision(&actor_a, "s1", s1.current_revision());
+        manager.record_revision(&actor_a, "s2", s2.current_revision());
+        manager.record_revision(&actor_b, "s1", s1.current_revision());
+        assert!(manager.stale_sources_for_actor(&actor_a).is_empty());
+
+        manager.forget_source_revision(&actor_a, "s1");
+
+        // Exactly s1 is stale for actor A...
+        assert_eq!(
+            manager.stale_sources_for_actor(&actor_a),
+            vec![("s1".to_string(), s1.current_revision())]
+        );
+        // ...and actor B's s1 record is untouched (s2 was never recorded for
+        // B, so only that one shows up).
+        assert_eq!(
+            manager.stale_sources_for_actor(&actor_b),
+            vec![("s2".to_string(), s2.current_revision())]
+        );
+
+        // Forgetting for an actor with no records at all is a no-op.
+        let actor_c: IpAddr = "fd5a:5052::c1".parse().unwrap();
+        manager.forget_source_revision(&actor_c, "s1");
+
+        fs::remove_file(&fp1).unwrap();
+        fs::remove_file(&fp2).unwrap();
     }
 }
