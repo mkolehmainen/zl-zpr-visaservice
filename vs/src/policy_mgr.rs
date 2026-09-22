@@ -948,6 +948,7 @@ mod tests {
             mappings: &["sub -> user.oidc-subject"],
             identity: &["sub"],
             oidc: Some(make_test_oidc_config()),
+            attr_query: None,
         };
         let file_spec = |secs: u32| TrustedServiceSpec {
             id: "attrfile",
@@ -956,6 +957,7 @@ mod tests {
             mappings: &[],
             identity: &[],
             oidc: None,
+            attr_query: None,
         };
 
         let ts_mgr = Arc::new(TrustedServicesMgr::new());
@@ -1397,6 +1399,7 @@ mod tests {
             mappings: &["sub -> user.oidc-subject"],
             identity: &["sub"],
             oidc: Some(make_test_oidc_config()),
+            attr_query: None,
         };
 
         let (mgr, _actor_repo) = make_policy_mgr_with_actors(
@@ -1421,6 +1424,7 @@ mod tests {
                     mappings: &[],
                     identity: &[],
                     oidc: None,
+                    attr_query: None,
                 },
             ])
         };
@@ -1494,6 +1498,7 @@ mod tests {
                     mappings: &["sub -> user.oidc-subject"],
                     identity: &["sub"],
                     oidc: Some(oidc.clone()),
+                    attr_query: None,
                 },
                 TrustedServiceSpec {
                     id: "nosuchfile",
@@ -1502,6 +1507,7 @@ mod tests {
                     mappings: &[],
                     identity: &[],
                     oidc: None,
+                    attr_query: None,
                 },
             ]);
             assert!(mgr.update_policy_from_container_bytes(bad).await.is_err());

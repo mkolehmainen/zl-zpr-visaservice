@@ -1445,6 +1445,7 @@ mod test {
                 .collect(),
             identity_attrs: identity.iter().map(|s| s.to_string()).collect(),
             oidc: None,
+            attr_query: None,
         }
     }
 

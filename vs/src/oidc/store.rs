@@ -414,6 +414,7 @@ mod tests {
                 .collect(),
             identity_attrs: vec!["sub".to_string()],
             oidc: Some(make_test_oidc_config()),
+            attr_query: None,
         }
     }
 

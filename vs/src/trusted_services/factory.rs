@@ -375,6 +375,7 @@ mod tests {
             mappings: &["sub -> user.oidc-subject"],
             identity: &["sub"],
             oidc: Some(make_test_oidc_config()), // same issuer both times
+            attr_query: None,
         };
         let policy = policy_from_container(make_trusted_services_policy(&[
             spec("idp-a"),
