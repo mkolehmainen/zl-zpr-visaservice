@@ -157,13 +157,25 @@ impl ReloadableApiKeys {
     /// secret matches the stored hash. If all that is good, return the permission associated with the key.
     /// If not, return None (ie, no permission).
     pub fn lookup_permission(&self, apikey: &ApiKey) -> Result<Option<Permission>, ServiceError> {
+        Ok(self
+            .lookup_permission_and_service(apikey)?
+            .map(|(perm, _)| perm))
+    }
+
+    /// As [Self::lookup_permission], but also returns the key's service
+    /// binding (zipline#79) so the notification endpoint can enforce that a
+    /// notify key only names its bound service.
+    pub fn lookup_permission_and_service(
+        &self,
+        apikey: &ApiKey,
+    ) -> Result<Option<(Permission, Option<String>)>, ServiceError> {
         let keys_file = self.keys_file.read().unwrap();
         if let Some(record) = keys_file.keys.get(&apikey.key_id_hex()) {
             if record.status == KeyStatus::Active {
                 let secret_hash = sha256_hex(apikey.secret_bytes())
                     .map_err(|e| ServiceError::AdminKey(format!("failed to hash key: {e}")))?;
                 if secret_hash == record.secret_hash {
-                    Ok(Some(record.permission.clone()))
+                    Ok(Some((record.permission.clone(), record.service.clone())))
                 } else {
                     Ok(None)
                 }

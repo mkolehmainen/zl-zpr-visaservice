@@ -184,6 +184,16 @@ impl TrustedServicesMgr {
         join_all(futures).await
     }
 
+    /// Whether a trusted service with this source id is currently configured
+    /// (zipline#79): the notification endpoint's existence check for bodies
+    /// that do not go through [Self::flush_one].
+    pub fn has_source(&self, source_ident: &str) -> bool {
+        self.services
+            .load()
+            .iter()
+            .any(|service| service.get_source_id() == source_ident)
+    }
+
     /// Flush one named trusted service.
     pub async fn flush_one(&self, source_ident: &str) -> Result<(), ServiceError> {
         let snapshot = self.services.load_full();
