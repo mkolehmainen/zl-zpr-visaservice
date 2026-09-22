@@ -1,4 +1,4 @@
-Admin HTTP API  - Current as of 9/18/2026
+Admin HTTP API  - Current as of 9/22/2026
 -----------------------------------------
 
 This document describes the admin HTTPS API implemented by the server and
@@ -23,11 +23,16 @@ API KEY
 -------
   Every request requires passing the api key in the `X-API-Key` header.
   A missing, malformed, or unknown key gets a 401 (not listed per endpoint).
-  Keys carry one of three permission levels: resolve, read, or read/write.
+  Keys carry one of four permission levels: resolve, read, read/write, or
+  notify.
   GET /admin/services, GET /admin/services/{name} and GET /admin/hosts/{name}
-  accept any active key, including a resolve key — a resolve key reaches
-  exactly those three endpoints. All other read endpoints require read; write
-  endpoints (POST/DELETE) require read/write, else 403.
+  accept any active key except notify — a resolve key reaches exactly those
+  three endpoints. All other read endpoints require read; write endpoints
+  (POST/DELETE) require read/write, else 403.
+  A notify key reaches exactly one endpoint: POST /admin/services/{id}/changed,
+  and only for the single trusted-service id the key was bound to at mint
+  time (vsapikey create notify <owner> --service <id>). Read/write keys may
+  also call that endpoint, for any id.
 
 Notes
 -----
@@ -278,6 +283,41 @@ DELETE /admin/services/{id}/cache
     returned.
     Actors with no live visa are not touched here -- they refresh on their next
     visa request.
+    Note that passed {id} must be url path encoded.
+
+POST /admin/services/{id}/changed
+---------------------------------
+  Summary
+    A trusted (attribute) service notifies the VS that its data changed
+    (zipline#79). Rides the same flush -> revision -> reconcile -> revoke
+    path as DELETE /admin/services/{id}/cache.
+  Request
+    {}                                        everything changed
+    { "identities": [ { "<zpr key>": "<value>" }, ... ] }
+                                              only the actors carrying a
+                                              listed identity pair changed
+  Response
+    202: accepted (reconciliation queued)
+    400: malformed body (non-JSON, unknown fields, or an empty identity
+         object)
+    403: permission denied (key without notify rights, or a notify key bound
+         to a different service id)
+    404: no such trusted service
+    500: reload failed, or actor listing failed
+  Notes
+    Requires a notify or readwrite key. A notify key is bound to exactly one
+    service id at mint time and gets 403 for any other id — checked BEFORE
+    the existence check, so a bound key cannot probe which ids exist. A
+    readwrite key may notify any id and sees the 404 for an unknown one.
+    Body {} is equivalent to DELETE /admin/services/{id}/cache: the service
+    is reloaded synchronously and the asynchronous reconciliation is queued
+    (actors behind live visas refreshed, their visas re-checked).
+    A targeted body does NOT reload the service (a service pushing a
+    notification is assumed to vend current data). Instead, for every
+    connected actor whose stored attributes contain a listed key=value pair
+    exactly, the actor's recorded revision for this source is forgotten, so
+    the queued reconciliation re-queries exactly those actors. Actors with no
+    live visa refresh lazily on their next visa request.
     Note that passed {id} must be url path encoded.
 
 GET /admin/hosts/{name}
