@@ -25,17 +25,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use hyper::Request;
-use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use rustls::pki_types::PrivateKeyDer;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tower_service::Service;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-use zpr_attr_server::router::{AppState, app};
+use zpr_attr_server::router::AppState;
+use zpr_attr_server::serve;
 use zpr_attr_server::store::AttrData;
 
 /// Reference implementation of the `zpr-attr/1` attribute-service protocol.
@@ -129,70 +125,28 @@ fn read_secret(path: &Path, what: &str) -> Result<String, String> {
     Ok(trimmed)
 }
 
-/// Build the TLS acceptor from the PEM certificate chain and private key —
-/// the same rustls construction the visa service's admin listener uses.
+/// Build the TLS acceptor from the PEM certificate chain and private key
+/// files ([serve::tls_acceptor_from_pem] does the parsing).
 fn tls_acceptor(cert_file: &Path, key_file: &Path) -> Result<TlsAcceptor, String> {
     let cert_pem = std::fs::read(cert_file)
         .map_err(|error| format!("failed to read cert file {cert_file:?}: {error}"))?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
-        .collect::<Result<_, _>>()
-        .map_err(|error| format!("failed to parse cert PEM {cert_file:?}: {error}"))?;
-
     let key_pem = std::fs::read(key_file)
         .map_err(|error| format!("failed to read key file {key_file:?}: {error}"))?;
-    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut &key_pem[..])
-        .map_err(|error| format!("failed to parse key PEM {key_file:?}: {error}"))?
-        .ok_or_else(|| format!("no private key found in {key_file:?}"))?;
-
-    let cfg = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|error| format!("failed to build TLS config: {error}"))?;
-    Ok(TlsAcceptor::from(Arc::new(cfg)))
+    serve::tls_acceptor_from_pem(&cert_pem, &key_pem)
 }
 
-/// Serve the router over TLS on `listen` until killed — accept, handshake,
-/// hand the connection to hyper, exactly the visa service admin listener's
-/// loop.
-async fn serve(acceptor: TlsAcceptor, listen: SocketAddr, state: AppState) -> Result<(), String> {
-    let router = app(state);
+/// Serve the router over TLS on `listen` until killed
+/// ([serve::serve_with_listener] runs the accept loop).
+async fn run_serve_loop(
+    acceptor: TlsAcceptor,
+    listen: SocketAddr,
+    state: AppState,
+) -> Result<(), String> {
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| format!("failed to bind {listen}: {error}"))?;
-    info!("zpr-attr/1 reference server listening on {listen} (TLS)");
-
-    loop {
-        let (cnx, addr) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                error!("accept failed: {error}");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        let acceptor = acceptor.clone();
-        let router = router.clone();
-        tokio::spawn(async move {
-            let stream = match acceptor.accept(cnx).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    warn!("TLS handshake from {addr} failed: {error}");
-                    return;
-                }
-            };
-            let stream = TokioIo::new(stream);
-            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                // Clone per request: Router::call needs &mut self.
-                router.clone().call(req)
-            });
-            if let Err(error) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                .serve_connection(stream, service)
-                .await
-            {
-                warn!("error serving connection from {addr}: {error}");
-            }
-        });
-    }
+    serve::serve_with_listener(listener, acceptor, state).await;
+    Ok(())
 }
 
 /// Notify mode: post `changed` to the visa service and report the status.
@@ -258,7 +212,7 @@ async fn run_server(args: &Args) -> Result<(), String> {
         .map_err(|error| format!("failed to load data file {data_path:?}: {error}"))?;
     let token = read_secret(token_path, "token")?;
     let acceptor = tls_acceptor(cert_path, key_path)?;
-    serve(
+    run_serve_loop(
         acceptor,
         args.listen,
         AppState {

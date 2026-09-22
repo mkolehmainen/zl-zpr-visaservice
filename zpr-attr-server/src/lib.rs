@@ -15,4 +15,5 @@
 //! a product binary.
 
 pub mod router;
+pub mod serve;
 pub mod store;
