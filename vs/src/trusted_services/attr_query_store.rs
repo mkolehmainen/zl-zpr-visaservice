@@ -255,7 +255,7 @@ impl AttrQueryStore {
             .await
             .map_err(|e| format!("schema fetch failed: {e}"))?;
         let status = resp.status();
-        if !status.is_success() {
+        if status != reqwest::StatusCode::OK {
             return Err(format!("schema endpoint returned status {status}"));
         }
         let body = read_body_capped(&mut resp, "schema response")
@@ -360,9 +360,11 @@ impl TrustedServiceInterface for AttrQueryStore {
                 ServiceError::Internal(format!("TS '{}' query failed: {e}", self.id))
             })?;
         let status = resp.status();
-        if !status.is_success() {
-            // Rule 1: every non-200 is a deny, logged by status for the
-            // operator; a 404 is a wrong URL, never an unknown actor.
+        if status != reqwest::StatusCode::OK {
+            // Rule 1: everything but exactly 200 is a deny, logged by status
+            // for the operator; a 404 is a wrong URL, never an unknown actor,
+            // and other 2xx codes (201, 206 partial content) are not the
+            // authoritative answer the spec requires.
             return Err(ServiceError::Internal(format!(
                 "TS '{}' query returned status {status}",
                 self.id
@@ -665,14 +667,25 @@ mod tests {
     }
 
     /// Fail closed on every bad response (spec rule 1): each non-200 status —
-    /// including 404, which means "wrong URL", never "unknown actor" — plus a
-    /// malformed body and a single-valued attribute with two values.
+    /// including 404, which means "wrong URL", never "unknown actor", and the
+    /// other 2xx codes (a 206 is a partial body an intermediary vouched for;
+    /// its plausible-looking attributes must not be taken as authoritative) —
+    /// plus a malformed body and a single-valued attribute with two values.
     #[tokio::test]
     async fn test_fail_closed_statuses_and_shapes() {
         let cases: Vec<(u16, &str)> = vec![
             (404, r#"{"attributes": {}}"#),
             (409, r#"{"error": "conflict"}"#),
             (500, "oops"),
+            // 2xx but not 200: spec says exactly 200, everything else denies.
+            (
+                201,
+                r#"{"attributes": {"title": {"values": ["ceo"], "expires_at": null}}}"#,
+            ),
+            (
+                206,
+                r#"{"attributes": {"title": {"values": ["ceo"], "expires_at": null}}}"#,
+            ),
             (200, "not json at all"),
             (
                 200,
