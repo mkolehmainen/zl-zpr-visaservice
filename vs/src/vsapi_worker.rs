@@ -1348,7 +1348,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             }
         }
 
-        let addr_attr = actor.get_attribute(key::ZPR_ADDR).unwrap();
         {
             let expires_val = if let Some(exp) = actor.get_authentication_expiration() {
                 let dt: DateTime<Utc> = exp.into();
@@ -1364,7 +1363,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 expires_val
             );
         }
-        let zpr_con = Connection::new(actor_addr, addr_attr.get_expires());
+        let zpr_con = Connection::new(actor_addr, connect_auth_expires(&actor));
         let mut resp_builder = results.get().init_resp().init_ok();
         zpr_con.write_to(&mut resp_builder);
 
@@ -1435,10 +1434,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             }
         };
 
-        let auth_expires = actor
-            .get_attribute(key::USER_AUTHORITY)
-            .map(|a| a.get_expires())
-            .unwrap_or(UNIX_EPOCH);
+        let auth_expires = connect_auth_expires(&actor);
         {
             let dt: DateTime<Utc> = auth_expires.into();
             info!(
@@ -1770,6 +1766,22 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
 
         Ok(())
     }
+}
+
+/// The `authExpires` for a `Connection` response (zipline#86): the actor's
+/// authentication expiry — the minimum over its authority and identity
+/// attributes — falling back to the ZPR-address attribute's expiry only when
+/// the actor carries no authentication expiry at all. Returning the address
+/// lease here (previous behaviour of `authorize_connect`) told the node its
+/// authentication lasted ~100 years, so it never scheduled silent OIDC
+/// renewal.
+fn connect_auth_expires(actor: &Actor) -> SystemTime {
+    actor.get_authentication_expiration().unwrap_or_else(|| {
+        actor
+            .get_attribute(key::ZPR_ADDR)
+            .expect("connected actor must carry a zpr.addr attribute")
+            .get_expires()
+    })
 }
 
 #[cfg(test)]
