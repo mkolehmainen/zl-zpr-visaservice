@@ -1777,6 +1777,95 @@ mod tests {
     use super::*;
     use capnp::message::Builder;
 
+    /// The authExpires an endpoint gets back must be its authentication
+    /// expiry, not the ZPR-address lease. With a user authority expiring in
+    /// 120 s and a default-expiry (far-future) zpr.addr, the helper returns
+    /// the user-authority expiry (zipline#86).
+    #[test]
+    fn test_connect_auth_expires_uses_user_authority_not_addr_lease() {
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de:1::9"),
+            )
+            .unwrap();
+        actor
+            .add_attribute(
+                Attribute::builder(key::USER_AUTHORITY)
+                    .expires_in(Duration::from_secs(120))
+                    .value("some-oidc-issuer"),
+            )
+            .unwrap();
+
+        let user_expiry = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .unwrap()
+            .get_expires();
+        let addr_expiry = actor.get_attribute(key::ZPR_ADDR).unwrap().get_expires();
+
+        let got = connect_auth_expires(&actor);
+        assert_eq!(
+            got, user_expiry,
+            "authExpires must be the authentication expiry, not the address lease"
+        );
+        assert_ne!(
+            got, addr_expiry,
+            "sanity: the address lease (default far-future) must not be the result"
+        );
+        // ≈ now + 120 s, well under the far-future address lease.
+        let secs_out = got
+            .duration_since(SystemTime::now())
+            .expect("expiry must be in the future")
+            .as_secs();
+        assert!(
+            (100..=120).contains(&secs_out),
+            "expected ~120 s out, got {secs_out} s"
+        );
+    }
+
+    /// A device-only actor (no user authority) gets its device-authority
+    /// expiry as authExpires.
+    #[test]
+    fn test_connect_auth_expires_device_only_uses_device_authority() {
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de:1::9"),
+            )
+            .unwrap();
+        actor
+            .add_attribute(
+                Attribute::builder(key::DEVICE_AUTHORITY)
+                    .expires_in(Duration::from_secs(3600))
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+
+        let device_expiry = actor
+            .get_attribute(key::DEVICE_AUTHORITY)
+            .unwrap()
+            .get_expires();
+        assert_eq!(connect_auth_expires(&actor), device_expiry);
+    }
+
+    /// With no authentication expiry at all, the helper falls back to the
+    /// zpr.addr attribute's expiry — the pre-#86 behaviour, now only the
+    /// fallback.
+    #[test]
+    fn test_connect_auth_expires_falls_back_to_addr_expiry() {
+        let mut actor = Actor::new();
+        actor
+            .add_attribute(
+                Attribute::builder(key::ZPR_ADDR)
+                    .expires_in(Duration::from_secs(500))
+                    .value("fd5a:5052:90de:1::9"),
+            )
+            .unwrap();
+
+        let addr_expiry = actor.get_attribute(key::ZPR_ADDR).unwrap().get_expires();
+        assert_eq!(connect_auth_expires(&actor), addr_expiry);
+    }
+
     /// Helper function to create a v_s_connect_request message with the given params
     fn build_connect_request(
         build_fn: impl FnOnce(vsapi::v_s_connect_request::Builder),
