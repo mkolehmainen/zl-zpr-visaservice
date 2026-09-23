@@ -1797,9 +1797,7 @@ mod tests {
     fn test_connect_auth_expires_uses_user_authority_not_addr_lease() {
         let mut actor = Actor::new();
         actor
-            .add_attribute(
-                Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de:1::9"),
-            )
+            .add_attribute(Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de:1::9"))
             .unwrap();
         actor
             .add_attribute(
@@ -1841,9 +1839,7 @@ mod tests {
     fn test_connect_auth_expires_device_only_uses_device_authority() {
         let mut actor = Actor::new();
         actor
-            .add_attribute(
-                Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de:1::9"),
-            )
+            .add_attribute(Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de:1::9"))
             .unwrap();
         actor
             .add_attribute(
