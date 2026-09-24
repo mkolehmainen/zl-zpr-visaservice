@@ -17,6 +17,21 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use zpr::policy::v1 as policy_capnp;
+use zpr::policy_types::{AttrExp, AttrOp};
+
+/// True if this join-policy match expression PINS zpr.addr: key `zpr.addr`
+/// with exact-equality (`Eq`) semantics and at least one concrete, non-empty
+/// value. Only such an expression admits exactly the pinned value(s), so only
+/// it can validate a peer-requested address in `approve_connection`. `Ne`,
+/// valueless `Has` and `Excludes` match whole families of peer-selected
+/// addresses; a valued `Has` is subset semantics rather than exact equality.
+/// None of those pin, so none of them commit the request.
+fn pins_zpr_addr(exp: &AttrExp) -> bool {
+    exp.key == key::ZPR_ADDR
+        && exp.op == AttrOp::Eq
+        && !exp.value.is_empty()
+        && exp.value.iter().all(|v| !v.is_empty())
+}
 
 // TODO: Not yet sure if this is useful. Maybe the context can build up
 // some cache or something to make future eval calls faster?
@@ -191,13 +206,18 @@ impl EvalContext {
     /// On success returns an actor object that will include additional attributes set from
     /// policy (eg, ROLE).
     ///
-    /// This does not set `zpr.addr` unless one is specified in policy (TODO).
-    ///
-    /// If the peer is requesting a specific ZPR address, then zpr.addr:<addr> should
-    /// be included in the `unauthenticated_claims`. Connection request will fail if the
-    /// policy specifies a different address for the actor.  Caller should scrub ZPR address
-    /// from unauthenticated_claims before calling this function if they do not want it
-    /// used in policy matching.
+    /// A requested ZPR address is a check, never a grant. If the peer requests a
+    /// specific address, `zpr.addr:<addr>` should be included in the
+    /// `unauthenticated_claims`; it is used for join-policy matching, but it is
+    /// committed to the returned actor only when at least one MATCHED join policy
+    /// pins `zpr.addr` — carries a `zpr.addr` condition with exact-equality
+    /// (`Eq`) semantics and a concrete value in its match expressions.
+    /// Non-pinning expressions on the key (`Ne`, valueless `Has`, `Excludes`,
+    /// or `Has` with a value) match families of addresses and do not commit.
+    /// A policy that matches on other keys alone does not validate the request:
+    /// the address is scrubbed and the caller allocates one from the pool. A
+    /// request that conflicts with a policy's pinned address simply fails to
+    /// match that policy.
     ///
     /// An actor that matches no join policy is still approved -- with its
     /// unauthenticated claims scrubbed -- because a join policy grants a role and
@@ -235,11 +255,21 @@ impl EvalContext {
 
         // Query to see if the claims match any join policies.
         let matching_jps = self.policy.match_join_policies(&query_claims);
-        // If nothing matched, the unauth claims are unvalidated and must be
-        // scrubbed from the actor: otherwise a bootstrap-authenticated peer with
-        // no matching join policy could claim an arbitrary or already-used ZPR
-        // address and overwrite/disconnect that actor.
-        let matched_join_policy = !matching_jps.is_empty();
+        // A matched join policy alone does not validate the requested address:
+        // the request is committed only when at least one MATCHED policy PINS
+        // zpr.addr — an exact-equality expression (`zpr.addr Eq <addr>`) with
+        // a concrete, non-empty value. Only Eq admits exactly the pinned
+        // value(s); `Ne`, valueless `Has` and `Excludes` match whole families
+        // of peer-selected addresses and validate nothing, and even a valued
+        // `Has` is subset semantics rather than exact equality, so it is
+        // conservatively rejected too. A policy that matched on other keys
+        // says nothing about the address, and an unvalidated claim must be
+        // scrubbed: otherwise a bootstrap-authenticated peer could claim an
+        // arbitrary or already-used ZPR address and overwrite/disconnect that
+        // actor.
+        let matched_addr_pin = matching_jps
+            .iter()
+            .any(|jp| jp.matches.iter().any(pins_zpr_addr));
         debug!(
             target: EVAL,
             "found {} matching join policies",
@@ -247,7 +277,6 @@ impl EvalContext {
         );
 
         // Each policy may have flags and services.
-        // TODO: Currently we have no way to set a static addr from policy.
         let mut flags: EnumSet<JFlag> = EnumSet::new();
         let mut services = HashSet::new();
         for jp in matching_jps {
@@ -261,15 +290,15 @@ impl EvalContext {
 
         let mut actor = Actor::new();
 
-        // Always commit the authenticated claims. Commit the unauth claims only
-        // if a join policy matched; otherwise scrub them.
-        let final_claims: &[Attribute] = if matched_join_policy {
+        // Always commit the authenticated claims. Commit the unauth claims
+        // only if a matched join policy pins zpr.addr; otherwise scrub them.
+        let final_claims: &[Attribute] = if matched_addr_pin {
             &query_claims
         } else {
             if !unauth_claims.is_empty() {
                 warn!(
                     target: EVAL,
-                    "scrubbing {} unauthenticated claim(s) from actor: no matching join policy",
+                    "scrubbing {} unauthenticated claim(s) from actor: no matched join policy pins zpr.addr",
                     unauth_claims.len()
                 );
             }
@@ -731,12 +760,14 @@ impl EvalContext {
 mod test {
     use super::*;
     use crate::attribute::key;
+    use crate::joinpolicy::JPolicy;
     use bytes::{Buf, Bytes};
     use std::net::IpAddr;
     use std::time::{Duration, SystemTime};
     use std::{path::Path, sync::Once};
     use tracing::Level;
     use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
+    use zpr::policy_types::{AttrExp, AttrOp};
 
     static TRACING_INIT: Once = Once::new();
 
@@ -1131,6 +1162,283 @@ mod test {
         assert!(actor.get_zpr_addr().is_some());
         // ...but the self-asserted user.sub claim was not.
         assert!(!actor.has_attribute_named("user.sub"));
+    }
+
+    // ---- zipline#97: a requested zpr.addr is a check, never a grant. ----
+    // approve_connection commits the peer's requested address only when at
+    // least one MATCHED join policy PINS zpr.addr — an exact-equality (Eq)
+    // condition with a concrete value in its `matches`. A policy that matches
+    // on other keys alone, or carries a non-pinning zpr.addr expression
+    // (NE / valueless HAS / EXCLUDES / valued HAS), does not validate
+    // the request: the address is scrubbed and the caller pool-allocates.
+
+    /// Single-expression join policy matching CN eq `cn`, with no zpr.addr pin.
+    fn jp_cn_eq(cn: &str) -> JPolicy {
+        JPolicy {
+            matches: vec![AttrExp {
+                key: key::CN.to_string(),
+                op: AttrOp::Eq,
+                value: vec![cn.to_string()],
+            }],
+            flags: EnumSet::new(),
+            services: None,
+        }
+    }
+
+    /// Join policy matching CN eq `cn` that also pins zpr.addr eq `addr`.
+    fn jp_cn_eq_with_addr_pin(cn: &str, addr: &str) -> JPolicy {
+        JPolicy {
+            matches: vec![
+                AttrExp {
+                    key: key::CN.to_string(),
+                    op: AttrOp::Eq,
+                    value: vec![cn.to_string()],
+                },
+                AttrExp {
+                    key: key::ZPR_ADDR.to_string(),
+                    op: AttrOp::Eq,
+                    value: vec![addr.to_string()],
+                },
+            ],
+            flags: EnumSet::new(),
+            services: None,
+        }
+    }
+
+    /// Join policy matching CN eq `cn` plus an arbitrary zpr.addr expression.
+    fn jp_cn_eq_with_addr_exp(cn: &str, op: AttrOp, values: &[&str]) -> JPolicy {
+        JPolicy {
+            matches: vec![
+                AttrExp {
+                    key: key::CN.to_string(),
+                    op: AttrOp::Eq,
+                    value: vec![cn.to_string()],
+                },
+                AttrExp {
+                    key: key::ZPR_ADDR.to_string(),
+                    op,
+                    value: values.iter().map(|v| v.to_string()).collect(),
+                },
+            ],
+            flags: EnumSet::new(),
+            services: None,
+        }
+    }
+
+    /// Approve a connection for `cn` requesting zpr.addr `addr` against a
+    /// single-join-policy Policy, returning the actor.
+    fn approve_with_policy(jp: JPolicy, cn: &str, addr: &str) -> Actor {
+        let mut pol = Policy::new_empty();
+        pol.push_join_policy(jp);
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value(cn)];
+        let unauthenticated_claims = vec![Attribute::builder(key::ZPR_ADDR).value(addr)];
+
+        ctx.approve_connection(
+            Some(authenticated_claims.as_slice()),
+            Some(unauthenticated_claims.as_slice()),
+        )
+        .unwrap()
+    }
+
+    // 1. A join policy that matches on CN alone (no zpr.addr condition) does
+    //    not validate a requested address: the actor is approved but the
+    //    address is scrubbed.
+    #[test]
+    fn test_addr_scrubbed_when_matched_policy_has_no_pin() {
+        setup();
+        let mut pol = Policy::new_empty();
+        pol.push_join_policy(jp_cn_eq("cn-only.zpr.org"));
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value("cn-only.zpr.org")];
+        let unauthenticated_claims =
+            vec![Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::99")];
+
+        let actor = ctx
+            .approve_connection(
+                Some(authenticated_claims.as_slice()),
+                Some(unauthenticated_claims.as_slice()),
+            )
+            .unwrap();
+
+        // The join policy matched on CN, so the actor is approved...
+        assert!(actor.has_attribute_named(key::CN));
+        // ...but no matched policy pins zpr.addr, so the requested address is
+        // unvalidated and must be scrubbed; the caller pool-allocates.
+        assert!(actor.get_zpr_addr().is_none());
+    }
+
+    // 2. A matched policy that pins zpr.addr eq X commits a request for X.
+    //    (Pins the existing test_node_can_connect behaviour to the new rule:
+    //    basic.bin2's node join policy carries the zpr.addr condition.)
+    #[test]
+    fn test_addr_committed_when_matched_policy_pins_it() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value("node.zpr.org")];
+        let unauthenticated_claims =
+            vec![Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::1")];
+
+        let actor = ctx
+            .approve_connection(
+                Some(authenticated_claims.as_slice()),
+                Some(unauthenticated_claims.as_slice()),
+            )
+            .unwrap();
+
+        assert!(actor.is_node());
+        assert_eq!(
+            actor.get_zpr_addr(),
+            Some(&"fd5a:5052:90de::1".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    // 3. A pin of X with a request of Y: the pinning policy does not match at
+    //    all (existing matcher semantics), so nothing validates the request
+    //    and it is scrubbed.
+    #[test]
+    fn test_addr_mismatching_pin_scrubbed() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value("node.zpr.org")];
+        let unauthenticated_claims =
+            vec![Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::2")];
+
+        let actor = ctx
+            .approve_connection(
+                Some(authenticated_claims.as_slice()),
+                Some(unauthenticated_claims.as_slice()),
+            )
+            .unwrap();
+
+        // The node join policy pins fd5a:5052:90de::1, so with a request of
+        // ::2 it does not match: no node role, and the address is scrubbed.
+        assert!(!actor.is_node());
+        assert!(actor.get_zpr_addr().is_none());
+    }
+
+    // 4. Two policies match and only one carries the zpr.addr pin: one
+    //    matched pin is enough to commit the request.
+    #[test]
+    fn test_addr_committed_when_any_matched_policy_pins() {
+        setup();
+        let mut pol = Policy::new_empty();
+        pol.push_join_policy(jp_cn_eq("two.zpr.org"));
+        pol.push_join_policy(jp_cn_eq_with_addr_pin("two.zpr.org", "fd5a:5052:90de::7"));
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value("two.zpr.org")];
+        let unauthenticated_claims =
+            vec![Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::7")];
+
+        let actor = ctx
+            .approve_connection(
+                Some(authenticated_claims.as_slice()),
+                Some(unauthenticated_claims.as_slice()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            actor.get_zpr_addr(),
+            Some(&"fd5a:5052:90de::7".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    // 4b. zipline#97 review P1 (PR #32): only an exact Eq expression pins.
+    //     A matched policy whose zpr.addr expression is NE cannot commit the
+    //     request: `zpr.addr NE X` matches (and thereby "validates") every
+    //     address except X, so the peer would be choosing its own address.
+    #[test]
+    fn test_addr_ne_expression_does_not_pin() {
+        setup();
+        let actor = approve_with_policy(
+            jp_cn_eq_with_addr_exp("ne.zpr.org", AttrOp::Ne, &["fd5a:5052:90de::1"]),
+            "ne.zpr.org",
+            "fd5a:5052:90de::2",
+        );
+        // The policy matched (::2 != ::1), so the actor is approved...
+        assert!(actor.has_attribute_named(key::CN));
+        // ...but NE does not pin an address: the request must be scrubbed.
+        assert!(actor.get_zpr_addr().is_none());
+    }
+
+    // 4c. A valueless HAS (`zpr.addr HAS ""`) only tests key presence: it
+    //     matches any requested address, so it must not count as a pin.
+    #[test]
+    fn test_addr_valueless_has_does_not_pin() {
+        setup();
+        let actor = approve_with_policy(
+            jp_cn_eq_with_addr_exp("has.zpr.org", AttrOp::Has, &[]),
+            "has.zpr.org",
+            "fd5a:5052:90de::3",
+        );
+        assert!(actor.has_attribute_named(key::CN));
+        assert!(actor.get_zpr_addr().is_none());
+    }
+
+    // 4d. A non-empty EXCLUDES matches every address outside the excluded
+    //     set, so it must not count as a pin either.
+    #[test]
+    fn test_addr_excludes_expression_does_not_pin() {
+        setup();
+        let actor = approve_with_policy(
+            jp_cn_eq_with_addr_exp("excl.zpr.org", AttrOp::Excludes, &["fd5a:5052:90de::1"]),
+            "excl.zpr.org",
+            "fd5a:5052:90de::4",
+        );
+        assert!(actor.has_attribute_named(key::CN));
+        assert!(actor.get_zpr_addr().is_none());
+    }
+
+    // 4e. Even HAS with a concrete value is conservative-rejected: for the
+    //     single-valued zpr.addr it behaves like Eq today, but HAS is subset
+    //     semantics, not exact equality — only Eq with a non-empty value pins.
+    #[test]
+    fn test_addr_has_with_value_does_not_pin() {
+        setup();
+        let actor = approve_with_policy(
+            jp_cn_eq_with_addr_exp("hasv.zpr.org", AttrOp::Has, &["fd5a:5052:90de::5"]),
+            "hasv.zpr.org",
+            "fd5a:5052:90de::5",
+        );
+        assert!(actor.has_attribute_named(key::CN));
+        assert!(actor.get_zpr_addr().is_none());
+    }
+
+    // 5. An unauthenticated `device.zpr_addr` claim never reaches the actor,
+    //    even when a matched policy pins zpr.addr and the request commits.
+    //    Extends the guarantee of
+    //    test_join_match_does_not_commit_non_addr_unauth_claims: A3 reads
+    //    device.zpr_addr from the actor, so pin it explicitly.
+    #[test]
+    fn test_unauth_device_zpr_addr_never_reaches_actor() {
+        setup();
+        let pol = load_policy("basic.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value("node.zpr.org")];
+        let unauthenticated_claims = vec![
+            Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:90de::1"),
+            Attribute::builder("device.zpr_addr").value("fd5a:5052:90de::bad"),
+        ];
+
+        let actor = ctx
+            .approve_connection(
+                Some(authenticated_claims.as_slice()),
+                Some(unauthenticated_claims.as_slice()),
+            )
+            .unwrap();
+
+        // The matched pin commits the requested zpr.addr...
+        assert!(actor.get_zpr_addr().is_some());
+        // ...but the self-asserted device.zpr_addr claim must not.
+        assert!(!actor.has_attribute_named("device.zpr_addr"));
     }
 
     // A node approved under the current policy should still pass re-check.
