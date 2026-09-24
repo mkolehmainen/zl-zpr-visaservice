@@ -17,6 +17,21 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use zpr::policy::v1 as policy_capnp;
+use zpr::policy_types::{AttrExp, AttrOp};
+
+/// True if this join-policy match expression PINS zpr.addr: key `zpr.addr`
+/// with exact-equality (`Eq`) semantics and at least one concrete, non-empty
+/// value. Only such an expression admits exactly the pinned value(s), so only
+/// it can validate a peer-requested address in `approve_connection`. `Ne`,
+/// valueless `Has` and `Excludes` match whole families of peer-selected
+/// addresses; a valued `Has` is subset semantics rather than exact equality.
+/// None of those pin, so none of them commit the request.
+fn pins_zpr_addr(exp: &AttrExp) -> bool {
+    exp.key == key::ZPR_ADDR
+        && exp.op == AttrOp::Eq
+        && !exp.value.is_empty()
+        && exp.value.iter().all(|v| !v.is_empty())
+}
 
 // TODO: Not yet sure if this is useful. Maybe the context can build up
 // some cache or something to make future eval calls faster?
@@ -195,7 +210,10 @@ impl EvalContext {
     /// specific address, `zpr.addr:<addr>` should be included in the
     /// `unauthenticated_claims`; it is used for join-policy matching, but it is
     /// committed to the returned actor only when at least one MATCHED join policy
-    /// pins `zpr.addr` — carries a `zpr.addr` condition in its match expressions.
+    /// pins `zpr.addr` — carries a `zpr.addr` condition with exact-equality
+    /// (`Eq`) semantics and a concrete value in its match expressions.
+    /// Non-pinning expressions on the key (`Ne`, valueless `Has`, `Excludes`,
+    /// or `Has` with a value) match families of addresses and do not commit.
     /// A policy that matches on other keys alone does not validate the request:
     /// the address is scrubbed and the caller allocates one from the pool. A
     /// request that conflicts with a policy's pinned address simply fails to
@@ -238,15 +256,20 @@ impl EvalContext {
         // Query to see if the claims match any join policies.
         let matching_jps = self.policy.match_join_policies(&query_claims);
         // A matched join policy alone does not validate the requested address:
-        // the request is committed only when at least one MATCHED policy pins
-        // zpr.addr (carries a zpr.addr condition in its matches). A policy
-        // that matched on other keys says nothing about the address, and an
-        // unvalidated claim must be scrubbed: otherwise a bootstrap-
-        // authenticated peer could claim an arbitrary or already-used ZPR
-        // address and overwrite/disconnect that actor.
+        // the request is committed only when at least one MATCHED policy PINS
+        // zpr.addr — an exact-equality expression (`zpr.addr Eq <addr>`) with
+        // a concrete, non-empty value. Only Eq admits exactly the pinned
+        // value(s); `Ne`, valueless `Has` and `Excludes` match whole families
+        // of peer-selected addresses and validate nothing, and even a valued
+        // `Has` is subset semantics rather than exact equality, so it is
+        // conservatively rejected too. A policy that matched on other keys
+        // says nothing about the address, and an unvalidated claim must be
+        // scrubbed: otherwise a bootstrap-authenticated peer could claim an
+        // arbitrary or already-used ZPR address and overwrite/disconnect that
+        // actor.
         let matched_addr_pin = matching_jps
             .iter()
-            .any(|jp| jp.matches.iter().any(|m| m.key == key::ZPR_ADDR));
+            .any(|jp| jp.matches.iter().any(pins_zpr_addr));
         debug!(
             target: EVAL,
             "found {} matching join policies",
@@ -1143,8 +1166,10 @@ mod test {
 
     // ---- zipline#97: a requested zpr.addr is a check, never a grant. ----
     // approve_connection commits the peer's requested address only when at
-    // least one MATCHED join policy carries a zpr.addr condition in its
-    // `matches`. A policy that matches on other keys alone does not validate
+    // least one MATCHED join policy PINS zpr.addr — an exact-equality (Eq)
+    // condition with a concrete value in its `matches`. A policy that matches
+    // on other keys alone, or carries a non-pinning zpr.addr expression
+    // (NE / valueless HAS / EXCLUDES / valued HAS), does not validate
     // the request: the address is scrubbed and the caller pool-allocates.
 
     /// Single-expression join policy matching CN eq `cn`, with no zpr.addr pin.
