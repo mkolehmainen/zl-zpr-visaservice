@@ -5342,6 +5342,108 @@ mod tests {
         );
     }
 
+    /// PR #34 review (P1): TWO trusted services each granting a single — but
+    /// different — `device.zpr_addr` is exactly as ambiguous as one service
+    /// granting two, and must be rejected loudly (plan Q1). Without a
+    /// pre-collapse check the actor's attribute map keeps only the
+    /// last-inserted grant (Actor::add_attribute is a keyed insert), so the
+    /// selected address would silently follow source iteration order.
+    #[tokio::test]
+    async fn granted_addr_conflicting_sources_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(crate::test_helpers::make_trusted_services_policy(&[
+            crate::test_helpers::TrustedServiceSpec {
+                id: "addresses-a",
+                api: "file",
+                expiration_seconds: Some(3600),
+                mappings: &["addr -> device.zpr_addr"],
+                identity: &[],
+                oidc: None,
+                attr_query: None,
+            },
+            crate::test_helpers::TrustedServiceSpec {
+                id: "addresses-b",
+                api: "file",
+                expiration_seconds: Some(3600),
+                mappings: &["addr -> device.zpr_addr"],
+                identity: &[],
+                oidc: None,
+                attr_query: None,
+            },
+        ]));
+        let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> = vec![
+            named_ts("addresses-a", &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::20")]),
+            named_ts("addresses-b", &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::21")]),
+        ];
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, stores),
+                "granted.zpr",
+                Vec::new(),
+                vec![Attribute::builder(key::CN).value("granted.zpr")],
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg))
+                if msg.contains(key::DEVICE_ZPR_ADDR)),
+            "conflicting grants from two trusted services must be rejected, got {result:?}"
+        );
+    }
+
+    /// Two trusted services granting the SAME address agree — redundancy, not
+    /// ambiguity — and the grant is honored. Guards the conflict check above
+    /// against over-rejection.
+    #[tokio::test]
+    async fn granted_addr_agreeing_sources_accepted() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(crate::test_helpers::make_trusted_services_policy(&[
+            crate::test_helpers::TrustedServiceSpec {
+                id: "addresses-a",
+                api: "file",
+                expiration_seconds: Some(3600),
+                mappings: &["addr -> device.zpr_addr"],
+                identity: &[],
+                oidc: None,
+                attr_query: None,
+            },
+            crate::test_helpers::TrustedServiceSpec {
+                id: "addresses-b",
+                api: "file",
+                expiration_seconds: Some(3600),
+                mappings: &["addr -> device.zpr_addr"],
+                identity: &[],
+                oidc: None,
+                attr_query: None,
+            },
+        ]));
+        let granted: IpAddr = "fd5a:5052:8888::22".parse().unwrap();
+        let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> = vec![
+            named_ts("addresses-a", &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::22")]),
+            named_ts("addresses-b", &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::22")]),
+        ];
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, stores),
+                "granted.zpr",
+                Vec::new(),
+                vec![Attribute::builder(key::CN).value("granted.zpr")],
+                0,
+            )
+            .await
+            .expect("agreeing grants must authorize");
+
+        assert_eq!(actor.get_zpr_addr(), Some(&granted));
+        assert!(!asm.net_mgr.is_managed_address(&granted));
+    }
+
     /// Re-authorization at the granted address keeps working: the live holder
     /// renewing its own session (`renewal_of == granted`) passes the proof arm,
     /// exactly as it does for a static pin.
