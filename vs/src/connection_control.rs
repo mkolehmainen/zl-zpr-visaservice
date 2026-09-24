@@ -1272,6 +1272,84 @@ impl ConnectionControl {
             Role::Adapter
         };
 
+        // zipline#99 (A3): a trusted service may grant the device's requested ZPR
+        // address by vending an authenticated `device.zpr_addr` attribute. Promote
+        // the grant to the requested `zpr.addr` HERE — before the pre-set-address
+        // checks below — so it flows through exactly the zipline#98 arms (in
+        // range, not the VS, outside the pools, unheld, proof arms) with no
+        // duplication. Only authenticated attributes reach the actor
+        // (approve_connection never commits self-asserted claims to it), so a
+        // peer cannot steer its own address by claiming a grant. `addr_source`
+        // tells the log/error lines below apart: a rejected pin reads "static",
+        // a rejected grant reads "granted" (operator answer on the plan, Q2).
+        let mut addr_source = "static";
+        // PR #34 review (P1): read the grant from the accumulated authenticated
+        // CLAIMS, not from the actor. Actor::add_attribute is a keyed insert,
+        // so by the time the actor exists, grants from two trusted services
+        // have already collapsed to whichever source was iterated last — and
+        // that order comes from policy HashMap iteration, so the surviving
+        // address could vary across policy loads. `authd_claims` still holds
+        // every vended attribute, so conflicting grants are visible here.
+        // Distinct addresses — across sources or within one attribute — are
+        // ambiguous and rejected loudly (plan Q1); duplicates that agree are
+        // redundancy, not ambiguity.
+        let grant_attr_count = authd_claims
+            .iter()
+            .filter(|a| a.get_key() == key::DEVICE_ZPR_ADDR)
+            .count();
+        if grant_attr_count > 0 {
+            let mut values: Vec<String> = authd_claims
+                .iter()
+                .filter(|a| a.get_key() == key::DEVICE_ZPR_ADDR)
+                .flat_map(|a| a.get_value().iter().cloned())
+                .collect();
+            values.sort();
+            values.dedup();
+            // A grant that cannot be understood is an operator error to surface
+            // loudly, never something to silently fall back to the pool on (plan
+            // Q1): a device the operator meant to place would quietly come up
+            // somewhere else.
+            let [value] = values.as_slice() else {
+                warn!(target: CC, "rejecting {} grant for cn {}: expected exactly one address, got {:?}", key::DEVICE_ZPR_ADDR, endpoint_cn, values);
+                return Err(ServiceError::AuthenticationFailed(format!(
+                    "{} grant must resolve to exactly one address, got {} distinct values",
+                    key::DEVICE_ZPR_ADDR,
+                    values.len()
+                )));
+            };
+            let granted: IpAddr = value.parse().map_err(|_| {
+                warn!(target: CC, "rejecting {} grant for cn {}: not an IP address: '{}'", key::DEVICE_ZPR_ADDR, endpoint_cn, value);
+                ServiceError::AuthenticationFailed(format!(
+                    "{} grant is not an IP address: '{value}'",
+                    key::DEVICE_ZPR_ADDR
+                ))
+            })?;
+            match authd_actor.get_zpr_addr().copied() {
+                // Two sources both claim to own the address decision: a policy
+                // pin that survived the join (zipline#97) and a trusted-service
+                // grant that disagrees with it. That is an operator error, not a
+                // tiebreak to invent — reject naming both.
+                Some(pinned) if pinned != granted => {
+                    warn!(target: CC, "rejecting connection for cn {}: trusted-service grant {}={} disagrees with the pre-set zpr address {}", endpoint_cn, key::DEVICE_ZPR_ADDR, granted, pinned);
+                    return Err(ServiceError::AuthenticationFailed(format!(
+                        "trusted-service grant {}={granted} disagrees with the pre-set zpr address {pinned}",
+                        key::DEVICE_ZPR_ADDR
+                    )));
+                }
+                // The grant agrees with the pre-set address: redundant, not an
+                // error. The address keeps its original (static/pin) source.
+                Some(_) => {
+                    info!(target: CC, "trusted-service grant {}={} agrees with the pre-set zpr address for cn {}", key::DEVICE_ZPR_ADDR, granted, endpoint_cn);
+                }
+                None => {
+                    authd_actor
+                        .add_attribute(Attribute::builder(key::ZPR_ADDR).value(value.as_str()))?;
+                    addr_source = "granted";
+                    info!(target: CC, "honoring trusted-service grant of zpr address {} for cn {}", granted, endpoint_cn);
+                }
+            }
+        }
+
         if let Some(addr) = authd_actor.get_zpr_addr() {
             // A pre-set address is either STATIC -- a policy pin committed under a
             // matched join policy (zipline#97) or, later, a trusted-service grant
@@ -1325,9 +1403,9 @@ impl ConnectionControl {
                     info!(target: CC, "re-authorizing the visa service at its own ZPR addr {}", addr);
                 }
                 Some(_) => {
-                    warn!(target: CC, "rejecting zpr address already held by a live actor, claimed by cn {}: {}", endpoint_cn, addr);
+                    warn!(target: CC, "rejecting {addr_source} zpr address already held by a live actor, claimed by cn {}: {}", endpoint_cn, addr);
                     return Err(ServiceError::AuthenticationFailed(format!(
-                        "zpr address already held by a live actor: {addr}"
+                        "{addr_source} zpr address already held by a live actor: {addr}"
                     )));
                 }
                 None => {
@@ -1336,18 +1414,18 @@ impl ConnectionControl {
                     if !net_mgr::is_zpr_addr(&addr)
                         || (addr == asm.config.get_vs_addr() && !is_vs_self)
                     {
-                        warn!(target: CC, "rejecting static zpr address out of range for cn {}: {}", endpoint_cn, addr);
+                        warn!(target: CC, "rejecting {addr_source} zpr address out of range for cn {}: {}", endpoint_cn, addr);
                         return Err(ServiceError::AuthenticationFailed(format!(
-                            "static zpr address out of range: {addr}"
+                            "{addr_source} zpr address out of range: {addr}"
                         )));
                     }
                     if asm.net_mgr.is_managed_address(&addr) {
-                        warn!(target: CC, "rejecting static zpr address inside a managed pool for cn {}: {}", endpoint_cn, addr);
+                        warn!(target: CC, "rejecting {addr_source} zpr address inside a managed pool for cn {}: {}", endpoint_cn, addr);
                         return Err(ServiceError::AuthenticationFailed(format!(
-                            "static zpr address inside a managed pool: {addr}"
+                            "{addr_source} zpr address inside a managed pool: {addr}"
                         )));
                     }
-                    info!(target: CC, "authorized connection of {actor_role:?} cn {} with ZPR addr {}", endpoint_cn, addr);
+                    info!(target: CC, "authorized connection of {actor_role:?} cn {} with {addr_source} ZPR addr {}", endpoint_cn, addr);
                 }
             }
         } else {
@@ -4928,6 +5006,505 @@ mod tests {
         assert_eq!(actor.get_zpr_addr(), Some(&addr));
         // Sanity: the accepted address is not pool-managed, so nothing to release.
         assert!(!asm.net_mgr.is_managed_address(&addr));
+    }
+
+    // ---- trusted-service address grants (zipline#99, A3) ----
+    //
+    // An AUTHENTICATED `device.zpr_addr` attribute — vended by a trusted service
+    // for the device's identity — is promoted to the requested `zpr.addr` right
+    // after approve_connection, so the grant flows through exactly the zipline#98
+    // checks above (in range, not the VS, outside the pools, unheld, proof arms).
+    // An unauthenticated `device.zpr_addr` claim never reaches the actor (libeval
+    // scrubs it; pinned there), so only TS-vouched grants can steer the address.
+
+    /// Authenticated claims carrying a `device.zpr_addr` grant, as the claim set
+    /// looks after the trusted-service fetch has appended the vended attributes.
+    /// The TS-append path itself is exercised by
+    /// [granted_addr_from_trusted_service_store_commits].
+    fn granted_addr_claims(cn: &str, granted: &str) -> Vec<Attribute> {
+        vec![
+            Attribute::builder(key::CN).value(cn),
+            Attribute::builder(key::DEVICE_ZPR_ADDR).value(granted),
+        ]
+    }
+
+    /// The full grant path: a policy-declared trusted service vends
+    /// `device.zpr_addr` for the device's CN, and the actor comes out committed
+    /// at the granted address — even though the peer requested a different one.
+    /// (A1/zipline#97 scrubs the unpinned request, so the grant wins.)
+    #[tokio::test]
+    async fn granted_addr_from_trusted_service_store_commits() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
+            "addresses",
+            "file",
+            Some(3600),
+            &["addr -> device.zpr_addr"],
+        ));
+        let granted: IpAddr = "fd5a:5052:8888::10".parse().unwrap();
+        let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> =
+            vec![named_ts(
+                "addresses",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::10")],
+            )];
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, stores),
+                "granted.zpr",
+                // The peer requests a different address; no pin matches it, so
+                // A1 scrubs it and the grant decides.
+                vec![Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:8888::99")],
+                vec![Attribute::builder(key::CN).value("granted.zpr")],
+                0,
+            )
+            .await
+            .expect("a valid trusted-service grant must authorize");
+
+        assert_eq!(actor.get_zpr_addr(), Some(&granted));
+        assert!(!asm.net_mgr.is_managed_address(&granted));
+    }
+
+    /// A grant with no competing request commits, and the managed pools are
+    /// untouched: granted addresses live in the static address space.
+    #[tokio::test]
+    async fn granted_addr_no_request_accepted_pool_untouched() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let granted: IpAddr = "fd5a:5052:8888::11".parse().unwrap();
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "granted.zpr",
+                Vec::new(),
+                granted_addr_claims("granted.zpr", "fd5a:5052:8888::11"),
+                0,
+            )
+            .await
+            .expect("a valid grant must authorize");
+
+        assert_eq!(actor.get_zpr_addr(), Some(&granted));
+        assert!(!asm.net_mgr.is_managed_address(&granted));
+    }
+
+    /// A granted address outside `fd5a:5052::/32` fails the range check, and the
+    /// rejection names the grant as the source (operator answer to plan Q2).
+    #[tokio::test]
+    async fn granted_addr_out_of_range_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "granted.zpr",
+                Vec::new(),
+                granted_addr_claims("granted.zpr", "fd00:1:2::1"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg))
+                if msg.contains("out of range") && msg.contains("granted")),
+            "an out-of-range grant must fail the range check naming the grant, got {result:?}"
+        );
+    }
+
+    /// A granted address inside a managed pool is rejected — the pool could hand
+    /// it to someone else — the pool stays untouched, and the rejection names the
+    /// grant as the source.
+    #[tokio::test]
+    async fn granted_addr_inside_pool_rejected_pool_untouched() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:adda:1::43".parse().unwrap();
+
+        let result = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "granted.zpr",
+                Vec::new(),
+                granted_addr_claims("granted.zpr", "fd5a:5052:adda:1::43"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg))
+                if msg.contains("managed pool") && msg.contains("granted")),
+            "an in-pool grant must fail the pool check naming the grant, got {result:?}"
+        );
+        assert!(
+            asm.net_mgr.take_zpr_addr(&addr).is_ok(),
+            "pool must be untouched by the rejection"
+        );
+    }
+
+    /// No trusted service may grant the visa service's own address.
+    #[tokio::test]
+    async fn granted_addr_vs_address_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "impostor.zpr",
+                Vec::new(),
+                granted_addr_claims("impostor.zpr", "fd5a:5052::1"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg))
+                if msg.contains("out of range") && msg.contains("granted")),
+            "the VS address must be rejected as a grant, got {result:?}"
+        );
+    }
+
+    /// A grant that disagrees with a surviving policy pin (zipline#97) is an
+    /// operator error: two sources claim to own the address decision. Rejected,
+    /// naming both addresses so the operator can see the disagreement.
+    #[tokio::test]
+    async fn granted_addr_disagreeing_with_policy_pin_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let mut claims = granted_addr_claims("pinned.zpr", "fd5a:5052:8888::12");
+        // A pin that survived approve_connection commits zpr.addr on the actor.
+        claims.push(Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:8888::13"));
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "pinned.zpr",
+                Vec::new(),
+                claims,
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg))
+                if msg.contains("fd5a:5052:8888::12") && msg.contains("fd5a:5052:8888::13")),
+            "a grant/pin disagreement must be rejected naming both addresses, got {result:?}"
+        );
+    }
+
+    /// A grant that AGREES with the policy pin is redundant, not an error: the
+    /// address commits once.
+    #[tokio::test]
+    async fn granted_addr_agreeing_with_policy_pin_accepted() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:8888::14".parse().unwrap();
+
+        let mut claims = granted_addr_claims("pinned.zpr", "fd5a:5052:8888::14");
+        claims.push(Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:8888::14"));
+
+        let actor = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "pinned.zpr",
+                Vec::new(),
+                claims,
+                0,
+            )
+            .await
+            .expect("a grant agreeing with the pin must authorize");
+
+        assert_eq!(actor.get_zpr_addr(), Some(&addr));
+    }
+
+    /// A granted address already held by a live actor is rejected on a fresh
+    /// connect — first holder wins — and the holder's record survives intact.
+    #[tokio::test]
+    async fn granted_addr_held_by_live_actor_rejected_record_unchanged() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:8888::15".parse().unwrap();
+
+        let first =
+            crate::test_helpers::make_adapter_actor_defexp("fd5a:5052:8888::15", "first.zpr");
+        asm.actor_mgr
+            .hack_add_adapter_no_node(&first, &asm.policy_service_names())
+            .await
+            .expect("holder must persist");
+
+        let result = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "second.zpr",
+                Vec::new(),
+                granted_addr_claims("second.zpr", "fd5a:5052:8888::15"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("held")),
+            "a granted address held by a live actor must be rejected, got {result:?}"
+        );
+        let still = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .expect("the original actor record must survive");
+        assert_eq!(still.get_cn(), Some("first.zpr"));
+    }
+
+    /// `device.zpr_addr` present only in UNAUTHENTICATED claims is a self-asserted
+    /// claim, not a grant: it never reaches the actor (libeval scrubs it), so the
+    /// pool allocates as if it were absent.
+    #[tokio::test]
+    async fn granted_addr_unauthenticated_only_ignored_pool_allocates() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "claimer.zpr",
+                vec![Attribute::builder(key::DEVICE_ZPR_ADDR).value("fd5a:5052:8888::16")],
+                vec![Attribute::builder(key::CN).value("claimer.zpr")],
+                0,
+            )
+            .await
+            .expect("the connection authorizes; the self-asserted grant is ignored");
+
+        let addr = *actor.get_zpr_addr().expect("pool must have allocated");
+        assert_ne!(addr, "fd5a:5052:8888::16".parse::<IpAddr>().unwrap());
+        assert!(
+            asm.net_mgr.is_managed_address(&addr),
+            "the address must come from a managed pool, got {addr}"
+        );
+    }
+
+    /// An unparsable grant is an operator error to surface, not something to
+    /// silently fall back to the pool on (plan Q1: reject loudly).
+    #[tokio::test]
+    async fn granted_addr_unparsable_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "granted.zpr",
+                Vec::new(),
+                granted_addr_claims("granted.zpr", "not-an-ip"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg))
+                if msg.contains(key::DEVICE_ZPR_ADDR)),
+            "an unparsable grant must be rejected loudly, got {result:?}"
+        );
+    }
+
+    /// A multi-valued grant is ambiguous — two trusted-service records, or a
+    /// misconfigured store — and is rejected loudly for the same reason (plan Q1).
+    #[tokio::test]
+    async fn granted_addr_multivalued_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let claims = vec![
+            Attribute::builder(key::CN).value("granted.zpr"),
+            Attribute::builder(key::DEVICE_ZPR_ADDR)
+                .values(&["fd5a:5052:8888::17", "fd5a:5052:8888::18"]),
+        ];
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "granted.zpr",
+                Vec::new(),
+                claims,
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg))
+                if msg.contains(key::DEVICE_ZPR_ADDR)),
+            "a multi-valued grant must be rejected loudly, got {result:?}"
+        );
+    }
+
+    /// PR #34 review (P1): TWO trusted services each granting a single — but
+    /// different — `device.zpr_addr` is exactly as ambiguous as one service
+    /// granting two, and must be rejected loudly (plan Q1). Without a
+    /// pre-collapse check the actor's attribute map keeps only the
+    /// last-inserted grant (Actor::add_attribute is a keyed insert), so the
+    /// selected address would silently follow source iteration order.
+    #[tokio::test]
+    async fn granted_addr_conflicting_sources_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(crate::test_helpers::make_trusted_services_policy(&[
+            crate::test_helpers::TrustedServiceSpec {
+                id: "addresses-a",
+                api: "file",
+                expiration_seconds: Some(3600),
+                mappings: &["addr -> device.zpr_addr"],
+                identity: &[],
+                oidc: None,
+                attr_query: None,
+            },
+            crate::test_helpers::TrustedServiceSpec {
+                id: "addresses-b",
+                api: "file",
+                expiration_seconds: Some(3600),
+                mappings: &["addr -> device.zpr_addr"],
+                identity: &[],
+                oidc: None,
+                attr_query: None,
+            },
+        ]));
+        let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> = vec![
+            named_ts(
+                "addresses-a",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::20")],
+            ),
+            named_ts(
+                "addresses-b",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::21")],
+            ),
+        ];
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, stores),
+                "granted.zpr",
+                Vec::new(),
+                vec![Attribute::builder(key::CN).value("granted.zpr")],
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg))
+                if msg.contains(key::DEVICE_ZPR_ADDR)),
+            "conflicting grants from two trusted services must be rejected, got {result:?}"
+        );
+    }
+
+    /// Two trusted services granting the SAME address agree — redundancy, not
+    /// ambiguity — and the grant is honored. Guards the conflict check above
+    /// against over-rejection.
+    #[tokio::test]
+    async fn granted_addr_agreeing_sources_accepted() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = policy_from_container(crate::test_helpers::make_trusted_services_policy(&[
+            crate::test_helpers::TrustedServiceSpec {
+                id: "addresses-a",
+                api: "file",
+                expiration_seconds: Some(3600),
+                mappings: &["addr -> device.zpr_addr"],
+                identity: &[],
+                oidc: None,
+                attr_query: None,
+            },
+            crate::test_helpers::TrustedServiceSpec {
+                id: "addresses-b",
+                api: "file",
+                expiration_seconds: Some(3600),
+                mappings: &["addr -> device.zpr_addr"],
+                identity: &[],
+                oidc: None,
+                attr_query: None,
+            },
+        ]));
+        let granted: IpAddr = "fd5a:5052:8888::22".parse().unwrap();
+        let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> = vec![
+            named_ts(
+                "addresses-a",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::22")],
+            ),
+            named_ts(
+                "addresses-b",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::22")],
+            ),
+        ];
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, stores),
+                "granted.zpr",
+                Vec::new(),
+                vec![Attribute::builder(key::CN).value("granted.zpr")],
+                0,
+            )
+            .await
+            .expect("agreeing grants must authorize");
+
+        assert_eq!(actor.get_zpr_addr(), Some(&granted));
+        assert!(!asm.net_mgr.is_managed_address(&granted));
+    }
+
+    /// Re-authorization at the granted address keeps working: the live holder
+    /// renewing its own session (`renewal_of == granted`) passes the proof arm,
+    /// exactly as it does for a static pin.
+    #[tokio::test]
+    async fn granted_addr_renewal_at_same_addr_accepted() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:8888::19".parse().unwrap();
+
+        let holder =
+            crate::test_helpers::make_adapter_actor_defexp("fd5a:5052:8888::19", "renewer.zpr");
+        asm.actor_mgr
+            .hack_add_adapter_no_node(&holder, &asm.policy_service_names())
+            .await
+            .expect("holder must persist");
+
+        let actor = cc
+            .authorize_connection_impl(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "renewer.zpr",
+                Vec::new(),
+                granted_addr_claims("renewer.zpr", "fd5a:5052:8888::19"),
+                0,
+                Some(addr),
+            )
+            .await
+            .expect("a proven renewal at the granted address must authorize");
+
+        assert_eq!(actor.get_zpr_addr(), Some(&addr));
     }
 
     /// The node path end to end: a join policy pinning an IN-POOL node address
