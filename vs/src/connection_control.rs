@@ -4702,6 +4702,146 @@ mod tests {
         assert_eq!(still.get_cn(), Some("first.zpr"));
     }
 
+    /// CN equality is NOT ownership proof (PR #33 review, P1): the repository
+    /// supports multiple same-CN actors, so a second adapter sharing the
+    /// holder's CN must not take over its live address on a fresh connect —
+    /// the fresh-connect path would go on to evict the holder's record in
+    /// `add_actor`. Same-CN renewal belongs to `reauthorize_actor`, which
+    /// proves the session first.
+    #[tokio::test]
+    async fn static_addr_held_by_same_cn_adapter_rejected_record_unchanged() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:8888::11".parse().unwrap();
+
+        let holder =
+            crate::test_helpers::make_adapter_actor_defexp("fd5a:5052:8888::11", "same.zpr");
+        asm.actor_mgr
+            .hack_add_adapter_no_node(&holder, &asm.policy_service_names())
+            .await
+            .expect("holder must persist");
+
+        let result = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "same.zpr",
+                Vec::new(),
+                static_addr_claims("same.zpr", "fd5a:5052:8888::11"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("held")),
+            "a same-CN fresh connect must not take over a live address, got {result:?}"
+        );
+        let still = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .expect("the holder's record must survive");
+        assert_eq!(still.get_cn(), Some("same.zpr"));
+    }
+
+    /// Two CN-less (OIDC-only) actors both report `None` for CN, and
+    /// `None == None` must never count as an ownership match (PR #33 review,
+    /// P1): a second user's fresh connect claiming the holder's address must
+    /// be rejected.
+    #[tokio::test]
+    async fn static_addr_held_by_cnless_actor_rejected_for_cnless_claimant() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:8888::12".parse().unwrap();
+
+        let holder = crate::test_helpers::make_oidc_only_adapter_defexp("fd5a:5052:8888::12");
+        asm.actor_mgr
+            .hack_add_adapter_no_node(&holder, &asm.policy_service_names())
+            .await
+            .expect("holder must persist");
+
+        // A CN-less claimant, as an OIDC-only connect produces: a ZPR address
+        // claim and no CN attribute at all.
+        let result = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "",
+                Vec::new(),
+                vec![Attribute::builder(key::ZPR_ADDR).value("fd5a:5052:8888::12")],
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("held")),
+            "None == None must not count as an ownership match, got {result:?}"
+        );
+        let still = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .expect("the holder's record must survive");
+        assert!(still.get_cn().is_none());
+    }
+
+    /// A node reconnecting to its own live pinned address must keep working:
+    /// node identity is RSA-proven against the policy bootstrap key for its
+    /// CN, and the pinned address is bound to that CN's join policy. This
+    /// pins the one same-CN carve-out that survives the P1 fix.
+    #[tokio::test]
+    async fn authenticate_node_reconnect_to_its_live_pinned_address_accepted() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        let pinned = "fd5a:5052:90de::7"; // outside both pools
+        let addr: IpAddr = pinned.parse().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_pinned_node_join(
+                cn,
+                &pubkey_der,
+                pinned,
+            ))
+            .await
+            .unwrap();
+
+        // The node's own record from its earlier connect is still live.
+        asm.actor_mgr
+            .add_node(
+                &crate::test_helpers::make_node_actor_defexp(pinned, cn, "127.0.0.1:1234"),
+                false,
+                &Default::default(),
+            )
+            .await
+            .expect("live node record must persist");
+
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+
+        let actor = cc
+            .authenticate_node(
+                asm,
+                challenge,
+                timestamp,
+                cn,
+                &sig,
+                addr,
+                "127.0.0.1:1234".parse().unwrap(),
+                None,
+            )
+            .await
+            .expect("a node reconnect to its own live pinned address must authenticate");
+
+        assert!(actor.is_node());
+        assert_eq!(actor.get_zpr_addr(), Some(&addr));
+    }
+
     /// The happy path: a static address in range, outside both pools, and unheld
     /// is accepted, and no pool allocation happens for it.
     #[tokio::test]

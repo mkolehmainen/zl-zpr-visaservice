@@ -946,6 +946,41 @@ mod test {
     };
     use libeval::attribute::{ROLE_ADAPTER, ROLE_NODE, key};
 
+    /// P2 (PR #33 review): `add_actor` must never evict a live record at the
+    /// address. Two first-time connections racing for the same static address
+    /// both pass the async holder lookup (both see `None`); persistence must
+    /// therefore be an atomic claim that FAILS the later writer, not a
+    /// clean-up-and-replace that silently disconnects the earlier one.
+    #[tokio::test]
+    async fn test_add_actor_does_not_evict_live_record_at_same_address() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let addr: IpAddr = "fd5a:5052:8888::21".parse().unwrap();
+        let first = make_adapter_actor_defexp("fd5a:5052:8888::21", "first.zpr");
+        let second = make_adapter_actor_defexp("fd5a:5052:8888::21", "second.zpr");
+
+        repo.add_actor(&first, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let result = repo
+            .add_actor(&second, &Default::default(), &Default::default())
+            .await;
+        assert!(
+            result.is_err(),
+            "the later writer must fail, not evict the live holder, got {result:?}"
+        );
+
+        // The failed add must not have destroyed the holder's record either
+        // (the add_actor error path cleans up after itself, and that cleanup
+        // must not fire for an occupied address).
+        let still = repo
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .expect("the first actor's record must survive the failed add");
+        assert_eq!(still.get_cn(), Some("first.zpr"));
+    }
+
     #[tokio::test]
     async fn test_add_and_get_actor_roundtrip() {
         let db = Arc::new(FakeDb::new());
