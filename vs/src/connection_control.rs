@@ -1283,10 +1283,28 @@ impl ConnectionControl {
         // tells the log/error lines below apart: a rejected pin reads "static",
         // a rejected grant reads "granted" (operator answer on the plan, Q2).
         let mut addr_source = "static";
-        let grant_values: Option<Vec<String>> = authd_actor
-            .get_attribute(key::DEVICE_ZPR_ADDR)
-            .map(|attr| attr.get_value().to_vec());
-        if let Some(values) = grant_values {
+        // PR #34 review (P1): read the grant from the accumulated authenticated
+        // CLAIMS, not from the actor. Actor::add_attribute is a keyed insert,
+        // so by the time the actor exists, grants from two trusted services
+        // have already collapsed to whichever source was iterated last — and
+        // that order comes from policy HashMap iteration, so the surviving
+        // address could vary across policy loads. `authd_claims` still holds
+        // every vended attribute, so conflicting grants are visible here.
+        // Distinct addresses — across sources or within one attribute — are
+        // ambiguous and rejected loudly (plan Q1); duplicates that agree are
+        // redundancy, not ambiguity.
+        let grant_attr_count = authd_claims
+            .iter()
+            .filter(|a| a.get_key() == key::DEVICE_ZPR_ADDR)
+            .count();
+        if grant_attr_count > 0 {
+            let mut values: Vec<String> = authd_claims
+                .iter()
+                .filter(|a| a.get_key() == key::DEVICE_ZPR_ADDR)
+                .flat_map(|a| a.get_value().iter().cloned())
+                .collect();
+            values.sort();
+            values.dedup();
             // A grant that cannot be understood is an operator error to surface
             // loudly, never something to silently fall back to the pool on (plan
             // Q1): a device the operator meant to place would quietly come up
@@ -1294,7 +1312,7 @@ impl ConnectionControl {
             let [value] = values.as_slice() else {
                 warn!(target: CC, "rejecting {} grant for cn {}: expected exactly one address, got {:?}", key::DEVICE_ZPR_ADDR, endpoint_cn, values);
                 return Err(ServiceError::AuthenticationFailed(format!(
-                    "{} grant must carry exactly one address, got {} values",
+                    "{} grant must resolve to exactly one address, got {} distinct values",
                     key::DEVICE_ZPR_ADDR,
                     values.len()
                 )));
@@ -5373,8 +5391,14 @@ mod tests {
             },
         ]));
         let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> = vec![
-            named_ts("addresses-a", &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::20")]),
-            named_ts("addresses-b", &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::21")]),
+            named_ts(
+                "addresses-a",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::20")],
+            ),
+            named_ts(
+                "addresses-b",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::21")],
+            ),
         ];
 
         let result = cc
@@ -5424,8 +5448,14 @@ mod tests {
         ]));
         let granted: IpAddr = "fd5a:5052:8888::22".parse().unwrap();
         let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> = vec![
-            named_ts("addresses-a", &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::22")]),
-            named_ts("addresses-b", &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::22")]),
+            named_ts(
+                "addresses-a",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::22")],
+            ),
+            named_ts(
+                "addresses-b",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::22")],
+            ),
         ];
 
         let actor = cc
