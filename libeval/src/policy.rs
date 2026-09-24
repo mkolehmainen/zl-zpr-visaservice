@@ -197,6 +197,15 @@ impl Policy {
         matched_policies
     }
 
+    /// Test-only: append a join policy directly, bypassing the compiled policy
+    /// bytes. Lets eval tests exercise join-policy matching cases that no
+    /// checked-in fixture compiles to — e.g. a policy that matches on CN alone
+    /// with no `zpr.addr` pin (zipline#97).
+    #[cfg(test)]
+    pub(crate) fn push_join_policy(&mut self, jp: JPolicy) {
+        self.join_policies.push(jp);
+    }
+
     pub fn get_bootstrap_key_by_cn(&self, cn: &str) -> Option<PKey<Public>> {
         self.bootstrap_keys.get(cn).cloned()
     }
