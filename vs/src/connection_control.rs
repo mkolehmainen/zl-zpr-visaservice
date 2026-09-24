@@ -40,6 +40,7 @@ use crate::auth;
 use crate::config;
 use crate::error::ServiceError;
 use crate::logging::targets::CC;
+use crate::net_mgr;
 use crate::oidc::{NonceExpectation, OidcError, OidcTrustedService, validate_id_token};
 use crate::policy_mgr::PolicySnapshot;
 use crate::trusted_services::{TrustedServicesMgr, derive_user_authority, lookup_identities};
@@ -1236,7 +1237,57 @@ impl ConnectionControl {
         };
 
         if let Some(addr) = authd_actor.get_zpr_addr() {
-            info!(target: CC, "authorized connection of {actor_role:?} cn {} with ZPR addr {}", endpoint_cn, addr);
+            // A pre-set address is either STATIC -- a policy pin committed under a
+            // matched join policy (zipline#97) or, later, a trusted-service grant
+            // (zipline#99) -- or a VS-assigned address riding back through a
+            // re-authorization (session renewal per zipline#43, a node reconnect,
+            // the VS adapter's own connect). Who holds the address decides which
+            // (zipline#98):
+            //
+            // - Held by a live actor with the SAME CN as this endpoint (including
+            //   both having none, the OIDC-only renewal case): this endpoint is
+            //   re-authorizing its own live address. Accept it unchanged -- it
+            //   passed these checks (or was pool-assigned by us) when it was
+            //   first admitted.
+            // - Held by any other live actor: a collision. Rejected and logged,
+            //   never silently renumbered or overwritten.
+            // - Held by nobody: a fresh static address. It must be inside the
+            //   ZPR range, not the visa service's own address (unless this IS
+            //   the visa service authorizing itself), and OUTSIDE both managed
+            //   pools -- static addresses live in a separate address space, so
+            //   the allocator can never double-allocate one and there is
+            //   nothing to reserve or undo.
+            let addr = *addr;
+            match asm.actor_mgr.get_actor_by_zpr_addr(&addr).await? {
+                Some(holder) if holder.get_cn() == authd_actor.get_cn() => {
+                    info!(target: CC, "re-authorizing {actor_role:?} cn {} at its live ZPR addr {}", endpoint_cn, addr);
+                }
+                Some(_) => {
+                    warn!(target: CC, "rejecting zpr address already held by a live actor, claimed by cn {}: {}", endpoint_cn, addr);
+                    return Err(ServiceError::AuthenticationFailed(format!(
+                        "zpr address already held by a live actor: {addr}"
+                    )));
+                }
+                None => {
+                    let is_vs_self = addr == asm.config.get_vs_addr()
+                        && authd_actor.get_cn() == Some(config::VS_CN);
+                    if !net_mgr::is_zpr_addr(&addr)
+                        || (addr == asm.config.get_vs_addr() && !is_vs_self)
+                    {
+                        warn!(target: CC, "rejecting static zpr address out of range for cn {}: {}", endpoint_cn, addr);
+                        return Err(ServiceError::AuthenticationFailed(format!(
+                            "static zpr address out of range: {addr}"
+                        )));
+                    }
+                    if asm.net_mgr.is_managed_address(&addr) {
+                        warn!(target: CC, "rejecting static zpr address inside a managed pool for cn {}: {}", endpoint_cn, addr);
+                        return Err(ServiceError::AuthenticationFailed(format!(
+                            "static zpr address inside a managed pool: {addr}"
+                        )));
+                    }
+                    info!(target: CC, "authorized connection of {actor_role:?} cn {} with ZPR addr {}", endpoint_cn, addr);
+                }
+            }
         } else {
             match asm.net_mgr.get_next_zpr_addr(&actor_role) {
                 Ok(addr) => {
