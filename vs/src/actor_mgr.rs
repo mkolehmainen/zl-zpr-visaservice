@@ -131,8 +131,13 @@ impl ActorMgr {
                 .await?;
             self.counters
                 .remove_node_info(actor.get_zpr_addr().unwrap());
+            // Replacing add: a node legitimately re-authenticates at its own
+            // live record (RSA-proven against the policy bootstrap key for its
+            // CN -- the occupied-address gate in authorize_connection already
+            // enforced this), so an existing record here is the node's own and
+            // is superseded, not evicted (PR #33 review, P2).
             self.actor_db
-                .add_actor(actor, policy_service_names, &self.counters)
+                .add_actor_replacing(actor, policy_service_names, &self.counters)
                 .await?;
         } else {
             // Is a reconnect...
@@ -281,6 +286,12 @@ impl ActorMgr {
     /// Hack: we use this to add the unauthenticated visa service adapter.
     /// We don't know what node it is attached to yet.
     ///
+    /// Replacing add: the VS re-authorizes itself at its own fixed address on
+    /// every startup, and a record from the previous run may still be
+    /// persisted — that record is the VS's own, superseded rather than
+    /// evicted (the occupied-address gate in authorize_connection admits only
+    /// the VS itself at this address; PR #33 review, P2).
+    ///
     /// See https://github.com/org-zpr/zpr-visaservice/issues/195
     pub async fn hack_add_adapter_no_node(
         &self,
@@ -293,7 +304,7 @@ impl ActorMgr {
             ));
         }
         self.actor_db
-            .add_actor(actor, policy_service_names, &self.counters)
+            .add_actor_replacing(actor, policy_service_names, &self.counters)
             .await?;
         Ok(())
     }

@@ -969,15 +969,20 @@ impl ConnectionControl {
         // evaluation denial is "login good, endpoint no longer admitted" and
         // surfaces as PolicyDenied so the caller can tell it from a
         // credential rejection; everything else keeps its classification.
+        // `renewal_of` carries the proven session address: this caller loaded
+        // the live actor at `zpr_addr` and re-validated its session blob
+        // above, which is what authorizes re-accepting an occupied address
+        // (PR #33 review, P1).
         let endpoint_cn = actor.get_cn().unwrap_or_default().to_string();
         let mut renewed = self
-            .authorize_connection(
+            .authorize_connection_impl(
                 asm.clone(),
                 &psnap,
                 &endpoint_cn,
                 Vec::new(),
                 authd_claims,
                 0,
+                Some(zpr_addr),
             )
             .await
             .map_err(Self::classify_reauth_policy_error)?;
@@ -1132,8 +1137,39 @@ impl ConnectionControl {
         psnap: &PolicySnapshot,
         endpoint_cn: &str,
         unauthd_claims: Vec<Attribute>,
+        authd_claims: Vec<Attribute>,
+        dock_interface: u8,
+    ) -> Result<Actor, ServiceError> {
+        self.authorize_connection_impl(
+            asm,
+            psnap,
+            endpoint_cn,
+            unauthd_claims,
+            authd_claims,
+            dock_interface,
+            None,
+        )
+        .await
+    }
+
+    /// As [Self::authorize_connection], but for the zipline#43 REAUTH path:
+    /// `renewal_of` names the live address whose session the caller has
+    /// already proven (blob re-validated, session anchors checked, actor
+    /// loaded from that address). Only [Self::reauthorize_actor] may pass
+    /// `Some` — it is what authorizes re-accepting an address that is
+    /// occupied by its own holder. A fresh connect never proves a session,
+    /// so it goes through [Self::authorize_connection] and gets `None`
+    /// (PR #33 review, P1).
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize_connection_impl(
+        &self,
+        asm: Arc<Assembly>,
+        psnap: &PolicySnapshot,
+        endpoint_cn: &str,
+        unauthd_claims: Vec<Attribute>,
         mut authd_claims: Vec<Attribute>,
         _dock_interface: u8,
+        renewal_of: Option<IpAddr>,
     ) -> Result<Actor, ServiceError> {
         // TODO: Check with our revocation tables.
         info!(target: CC, "authorize_connection - TODO: check revocation table");
@@ -1244,13 +1280,24 @@ impl ConnectionControl {
             // the VS adapter's own connect). Who holds the address decides which
             // (zipline#98):
             //
-            // - Held by a live actor with the SAME CN as this endpoint (including
-            //   both having none, the OIDC-only renewal case): this endpoint is
-            //   re-authorizing its own live address. Accept it unchanged -- it
-            //   passed these checks (or was pool-assigned by us) when it was
-            //   first admitted.
-            // - Held by any other live actor: a collision. Rejected and logged,
-            //   never silently renumbered or overwritten.
+            // - Held by a live actor: accepted ONLY under a proven
+            //   re-authorization or reconnect (PR #33 review, P1). CN equality
+            //   alone is NOT ownership -- the repository supports multiple
+            //   same-CN actors, and two CN-less OIDC actors both report `None`,
+            //   which must never count as a match. The proofs accepted:
+            //   - the caller proved this endpoint's session against the live
+            //     actor at exactly this address (`renewal_of`, the zipline#43
+            //     REAUTH path);
+            //   - a node reconnecting to its own live node record: node
+            //     identity is RSA-proven against the policy bootstrap key for
+            //     its CN, and a second holder of that key IS the node;
+            //   - the visa service re-authorizing itself at its own address
+            //     across a restart (CN authenticated by construction or
+            //     against the VS bootstrap key).
+            //   Anything else -- including a same-CN adapter -- is a collision:
+            //   rejected and logged, never silently renumbered or overwritten.
+            //   A rejected same-CN adapter reconnects once its stale record
+            //   expires or is disconnected; it must not evict it.
             // - Held by nobody: a fresh static address. It must be inside the
             //   ZPR range, not the visa service's own address (unless this IS
             //   the visa service authorizing itself), and OUTSIDE both managed
@@ -1259,8 +1306,23 @@ impl ConnectionControl {
             //   nothing to reserve or undo.
             let addr = *addr;
             match asm.actor_mgr.get_actor_by_zpr_addr(&addr).await? {
-                Some(holder) if holder.get_cn() == authd_actor.get_cn() => {
-                    info!(target: CC, "re-authorizing {actor_role:?} cn {} at its live ZPR addr {}", endpoint_cn, addr);
+                Some(_) if renewal_of == Some(addr) => {
+                    info!(target: CC, "re-authorizing {actor_role:?} cn {} at its live ZPR addr {} (proven session renewal)", endpoint_cn, addr);
+                }
+                Some(holder)
+                    if holder.is_node()
+                        && authd_actor.is_node()
+                        && holder.get_cn().is_some()
+                        && holder.get_cn() == authd_actor.get_cn() =>
+                {
+                    info!(target: CC, "re-authorizing node cn {} at its live ZPR addr {} (RSA-proven node reconnect)", endpoint_cn, addr);
+                }
+                Some(holder)
+                    if addr == asm.config.get_vs_addr()
+                        && holder.get_cn() == Some(config::VS_CN)
+                        && authd_actor.get_cn() == Some(config::VS_CN) =>
+                {
+                    info!(target: CC, "re-authorizing the visa service at its own ZPR addr {}", addr);
                 }
                 Some(_) => {
                     warn!(target: CC, "rejecting zpr address already held by a live actor, claimed by cn {}: {}", endpoint_cn, addr);

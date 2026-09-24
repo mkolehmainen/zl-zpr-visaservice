@@ -122,6 +122,11 @@ pub enum StoreError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// The ZPR address is already claimed by a live actor record and the
+    /// write was refused without touching it (PR #33 review, P2).
+    #[error("address occupied: {0}")]
+    AddressOccupied(String),
+
     #[error("serialization/deserialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
