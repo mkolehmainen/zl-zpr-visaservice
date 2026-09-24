@@ -1868,6 +1868,56 @@ mod tests {
         )
     }
 
+    /// As [make_policy_with_node_join_policy], but the join policy carries a
+    /// `zpr.addr eq <addr>` condition — the shape the compiler emits for a node's
+    /// `zpr_address` — so a matching requested address is committed under the pin
+    /// (zipline#97) and reaches the static-address checks (zipline#98).
+    fn make_policy_with_pinned_node_join(cn: &str, pubkey_der: &[u8], addr: &str) -> Vec<u8> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut policy_bldr = msg.init_root::<v1::policy::Builder>();
+            policy_bldr.set_created("2024-01-01T00:00:00Z");
+            policy_bldr.set_version(1);
+            policy_bldr.set_metadata("");
+            {
+                let mut keys = policy_bldr.reborrow().init_keys(1);
+                keys.reborrow().get(0).set_id(cn);
+                keys.reborrow()
+                    .get(0)
+                    .set_key_type(v1::KeyMaterialT::RsaPub);
+                keys.reborrow()
+                    .get(0)
+                    .init_key_allows(1)
+                    .set(0, v1::KeyAllowance::Bootstrap);
+                keys.reborrow().get(0).set_key_data(pubkey_der);
+            }
+            {
+                // Raw capnp for the `zpr.addr eq <addr>` condition: the
+                // policy_types::Attribute builder rejects the reserved `zpr.`
+                // domain, but the compiler emits exactly this expression for a
+                // node's `zpr_address` (node_link.rs).
+                let mut jps = policy_bldr.reborrow().init_join_policies(1);
+                let mut jp = jps.reborrow().get(0);
+                {
+                    let mut matches = jp.reborrow().init_match(1);
+                    let mut cond = matches.reborrow().get(0);
+                    cond.set_key(key::ZPR_ADDR);
+                    cond.set_op(v1::AttrOp::Eq);
+                    cond.init_value(1).set(0, addr);
+                }
+                jp.init_flags(1).set(0, v1::JoinFlag::Node);
+            }
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+        make_container_bytes(
+            config::POLICY_MIN_COMPILER_MAJOR,
+            config::POLICY_MIN_COMPILER_MINOR,
+            config::POLICY_MIN_COMPILER_PATCH,
+            &bytes,
+        )
+    }
+
     #[tokio::test]
     async fn authenticate_node_policy_denied() {
         // Test a valid node, but policy lacking a join policy for it.
@@ -4402,5 +4452,316 @@ mod tests {
             matches!(passthrough, ServiceError::Internal(_)),
             "non-eval errors must pass through unchanged"
         );
+    }
+
+    // ---- static-address checks at authorize time (zipline#98) ----
+    //
+    // A static (pre-set) `zpr.addr` on the approved actor — a policy pin committed
+    // under zipline#97, or later a trusted-service grant (zipline#99) — must be
+    // inside `fd5a:5052::/32`, not the visa service address, OUTSIDE both managed
+    // pools, and not held by a live actor. Static addresses live in a different
+    // address space from the pools, so an accepted one never touches the allocator.
+
+    /// Authenticated claims carrying a static ZPR address, as the RSA arm plus a
+    /// zipline#97 pin commit (or an A3 trusted-service grant) would produce.
+    fn static_addr_claims(cn: &str, addr: &str) -> Vec<Attribute> {
+        vec![
+            Attribute::builder(key::CN).value(cn),
+            Attribute::builder(key::ZPR_ADDR).value(addr),
+        ]
+    }
+
+    /// A static address inside the ADAPTER pool must be rejected — the pool could
+    /// hand the same address to someone else — and the pool must stay untouched:
+    /// nothing was taken, so taking it afterwards still succeeds.
+    #[tokio::test]
+    async fn static_addr_inside_adapter_pool_rejected_pool_untouched() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
+
+        let result = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "pinned.zpr",
+                Vec::new(),
+                static_addr_claims("pinned.zpr", "fd5a:5052:adda:1::42"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("managed pool")),
+            "in-pool static address must fail the pool check, got {result:?}"
+        );
+        // The rejection took nothing out of the pool.
+        assert!(
+            asm.net_mgr.take_zpr_addr(&addr).is_ok(),
+            "pool must be untouched by the rejection"
+        );
+    }
+
+    /// Same for the NODE pool, via an adapter-shaped claim set: the pool check is
+    /// on the address value, not the actor's role.
+    #[tokio::test]
+    async fn static_addr_inside_node_pool_rejected_pool_untouched() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:90de:1::42".parse().unwrap();
+
+        let result = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "pinned.zpr",
+                Vec::new(),
+                static_addr_claims("pinned.zpr", "fd5a:5052:90de:1::42"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("managed pool")),
+            "in-pool static address must fail the pool check, got {result:?}"
+        );
+        assert!(
+            asm.net_mgr.take_zpr_addr(&addr).is_ok(),
+            "pool must be untouched by the rejection"
+        );
+    }
+
+    /// A static address outside `fd5a:5052::/32` must be rejected. `fd00:1:2::1`
+    /// is the shape the old core integration tests used before P1 (zipline#96)
+    /// renumbered them.
+    #[tokio::test]
+    async fn static_addr_out_of_range_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "pinned.zpr",
+                Vec::new(),
+                static_addr_claims("pinned.zpr", "fd00:1:2::1"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("out of range")),
+            "out-of-range static address must fail the range check, got {result:?}"
+        );
+    }
+
+    /// An IPv4 static address is outside `fd5a:5052::/32` by construction, so the
+    /// range check rejects it even though it is inside a managed IPv4 pool.
+    #[tokio::test]
+    async fn static_addr_ipv4_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "pinned.zpr",
+                Vec::new(),
+                static_addr_claims("pinned.zpr", "10.128.0.5"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("out of range")),
+            "IPv4 static address must fail the range check, got {result:?}"
+        );
+    }
+
+    /// The visa service's own address is in range and outside both pools, so it
+    /// needs its own rejection: no peer may claim `fd5a:5052::1`.
+    #[tokio::test]
+    async fn static_addr_vs_address_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let result = cc
+            .authorize_connection(
+                asm,
+                &snap(policy, Vec::new()),
+                "impostor.zpr",
+                Vec::new(),
+                static_addr_claims("impostor.zpr", "fd5a:5052::1"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("out of range")),
+            "the VS address must be rejected as a static claim, got {result:?}"
+        );
+    }
+
+    /// A static address already held by a live actor is rejected — logged, never
+    /// overwritten — and the holder's record survives intact.
+    #[tokio::test]
+    async fn static_addr_held_by_live_actor_rejected_record_unchanged() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:8888::5".parse().unwrap();
+
+        // A live actor already holds the address.
+        let first =
+            crate::test_helpers::make_adapter_actor_defexp("fd5a:5052:8888::5", "first.zpr");
+        asm.actor_mgr
+            .hack_add_adapter_no_node(&first, &asm.policy_service_names())
+            .await
+            .expect("holder must persist");
+
+        let result = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "second.zpr",
+                Vec::new(),
+                static_addr_claims("second.zpr", "fd5a:5052:8888::5"),
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("held")),
+            "an address held by a live actor must be rejected, got {result:?}"
+        );
+        // The holder's record is unchanged.
+        let still = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .expect("the original actor record must survive");
+        assert_eq!(still.get_cn(), Some("first.zpr"));
+    }
+
+    /// The happy path: a static address in range, outside both pools, and unheld
+    /// is accepted, and no pool allocation happens for it.
+    #[tokio::test]
+    async fn static_addr_outside_pools_accepted_pool_untouched() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+        let addr: IpAddr = "fd5a:5052:8888::7".parse().unwrap();
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                "pinned.zpr",
+                Vec::new(),
+                static_addr_claims("pinned.zpr", "fd5a:5052:8888::7"),
+                0,
+            )
+            .await
+            .expect("a valid static address must authorize");
+
+        assert_eq!(actor.get_zpr_addr(), Some(&addr));
+        // Sanity: the accepted address is not pool-managed, so nothing to release.
+        assert!(!asm.net_mgr.is_managed_address(&addr));
+    }
+
+    /// The node path end to end: a join policy pinning an IN-POOL node address
+    /// (the compiler would emit this for an in-pool `zpr_address` in the .zplc)
+    /// is a join-time error, and the pool is untouched — this replaces the
+    /// in-pool reservation (`undo.took_zpr_addr`) that used to cover it.
+    #[tokio::test]
+    async fn authenticate_node_with_in_pool_pinned_address_rejected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        let pinned = "fd5a:5052:90de:1::9";
+        let addr: IpAddr = pinned.parse().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_pinned_node_join(
+                cn,
+                &pubkey_der,
+                pinned,
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+
+        let result = cc
+            .authenticate_node(
+                asm.clone(),
+                challenge,
+                timestamp,
+                cn,
+                &sig,
+                addr,
+                "127.0.0.1:1234".parse().unwrap(),
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("managed pool")),
+            "an in-pool node pin must be a join-time error, got {result:?}"
+        );
+        assert!(
+            asm.net_mgr.take_zpr_addr(&addr).is_ok(),
+            "pool must be untouched by the rejection"
+        );
+    }
+
+    /// The node path still accepts a pinned address outside the pools — the shape
+    /// every pinned node in the tree uses (e.g. `fd5a:5052:90de::1`, note the
+    /// missing `:1` — outside `fd5a:5052:90de:1::/64`).
+    #[tokio::test]
+    async fn authenticate_node_with_out_of_pool_pinned_address_accepted() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        let pinned = "fd5a:5052:90de::1";
+        let addr: IpAddr = pinned.parse().unwrap();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_pinned_node_join(
+                cn,
+                &pubkey_der,
+                pinned,
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+
+        let actor = cc
+            .authenticate_node(
+                asm,
+                challenge,
+                timestamp,
+                cn,
+                &sig,
+                addr,
+                "127.0.0.1:1234".parse().unwrap(),
+                None,
+            )
+            .await
+            .expect("an out-of-pool pinned node address must authenticate");
+
+        assert!(actor.is_node());
+        assert_eq!(actor.get_zpr_addr(), Some(&addr));
     }
 }
