@@ -1272,6 +1272,66 @@ impl ConnectionControl {
             Role::Adapter
         };
 
+        // zipline#99 (A3): a trusted service may grant the device's requested ZPR
+        // address by vending an authenticated `device.zpr_addr` attribute. Promote
+        // the grant to the requested `zpr.addr` HERE — before the pre-set-address
+        // checks below — so it flows through exactly the zipline#98 arms (in
+        // range, not the VS, outside the pools, unheld, proof arms) with no
+        // duplication. Only authenticated attributes reach the actor
+        // (approve_connection never commits self-asserted claims to it), so a
+        // peer cannot steer its own address by claiming a grant. `addr_source`
+        // tells the log/error lines below apart: a rejected pin reads "static",
+        // a rejected grant reads "granted" (operator answer on the plan, Q2).
+        let mut addr_source = "static";
+        let grant_values: Option<Vec<String>> = authd_actor
+            .get_attribute(key::DEVICE_ZPR_ADDR)
+            .map(|attr| attr.get_value().to_vec());
+        if let Some(values) = grant_values {
+            // A grant that cannot be understood is an operator error to surface
+            // loudly, never something to silently fall back to the pool on (plan
+            // Q1): a device the operator meant to place would quietly come up
+            // somewhere else.
+            let [value] = values.as_slice() else {
+                warn!(target: CC, "rejecting {} grant for cn {}: expected exactly one address, got {:?}", key::DEVICE_ZPR_ADDR, endpoint_cn, values);
+                return Err(ServiceError::AuthenticationFailed(format!(
+                    "{} grant must carry exactly one address, got {} values",
+                    key::DEVICE_ZPR_ADDR,
+                    values.len()
+                )));
+            };
+            let granted: IpAddr = value.parse().map_err(|_| {
+                warn!(target: CC, "rejecting {} grant for cn {}: not an IP address: '{}'", key::DEVICE_ZPR_ADDR, endpoint_cn, value);
+                ServiceError::AuthenticationFailed(format!(
+                    "{} grant is not an IP address: '{value}'",
+                    key::DEVICE_ZPR_ADDR
+                ))
+            })?;
+            match authd_actor.get_zpr_addr().copied() {
+                // Two sources both claim to own the address decision: a policy
+                // pin that survived the join (zipline#97) and a trusted-service
+                // grant that disagrees with it. That is an operator error, not a
+                // tiebreak to invent — reject naming both.
+                Some(pinned) if pinned != granted => {
+                    warn!(target: CC, "rejecting connection for cn {}: trusted-service grant {}={} disagrees with the pre-set zpr address {}", endpoint_cn, key::DEVICE_ZPR_ADDR, granted, pinned);
+                    return Err(ServiceError::AuthenticationFailed(format!(
+                        "trusted-service grant {}={granted} disagrees with the pre-set zpr address {pinned}",
+                        key::DEVICE_ZPR_ADDR
+                    )));
+                }
+                // The grant agrees with the pre-set address: redundant, not an
+                // error. The address keeps its original (static/pin) source.
+                Some(_) => {
+                    info!(target: CC, "trusted-service grant {}={} agrees with the pre-set zpr address for cn {}", key::DEVICE_ZPR_ADDR, granted, endpoint_cn);
+                }
+                None => {
+                    authd_actor
+                        .add_attribute(Attribute::builder(key::ZPR_ADDR).value(value.as_str()))?;
+                    addr_source = "granted";
+                    info!(target: CC, "honoring trusted-service grant of zpr address {} for cn {}", granted, endpoint_cn);
+                }
+            }
+        }
+
         if let Some(addr) = authd_actor.get_zpr_addr() {
             // A pre-set address is either STATIC -- a policy pin committed under a
             // matched join policy (zipline#97) or, later, a trusted-service grant
@@ -1325,9 +1385,9 @@ impl ConnectionControl {
                     info!(target: CC, "re-authorizing the visa service at its own ZPR addr {}", addr);
                 }
                 Some(_) => {
-                    warn!(target: CC, "rejecting zpr address already held by a live actor, claimed by cn {}: {}", endpoint_cn, addr);
+                    warn!(target: CC, "rejecting {addr_source} zpr address already held by a live actor, claimed by cn {}: {}", endpoint_cn, addr);
                     return Err(ServiceError::AuthenticationFailed(format!(
-                        "zpr address already held by a live actor: {addr}"
+                        "{addr_source} zpr address already held by a live actor: {addr}"
                     )));
                 }
                 None => {
@@ -1336,18 +1396,18 @@ impl ConnectionControl {
                     if !net_mgr::is_zpr_addr(&addr)
                         || (addr == asm.config.get_vs_addr() && !is_vs_self)
                     {
-                        warn!(target: CC, "rejecting static zpr address out of range for cn {}: {}", endpoint_cn, addr);
+                        warn!(target: CC, "rejecting {addr_source} zpr address out of range for cn {}: {}", endpoint_cn, addr);
                         return Err(ServiceError::AuthenticationFailed(format!(
-                            "static zpr address out of range: {addr}"
+                            "{addr_source} zpr address out of range: {addr}"
                         )));
                     }
                     if asm.net_mgr.is_managed_address(&addr) {
-                        warn!(target: CC, "rejecting static zpr address inside a managed pool for cn {}: {}", endpoint_cn, addr);
+                        warn!(target: CC, "rejecting {addr_source} zpr address inside a managed pool for cn {}: {}", endpoint_cn, addr);
                         return Err(ServiceError::AuthenticationFailed(format!(
-                            "static zpr address inside a managed pool: {addr}"
+                            "{addr_source} zpr address inside a managed pool: {addr}"
                         )));
                     }
-                    info!(target: CC, "authorized connection of {actor_role:?} cn {} with ZPR addr {}", endpoint_cn, addr);
+                    info!(target: CC, "authorized connection of {actor_role:?} cn {} with {addr_source} ZPR addr {}", endpoint_cn, addr);
                 }
             }
         } else {
