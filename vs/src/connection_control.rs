@@ -4730,8 +4730,9 @@ mod tests {
 
     /// The node path end to end: a join policy pinning an IN-POOL node address
     /// (the compiler would emit this for an in-pool `zpr_address` in the .zplc)
-    /// is a join-time error, and the pool is untouched — this replaces the
-    /// in-pool reservation (`undo.took_zpr_addr`) that used to cover it.
+    /// is a join-time error, and the pool is untouched. The static path never
+    /// reaches the node-path in-pool reservation (`undo.took_zpr_addr`), which
+    /// stays for pool-ALLOCATED addresses (see vsapi_worker.rs).
     #[tokio::test]
     async fn authenticate_node_with_in_pool_pinned_address_rejected() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
