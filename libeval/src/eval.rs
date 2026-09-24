@@ -235,11 +235,16 @@ impl EvalContext {
 
         // Query to see if the claims match any join policies.
         let matching_jps = self.policy.match_join_policies(&query_claims);
-        // If nothing matched, the unauth claims are unvalidated and must be
-        // scrubbed from the actor: otherwise a bootstrap-authenticated peer with
-        // no matching join policy could claim an arbitrary or already-used ZPR
+        // A matched join policy alone does not validate the requested address:
+        // the request is committed only when at least one MATCHED policy pins
+        // zpr.addr (carries a zpr.addr condition in its matches). A policy
+        // that matched on other keys says nothing about the address, and an
+        // unvalidated claim must be scrubbed: otherwise a bootstrap-
+        // authenticated peer could claim an arbitrary or already-used ZPR
         // address and overwrite/disconnect that actor.
-        let matched_join_policy = !matching_jps.is_empty();
+        let matched_addr_pin = matching_jps
+            .iter()
+            .any(|jp| jp.matches.iter().any(|m| m.key == key::ZPR_ADDR));
         debug!(
             target: EVAL,
             "found {} matching join policies",
@@ -247,7 +252,6 @@ impl EvalContext {
         );
 
         // Each policy may have flags and services.
-        // TODO: Currently we have no way to set a static addr from policy.
         let mut flags: EnumSet<JFlag> = EnumSet::new();
         let mut services = HashSet::new();
         for jp in matching_jps {
@@ -261,15 +265,15 @@ impl EvalContext {
 
         let mut actor = Actor::new();
 
-        // Always commit the authenticated claims. Commit the unauth claims only
-        // if a join policy matched; otherwise scrub them.
-        let final_claims: &[Attribute] = if matched_join_policy {
+        // Always commit the authenticated claims. Commit the unauth claims
+        // only if a matched join policy pins zpr.addr; otherwise scrub them.
+        let final_claims: &[Attribute] = if matched_addr_pin {
             &query_claims
         } else {
             if !unauth_claims.is_empty() {
                 warn!(
                     target: EVAL,
-                    "scrubbing {} unauthenticated claim(s) from actor: no matching join policy",
+                    "scrubbing {} unauthenticated claim(s) from actor: no matched join policy pins zpr.addr",
                     unauth_claims.len()
                 );
             }
