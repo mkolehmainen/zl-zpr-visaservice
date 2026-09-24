@@ -191,13 +191,15 @@ impl EvalContext {
     /// On success returns an actor object that will include additional attributes set from
     /// policy (eg, ROLE).
     ///
-    /// This does not set `zpr.addr` unless one is specified in policy (TODO).
-    ///
-    /// If the peer is requesting a specific ZPR address, then zpr.addr:<addr> should
-    /// be included in the `unauthenticated_claims`. Connection request will fail if the
-    /// policy specifies a different address for the actor.  Caller should scrub ZPR address
-    /// from unauthenticated_claims before calling this function if they do not want it
-    /// used in policy matching.
+    /// A requested ZPR address is a check, never a grant. If the peer requests a
+    /// specific address, `zpr.addr:<addr>` should be included in the
+    /// `unauthenticated_claims`; it is used for join-policy matching, but it is
+    /// committed to the returned actor only when at least one MATCHED join policy
+    /// pins `zpr.addr` — carries a `zpr.addr` condition in its match expressions.
+    /// A policy that matches on other keys alone does not validate the request:
+    /// the address is scrubbed and the caller allocates one from the pool. A
+    /// request that conflicts with a policy's pinned address simply fails to
+    /// match that policy.
     ///
     /// An actor that matches no join policy is still approved -- with its
     /// unauthenticated claims scrubbed -- because a join policy grants a role and

@@ -2886,8 +2886,8 @@ mod tests {
     /// zipline#50, negative: a peer-asserted `device.hostname` is an
     /// unauthenticated claim and must never reach the actor. Only the trusted
     /// service's value survives — the scrub in `approve_connection` commits
-    /// unauthenticated claims only for `zpr.addr` under a matching join policy,
-    /// never for arbitrary `device.*` keys.
+    /// unauthenticated claims only for `zpr.addr` under a matched join policy
+    /// that pins `zpr.addr`, never for arbitrary `device.*` keys.
     #[tokio::test]
     async fn peer_asserted_device_hostname_is_not_authenticated() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
