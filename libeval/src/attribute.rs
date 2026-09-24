@@ -41,6 +41,13 @@ pub mod key {
     /// "zpr.config_id"
     pub const CONFIG_ID: &str = "zpr.config_id";
 
+    /// A trusted-service grant of the connecting device's requested ZPR address
+    /// (zipline#99). `zpr.addr` remains the actor's committed address and the
+    /// peer's request; this attribute is the grant, honored only when it arrives
+    /// authenticated (TS-vouched) and only after it passes the same checks as a
+    /// static address (zipline#98).
+    pub const DEVICE_ZPR_ADDR: &str = "device.zpr_addr";
+
     /// AAA network in CIDR notation
     pub const AAA_NET: &str = "device.zpr.node.aaa_net";
 
