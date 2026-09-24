@@ -5026,7 +5026,10 @@ mod tests {
         ));
         let granted: IpAddr = "fd5a:5052:8888::10".parse().unwrap();
         let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> =
-            vec![named_ts("addresses", &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::10")])];
+            vec![named_ts(
+                "addresses",
+                &[(key::DEVICE_ZPR_ADDR, "fd5a:5052:8888::10")],
+            )];
 
         let actor = cc
             .authorize_connection(
