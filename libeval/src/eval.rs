@@ -1180,6 +1180,43 @@ mod test {
         }
     }
 
+    /// Join policy matching CN eq `cn` plus an arbitrary zpr.addr expression.
+    fn jp_cn_eq_with_addr_exp(cn: &str, op: AttrOp, values: &[&str]) -> JPolicy {
+        JPolicy {
+            matches: vec![
+                AttrExp {
+                    key: key::CN.to_string(),
+                    op: AttrOp::Eq,
+                    value: vec![cn.to_string()],
+                },
+                AttrExp {
+                    key: key::ZPR_ADDR.to_string(),
+                    op,
+                    value: values.iter().map(|v| v.to_string()).collect(),
+                },
+            ],
+            flags: EnumSet::new(),
+            services: None,
+        }
+    }
+
+    /// Approve a connection for `cn` requesting zpr.addr `addr` against a
+    /// single-join-policy Policy, returning the actor.
+    fn approve_with_policy(jp: JPolicy, cn: &str, addr: &str) -> Actor {
+        let mut pol = Policy::new_empty();
+        pol.push_join_policy(jp);
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let authenticated_claims = vec![Attribute::builder(key::CN).value(cn)];
+        let unauthenticated_claims = vec![Attribute::builder(key::ZPR_ADDR).value(addr)];
+
+        ctx.approve_connection(
+            Some(authenticated_claims.as_slice()),
+            Some(unauthenticated_claims.as_slice()),
+        )
+        .unwrap()
+    }
+
     // 1. A join policy that matches on CN alone (no zpr.addr condition) does
     //    not validate a requested address: the actor is approved but the
     //    address is scrubbed.
@@ -1286,6 +1323,67 @@ mod test {
             actor.get_zpr_addr(),
             Some(&"fd5a:5052:90de::7".parse::<IpAddr>().unwrap())
         );
+    }
+
+    // 4b. zipline#97 review P1 (PR #32): only an exact Eq expression pins.
+    //     A matched policy whose zpr.addr expression is NE cannot commit the
+    //     request: `zpr.addr NE X` matches (and thereby "validates") every
+    //     address except X, so the peer would be choosing its own address.
+    #[test]
+    fn test_addr_ne_expression_does_not_pin() {
+        setup();
+        let actor = approve_with_policy(
+            jp_cn_eq_with_addr_exp("ne.zpr.org", AttrOp::Ne, &["fd5a:5052:90de::1"]),
+            "ne.zpr.org",
+            "fd5a:5052:90de::2",
+        );
+        // The policy matched (::2 != ::1), so the actor is approved...
+        assert!(actor.has_attribute_named(key::CN));
+        // ...but NE does not pin an address: the request must be scrubbed.
+        assert!(actor.get_zpr_addr().is_none());
+    }
+
+    // 4c. A valueless HAS (`zpr.addr HAS ""`) only tests key presence: it
+    //     matches any requested address, so it must not count as a pin.
+    #[test]
+    fn test_addr_valueless_has_does_not_pin() {
+        setup();
+        let actor = approve_with_policy(
+            jp_cn_eq_with_addr_exp("has.zpr.org", AttrOp::Has, &[]),
+            "has.zpr.org",
+            "fd5a:5052:90de::3",
+        );
+        assert!(actor.has_attribute_named(key::CN));
+        assert!(actor.get_zpr_addr().is_none());
+    }
+
+    // 4d. A non-empty EXCLUDES matches every address outside the excluded
+    //     set, so it must not count as a pin either.
+    #[test]
+    fn test_addr_excludes_expression_does_not_pin() {
+        setup();
+        let actor = approve_with_policy(
+            jp_cn_eq_with_addr_exp("excl.zpr.org", AttrOp::Excludes, &["fd5a:5052:90de::1"]),
+            "excl.zpr.org",
+            "fd5a:5052:90de::4",
+        );
+        assert!(actor.has_attribute_named(key::CN));
+        assert!(actor.get_zpr_addr().is_none());
+    }
+
+    // 4e. Even HAS with a concrete value is conservative-rejected: for the
+    //     single-valued zpr.addr it behaves like Eq today, but HAS is subset
+    //     semantics, not exact equality — only Eq with a non-empty value pins.
+    #[test]
+    fn test_addr_has_with_value_does_not_pin() {
+        setup();
+        let actor = approve_with_policy(
+            jp_cn_eq_with_addr_exp("hasv.zpr.org", AttrOp::Has, &["fd5a:5052:90de::5"]),
+            "hasv.zpr.org",
+            "fd5a:5052:90de::5",
+        );
+        assert!(actor.has_attribute_named(key::CN));
+        assert!(actor.get_zpr_addr().is_none());
     }
 
     // 5. An unauthenticated `device.zpr_addr` claim never reaches the actor,
