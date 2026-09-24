@@ -941,6 +941,15 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                 );
             }
         };
+        // Release-on-failure for a pool-allocated address. After zipline#98 a
+        // STATIC (policy-pinned) node address can never be in-pool -- the
+        // authorize path rejects it -- so reaching here with a managed address
+        // means authorize_connection just allocated it from the node pool
+        // (the request was scrubbed or absent). If a later step fails, the
+        // undo returns that fresh allocation to the pool. The zipline#98 plan
+        // slated this branch for removal as dead; it is dead for static
+        // addresses but still live for pool-allocated ones, so it stays (see
+        // the note on the issue).
         if self.asm.net_mgr.is_managed_address(&node_zpr_addr) {
             undo.took_zpr_addr(&node_zpr_addr);
         }

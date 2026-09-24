@@ -233,17 +233,59 @@ impl ActorRepo {
     /// hostname claim colliding with one is rejected ("policy services win");
     /// passed as a parameter so this layer stays testable against `FakeDb`
     /// with no global state. Claim rejections are counted on `counters`.
+    ///
+    /// **The address claim is atomic and this NEVER evicts a live record**
+    /// (PR #33 review, P2): the ZPR address is claimed with an HSETNX before
+    /// anything is written, so of two concurrent writers racing for the same
+    /// address exactly one wins and the other gets
+    /// [StoreError::AddressOccupied] — the check-then-persist window in
+    /// `authorize_connection` cannot be exploited to silently replace the
+    /// earlier winner. A caller that legitimately re-adds an actor at its own
+    /// live address (node re-authentication, the VS's startup self-authorize
+    /// — both proven upstream by `authorize_connection`'s occupied-address
+    /// carve-outs) uses [Self::add_actor_replacing].
     pub async fn add_actor(
         &self,
         actor: &Actor,
         policy_service_names: &HashSet<String>,
         counters: &Counters,
     ) -> Result<(), StoreError> {
+        self.add_actor_with_mode(actor, policy_service_names, counters, false)
+            .await
+    }
+
+    /// As [Self::add_actor], but REPLACES any existing record at the address
+    /// (the pre-P2 behaviour). Only for callers whose right to the occupied
+    /// address was already proven by `authorize_connection`: a node
+    /// re-authenticating at its live record (RSA-proven against the policy
+    /// bootstrap key) and the visa service re-adding itself at startup.
+    pub async fn add_actor_replacing(
+        &self,
+        actor: &Actor,
+        policy_service_names: &HashSet<String>,
+        counters: &Counters,
+    ) -> Result<(), StoreError> {
+        self.add_actor_with_mode(actor, policy_service_names, counters, true)
+            .await
+    }
+
+    async fn add_actor_with_mode(
+        &self,
+        actor: &Actor,
+        policy_service_names: &HashSet<String>,
+        counters: &Counters,
+        replace: bool,
+    ) -> Result<(), StoreError> {
         match self
-            .try_add_actor(actor, policy_service_names, counters)
+            .try_add_actor(actor, policy_service_names, counters, replace)
             .await
         {
             Ok(_) => Ok(()),
+            // The address is held by a live actor and nothing was written:
+            // there is nothing to clean up, and cleaning up here would
+            // destroy the HOLDER's record — the exact eviction this error
+            // exists to prevent.
+            Err(e @ StoreError::AddressOccupied(_)) => Err(e),
             Err(e) => {
                 // Attempt to clean up after ourselves...
                 warn!(target: DB, "add_actor failed, attempting cleanup");
@@ -684,6 +726,7 @@ impl ActorRepo {
         actor: &Actor,
         policy_service_names: &HashSet<String>,
         counters: &Counters,
+        replace: bool,
     ) -> Result<(), StoreError> {
         let zpraddr = match actor.get_zpr_addr() {
             Some(addr) => addr.clone(),
@@ -694,14 +737,29 @@ impl ActorRepo {
             }
         };
 
-        self.clean_up(&zpraddr).await?;
-
         let zpraddr_str = zpraddr.to_string();
         let base_key = actor_key_for(&zpraddr);
         let attrs_key = attrs_key_for(&zpraddr);
         let services_key = actor_services_key_for(&zpraddr);
 
         let ts = gen_timestamp();
+
+        if replace {
+            // The caller proved its right to this address upstream; clear any
+            // existing record before writing, as add_actor always did.
+            self.clean_up(&zpraddr).await?;
+        } else {
+            // Atomically claim the address (PR #33 review, P2): HSETNX on the
+            // base record's ctime succeeds for exactly one writer. A `false`
+            // here means a live actor already holds the address — a lost race
+            // or an occupied-address claim that slipped past the authorize-time
+            // holder lookup — and the holder must not be evicted.
+            if !self.db.hset_nx(&base_key, "ctime", &ts).await? {
+                return Err(StoreError::AddressOccupied(format!(
+                    "zpr address already held by a live actor: {zpraddr}"
+                )));
+            }
+        }
 
         //
         // actor:<ZADDR>:attrs
@@ -945,6 +1003,41 @@ mod test {
         make_oidc_only_adapter_defexp,
     };
     use libeval::attribute::{ROLE_ADAPTER, ROLE_NODE, key};
+
+    /// P2 (PR #33 review): `add_actor` must never evict a live record at the
+    /// address. Two first-time connections racing for the same static address
+    /// both pass the async holder lookup (both see `None`); persistence must
+    /// therefore be an atomic claim that FAILS the later writer, not a
+    /// clean-up-and-replace that silently disconnects the earlier one.
+    #[tokio::test]
+    async fn test_add_actor_does_not_evict_live_record_at_same_address() {
+        let db = Arc::new(FakeDb::new());
+        let repo = ActorRepo::new(db);
+        let addr: IpAddr = "fd5a:5052:8888::21".parse().unwrap();
+        let first = make_adapter_actor_defexp("fd5a:5052:8888::21", "first.zpr");
+        let second = make_adapter_actor_defexp("fd5a:5052:8888::21", "second.zpr");
+
+        repo.add_actor(&first, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let result = repo
+            .add_actor(&second, &Default::default(), &Default::default())
+            .await;
+        assert!(
+            result.is_err(),
+            "the later writer must fail, not evict the live holder, got {result:?}"
+        );
+
+        // The failed add must not have destroyed the holder's record either
+        // (the add_actor error path cleans up after itself, and that cleanup
+        // must not fire for an occupied address).
+        let still = repo
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .expect("the first actor's record must survive the failed add");
+        assert_eq!(still.get_cn(), Some("first.zpr"));
+    }
 
     #[tokio::test]
     async fn test_add_and_get_actor_roundtrip() {
