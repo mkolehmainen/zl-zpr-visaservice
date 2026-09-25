@@ -270,9 +270,24 @@ impl ActorMgr {
             )));
         };
 
-        self.actor_db
-            .add_actor(actor, policy_service_names, &self.counters)
-            .await?;
+        // The visa service's own adapter re-adds itself at its fixed address,
+        // where its startup self-authorization (hack_add_adapter_no_node)
+        // already wrote a record: that record is the VS's own, so it is
+        // superseded rather than reported occupied (zipline#102). The
+        // occupied-address gate in authorize_connection admits only the
+        // authenticated VS at this address. Every other adapter keeps the
+        // non-evicting add (PR #33 review, P2).
+        let is_vs_self = actor.get_cn() == Some(config::VS_CN)
+            && *adapter_addr == IpAddr::V6(config::VS_ZPR_ADDR);
+        if is_vs_self {
+            self.actor_db
+                .add_actor_replacing(actor, policy_service_names, &self.counters)
+                .await?;
+        } else {
+            self.actor_db
+                .add_actor(actor, policy_service_names, &self.counters)
+                .await?;
+        }
         self.node_db
             .add_connected_adater(connected_to_node, adapter_addr)
             .await?;
@@ -800,6 +815,50 @@ mod test {
 
         let result = mgr.get_actor_by_zpr_addr(&addr).await.unwrap();
         assert!(result.is_none());
+    }
+
+    /// zipline#102: the VS adapter's real connect re-adds the visa service at
+    /// its own address, where its startup self-authorization already put a
+    /// record. That record is the VS's own and must be superseded, not reported
+    /// as an occupied address -- otherwise the VS can never finish connecting.
+    #[tokio::test]
+    async fn test_add_adapter_via_node_supersedes_vs_self_record() {
+        let mgr = make_mgr();
+        let vs_addr = IpAddr::V6(config::VS_ZPR_ADDR);
+        let node_addr: IpAddr = "fd5a:5052::4".parse().unwrap();
+        let vs_actor = make_adapter_actor_defexp(&vs_addr.to_string(), config::VS_CN);
+
+        mgr.hack_add_adapter_no_node(&vs_actor, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&vs_actor, &node_addr, &Default::default())
+            .await
+            .expect("the VS must be able to re-add itself at its own address");
+
+        let adapters = mgr
+            .get_adapters_connected_to_node(&node_addr)
+            .await
+            .unwrap();
+        assert!(adapters.contains(&vs_addr));
+    }
+
+    /// Any other adapter at an occupied address is still refused: the VS
+    /// carve-out must not reopen the eviction PR #33 (P2) closed.
+    #[tokio::test]
+    async fn test_add_adapter_via_node_occupied_address_rejected() {
+        let mgr = make_mgr();
+        let node_addr: IpAddr = "fd5a:5052::4".parse().unwrap();
+        let holder = make_adapter_actor_defexp("fd5a:5052:8888::5", "holder");
+        let intruder = make_adapter_actor_defexp("fd5a:5052:8888::5", "intruder");
+
+        mgr.add_adapter_via_node(&holder, &node_addr, &Default::default())
+            .await
+            .unwrap();
+        let result = mgr
+            .add_adapter_via_node(&intruder, &node_addr, &Default::default())
+            .await;
+
+        assert!(result.is_err(), "occupied address must be refused");
     }
 
     #[tokio::test]
