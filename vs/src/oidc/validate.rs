@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use jsonwebtoken as jwt;
 
 /// Everything the validator needs from policy for one provider. Built from
-/// `zpr::policy_types::OidcConfig` in C4; kept separate so this module has no
+/// `zpr::policy_types::OidcConfig` in zipline#10; kept separate so this module has no
 /// policy dependency.
 pub struct IdpParams<'a> {
     /// Expected `iss` claim, e.g. `https://accounts.google.com`.
@@ -58,7 +58,7 @@ pub struct ValidatedToken {
     /// The `iat` claim: when this token was minted. Anchors the renewal
     /// window of the dual-clock credential lifetime (zipline#42).
     pub iat: SystemTime,
-    /// The full validated claim set, for `returns_attributes` mapping (C4).
+    /// The full validated claim set, for `returns_attributes` mapping (zipline#10).
     pub raw_claims: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -90,7 +90,7 @@ pub enum OidcError {
     /// -> `ErrorCode::authError` (`hd`, `max_auth_age`)
     #[error("token rejected: {0}")]
     Rejected(String),
-    /// -> `invalidSignature` (after one JWKS refresh attempt in C3)
+    /// -> `invalidSignature` (after one JWKS refresh attempt in zipline#9)
     #[error("unknown key id {0}")]
     UnknownKid(String),
     /// -> `temporarilyUnavailable`
@@ -203,7 +203,7 @@ pub fn validate_id_token(
 
     // `email` is only trustworthy when the provider says it verified it. An
     // unverified email is also stripped from `raw_claims`, which feeds the
-    // `returns_attributes` mapping (C4) — otherwise the unverified value
+    // `returns_attributes` mapping (zipline#10) — otherwise the unverified value
     // would still be ingested through that path.
     let email_verified = claims
         .get("email_verified")
@@ -507,7 +507,7 @@ mod tests {
         assert!(matches!(err, OidcError::Signature(_)), "{err}");
     }
 
-    // zipline#43 (R3): under SessionBound the nonce equality — and only it —
+    // zipline#43: under SessionBound the nonce equality — and only it —
     // is skipped: a token whose nonce matches no fresh challenge (a refresh
     // grant SHOULD NOT carry a nonce, and one it does carry is the original
     // login nonce — never a fresh one; OIDC Core §12.2) validates,
@@ -589,7 +589,7 @@ mod tests {
     }
 
     // email_verified: false -> email removed from raw_claims too, so the
-    // returns_attributes mapping (C4) can never ingest an unverified email
+    // returns_attributes mapping (zipline#10) can never ingest an unverified email
     #[test]
     fn unverified_email_stripped_from_raw_claims() {
         let mut c = base_claims();

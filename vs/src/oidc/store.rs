@@ -2,7 +2,7 @@
 //!
 //! Unlike file/network trusted services an OIDC provider cannot be *queried*
 //! for an arbitrary identity: the claims arrive with the validated `id_token`.
-//! The connect path (C5) calls [`OidcTrustedService::admit`] after validation;
+//! The connect path (zipline#11) calls [`OidcTrustedService::admit`] after validation;
 //! [`crate::trusted_services::TrustedServiceInterface::get_attributes_for_actor`]
 //! then serves those cached claims, so the normal ts_mgr union/conflict/refresh
 //! machinery applies unchanged.
@@ -39,7 +39,7 @@ pub(crate) struct AdmittedEntry {
     pub expires: SystemTime,
 }
 
-/// One live actor session's dual-clock renewal anchors (zipline#43 R3),
+/// One live actor session's dual-clock renewal anchors (zipline#43),
 /// keyed by the actor's session id (its ZPR address): `auth_time` (fixed per
 /// login: the session ceiling) and `iat` (advances on refresh: the renewal
 /// window), plus the admitted subject and the admission expiry the anchors
@@ -66,7 +66,7 @@ pub struct OidcTrustedService {
     cfg: OidcConfig,
     /// `returns_attributes` mapping from claim names to ZPR attribute keys.
     mapper: AttributeMapper,
-    /// Cached signing keys for this provider (C3).
+    /// Cached signing keys for this provider (zipline#9).
     keys: Arc<KeySource>,
     /// Admitted claims, keyed by the provider's `sub`.
     admitted: DashMap<String, AdmittedEntry>,
@@ -107,9 +107,9 @@ impl OidcTrustedService {
         })
     }
 
-    /// The validator parameters for this provider (C2). `max_auth_age_seconds`
+    /// The validator parameters for this provider (zipline#8). `max_auth_age_seconds`
     /// of 0 means no freshness requirement.
-    #[allow(dead_code)] // consumed by the C5 connect path
+    #[allow(dead_code)] // consumed by the zipline#11 connect path
     pub fn params(&self) -> IdpParams<'_> {
         IdpParams {
             issuer: &self.cfg.issuer,
@@ -128,13 +128,13 @@ impl OidcTrustedService {
     /// Zipline#42.
     ///
     /// The `clock_skew` term is symmetric with acceptance (PR #18 review):
-    /// C2 validation accepts an `auth_time` up to `max_auth_age + clock_skew`
+    /// zipline#8 validation accepts an `auth_time` up to `max_auth_age + clock_skew`
     /// old, so without it the skew window would admit tokens whose ceiling is
     /// already in the past — a successful connect carrying an expired
     /// `user.zpr.authority` that policy then immediately denies. The addition
     /// is checked: an unrepresentably far ceiling bounds nothing, which is
     /// exactly what `None` means (and only a nonsense `auth_time` gets there).
-    #[allow(dead_code)] // consumed by the C5 connect path
+    #[allow(dead_code)] // consumed by the zipline#11 connect path
     pub fn session_ceiling(&self, auth_time: SystemTime) -> Option<SystemTime> {
         if self.cfg.max_auth_age_seconds == 0 {
             return None;
@@ -146,7 +146,7 @@ impl OidcTrustedService {
     }
 
     /// This provider's cached signing keys.
-    #[allow(dead_code)] // consumed by the C5 connect path
+    #[allow(dead_code)] // consumed by the zipline#11 connect path
     pub fn keys(&self) -> &KeySource {
         &self.keys
     }
@@ -159,7 +159,7 @@ impl OidcTrustedService {
     }
 
     /// How long admitted attributes live (`expiration_seconds` from policy).
-    #[allow(dead_code)] // consumed by the C5 connect path
+    #[allow(dead_code)] // consumed by the zipline#11 connect path
     pub fn lifetime(&self) -> Duration {
         Duration::from_secs(self.expiration_seconds as u64)
     }
@@ -171,7 +171,7 @@ impl OidcTrustedService {
     }
 
     /// The trusted-service id (e.g. `"google"`): the value stamped into
-    /// `user.zpr.authority` by the connect path (C5).
+    /// `user.zpr.authority` by the connect path (zipline#11).
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -240,7 +240,7 @@ impl OidcTrustedService {
 
     /// The ZPR key the `sub` claim maps to — the identity key admitted actors
     /// are looked up under. `None` when policy does not map `sub` at all (the
-    /// store then never matches an identity). The connect path (C5) uses this
+    /// store then never matches an identity). The connect path (zipline#11) uses this
     /// to push the mapped subject as the user identity anchor, so the
     /// trusted-service lookup can find the admission it just cached.
     pub(crate) fn mapped_sub_key(&self) -> Option<String> {
@@ -248,7 +248,7 @@ impl OidcTrustedService {
     }
 
     /// Record (or advance) the dual-clock renewal anchors for one live actor
-    /// session (zipline#43 R3, scoped per session — PR #19 review). The
+    /// session (zipline#43, scoped per session — PR #19 review). The
     /// session id is the actor's ZPR address: unique per live actor and
     /// stable across renewals, so two actors authenticated as the same
     /// provider account keep independent anchors. Expired records are swept
@@ -275,7 +275,7 @@ impl OidcTrustedService {
     }
 
     /// The recorded dual-clock anchors of one live actor session, or `None`
-    /// when this store never recorded that session (or it was swept). R3
+    /// when this store never recorded that session (or it was swept). zipline#43
     /// (zipline#43) reads these on re-admission to bind a refreshed token to
     /// the same login session: same `sub`, unchanged `auth_time`, strictly
     /// greater `iat`. In-memory only — after a VS restart there is no
@@ -435,7 +435,7 @@ mod tests {
     }
 
     /// A validated token for `sub`, carrying a verified email when given (an
-    /// unverified email never reaches `raw_claims` — the C2 validator strips it).
+    /// unverified email never reaches `raw_claims` — the zipline#8 validator strips it).
     fn make_token(sub: &str, email: Option<&str>) -> ValidatedToken {
         let mut raw_claims = serde_json::Map::new();
         raw_claims.insert("sub".to_string(), json!(sub));
@@ -657,7 +657,7 @@ mod tests {
         assert!(!entry.attrs.is_empty());
     }
 
-    /// R3 (zipline#43, per-session — PR #19 review): `session_anchors`
+    /// zipline#43 (per-session — PR #19 review): `session_anchors`
     /// returns what `record_session` recorded for that session id, `None`
     /// for an unknown session, and two sessions for the SAME subject keep
     /// independent anchors.
@@ -697,7 +697,7 @@ mod tests {
     }
 
     /// T3 (zipline#42): `session_ceiling` is `auth_time + max_auth_age_seconds
-    /// + clock_skew` (the skew term mirrors C2 acceptance, PR #18 review) and
+    /// + clock_skew` (the skew term mirrors zipline#8 acceptance, PR #18 review) and
     /// `None` when the knob is 0 (no ceiling: the session may renew forever).
     #[tokio::test]
     async fn test_session_ceiling_from_max_auth_age() {
@@ -722,7 +722,7 @@ mod tests {
     }
 
     /// zipline#42 review (PR #18): validation accepts an `auth_time` up to
-    /// `max_auth_age + clock_skew` old (C2 skew leeway), so the ceiling must
+    /// `max_auth_age + clock_skew` old (zipline#8 skew leeway), so the ceiling must
     /// carry the same allowance — an accepted token must never be stamped an
     /// already-expired `user.zpr.authority`. The worst accepted case
     /// (`auth_time` exactly `max_auth_age + clock_skew` old) yields a ceiling

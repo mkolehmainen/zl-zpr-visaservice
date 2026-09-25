@@ -6,7 +6,7 @@
 //! policy-designated CONNECT proxy so the visa service needs no direct
 //! internet route.
 //!
-//! Proxy resolution is the caller's job (C4, wired in zipline#19): when
+//! Proxy resolution is the caller's job (zipline#10, wired in zipline#19): when
 //! policy names a `jwks_proxy_service`, `PolicyMgr::build_state` builds a
 //! resolver that looks up the providing actor with
 //! `ActorRepo::get_zpr_addr_for_service` and pairs it with the port from the
@@ -329,7 +329,7 @@ pub(crate) mod test_support {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
 
-    /// The C2 fixture JWKS (kid "k1").
+    /// The zipline#8 fixture JWKS (kid "k1").
     pub(crate) fn seed_jwks_json() -> &'static str {
         include_str!("../../tests/data/oidc-test-jwks.json")
     }
@@ -478,7 +478,7 @@ pub(crate) mod test_support {
         (addr, client_cert)
     }
 
-    /// CONNECT-speaking stub proxy (written to be liftable for D5): records
+    /// CONNECT-speaking stub proxy (written to be liftable for zipline#16): records
     /// each connection's request line, answers `HTTP/1.1 200` to a CONNECT,
     /// then splices bytes to `upstream`. Anything that is not a CONNECT is
     /// recorded and dropped.

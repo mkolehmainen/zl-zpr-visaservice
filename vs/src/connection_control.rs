@@ -380,7 +380,7 @@ impl ConnectionControl {
                     ));
                 }
                 // A user login: validate the id_token offline against the declared
-                // provider and stamp the user authority (zipline#11, C5).
+                // provider and stamp the user authority (zipline#11).
                 AuthBlob::Oidc(oidc_blob) => self.authenticate_oidc_blob(&psnap, oidc_blob).await?,
             };
             if seen_namespaces.contains(&outcome.namespace) {
@@ -541,7 +541,7 @@ impl ConnectionControl {
         Ok(vec![Attribute::builder(key::CN).value(&ssb.cn)])
     }
 
-    /// Verify one OIDC auth blob (zipline#11, C5): resolve the declared provider by
+    /// Verify one OIDC auth blob (zipline#11): resolve the declared provider by
     /// the blob's issuer (a selector, not a trust input -- client_id and
     /// allowed_domains always come from policy), validate the `id_token` offline
     /// against the provider's cached JWKS, admit the mapped claims into the
@@ -550,7 +550,7 @@ impl ConnectionControl {
     /// The outcome carries the namespaced user authority plus the mapped subject:
     /// the authority names the vouching service and the subject anchors the
     /// trusted-service lookup in [Self::authorize_connection] that serves the
-    /// remaining mapped claims (C4). Token claims are never pushed directly.
+    /// remaining mapped claims (zipline#10). Token claims are never pushed directly.
     ///
     /// Failures are classified per the `ErrorCode` table in vs.capnp (zipline#3) and returned as
     /// [ServiceError::ApiResponse] so the real code and retry hint reach the wire.
@@ -588,7 +588,7 @@ impl ConnectionControl {
             result,
             Err(OidcError::UnknownKid(_)) | Err(OidcError::NoKeys)
         ) {
-            // Two cache states are recoverable by fetching (C3): UnknownKid
+            // Two cache states are recoverable by fetching (zipline#9): UnknownKid
             // (the provider rotated its signing keys) and NoKeys (policy
             // shipped an empty seed_jwks, so the very first login finds an
             // empty cache). Refresh once and retry once. Both triggers derive
@@ -610,7 +610,7 @@ impl ConnectionControl {
         let token = match result {
             Ok(token) => token,
             Err(err) => {
-                // The OidcError detail carries claim names, never values (C2), so
+                // The OidcError detail carries claim names, never values (zipline#8), so
                 // it is safe to log -- but not to send.
                 info!(target: CC, "OIDC token rejected for provider '{}': {err}", svc.id());
                 let api = match err {
@@ -675,7 +675,7 @@ impl ConnectionControl {
         })
     }
 
-    /// Renew one OIDC user authentication (zipline#43, R3): validate the
+    /// Renew one OIDC user authentication (zipline#43): validate the
     /// refreshed `id_token` with the nonce check replaced by session binding.
     /// A refresh-grant token SHOULD NOT carry a `nonce` claim, and one it
     /// does carry MUST equal the *original* login nonce (OIDC Core
@@ -756,7 +756,7 @@ impl ConnectionControl {
         let token = match result {
             Ok(token) => token,
             Err(err) => {
-                // The OidcError detail carries claim names, never values (C2),
+                // The OidcError detail carries claim names, never values (zipline#8),
                 // so it is safe to log -- but not to send.
                 info!(target: CC, "reauth token rejected for provider '{}': {err}", svc.id());
                 let api = match err {
@@ -2858,7 +2858,7 @@ mod tests {
         assert_eq!(asm.ts_mgr.stale_sources_for_actor(&adapter_addr).len(), 1);
     }
 
-    // ---- multi-blob authentication (zipline#7, C1) ----
+    // ---- multi-blob authentication (zipline#7) ----
 
     fn make_connect_request(blobs: Vec<AuthBlob>, cn: &str) -> ConnectRequest {
         ConnectRequest {
@@ -2885,7 +2885,7 @@ mod tests {
     }
 
     /// A syntactically-present OIDC blob naming an issuer no trusted service
-    /// declares. Under C5 this is a real validation failure (paramError), which
+    /// declares. Under zipline#11 this is a real validation failure (paramError), which
     /// keeps this fixture useful for the fail-closed property below.
     fn oidc_stub_blob() -> AuthBlob {
         AuthBlob::Oidc(zpr::vsapi_types::OidcBlob {
@@ -2998,7 +2998,7 @@ mod tests {
             ),
         );
 
-        // Authenticated: user identity only (as the C5 OIDC arm will produce).
+        // Authenticated: user identity only (as the zipline#11 OIDC arm will produce).
         let authd = vec![
             Attribute::builder(key::USER_AUTHORITY)
                 .expires_in(Duration::from_secs(600))
@@ -3199,7 +3199,7 @@ mod tests {
         );
     }
 
-    // ---- OIDC blob on the connect path (zipline#11, C5) ----
+    // ---- OIDC blob on the connect path (zipline#11) ----
 
     use crate::oidc::mint::{TEST_KID, test_rsa_pem, token as mint_token};
     use crate::test_helpers::{make_oidc_connect_policy, make_test_oidc_config};
@@ -3214,13 +3214,13 @@ mod tests {
     const OIDC_NONCE: &str = "test-nonce-1";
     /// The subject minted into the test tokens.
     const OIDC_SUB: &str = "test-sub-12345";
-    /// The claim -> ZPR attribute mappings the C5 test policies declare.
+    /// The claim -> ZPR attribute mappings the zipline#11 test policies declare.
     const OIDC_MAPPINGS: &[&str] = &[
         "sub -> user.oidc-subject",
         "email -> user.email",
         "hd -> user.domain",
     ];
-    /// `expiration_seconds` in the C5 test policies (12 h).
+    /// `expiration_seconds` in the zipline#11 test policies (12 h).
     const OIDC_LIFETIME_SECS: u32 = 43200;
 
     /// Unix seconds for "now" (the JWT library validates `exp` against real time).
@@ -3261,7 +3261,7 @@ mod tests {
         })
     }
 
-    /// Install the standard C5 OIDC policy (no bootstrap keys, join-any) on `asm`.
+    /// Install the standard zipline#11 OIDC policy (no bootstrap keys, join-any) on `asm`.
     async fn install_oidc_policy(asm: &Arc<Assembly>, oidc: OidcConfig) {
         asm.policy_mgr
             .update_policy_from_container_bytes(make_oidc_connect_policy(
@@ -3913,7 +3913,7 @@ mod tests {
         }
     }
 
-    /// zipline#24 (V1 gate, connect path): a valid OIDC login through `google` must
+    /// zipline#24 (connect-path gate): a valid OIDC login through `google` must
     /// leave `user.zpr.authority == "google"` on the actor even when a second,
     /// decorating trusted service (`happyfile`, a file store vending the tag
     /// `user.zpr.tag.lazy` for the mapped subject) also answers the connect-time
@@ -4028,7 +4028,7 @@ mod tests {
         );
     }
 
-    // ---- reauthorize: session-bound OIDC renewal (zipline#43, R3) ----
+    // ---- reauthorize: session-bound OIDC renewal (zipline#43) ----
 
     /// Unwrap any reauth failure into its wire-classified [ApiResponseError].
     fn api_err<T>(result: Result<T, ServiceError>) -> ApiResponseError {
@@ -4426,7 +4426,7 @@ mod tests {
 
     /// PR #19 review (P1): a claim the refreshed token no longer admits must
     /// not survive renewal. The fixture's connect admitted a verified email;
-    /// the renewal token's email is unverified (the C2 validator strips it),
+    /// the renewal token's email is unverified (the zipline#8 validator strips it),
     /// so the provider no longer vouches `user.email` — the stale
     /// source-stamped attribute must be dropped before policy evaluation,
     /// not carried into the renewed actor.
