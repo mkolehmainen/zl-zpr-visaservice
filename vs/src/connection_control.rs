@@ -1243,6 +1243,25 @@ impl ConnectionControl {
             }
         }
 
+        // zipline#102: the visa service's own address is fixed by configuration. It
+        // cannot come from a policy pin (zipline#98 rejects pinning it) and a peer's
+        // request is scrubbed unless pinned (zipline#97), so an endpoint whose
+        // AUTHENTICATED CN is the visa service's is assigned that address here, as
+        // an authenticated claim that approve_connection always commits. Only a
+        // validated blob (or the VS authorizing itself) promotes the CN into
+        // `authd_claims`, so a merely claimed `vs.zpr` gets nothing. The
+        // re-authorization and range arms below then treat it like any other
+        // pre-set address.
+        let authenticated_as_vs = authd_claims
+            .iter()
+            .any(|a| a.get_key() == key::CN && a.get_value().iter().any(|v| v == config::VS_CN));
+        let has_authd_addr = authd_claims.iter().any(|a| a.get_key() == key::ZPR_ADDR);
+        if authenticated_as_vs && !has_authd_addr {
+            authd_claims.push(
+                Attribute::builder(key::ZPR_ADDR).value(asm.config.get_vs_addr().to_string()),
+            );
+        }
+
         let ectx = EvalContext::new(psnap.policy_arc());
 
         // TODO: Need to go in to eval and fix the approve_connection logic w/respect to the ROLE claim.
@@ -4798,6 +4817,98 @@ mod tests {
             matches!(&result, Err(ServiceError::AuthenticationFailed(msg)) if msg.contains("out of range")),
             "the VS address must be rejected as a static claim, got {result:?}"
         );
+    }
+
+    // ---- the visa service's own address (zipline#102) ----
+    //
+    // The VS address is fixed by configuration: it is neither a policy pin (which
+    // zipline#98 forbids for `fd5a:5052::1`) nor a trusted-service grant. Since
+    // zipline#97 scrubs any unpinned request, the VS adapter's own connect must be
+    // given its address by authorize_connection itself, keyed on the
+    // AUTHENTICATED `vs.zpr` CN — never on a claimed one.
+
+    /// The unauthenticated `zpr.addr` request the adapter sends with `--zpr-addr`.
+    fn addr_request(addr: &str) -> Vec<Attribute> {
+        vec![Attribute::builder(key::ZPR_ADDR).value(addr)]
+    }
+
+    /// The VS adapter, authenticated as `vs.zpr` and requesting the VS address
+    /// under a policy that pins nothing, lands on the VS address. This is the
+    /// connect every netns integration test makes; before the fix the request was
+    /// scrubbed and the adapter came up on a pool address.
+    #[tokio::test]
+    async fn vs_adapter_requesting_vs_addr_gets_vs_addr() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                config::VS_CN,
+                addr_request("fd5a:5052::1"),
+                vec![Attribute::builder(key::CN).value(config::VS_CN)],
+                0,
+            )
+            .await
+            .expect("the VS adapter must be authorized");
+
+        assert_eq!(actor.get_zpr_addr(), Some(&asm.config.get_vs_addr()));
+    }
+
+    /// The VS address does not depend on the adapter asking for it: an
+    /// authenticated `vs.zpr` with no request still lands on the VS address.
+    #[tokio::test]
+    async fn vs_adapter_without_request_gets_vs_addr() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let actor = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                config::VS_CN,
+                Vec::new(),
+                vec![Attribute::builder(key::CN).value(config::VS_CN)],
+                0,
+            )
+            .await
+            .expect("the VS adapter must be authorized");
+
+        assert_eq!(actor.get_zpr_addr(), Some(&asm.config.get_vs_addr()));
+    }
+
+    /// A peer that only CLAIMS the `vs.zpr` CN (no validated blob promoted it to
+    /// an authenticated claim) must not be given the VS address, whatever it
+    /// requests.
+    #[tokio::test]
+    async fn claimed_vs_cn_does_not_get_vs_addr() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cc = make_cc("test-vs");
+        let policy = asm.policy_mgr.get_current();
+
+        let mut unauthd = addr_request("fd5a:5052::1");
+        unauthd.push(Attribute::builder(key::CN).value(config::VS_CN));
+        let result = cc
+            .authorize_connection(
+                asm.clone(),
+                &snap(policy, Vec::new()),
+                config::VS_CN,
+                unauthd,
+                Vec::new(),
+                0,
+            )
+            .await;
+
+        if let Ok(actor) = result {
+            assert_ne!(
+                actor.get_zpr_addr(),
+                Some(&asm.config.get_vs_addr()),
+                "a claimed vs.zpr CN must not be given the VS address"
+            );
+        }
     }
 
     /// A static address already held by a live actor is rejected — logged, never
