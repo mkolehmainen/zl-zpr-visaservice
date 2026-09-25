@@ -90,7 +90,7 @@ pub enum ServiceError {
     /// An error already classified for the VSAPI wire by the layer that produced
     /// it: carries the exact `ErrorCode` and `retry_in` to send. The VSAPI worker
     /// writes these verbatim instead of flattening to a blanket `authError`
-    /// (zipline#11, Contract 2 error table). Messages must stay generic — no
+    /// (zipline#11; the `ErrorCode` table in vs.capnp). Messages must stay generic — no
     /// token claim values, issuer strings, or validation internals.
     #[error("{0}")]
     ApiResponse(#[from] ApiResponseError),

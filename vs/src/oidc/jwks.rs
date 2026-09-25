@@ -1,4 +1,4 @@
-//! JWKS key source for OIDC trusted services (OIDC master plan C3).
+//! JWKS key source for OIDC trusted services (zipline#9).
 //!
 //! Cached signing keys for one provider: seeded from policy (`seed_jwks`),
 //! refreshed periodically and on unknown `kid`, and never discarded on fetch

@@ -224,7 +224,7 @@ impl EvalContext {
     /// services, and an endpoint that gets neither can reach nothing anyway (#227).
     /// Authentication admits the endpoint; communication policy decides what it may
     /// do. This holds however the actor authenticated: it was briefly not true for
-    /// OIDC user logins (zipline#11 "Contract 2"), which is now reverted.
+    /// OIDC user logins (zipline#11), which is now reverted.
     pub fn approve_connection(
         &self,
         authenticated_claims: Option<&[Attribute]>,

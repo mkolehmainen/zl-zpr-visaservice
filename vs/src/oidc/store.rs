@@ -1,4 +1,4 @@
-//! The `api = "oidc"` trusted service (OIDC master plan C4).
+//! The `api = "oidc"` trusted service (zipline#10).
 //!
 //! Unlike file/network trusted services an OIDC provider cannot be *queried*
 //! for an arbitrary identity: the claims arrive with the validated `id_token`.

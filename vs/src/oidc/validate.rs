@@ -81,7 +81,7 @@ pub enum NonceExpectation<'a> {
 }
 
 /// Validation failures, partitioned by the `ErrorCode` they map to on the
-/// connect path (Contract 2 error table).
+/// connect path (the `ErrorCode` table in vs.capnp, zipline#3).
 #[derive(Debug, thiserror::Error)]
 pub enum OidcError {
     /// -> `ErrorCode::invalidSignature`

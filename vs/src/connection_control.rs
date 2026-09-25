@@ -111,7 +111,7 @@ impl OidcSessionRecord {
 /// `iat + lifetime` (advances on refresh), capped by the fixed per-login
 /// session ceiling (`auth_time + max_auth_age`; `None` = unbounded). The
 /// token's `exp` is reject-only at validation and plays no part here
-/// (Contract 7).
+/// (OIDC.md: the `<ns>.zpr.authority` invariant).
 pub(crate) fn compute_authority_expiry(
     iat: SystemTime,
     session_ceiling: Option<SystemTime>,
@@ -279,7 +279,8 @@ impl ConnectionControl {
             signature: challenge_response.to_vec(),
         };
 
-        // Built-in RSA verification is the device authority (Contract 7).
+        // Built-in RSA verification is the device authority
+        // (OIDC.md: the `<ns>.zpr.authority` invariant).
         authd_claims.push(
             Attribute::builder(key::DEVICE_AUTHORITY)
                 .expires_in(config::DEFAULT_AUTH_EXPIRATION)
@@ -354,7 +355,8 @@ impl ConnectionControl {
             let outcome = match blob {
                 AuthBlob::SS(ssb) => match ssb.alg {
                     ChallengeAlg::RsaSha256Pkcs1v15 => {
-                        // Built-in RSA verification is the device authority (Contract 7).
+                        // Built-in RSA verification is the device authority
+                        // (OIDC.md: the `<ns>.zpr.authority` invariant).
                         let mut authd = vec![
                             Attribute::builder(key::DEVICE_AUTHORITY)
                                 .expires_in(config::DEFAULT_AUTH_EXPIRATION)
@@ -550,7 +552,7 @@ impl ConnectionControl {
     /// trusted-service lookup in [Self::authorize_connection] that serves the
     /// remaining mapped claims (C4). Token claims are never pushed directly.
     ///
-    /// Failures are classified per the Contract 2 error table and returned as
+    /// Failures are classified per the `ErrorCode` table in vs.capnp (zipline#3) and returned as
     /// [ServiceError::ApiResponse] so the real code and retry hint reach the wire.
     /// Wire messages stay generic -- no claim values, no issuer echo, no
     /// validation internals -- so error responses cannot become a claim-probing
@@ -618,7 +620,7 @@ impl ConnectionControl {
                         config::OIDC_NO_KEYS_RETRY_SECS,
                     ),
                     // UnknownKid after the one refresh+retry is a signature-class
-                    // failure (Contract 2).
+                    // failure (`ErrorCode` in vs.capnp).
                     OidcError::Signature(_) | OidcError::UnknownKid(_) => {
                         ApiResponseError::new_code_msg(
                             ErrorCode::InvalidSignature,
@@ -641,7 +643,7 @@ impl ConnectionControl {
         // The ceiling is auth_time-anchored because the authentication event
         // is what policy bounds — refreshes must not extend it. The token's
         // `exp` was reject-only during validation and plays no part here
-        // (Contract 7).
+        // (OIDC.md: the `<ns>.zpr.authority` invariant).
         let expires = compute_authority_expiry(
             token.iat,
             svc.session_ceiling(token.auth_time),
@@ -684,7 +686,7 @@ impl ConnectionControl {
     /// `auth_time` (a different login session must reconnect). Every other
     /// validation check — signature, `iss`, `aud`, `exp`, `kid`, `alg`, `hd`,
     /// `email_verified` — runs exactly as on the connect path, including the
-    /// one JWKS refresh-and-retry and the Contract 2 error classification.
+    /// one JWKS refresh-and-retry and the `ErrorCode` classification (vs.capnp).
     ///
     /// Session-binding failures are a clean `AuthError` with the generic
     /// "authentication rejected" wire message — the node's cue to tear down
@@ -726,7 +728,7 @@ impl ConnectionControl {
         }
 
         // Validate under SessionBound: only the nonce equality is skipped —
-        // same JWKS refresh-and-retry and same Contract 2 classification as
+        // same JWKS refresh-and-retry and same `ErrorCode` classification as
         // the connect path.
         let now = SystemTime::now();
         let mut result = validate_id_token(
@@ -1278,7 +1280,7 @@ impl ConnectionControl {
 
         // The blob arms own the authority: register whichever namespaced authority
         // attributes the authentication path stamped as identity attributes, rather
-        // than adding a blanket one here (Contract 7).
+        // than adding a blanket one here (OIDC.md: the `<ns>.zpr.authority` invariant).
         for authority_key in [key::DEVICE_AUTHORITY, key::USER_AUTHORITY] {
             if authd_actor.get_attribute(authority_key).is_some() {
                 authd_actor.add_identity_key(usize::MAX, authority_key)?;
@@ -2212,7 +2214,8 @@ mod tests {
 
     /// The RSA-verified (bootstrap) path installs the namespaced device authority
     /// `device.zpr.authority = "zpr-bootstrap"` as an identity attribute, and no
-    /// legacy `zpr.authority` or `user.zpr.authority` attribute exists (Contract 7).
+    /// legacy `zpr.authority` or `user.zpr.authority` attribute exists
+    /// (OIDC.md: the `<ns>.zpr.authority` invariant).
     #[tokio::test]
     async fn test_rsa_path_installs_device_authority_bootstrap() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);

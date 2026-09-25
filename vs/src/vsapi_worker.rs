@@ -1266,7 +1266,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 warn!(target: API, "connection authorization failed for node {:?}: {}", connect_via, e);
                 let mut err_builder = results.get().init_resp().init_error();
                 // An error the auth path already classified for the wire carries its
-                // exact code and retry hint (zipline#11, Contract 2); everything else
+                // exact code and retry hint (zipline#11; `ErrorCode` in vs.capnp); everything else
                 // stays a blanket authError. Neither branch echoes internal detail.
                 match e {
                     ServiceError::ApiResponse(api) => {
