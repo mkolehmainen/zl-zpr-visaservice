@@ -25,9 +25,13 @@ pub const MAX_VISA_REQUEST_WORKERS: usize = 1024;
 pub const VISA_REQUEST_QUEUE_DEPTH: usize = 1024;
 pub const EVENT_QUEUE_DEPTH: usize = 1024;
 
-// We only load policy files built by this version or later.
+// We only load policy files built by exactly this minor version (and any
+// patch >= the minimum): pre-1.0, an advanced compiler minor means "probably
+// won't work with this visa service", so vs rejects it (zipline#114). This
+// constant therefore moves in lockstep with zplc's minor on every zplc minor
+// bump.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 19;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 20;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 0;
 
 /// Retry hint (seconds) sent with `temporarilyUnavailable` when an OIDC
