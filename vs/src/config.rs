@@ -25,9 +25,13 @@ pub const MAX_VISA_REQUEST_WORKERS: usize = 1024;
 pub const VISA_REQUEST_QUEUE_DEPTH: usize = 1024;
 pub const EVENT_QUEUE_DEPTH: usize = 1024;
 
-// We only load policy files built by this version or later.
+// We only load policy files built by exactly this minor version (and any
+// patch >= the minimum): pre-1.0, an advanced compiler minor means "probably
+// won't work with this visa service", so vs rejects it (zipline#114). This
+// constant therefore moves in lockstep with zplc's minor on every zplc minor
+// bump.
 pub const POLICY_MIN_COMPILER_MAJOR: u32 = 0;
-pub const POLICY_MIN_COMPILER_MINOR: u32 = 19;
+pub const POLICY_MIN_COMPILER_MINOR: u32 = 20;
 pub const POLICY_MIN_COMPILER_PATCH: u32 = 0;
 
 /// Retry hint (seconds) sent with `temporarilyUnavailable` when an OIDC
@@ -424,5 +428,50 @@ mod test {
         .unwrap();
         cfg.resolve_paths(std::path::Path::new("vs.toml").parent().unwrap());
         assert_eq!(cfg.core.admin_cert, PathBuf::from("cert.pem"));
+    }
+
+    // The shipped POLICY_MIN_VERSION must accept what the current zplc emits.
+    // check_version matches the minor version exactly (deliberate, zipline#114:
+    // an advanced minor means "probably won't work with this vs", so vs rejects
+    // it), which makes this constant the single thing that has to move in
+    // lockstep with the compiler's version — this test is what fails when zplc
+    // advances its minor and the constant is left behind.
+    #[test]
+    fn test_policy_min_version_accepts_current_compiler_output() {
+        // Minimal valid inner policy, same shape as test_helpers builders emit.
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut policy = msg.init_root::<zpr::policy::v1::policy::Builder>();
+            policy.set_created("2026-01-01T00:00:00Z");
+            policy.set_version(1);
+            policy.set_metadata("");
+        }
+        let mut inner = Vec::new();
+        capnp::serialize::write_message(&mut inner, &msg).unwrap();
+
+        // zplc at tip is 0.20.0: its containers must load.
+        let current = crate::test_helpers::make_container_bytes(0, 20, 0, &inner);
+        let loaded = libeval::pio::load_policy_from_container(
+            &bytes::Bytes::from(current),
+            &POLICY_MIN_VERSION,
+        );
+        assert!(
+            loaded.is_ok(),
+            "a 0.20.0-compiled policy container must load against POLICY_MIN_VERSION {}: {:?}",
+            POLICY_MIN_VERSION,
+            loaded.err()
+        );
+
+        // The previous minor must be rejected — exact-minor matching.
+        let previous = crate::test_helpers::make_container_bytes(0, 19, 3, &inner);
+        assert!(
+            libeval::pio::load_policy_from_container(
+                &bytes::Bytes::from(previous),
+                &POLICY_MIN_VERSION
+            )
+            .is_err(),
+            "a 0.19.x-compiled policy container must be rejected by POLICY_MIN_VERSION {} (exact-minor match)",
+            POLICY_MIN_VERSION
+        );
     }
 }
