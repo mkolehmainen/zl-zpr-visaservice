@@ -465,8 +465,11 @@ mod test {
         // The previous minor must be rejected — exact-minor matching.
         let previous = crate::test_helpers::make_container_bytes(0, 19, 3, &inner);
         assert!(
-            libeval::pio::load_policy_from_container(&bytes::Bytes::from(previous), &POLICY_MIN_VERSION)
-                .is_err(),
+            libeval::pio::load_policy_from_container(
+                &bytes::Bytes::from(previous),
+                &POLICY_MIN_VERSION
+            )
+            .is_err(),
             "a 0.19.x-compiled policy container must be rejected by POLICY_MIN_VERSION {} (exact-minor match)",
             POLICY_MIN_VERSION
         );
