@@ -204,6 +204,23 @@ impl VSHandleImpl {
         VSHandleImpl { asm, node }
     }
 
+    /// Capability-liveness gate (zipline#123, K2): a `VSHandleImpl` holds a
+    /// snapshot of the node actor, and capnp keeps the capability alive for as
+    /// long as the client holds it — so a node dropped by `cc.disconnect`
+    /// could keep using its old handle indefinitely. Every handler consults
+    /// this first: the stored actor must still exist at the handle's address
+    /// and still be a node. A dropped node gets `authRequired` and must
+    /// re-authenticate through `connect`.
+    async fn node_is_live(&self) -> bool {
+        let Some(addr) = self.node.get_zpr_addr() else {
+            return false;
+        };
+        matches!(
+            self.asm.actor_mgr.get_actor_by_zpr_addr(addr).await,
+            Ok(Some(actor)) if actor.is_node()
+        )
+    }
+
     /// Squash (but log) any errors.
     async fn update_last_seen_time(&self, node_addr: &IpAddr) {
         match self.asm.actor_mgr.update_node_last_seen(node_addr).await {
@@ -1126,6 +1143,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut res: vsapi::v_s_handle::RegisterVssResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "register_vss from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "register_vss from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = res.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
         let saddr_rdr = params.get()?.get_addr()?;
 
         let node_zpr_addr = self.node.get_zpr_addr().unwrap();
@@ -1223,14 +1251,31 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
 
         // As we return we kick off the vss worker for this node which will send config and list of services.
         // but will not work until visas are installed... So start it with small delay.
-        if let Err(e) = self.asm.vss_mgr.start_vss_worker(
-            self.asm.clone(),
-            &self.node.get_zpr_addr().unwrap(),
-            &saddr,
-            config::VSS_START_DELAY,
-        ) {
+        //
+        // A worker may already be running for this node — a reconnecting node
+        // re-registers its VSS while the previous session's worker is still
+        // around (zipline#123, K2). The node just restarted its listener, so
+        // the old worker's connection is dead: replace it rather than warn and
+        // leave the node without a live VSS channel.
+        let node_zpr_addr = self.node.get_zpr_addr().unwrap();
+        let start_result = if self.asm.vss_mgr.get_handle(node_zpr_addr).is_some() {
+            info!(target: API, "VSS worker already running for node {:?}; restarting it for the re-registered VSS", self.node.get_cn());
+            self.asm.vss_mgr.restart_vss_worker(
+                self.asm.clone(),
+                node_zpr_addr,
+                &saddr,
+                config::VSS_START_DELAY,
+            )
+        } else {
+            self.asm.vss_mgr.start_vss_worker(
+                self.asm.clone(),
+                node_zpr_addr,
+                &saddr,
+                config::VSS_START_DELAY,
+            )
+        };
+        if let Err(e) = start_result {
             warn!(target: API, "failed to start VSS worker for node {:?}: {}", self.node.get_cn(), e);
-            // TODO: handle the duplicate error here - if worker already running we are ok, I think.
         }
 
         Ok(())
@@ -1247,6 +1292,16 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut results: vsapi::v_s_handle::AuthorizeConnectResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "authorize_connect from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "authorize_connect from disconnected node {:?}: refused", self.node.get_cn());
+            let mut err_builder = results.get().init_resp().init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         let cr_rdr = params.get()?.get_req()?;
         let creq = ConnectRequest::try_from(cr_rdr).map_err(|e| {
@@ -1404,6 +1459,16 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut results: vsapi::v_s_handle::ReauthorizeResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "reauthorize from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "reauthorize from disconnected node {:?}: refused", self.node.get_cn());
+            let mut err_builder = results.get().init_resp().init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         let req = ReauthRequest::try_from(params.get()?.get_req()?)
             .map_err(|e| capnp::Error::failed(format!("failed to parse ReauthRequest: {}", e)))?;
@@ -1545,6 +1610,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut response: vsapi::v_s_handle::VisaRequestResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "visa_request from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "visa_request from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = response.get().init_resp();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         self.asm.counters.incr(CounterType::VsApiVisaRequests);
 
@@ -1599,6 +1675,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     ) -> Result<(), capnp::Error> {
         let node_cn = self.node.get_cn().unwrap_or("<unknown>");
         trace!(target: API, "ping from {node_cn}");
+        if !self.node_is_live().await {
+            warn!(target: API, "ping from disconnected node {node_cn}: refused");
+            let res_builder = results.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
         if let Some(addr) = self.node.get_zpr_addr() {
             self.update_last_seen_time(addr).await;
         }
@@ -1642,6 +1729,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut res: vsapi::v_s_handle::VisaIdsRequestResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "visa_ids_request from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "visa_ids_request from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = res.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         let requestor_addr = self
             .node
@@ -1684,6 +1782,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut res: vsapi::v_s_handle::VisaRequestByIdResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "visa_request_by_id from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "visa_request_by_id from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = res.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         let requestor_addr = self
             .node
@@ -2105,6 +2214,116 @@ mod tests {
             assert!(
                 asm.net_mgr.take_zpr_addr(&addr).is_ok(),
                 "zpr address should have been released"
+            );
+        }
+    }
+
+    // ---- K2 VS side (zipline#123) ----
+
+    mod k2_reconnect {
+        use super::*;
+        use crate::assembly::tests::new_assembly_for_tests;
+        use crate::test_helpers::{make_adapter_actor_defexp, make_node_actor_defexp};
+        use std::sync::Arc;
+        use zpr::vsapi::v1::DisconnectReason;
+
+        const NODE: &str = "fd5a:5052:3000::1";
+        const ADAPTER: &str = "fd5a:5052:4000::a";
+
+        /// A node's `Reconnect` re-approval must not disturb its docked
+        /// adapters (K2): `add_node(reconnect = true)` — the store update the
+        /// authenticate handler performs for `ctype=Reconnect` — updates the
+        /// stored node actor (here its `zpr.vinst`) while the adapter stays
+        /// connected to it.
+        #[tokio::test]
+        async fn test_reconnect_add_node_updates_vinst_and_keeps_adapters() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node_addr: std::net::IpAddr = NODE.parse().unwrap();
+
+            let mut node =
+                make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            node.add_attribute(Attribute::builder(key::VINST).value("1"))
+                .unwrap();
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            asm.actor_mgr
+                .add_adapter_via_node(
+                    &make_adapter_actor_defexp(ADAPTER, "adapter-k2"),
+                    &node_addr,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+
+            // The reconnect re-approval under the new snapshot: same node,
+            // fresh vinst stamp, updated in place.
+            let mut renewed =
+                make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            renewed
+                .add_attribute(Attribute::builder(key::VINST).value("2"))
+                .unwrap();
+            asm.actor_mgr
+                .add_node(&renewed, true, &Default::default())
+                .await
+                .unwrap();
+
+            let stored = asm
+                .actor_mgr
+                .get_actor_by_zpr_addr(&node_addr)
+                .await
+                .unwrap()
+                .expect("node must still exist after reconnect");
+            assert_eq!(
+                stored
+                    .get_attribute(key::VINST)
+                    .and_then(|a| a.get_single_value().ok().map(str::to_string)),
+                Some("2".to_string()),
+                "reconnect must stamp the new zpr.vinst"
+            );
+            let adapters = asm
+                .actor_mgr
+                .get_adapters_connected_to_node(&node_addr)
+                .await
+                .unwrap();
+            assert_eq!(
+                adapters,
+                vec![ADAPTER.parse::<std::net::IpAddr>().unwrap()],
+                "docked adapters must be untouched by the reconnect"
+            );
+        }
+
+        /// A node dropped by `cc.disconnect` is refused on its next VS-API
+        /// call (K2): the handle's liveness gate goes false, so every
+        /// `VSHandleImpl` method answers `authRequired` instead of serving
+        /// the stale capability.
+        #[tokio::test]
+        async fn test_disconnected_node_handle_is_refused() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node_addr: std::net::IpAddr = NODE.parse().unwrap();
+
+            let node = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+
+            // The handle the node held from its authenticate call.
+            let handle = VSHandleImpl::new(asm.clone(), node);
+            assert!(
+                handle.node_is_live().await,
+                "a connected node's handle must be live"
+            );
+
+            asm.cc
+                .disconnect(asm.clone(), node_addr, DisconnectReason::Admin)
+                .await
+                .unwrap();
+
+            assert!(
+                !handle.node_is_live().await,
+                "a disconnected node's handle must be refused"
             );
         }
     }

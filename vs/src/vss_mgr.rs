@@ -143,6 +143,30 @@ impl VssMgr {
         }
     }
 
+    /// Start a fresh VSS worker for the node, replacing any existing one
+    /// (zipline#123, K2): the running worker (if any) is told to stop and its
+    /// handle is overwritten immediately, so callers holding the old handle
+    /// fail fast with `ConnClosed` once the worker exits. Used by
+    /// `register_vss` when a reconnecting node re-registers its VSS while the
+    /// previous session's worker is still around — the node restarted its VSS
+    /// listener, so the old worker's connection is dead weight.
+    pub fn restart_vss_worker(
+        &self,
+        asm: Arc<Assembly>,
+        node_addr: &IpAddr,
+        vss_addr: &SocketAddr,
+        delay: std::time::Duration,
+    ) -> Result<(), VssSyncError> {
+        if let Some(old) = self.get_handle(node_addr) {
+            // Best-effort: a full channel or an already-dead worker both mean
+            // the worker is on its way out; the map overwrite below is what
+            // actually decommissions it.
+            let _ = old.cmd_tx.try_send(VssCmd::Stop());
+            self.workers.remove(node_addr);
+        }
+        self.start_vss_worker(asm, node_addr, vss_addr, delay)
+    }
+
     /// Obtain a handle to the VSS worker for the given node. Using the handle you can
     /// send VSS API messages.
     pub fn get_handle(&self, naddr: &IpAddr) -> Option<VssHandle> {
@@ -158,11 +182,17 @@ impl VssMgr {
     }
 
     /// Housekeeping function to remove (presumably stale/not-running) worker.
-    /// Called when the worker run loop exists.
+    /// Called when the worker run loop exits.
+    ///
+    /// Removes the entry only when its command channel is closed — i.e. it
+    /// still belongs to the exited worker. If [VssMgr::restart_vss_worker]
+    /// already replaced the entry with a live worker's handle, that handle is
+    /// left alone (zipline#123): the exiting worker must not tear down its
+    /// replacement.
     ///
     /// TODO: May need a way to alert the system when the VSS worker stops unexpectedly.
     fn clear_handle(&self, naddr: &IpAddr) {
-        self.workers.remove(naddr);
+        self.workers.remove_if(naddr, |_, h| h.cmd_tx.is_closed());
     }
 }
 
