@@ -2240,8 +2240,7 @@ mod tests {
             let asm = Arc::new(new_assembly_for_tests(None).await);
             let node_addr: std::net::IpAddr = NODE.parse().unwrap();
 
-            let mut node =
-                make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            let mut node = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
             node.add_attribute(Attribute::builder(key::VINST).value("1"))
                 .unwrap();
             asm.actor_mgr
@@ -2259,8 +2258,7 @@ mod tests {
 
             // The reconnect re-approval under the new snapshot: same node,
             // fresh vinst stamp, updated in place.
-            let mut renewed =
-                make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            let mut renewed = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
             renewed
                 .add_attribute(Attribute::builder(key::VINST).value("2"))
                 .unwrap();

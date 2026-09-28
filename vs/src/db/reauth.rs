@@ -82,9 +82,7 @@ impl ReauthRepo {
     /// Remove the obligation for `vinst` (satisfied or enforced). Removing an
     /// absent entry is a no-op.
     pub async fn remove_obligation(&self, vinst: u64) -> Result<(), StoreError> {
-        self.db
-            .hdel(KEY_REAUTH_PENDING, &vinst.to_string())
-            .await?;
+        self.db.hdel(KEY_REAUTH_PENDING, &vinst.to_string()).await?;
         Ok(())
     }
 }

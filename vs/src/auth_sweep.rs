@@ -204,7 +204,10 @@ pub(crate) async fn sweep_reauth_obligations(asm: &Arc<Assembly>) -> ReauthSweep
         // Overdue adapters, batched per docking node — skipping adapters whose
         // node was just disconnected (the cascade already removed them).
         let mut by_node: BTreeMap<IpAddr, Vec<IpAddr>> = BTreeMap::new();
-        for entry in entries.iter().filter(|e| !e.is_node && e.vinst < required_v) {
+        for entry in entries
+            .iter()
+            .filter(|e| !e.is_node && e.vinst < required_v)
+        {
             let Some(dock) = entry.dock else {
                 warn!(target: ACTOR, "reauth sweep: no docking node for stale adapter {}; deferring", entry.addr);
                 stats.deferred += 1;
@@ -1125,7 +1128,10 @@ mod tests {
             &[vec![adapter]],
             "the docking node must see the re-ask for the laggard"
         );
-        assert!(actor_exists(&asm, &adapter).await, "still inside the window");
+        assert!(
+            actor_exists(&asm, &adapter).await,
+            "still inside the window"
+        );
 
         // The deadline passes (rewrite the obligation into the past).
         record_obligation(&asm, 2, -5).await;
@@ -1205,7 +1211,10 @@ mod tests {
 
         let stats = sweep_reauth_obligations(&asm).await;
 
-        assert_eq!(stats.revoked, 1, "one node disconnect counts as one revocation");
+        assert_eq!(
+            stats.revoked, 1,
+            "one node disconnect counts as one revocation"
+        );
         assert!(
             actor_exists(&asm, &good_node).await,
             "the node that answered must be kept"
@@ -1241,7 +1250,11 @@ mod tests {
         let stats = sweep_reauth_obligations(&asm).await;
         assert_eq!(stats.revoked, 0);
         assert_eq!(stats.deferred, 1, "an Err ack must defer, not remove");
-        assert_eq!(revokes_err.lock().unwrap().len(), 1, "the revoke was attempted");
+        assert_eq!(
+            revokes_err.lock().unwrap().len(),
+            1,
+            "the revoke was attempted"
+        );
         assert!(
             actor_exists(&asm, &adapter).await,
             "actor must survive an unacked revoke"
@@ -1277,7 +1290,10 @@ mod tests {
         // restarted process would — enforces it.
         let (revokes, _) = install_fake_vss_with_requests(&asm, node, true);
         let stats = sweep_reauth_obligations(&asm).await;
-        assert_eq!(stats.revoked, 1, "the persisted obligation must be enforced");
+        assert_eq!(
+            stats.revoked, 1,
+            "the persisted obligation must be enforced"
+        );
         assert_eq!(revokes.lock().unwrap().as_slice(), &[vec![adapter]]);
         assert!(!actor_exists(&asm, &adapter).await);
     }
