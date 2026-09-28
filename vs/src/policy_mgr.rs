@@ -234,6 +234,19 @@ impl PolicySnapshot {
             .cloned()
     }
 
+    /// Whether this snapshot's policy declares an OIDC trusted service with
+    /// id `id`. The reauth exact-set check resolves whether an actor's
+    /// `user.zpr.authority` is credential-backed through this (PR #40 review,
+    /// Codex P1): an authority synthesized from trusted-service enrichment
+    /// names a file/BAS store, which no OIDC declaration matches, so no user
+    /// blob is demanded — or accepted — for it.
+    pub fn declares_oidc_service(&self, id: &str) -> bool {
+        self.0
+            .oidc_services
+            .iter()
+            .any(|service| service.id() == id)
+    }
+
     /// Build a snapshot directly from a policy and its stores, for unit tests
     /// that drive `authorize_connection` without a full policy install.
     #[cfg(test)]

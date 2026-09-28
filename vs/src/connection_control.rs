@@ -1088,25 +1088,38 @@ impl ConnectionControl {
             .into());
         }
 
-        // Exact-set rule (K3): the namespaces the blobs renew must equal the
-        // namespaces the live actor authenticated with — every authority is
+        // One coherent policy view for the whole renewal (PR #6 review):
+        // blob validation and re-authorization read this snapshot, so a
+        // concurrent policy update cannot admit a credential under one
+        // revision and authorize it under another. Read before the exact-set
+        // check below, which resolves credential-backedness against it.
+        let psnap = asm.policy_mgr.get_current_snapshot();
+
+        // Exact-set rule (K3), on CREDENTIAL-BACKED authorities only: the
+        // namespaces the blobs renew must equal the namespaces the actor
+        // holds a renewable credential arm for — every credential is
         // re-proved, none silently dropped, none invented. A subset or
-        // superset is a caller bug.
+        // superset is a caller bug. A `user.zpr.authority` synthesized from
+        // trusted-service enrichment ([derive_user_authority]) is excluded
+        // (PR #40 review, Codex P1): the device never presented an OIDC
+        // credential — the authority names a file/BAS store, not an OIDC
+        // provider — so demanding a user blob for it would make the actor's
+        // only valid renewal (its SS blob) permanently rejected after a
+        // policy update. Such authorities are recreated by re-enrichment
+        // once the credential-backed identity renews.
         let actor_has_device = actor.get_attribute(key::DEVICE_AUTHORITY).is_some();
-        let actor_has_user = actor.get_attribute(key::USER_AUTHORITY).is_some();
-        if ss_blob.is_some() != actor_has_device || oidc_blob.is_some() != actor_has_user {
+        let user_credential_backed = actor
+            .get_attribute(key::USER_AUTHORITY)
+            .and_then(|a| a.get_single_value().ok())
+            .is_some_and(|authority| psnap.declares_oidc_service(&authority));
+        if ss_blob.is_some() != actor_has_device || oidc_blob.is_some() != user_credential_backed {
             return Err(ApiResponseError::new_code_msg(
                 ErrorCode::ParamError,
-                "reauthorize blobs must cover exactly the actor's authenticated namespaces",
+                "reauthorize blobs must cover exactly the actor's credential-backed namespaces",
             )
             .into());
         }
 
-        // One coherent policy view for the whole renewal (PR #6 review):
-        // blob validation and re-authorization read this snapshot, so a
-        // concurrent policy update cannot admit a credential under one
-        // revision and authorize it under another.
-        let psnap = asm.policy_mgr.get_current_snapshot();
         let mut outcomes: Vec<BlobOutcome> = Vec::new();
         if let Some(ssb) = &ss_blob {
             outcomes.push(self.reauthenticate_ss_blob(&psnap, &actor, ssb)?);
@@ -4969,7 +4982,7 @@ mod tests {
         );
         assert_eq!(
             api.message,
-            "reauthorize blobs must cover exactly the actor's authenticated namespaces"
+            "reauthorize blobs must cover exactly the actor's credential-backed namespaces"
         );
     }
 
@@ -5244,6 +5257,92 @@ mod tests {
         );
     }
 
+    /// PR #40 review (Codex P1): a `user.zpr.authority` synthesized by
+    /// trusted-service enrichment ([derive_user_authority]) is NOT
+    /// credential-backed — the device never presented an OIDC credential, so
+    /// demanding a user blob for it makes the actor's only valid renewal
+    /// (its SS blob) a permanent `paramError` and strands it after a policy
+    /// update. The SS-only renewal must succeed; post-renewal enrichment is
+    /// what re-derives the authority.
+    #[tokio::test]
+    async fn test_reauthorize_actor_ss_only_with_ts_derived_user_authority() {
+        let cn = "enriched-adapter.zpr";
+        let (asm, cc, mut actor, connect_via, privkey, _pubkey_der) = ss_reauth_fixture(cn).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+
+        // What enrichment does when a file/BAS store vends a `user.*`
+        // attribute for this device: the vended attribute lands on the actor
+        // together with the derived authority (source = the store's id).
+        let vended = AttributeSource::new("happyfile")
+            .builder("user.zpr.tag.lazy")
+            .expires_in(Duration::from_secs(3600))
+            .value("");
+        let derived = derive_user_authority("happyfile", &[vended.clone()], None)
+            .expect("a vended user.* attribute derives the authority");
+        actor.add_attribute(vended).unwrap();
+        actor.add_attribute(derived).unwrap();
+        asm.actor_mgr
+            .update_actor(&actor, &asm.policy_service_names())
+            .await
+            .expect("enriched actor must persist");
+
+        // The only credential this actor can ever renew is its SS blob.
+        let renewed = cc
+            .reauthorize_actor(
+                asm,
+                addr,
+                vec![make_fresh_ss_blob(&privkey, cn)],
+                &connect_via,
+            )
+            .await
+            .expect("SS-only renewal must succeed for a TS-enriched actor");
+        assert_eq!(
+            renewed.get_zpr_addr(),
+            Some(&addr),
+            "reauth must never re-allocate the address"
+        );
+    }
+
+    /// PR #40 review (Codex P1), flip side: an OIDC blob offered for a
+    /// TS-derived authority is a set mismatch — no renewable credential arm
+    /// backs that authority, so the credential-backed namespace set is
+    /// {device} only and the user blob covers nothing. `paramError`, before
+    /// any credential is validated.
+    #[tokio::test]
+    async fn test_reauthorize_actor_oidc_blob_for_ts_derived_authority_param_error() {
+        let cn = "enriched-adapter2.zpr";
+        let (asm, cc, mut actor, connect_via, privkey, _pubkey_der) = ss_reauth_fixture(cn).await;
+        let addr = *actor.get_zpr_addr().unwrap();
+        let vended = AttributeSource::new("happyfile")
+            .builder("user.zpr.tag.lazy")
+            .expires_in(Duration::from_secs(3600))
+            .value("");
+        let derived = derive_user_authority("happyfile", &[vended.clone()], None)
+            .expect("a vended user.* attribute derives the authority");
+        actor.add_attribute(vended).unwrap();
+        actor.add_attribute(derived).unwrap();
+        asm.actor_mgr
+            .update_actor(&actor, &asm.policy_service_names())
+            .await
+            .expect("enriched actor must persist");
+
+        let iat1 = unix_now() - 120;
+        let blobs = vec![
+            make_fresh_ss_blob(&privkey, cn),
+            AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)))),
+        ];
+        let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &connect_via).await);
+        assert!(
+            matches!(api.code, ErrorCode::ParamError),
+            "unexpected code {:?}",
+            api.code
+        );
+        assert_eq!(
+            api.message,
+            "reauthorize blobs must cover exactly the actor's credential-backed namespaces"
+        );
+    }
+
     /// Contract K3: a duplicate namespace in the blob set is a caller bug —
     /// `paramError`, before any credential is validated.
     #[tokio::test]
@@ -5286,7 +5385,7 @@ mod tests {
         );
         assert_eq!(
             api.message,
-            "reauthorize blobs must cover exactly the actor's authenticated namespaces"
+            "reauthorize blobs must cover exactly the actor's credential-backed namespaces"
         );
     }
 
@@ -5311,7 +5410,7 @@ mod tests {
         );
         assert_eq!(
             api.message,
-            "reauthorize blobs must cover exactly the actor's authenticated namespaces"
+            "reauthorize blobs must cover exactly the actor's credential-backed namespaces"
         );
     }
 
