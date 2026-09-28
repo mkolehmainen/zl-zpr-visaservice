@@ -67,14 +67,20 @@ impl ActorMgr {
     /// When we start VS with state in the DB, we are primarily concerned about any nodes
     /// that were connected.
     ///
-    /// For each node we find in here we check to make sure that the node auth has not
-    /// expired.  Expired nodes are removed (along with any connected adapters).
+    /// For each node we find in here we check how long ago it was last seen. Nodes
+    /// last seen more than [config::DEFAULT_AUTH_EXPIRATION] ago are removed (along
+    /// with any connected adapters). Culling by last-seen age instead of
+    /// authentication expiry (zipline#119): bootstrap authentication no longer
+    /// expires, so an auth-expiry check would keep dead nodes forever; the 4 h
+    /// window this preserves is the same one the old auth-expiry check gave a
+    /// bootstrap node. A node with no recorded last-seen time is treated as stale
+    /// and removed — its record predates last-seen tracking or never carried one.
     ///
-    /// For non-expired nodes, we wipe their vss info.
+    /// For nodes seen recently enough, we wipe their vss info.
     pub async fn refresh_state(&self) -> Result<(), ServiceError> {
         for node_addr in &self.node_db.list_node_addrs().await? {
-            let node_actor = match self.actor_db.get_actor_by_zpr_addr(node_addr).await {
-                Ok(actor) => actor,
+            match self.actor_db.get_actor_by_zpr_addr(node_addr).await {
+                Ok(_actor) => {}
                 Err(StoreError::NotFound(_)) => {
                     debug!(target: ACTOR, "refresh_state: node at {} not found in actor DB, removing from node DB", node_addr);
                     self.remove_actor_by_zpr_addr(node_addr).await?;
@@ -83,12 +89,18 @@ impl ActorMgr {
                 Err(e) => return Err(ServiceError::from(e)),
             };
 
-            if let Some(exp) = node_actor.get_authentication_expiration() {
-                if exp < SystemTime::now() {
-                    info!(target: ACTOR, "refresh_state: node at {node_addr} has expired auth, removing");
-                    self.remove_actor_by_zpr_addr(node_addr).await?;
-                    continue;
-                }
+            let stale = match self.node_db.get_last_seen_time(node_addr).await? {
+                Some(last_seen) => match SystemTime::now().duration_since(last_seen) {
+                    Ok(age) => age > config::DEFAULT_AUTH_EXPIRATION,
+                    // A last-seen in the future is clock skew, not staleness.
+                    Err(_) => false,
+                },
+                None => true,
+            };
+            if stale {
+                info!(target: ACTOR, "refresh_state: node at {node_addr} last seen too long ago, removing");
+                self.remove_actor_by_zpr_addr(node_addr).await?;
+                continue;
             }
 
             if let Err(e) = self.node_db.clear_node_vss(node_addr).await {
@@ -732,6 +744,7 @@ mod test {
     use libeval::policy::Policy;
     use std::net::{IpAddr, SocketAddr};
     use std::sync::Arc;
+    use std::time::Duration;
     use zpr::policy::v1 as capnp_policy;
     use zpr::policy_types::{JoinPolicy, PFlags, Service};
     use zpr::write_to::WriteTo;
@@ -1584,6 +1597,152 @@ mod test {
         assert_eq!(
             mgr2.get_docking_node_for_actor(&adapter_actor),
             Some(node_addr)
+        );
+    }
+
+    /// Backdate a node's recorded last-seen time by writing the raw
+    /// `node:<ZADDR>:lastseen` key (same key `NodeRepo` uses; a ZADDR is the
+    /// IPv6 address with colons replaced by dashes), so the culling tests do
+    /// not need to sleep.
+    async fn backdate_last_seen(
+        db: &Arc<crate::db::FakeDb>,
+        addr: &IpAddr,
+        age: std::time::Duration,
+    ) {
+        use crate::db::DbConnection;
+        let ts = chrono::Utc::now() - chrono::Duration::from_std(age).unwrap();
+        db.set(
+            &format!("node:{}:lastseen", addr.to_string().replace(':', "-")),
+            &ts.to_rfc3339(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// refresh_state culls a node by LAST-SEEN age (zipline#119): a node last
+    /// seen longer than DEFAULT_AUTH_EXPIRATION ago is removed at startup even
+    /// though its (non-expiring) bootstrap authentication is still valid.
+    #[tokio::test]
+    async fn test_refresh_state_culls_node_last_seen_too_long_ago() {
+        let db = Arc::new(crate::db::FakeDb::new());
+        let mgr = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+
+        let node_addr: IpAddr = "fd5a:5052::46".parse().unwrap();
+        // Far-future authentication expiry: under the OLD auth-expiry rule
+        // this node would never be culled.
+        let mut node_actor =
+            make_node_actor_defexp("fd5a:5052::46", "node-stale", "[fd5a:5052::146]:1234");
+        node_actor
+            .add_attribute(
+                libeval::attribute::Attribute::builder(libeval::attribute::key::DEVICE_AUTHORITY)
+                    .expires_in(crate::config::VS_AUTH_EXPIRATION)
+                    .value(libeval::attribute::key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+
+        // Last seen just over the window ago.
+        backdate_last_seen(
+            &db,
+            &node_addr,
+            crate::config::DEFAULT_AUTH_EXPIRATION + Duration::from_secs(60),
+        )
+        .await;
+
+        mgr.refresh_state().await.unwrap();
+
+        assert!(
+            mgr.get_actor_by_zpr_addr(&node_addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "a node last seen more than DEFAULT_AUTH_EXPIRATION ago must be culled \
+             regardless of its authentication expiry"
+        );
+    }
+
+    /// refresh_state keeps a recently-seen node — even one whose recorded
+    /// authentication has already EXPIRED, which the old auth-expiry rule
+    /// would have removed. Last-seen age is the only startup culling input
+    /// (zipline#119).
+    #[tokio::test]
+    async fn test_refresh_state_keeps_recently_seen_node() {
+        let db = Arc::new(crate::db::FakeDb::new());
+        let mgr = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+
+        let node_addr: IpAddr = "fd5a:5052::47".parse().unwrap();
+        let mut node_actor =
+            make_node_actor_defexp("fd5a:5052::47", "node-recent", "[fd5a:5052::147]:1234");
+        node_actor
+            .add_attribute(
+                libeval::attribute::Attribute::builder(libeval::attribute::key::DEVICE_AUTHORITY)
+                    .expires_in(Duration::ZERO)
+                    .value(libeval::attribute::key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        // add_node records "now" as last seen; leave it in place.
+
+        mgr.refresh_state().await.unwrap();
+
+        assert!(
+            mgr.get_actor_by_zpr_addr(&node_addr)
+                .await
+                .unwrap()
+                .is_some(),
+            "a recently-seen node must survive refresh_state even with expired auth"
+        );
+    }
+
+    /// A node record with NO last-seen timestamp at all is treated as stale
+    /// and removed (zipline#119): it predates last-seen tracking or never
+    /// carried one, and non-expiring auth would otherwise keep it forever.
+    #[tokio::test]
+    async fn test_refresh_state_culls_node_without_last_seen() {
+        let db = Arc::new(crate::db::FakeDb::new());
+        let mgr = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+
+        let node_addr: IpAddr = "fd5a:5052::48".parse().unwrap();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::48", "node-nolastseen", "[fd5a:5052::148]:1234");
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        // Delete the last-seen key add_node just wrote.
+        {
+            use crate::db::DbConnection;
+            db.del(&format!(
+                "node:{}:lastseen",
+                node_addr.to_string().replace(':', "-")
+            ))
+            .await
+            .unwrap();
+        }
+
+        mgr.refresh_state().await.unwrap();
+
+        assert!(
+            mgr.get_actor_by_zpr_addr(&node_addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "a node with no recorded last-seen time must be treated as stale"
         );
     }
 }

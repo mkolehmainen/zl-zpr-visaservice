@@ -52,6 +52,33 @@ const CLASS_SERVICE: &str = "service";
 
 const ATTR_KEY_VS_IDENT: &str = "zpr.vs.bootstrap.ident";
 
+/// Expiration window for every bootstrap (RSA-verified) `device.zpr.authority`
+/// stamp (zipline#119): bootstrap authentication does not expire, so every
+/// bootstrap stamp gets the same far-future window the visa service's own
+/// self-authentication always got ([config::VS_AUTH_EXPIRATION]). A bootstrap
+/// key is policy state, not a session credential — removing the key from
+/// policy is the revocation path — and dead nodes are culled by last-seen age
+/// at startup (`actor_mgr::refresh_state`), not by authentication expiry.
+fn bootstrap_authority_expiration() -> Duration {
+    config::VS_AUTH_EXPIRATION
+}
+
+/// Expiration for the `zpr.vs.bootstrap.ident` identity token (zipline#119):
+/// the minimum of the actor's device/user authority expiries. The token is a
+/// proxy for those credentials, so it must never gate the actor's
+/// authentication window on its own — `get_authentication_expiration()` takes
+/// the minimum across authority AND identity attributes, and an ident stamped
+/// shorter than the authorities would cap the actor at its own lifetime.
+/// Falls back to [config::DEFAULT_AUTH_EXPIRATION] when the actor carries no
+/// authority attribute at all.
+fn vs_ident_expiration(actor: &Actor) -> SystemTime {
+    [key::DEVICE_AUTHORITY, key::USER_AUTHORITY]
+        .iter()
+        .filter_map(|k| actor.get_attribute(k).map(|a| a.get_expires()))
+        .min()
+        .unwrap_or_else(|| SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
+}
+
 /// Identity namespace one auth blob authenticates. A connection may present at most
 /// one blob per namespace (zipline#7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,10 +307,11 @@ impl ConnectionControl {
         };
 
         // Built-in RSA verification is the device authority
-        // (OIDC.md: the `<ns>.zpr.authority` invariant).
+        // (OIDC.md: the `<ns>.zpr.authority` invariant). Bootstrap
+        // authentication does not expire (zipline#119).
         authd_claims.push(
             Attribute::builder(key::DEVICE_AUTHORITY)
-                .expires_in(config::DEFAULT_AUTH_EXPIRATION)
+                .expires_in(bootstrap_authority_expiration())
                 .value(key::AUTHORITY_METHOD_BOOTSTRAP),
         );
 
@@ -357,9 +385,10 @@ impl ConnectionControl {
                     ChallengeAlg::RsaSha256Pkcs1v15 => {
                         // Built-in RSA verification is the device authority
                         // (OIDC.md: the `<ns>.zpr.authority` invariant).
+                        // Bootstrap authentication does not expire (zipline#119).
                         let mut authd = vec![
                             Attribute::builder(key::DEVICE_AUTHORITY)
-                                .expires_in(config::DEFAULT_AUTH_EXPIRATION)
+                                .expires_in(bootstrap_authority_expiration())
                                 .value(key::AUTHORITY_METHOD_BOOTSTRAP),
                         ];
                         authd.extend(self.authenticate_ss_blob(
@@ -417,19 +446,21 @@ impl ConnectionControl {
             }
         }
 
-        let auth_expiration = if endpoint_cn == config::VS_CN {
-            config::VS_AUTH_EXPIRATION
-        } else {
-            config::DEFAULT_AUTH_EXPIRATION
-        };
+        // The `zpr.vs.bootstrap.ident` token follows the actor's authority
+        // expiries (zipline#119): it is a proxy credential and must not gate
+        // the authentication window on its own.
+        let ident_expires = vs_ident_expiration(&actor);
+        let jwt_lifetime = ident_expires
+            .duration_since(SystemTime::now())
+            .unwrap_or(config::DEFAULT_AUTH_EXPIRATION);
         let actor_jwt = if actor.is_node() {
-            self.gen_jwt(format!("node/{}", endpoint_cn), auth_expiration)?
+            self.gen_jwt(format!("node/{}", endpoint_cn), jwt_lifetime)?
         } else {
-            self.gen_jwt(format!("adapter/{}", endpoint_cn), auth_expiration)?
+            self.gen_jwt(format!("adapter/{}", endpoint_cn), jwt_lifetime)?
         };
         let _ = actor.add_attribute(
             Attribute::builder(ATTR_KEY_VS_IDENT)
-                .expires(SystemTime::now() + auth_expiration)
+                .expires(ident_expires)
                 .value(actor_jwt),
         );
         let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
@@ -444,12 +475,13 @@ impl ConnectionControl {
                     actor.get_zpr_addr()
                 )));
             }
-            // The ordinary adapter path already stamped DEVICE_AUTHORITY with the default
-            // (4 hour) expiration; re-add it with the VS expiration so the VS does not
-            // expire itself.
+            // The ordinary adapter path already stamped DEVICE_AUTHORITY with the
+            // bootstrap expiration; re-add it so the (single-valued) attribute is
+            // not duplicated. Both stamps share bootstrap_authority_expiration()
+            // since zipline#119.
             actor.add_attribute(
                 Attribute::builder(key::DEVICE_AUTHORITY)
-                    .expires_in(config::VS_AUTH_EXPIRATION)
+                    .expires_in(bootstrap_authority_expiration())
                     .value(key::AUTHORITY_METHOD_BOOTSTRAP),
             )?;
         }
@@ -465,9 +497,10 @@ impl ConnectionControl {
         let mut authd_claims = Vec::new();
 
         // The VS authenticates itself by construction; that is the device authority.
+        // Bootstrap authentication does not expire (zipline#119).
         authd_claims.push(
             Attribute::builder(key::DEVICE_AUTHORITY)
-                .expires_in(config::VS_AUTH_EXPIRATION)
+                .expires_in(bootstrap_authority_expiration())
                 .value(key::AUTHORITY_METHOD_BOOTSTRAP),
         );
         // The VS authorizes itself: its own CN is authenticated by construction, so it
@@ -999,19 +1032,20 @@ impl ConnectionControl {
         // connect; re-registered as the first identity key, exactly as
         // connect does.
         if renewed.get_attribute(ATTR_KEY_VS_IDENT).is_some() {
-            let auth_expiration = if endpoint_cn == config::VS_CN {
-                config::VS_AUTH_EXPIRATION
-            } else {
-                config::DEFAULT_AUTH_EXPIRATION
-            };
+            // The token follows the renewed actor's authority expiries
+            // (zipline#119) — same minting rule as connect.
+            let ident_expires = vs_ident_expiration(&renewed);
+            let jwt_lifetime = ident_expires
+                .duration_since(SystemTime::now())
+                .unwrap_or(config::DEFAULT_AUTH_EXPIRATION);
             let actor_jwt = if renewed.is_node() {
-                self.gen_jwt(format!("node/{}", endpoint_cn), auth_expiration)?
+                self.gen_jwt(format!("node/{}", endpoint_cn), jwt_lifetime)?
             } else {
-                self.gen_jwt(format!("adapter/{}", endpoint_cn), auth_expiration)?
+                self.gen_jwt(format!("adapter/{}", endpoint_cn), jwt_lifetime)?
             };
             let _ = renewed.add_attribute(
                 Attribute::builder(ATTR_KEY_VS_IDENT)
-                    .expires(SystemTime::now() + auth_expiration)
+                    .expires(ident_expires)
                     .value(actor_jwt),
             );
             let _ = renewed.add_identity_key(0, ATTR_KEY_VS_IDENT);
@@ -1093,19 +1127,20 @@ impl ConnectionControl {
 
         // The visa service's own token gets the VS expiration. A 4 hour token would expire its
         // own authentication and it would start denying its own visas.
-        let auth_expiration = if ssb.cn == config::VS_CN {
-            config::VS_AUTH_EXPIRATION
-        } else {
-            config::DEFAULT_AUTH_EXPIRATION
-        };
+        // The `zpr.vs.bootstrap.ident` token follows the actor's authority
+        // expiries (zipline#119) — same minting rule as connect.
+        let ident_expires = vs_ident_expiration(&actor);
+        let jwt_lifetime = ident_expires
+            .duration_since(SystemTime::now())
+            .unwrap_or(config::DEFAULT_AUTH_EXPIRATION);
         let actor_jwt = if actor.is_node() {
-            self.gen_jwt(format!("node/{}", ssb.cn), auth_expiration)?
+            self.gen_jwt(format!("node/{}", ssb.cn), jwt_lifetime)?
         } else {
-            self.gen_jwt(format!("adapter/{}", ssb.cn), auth_expiration)?
+            self.gen_jwt(format!("adapter/{}", ssb.cn), jwt_lifetime)?
         };
         let _ = actor.add_attribute(
             Attribute::builder(ATTR_KEY_VS_IDENT)
-                .expires(SystemTime::now() + auth_expiration)
+                .expires(ident_expires)
                 .value(actor_jwt),
         );
         let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
@@ -4550,6 +4585,178 @@ mod tests {
         let blob = oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)));
         let api = api_err(cc.reauthenticate_oidc_blob(&psnap, &actor, &blob).await);
         assert_auth_rejected(api);
+    }
+
+    /// zipline#119 bug test: an RSA+OIDC actor's authentication window after
+    /// an OIDC `reauthorize` must extend beyond connect +
+    /// `DEFAULT_AUTH_EXPIRATION`. Today it cannot: the claim-rebuild filter
+    /// (`reauthorize_actor`) passes `device.zpr.authority` through unchanged,
+    /// so the bootstrap stamp minted at connect with
+    /// `DEFAULT_AUTH_EXPIRATION` pins `get_authentication_expiration()` at
+    /// connect + 4 h no matter how often the user authority renews.
+    #[tokio::test]
+    async fn test_reauth_rsa_oidc_not_pinned_to_default_window() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                OIDC_MAPPINGS,
+                &["sub"],
+                make_test_oidc_config(),
+                &[(cn, &pubkey_der)],
+                &[],
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let connect_via: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let connect_time = SystemTime::now();
+        let iat1 = unix_now() - 120;
+        let mut claims = oidc_base_claims();
+        claims["iat"] = json!(iat1);
+        let req = make_connect_request(
+            vec![
+                make_valid_ss_blob(&privkey, cn),
+                oidc_blob(mint_signed(claims)),
+            ],
+            cn,
+        );
+        let actor = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &connect_via)
+            .await
+            .expect("RSA+OIDC connect must authorize");
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, &connect_via, &Default::default())
+            .await
+            .expect("fixture actor must persist");
+        let addr = *actor.get_zpr_addr().unwrap();
+
+        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
+            unix_now(),
+            iat1,
+        ))))];
+        let renewed = cc
+            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .await
+            .expect("reauthorize must succeed");
+
+        let exp = renewed
+            .get_authentication_expiration()
+            .expect("an authenticated actor must carry an expiration");
+        assert!(
+            exp > connect_time + config::DEFAULT_AUTH_EXPIRATION + Duration::from_secs(3600),
+            "an OIDC renewal must extend the actor's authentication window \
+             beyond connect + DEFAULT_AUTH_EXPIRATION; the bootstrap \
+             device-authority stamp must not pin it (zipline#119)"
+        );
+    }
+
+    /// zipline#119: an RSA-only (bootstrap) adapter's authentication never
+    /// expires — its device authority and its `zpr.vs.bootstrap.ident` are
+    /// both stamped far-future, so `get_authentication_expiration()` is
+    /// far in the future.
+    #[tokio::test]
+    async fn test_rsa_only_adapter_auth_expiration_far_future() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-adapter.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        // Bootstrap key + join-any policy WITHOUT the Node flag: the actor is
+        // an adapter.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                OIDC_MAPPINGS,
+                &["sub"],
+                make_test_oidc_config(),
+                &[(cn, &pubkey_der)],
+                &[],
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(vec![make_valid_ss_blob(&privkey, cn)], cn);
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("RSA-only connect must authorize");
+
+        assert!(!actor.is_node(), "fixture must yield an adapter");
+        let exp = actor
+            .get_authentication_expiration()
+            .expect("bootstrap actor must carry an expiration");
+        assert!(
+            exp > SystemTime::now() + Duration::from_secs(50 * 365 * 24 * 60 * 60),
+            "bootstrap authentication must be far-future (zipline#119)"
+        );
+    }
+
+    /// zipline#119: an OIDC-only actor's lifetimes are UNCHANGED — its
+    /// authentication expiration stays within the provider's session window,
+    /// nowhere near the bootstrap far-future stamp.
+    #[tokio::test]
+    async fn test_oidc_only_auth_expiration_unchanged() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(vec![oidc_blob(mint_signed(oidc_base_claims()))], "some.cn");
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("OIDC-only connect must authorize");
+
+        let exp = actor
+            .get_authentication_expiration()
+            .expect("OIDC actor must carry an expiration");
+        assert!(
+            exp <= SystemTime::now() + Duration::from_secs(OIDC_LIFETIME_SECS as u64 + 60),
+            "an OIDC-only actor's window must stay within the provider session \
+             lifetime — zipline#119 must not extend OIDC"
+        );
+    }
+
+    /// zipline#119: a node authenticated over the bootstrap path gets a
+    /// far-future authentication expiration.
+    #[tokio::test]
+    async fn test_node_bootstrap_auth_expiration_far_future() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+
+        let actor = cc
+            .authenticate_node(
+                asm,
+                challenge,
+                timestamp,
+                cn,
+                &sig,
+                "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
+                None,
+            )
+            .await
+            .expect("node authentication should succeed");
+
+        let exp = actor
+            .get_authentication_expiration()
+            .expect("node must carry an expiration");
+        assert!(
+            exp > SystemTime::now() + Duration::from_secs(50 * 365 * 24 * 60 * 60),
+            "a bootstrap node's authentication must be far-future (zipline#119)"
+        );
     }
 
     /// A non-OIDC blob is a caller bug: `paramError` with explicit text, not
