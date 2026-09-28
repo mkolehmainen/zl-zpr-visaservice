@@ -4654,6 +4654,111 @@ mod tests {
         );
     }
 
+    /// zipline#119: an RSA-only (bootstrap) adapter's authentication never
+    /// expires — its device authority and its `zpr.vs.bootstrap.ident` are
+    /// both stamped far-future, so `get_authentication_expiration()` is
+    /// far in the future.
+    #[tokio::test]
+    async fn test_rsa_only_adapter_auth_expiration_far_future() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-adapter.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        // Bootstrap key + join-any policy WITHOUT the Node flag: the actor is
+        // an adapter.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                OIDC_MAPPINGS,
+                &["sub"],
+                make_test_oidc_config(),
+                &[(cn, &pubkey_der)],
+                &[],
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(vec![make_valid_ss_blob(&privkey, cn)], cn);
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("RSA-only connect must authorize");
+
+        assert!(!actor.is_node(), "fixture must yield an adapter");
+        let exp = actor
+            .get_authentication_expiration()
+            .expect("bootstrap actor must carry an expiration");
+        assert!(
+            exp > SystemTime::now() + Duration::from_secs(50 * 365 * 24 * 60 * 60),
+            "bootstrap authentication must be far-future (zipline#119)"
+        );
+    }
+
+    /// zipline#119: an OIDC-only actor's lifetimes are UNCHANGED — its
+    /// authentication expiration stays within the provider's session window,
+    /// nowhere near the bootstrap far-future stamp.
+    #[tokio::test]
+    async fn test_oidc_only_auth_expiration_unchanged() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        install_oidc_policy(&asm, make_test_oidc_config()).await;
+        let cc = make_cc("test-vs");
+        let req = make_connect_request(vec![oidc_blob(mint_signed(oidc_base_claims()))], "some.cn");
+
+        let actor = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("OIDC-only connect must authorize");
+
+        let exp = actor
+            .get_authentication_expiration()
+            .expect("OIDC actor must carry an expiration");
+        assert!(
+            exp <= SystemTime::now() + Duration::from_secs(OIDC_LIFETIME_SECS as u64 + 60),
+            "an OIDC-only actor's window must stay within the provider session \
+             lifetime — zipline#119 must not extend OIDC"
+        );
+    }
+
+    /// zipline#119: a node authenticated over the bootstrap path gets a
+    /// far-future authentication expiration.
+    #[tokio::test]
+    async fn test_node_bootstrap_auth_expiration_far_future() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+
+        let actor = cc
+            .authenticate_node(
+                asm,
+                challenge,
+                timestamp,
+                cn,
+                &sig,
+                "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
+                None,
+            )
+            .await
+            .expect("node authentication should succeed");
+
+        let exp = actor
+            .get_authentication_expiration()
+            .expect("node must carry an expiration");
+        assert!(
+            exp > SystemTime::now() + Duration::from_secs(50 * 365 * 24 * 60 * 60),
+            "a bootstrap node's authentication must be far-future (zipline#119)"
+        );
+    }
+
     /// A non-OIDC blob is a caller bug: `paramError` with explicit text, not
     /// the generic credential rejection (open question 3 / operator Q3).
     #[tokio::test]

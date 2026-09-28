@@ -1843,7 +1843,9 @@ mod tests {
     }
 
     /// A device-only actor (no user authority) gets its device-authority
-    /// expiry as authExpires.
+    /// expiry as authExpires. Since zipline#119 the bootstrap stamp is
+    /// far-future, so a bootstrap-only endpoint's authExpires is far-future
+    /// too — it never needs to schedule renewal.
     #[test]
     fn test_connect_auth_expires_device_only_uses_device_authority() {
         let mut actor = Actor::new();
@@ -1853,7 +1855,7 @@ mod tests {
         actor
             .add_attribute(
                 Attribute::builder(key::DEVICE_AUTHORITY)
-                    .expires_in(Duration::from_secs(3600))
+                    .expires_in(crate::config::VS_AUTH_EXPIRATION)
                     .value(key::AUTHORITY_METHOD_BOOTSTRAP),
             )
             .unwrap();
@@ -1863,6 +1865,8 @@ mod tests {
             .unwrap()
             .get_expires();
         assert_eq!(connect_auth_expires(&actor), device_expiry);
+        // Sanity: the bootstrap window really is far-future (zipline#119).
+        assert!(device_expiry > SystemTime::now() + Duration::from_secs(50 * 365 * 24 * 60 * 60));
     }
 
     /// With no authentication expiry at all, the helper falls back to the

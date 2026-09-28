@@ -415,6 +415,33 @@ mod tests {
         );
     }
 
+    /// zipline#119: an adapter whose device authority carries the far-future
+    /// bootstrap stamp is NEVER revoked by the sweep — bootstrap
+    /// authentication does not expire, so revocation is a policy change (key
+    /// removal), not a timer.
+    #[tokio::test]
+    async fn test_sweep_never_revokes_bootstrap_far_future_actor() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter: IpAddr = ADAPTER.parse().unwrap();
+        add_adapter_with_auth(&asm, ADAPTER, &node, config::VS_AUTH_EXPIRATION).await;
+        let seen = install_fake_vss(&asm, node, true);
+
+        let stats = sweep_expired_auths(&asm).await;
+
+        assert_eq!(stats.revoked, 0, "a bootstrap actor must never be revoked");
+        assert_eq!(stats.deferred, 0);
+        assert!(seen.lock().unwrap().is_empty(), "no revoke may be sent");
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&adapter)
+                .await
+                .unwrap()
+                .is_some(),
+            "the bootstrap actor must survive the sweep"
+        );
+    }
+
     /// An actor with no authentication expiration at all (no authority and no
     /// identity attributes) is skipped entirely.
     #[tokio::test]
