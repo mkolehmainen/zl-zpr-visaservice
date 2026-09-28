@@ -1529,6 +1529,22 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         req: vsapi::v_s_handle::NotifyDisconnectParams,
         mut resp: vsapi::v_s_handle::NotifyDisconnectResults,
     ) -> Result<(), capnp::Error> {
+        debug!(target: API, "notify_disconnect from {:?}", self.node.get_cn());
+        // Liveness gate BEFORE parsing or acting on the notice (PR #41 review,
+        // Codex P1): a node dropped by `cc.disconnect` retains its capnp
+        // capability, and without this gate that dead handle could still
+        // drive `cc.disconnect` for any address and remove live actor state.
+        if !self.node_is_live().await {
+            warn!(target: API, "notify_disconnect from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = resp.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
         let dnotice = req.get()?.get_req()?;
 
         // If no ZPR address is specified that means that the node itself is disconnecting.
@@ -2323,6 +2339,85 @@ mod tests {
                 !handle.node_is_live().await,
                 "a disconnected node's handle must be refused"
             );
+        }
+
+        /// PR #41 review (Codex P1, zipline#123): `notify_disconnect` must apply
+        /// the same liveness gate as every other `VSHandleImpl` handler. A node
+        /// dropped by `cc.disconnect` retains its capnp capability; without the
+        /// gate that dead handle can still submit a disconnect notice for any
+        /// address and remove live actor state.
+        #[tokio::test]
+        async fn test_disconnected_node_handle_notify_disconnect_refused() {
+            const VICTIM: &str = "fd5a:5052:3000::2";
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let asm = Arc::new(new_assembly_for_tests(None).await);
+                    let node_addr: std::net::IpAddr = NODE.parse().unwrap();
+                    let victim_addr: std::net::IpAddr = VICTIM.parse().unwrap();
+
+                    let node =
+                        make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+                    asm.actor_mgr
+                        .add_node(&node, false, &Default::default())
+                        .await
+                        .unwrap();
+                    // An independent second node: disconnecting the first must not
+                    // touch it, so any removal below is the dead handle's doing.
+                    asm.actor_mgr
+                        .add_node(
+                            &make_node_actor_defexp(
+                                VICTIM,
+                                "node-k2b",
+                                "[fd5a:5052:3000::102]:1234",
+                            ),
+                            false,
+                            &Default::default(),
+                        )
+                        .await
+                        .unwrap();
+
+                    // The capability the first node held from its authenticate call.
+                    let handle: vsapi::v_s_handle::Client =
+                        capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), node));
+
+                    // Drop the first node; its retained capability must go dead.
+                    asm.cc
+                        .disconnect(asm.clone(), node_addr, DisconnectReason::Admin)
+                        .await
+                        .unwrap();
+
+                    let mut req = handle.notify_disconnect_request();
+                    {
+                        let mut dnotice = req.get().init_req();
+                        let mut addr_bldr = dnotice.reborrow().init_zpr_addr();
+                        victim_addr.write_to(&mut addr_bldr);
+                        dnotice.set_reason_code(DisconnectReason::RemoteDisconnect);
+                    }
+                    let resp = req.send().promise.await.unwrap();
+                    let res = resp.get().unwrap().get_res().unwrap();
+                    match res.which().unwrap() {
+                        vsapi::ok_or_error::Which::Error(err) => {
+                            assert_eq!(
+                                err.unwrap().get_code().unwrap(),
+                                vsapi::ErrorCode::AuthRequired,
+                                "a revoked handle must be told to re-authenticate"
+                            );
+                        }
+                        vsapi::ok_or_error::Which::Ok(_) => {
+                            panic!("a revoked handle must not drive notify_disconnect")
+                        }
+                    }
+                    assert!(
+                        asm.actor_mgr
+                            .get_actor_by_zpr_addr(&victim_addr)
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "live actor state must survive a revoked handle's disconnect notice"
+                    );
+                })
+                .await;
         }
     }
 }
