@@ -4552,6 +4552,73 @@ mod tests {
         assert_auth_rejected(api);
     }
 
+    /// zipline#119 bug test: an RSA+OIDC actor's authentication window after
+    /// an OIDC `reauthorize` must extend beyond connect +
+    /// `DEFAULT_AUTH_EXPIRATION`. Today it cannot: the claim-rebuild filter
+    /// (`reauthorize_actor`) passes `device.zpr.authority` through unchanged,
+    /// so the bootstrap stamp minted at connect with
+    /// `DEFAULT_AUTH_EXPIRATION` pins `get_authentication_expiration()` at
+    /// connect + 4 h no matter how often the user authority renews.
+    #[tokio::test]
+    async fn test_reauth_rsa_oidc_not_pinned_to_default_window() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                OIDC_MAPPINGS,
+                &["sub"],
+                make_test_oidc_config(),
+                &[(cn, &pubkey_der)],
+                &[],
+            ))
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let connect_via: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let connect_time = SystemTime::now();
+        let iat1 = unix_now() - 120;
+        let mut claims = oidc_base_claims();
+        claims["iat"] = json!(iat1);
+        let req = make_connect_request(
+            vec![
+                make_valid_ss_blob(&privkey, cn),
+                oidc_blob(mint_signed(claims)),
+            ],
+            cn,
+        );
+        let actor = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &connect_via)
+            .await
+            .expect("RSA+OIDC connect must authorize");
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, &connect_via, &Default::default())
+            .await
+            .expect("fixture actor must persist");
+        let addr = *actor.get_zpr_addr().unwrap();
+
+        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
+            unix_now(),
+            iat1,
+        ))))];
+        let renewed = cc
+            .reauthorize_actor(asm, addr, blobs, &connect_via)
+            .await
+            .expect("reauthorize must succeed");
+
+        let exp = renewed
+            .get_authentication_expiration()
+            .expect("an authenticated actor must carry an expiration");
+        assert!(
+            exp > connect_time + config::DEFAULT_AUTH_EXPIRATION + Duration::from_secs(3600),
+            "an OIDC renewal must extend the actor's authentication window \
+             beyond connect + DEFAULT_AUTH_EXPIRATION; the bootstrap \
+             device-authority stamp must not pin it (zipline#119)"
+        );
+    }
+
     /// A non-OIDC blob is a caller bug: `paramError` with explicit text, not
     /// the generic credential rejection (open question 3 / operator Q3).
     #[tokio::test]
