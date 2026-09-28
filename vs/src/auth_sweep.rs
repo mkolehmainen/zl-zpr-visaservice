@@ -994,6 +994,7 @@ mod tests {
     // ---- policy-install reauth obligation sweep (zipline#123) ----
 
     use crate::db::{ReauthObligation, ReauthRepo};
+    use crate::test_helpers::make_node_actor_defexp;
     use std::time::SystemTime;
 
     /// Add an adapter docked at `node` with far-future bootstrap auth (so the
@@ -1074,5 +1075,210 @@ mod tests {
             !actor_exists(&asm, &adapter).await,
             "the actor must be gone after the deadline"
         );
+    }
+
+    /// An actor already re-authenticated under V is never revoked and never
+    /// re-asked, and the satisfied obligation is pruned from the store.
+    #[tokio::test]
+    async fn test_reauth_satisfied_actor_never_revoked_and_obligation_pruned() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter: IpAddr = ADAPTER.parse().unwrap();
+        add_adapter_with_vinst(&asm, ADAPTER, &node, 2).await;
+        record_obligation(&asm, 2, -5).await; // Overdue, but already satisfied.
+        let (revokes, requests) = install_fake_vss_with_requests(&asm, node, true);
+
+        let stats = sweep_reauth_obligations(&asm).await;
+
+        assert_eq!(stats.revoked, 0, "a satisfied actor must never be revoked");
+        assert_eq!(stats.pruned, 1, "the satisfied obligation must be pruned");
+        assert!(revokes.lock().unwrap().is_empty(), "no revoke may be sent");
+        assert!(requests.lock().unwrap().is_empty(), "no re-ask may be sent");
+        assert!(actor_exists(&asm, &adapter).await);
+        assert!(
+            ReauthRepo::new(asm.state_db.clone())
+                .list_obligations()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the obligation must be gone from the store"
+        );
+    }
+
+    /// A silent actor inside its window is re-asked (requestAuthentication),
+    /// not revoked; only once the deadline passes is it revoked.
+    #[tokio::test]
+    async fn test_reauth_silent_actor_revoked_after_deadline_not_before() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter: IpAddr = ADAPTER.parse().unwrap();
+        add_adapter_with_vinst(&asm, ADAPTER, &node, 1).await;
+        record_obligation(&asm, 2, 3600).await; // Deadline well in the future.
+        let (revokes, requests) = install_fake_vss_with_requests(&asm, node, true);
+
+        let stats = sweep_reauth_obligations(&asm).await;
+        assert_eq!(stats.revoked, 0, "inside the window no one is revoked");
+        assert_eq!(stats.requested, 1, "the laggard must be re-asked");
+        assert!(revokes.lock().unwrap().is_empty());
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[vec![adapter]],
+            "the docking node must see the re-ask for the laggard"
+        );
+        assert!(actor_exists(&asm, &adapter).await, "still inside the window");
+
+        // The deadline passes (rewrite the obligation into the past).
+        record_obligation(&asm, 2, -5).await;
+        let stats = sweep_reauth_obligations(&asm).await;
+        assert_eq!(stats.revoked, 1, "past the deadline the laggard is revoked");
+        assert!(!actor_exists(&asm, &adapter).await);
+    }
+
+    /// Two installs V2 then V3: re-authenticating under V3 (the newest)
+    /// satisfies both obligations, while a laggard still on V1 is revoked by
+    /// the earlier deadline.
+    #[tokio::test]
+    async fn test_reauth_newest_generation_satisfies_older_obligations() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let good: IpAddr = ADAPTER.parse().unwrap();
+        let laggard: IpAddr = "fd5a:5052:4000::b".parse().unwrap();
+        // `good` re-authenticated under the newest generation; `laggard` never did.
+        add_adapter_with_vinst(&asm, ADAPTER, &node, 3).await;
+        add_adapter_with_vinst(&asm, "fd5a:5052:4000::b", &node, 1).await;
+        // V2's deadline has passed; V3's is still open — the earliest unmet
+        // deadline (V2's) applies to the laggard anyway.
+        record_obligation(&asm, 2, -5).await;
+        record_obligation(&asm, 3, 3600).await;
+        let (revokes, _requests) = install_fake_vss_with_requests(&asm, node, true);
+
+        let stats = sweep_reauth_obligations(&asm).await;
+
+        assert_eq!(
+            stats.revoked, 1,
+            "only the laggard is revoked; newest-generation auth satisfies both"
+        );
+        assert_eq!(revokes.lock().unwrap().as_slice(), &[vec![laggard]]);
+        assert!(actor_exists(&asm, &good).await, "the good actor is kept");
+        assert!(!actor_exists(&asm, &laggard).await);
+    }
+
+    /// A node that re-authenticated is kept; a node that did not is
+    /// disconnected past the deadline — and its docked adapters go with it
+    /// (cc.disconnect cascade), with no separate adapter revoke needed.
+    #[tokio::test]
+    async fn test_reauth_stale_node_disconnected_with_its_adapters() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let good_node: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let bad_node: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let bad_adapter: IpAddr = ADAPTER.parse().unwrap();
+
+        // Node actors: `good` re-authenticated under generation 2, `bad` did not.
+        let mut good = make_node_actor_defexp(
+            "fd5a:5052:3000::1",
+            "node-good",
+            "[fd5a:5052:3000::101]:1234",
+        );
+        good.add_attribute(Attribute::builder(key::VINST).value("2"))
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&good, false, &Default::default())
+            .await
+            .unwrap();
+        let mut bad = make_node_actor_defexp(
+            "fd5a:5052:3000::2",
+            "node-bad",
+            "[fd5a:5052:3000::102]:1234",
+        );
+        bad.add_attribute(Attribute::builder(key::VINST).value("1"))
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&bad, false, &Default::default())
+            .await
+            .unwrap();
+        // An adapter docked at the bad node, also stale.
+        add_adapter_with_vinst(&asm, ADAPTER, &bad_node, 1).await;
+
+        record_obligation(&asm, 2, -5).await;
+        let (good_revokes, _) = install_fake_vss_with_requests(&asm, good_node, true);
+        let (bad_revokes, _) = install_fake_vss_with_requests(&asm, bad_node, true);
+
+        let stats = sweep_reauth_obligations(&asm).await;
+
+        assert_eq!(stats.revoked, 1, "one node disconnect counts as one revocation");
+        assert!(
+            actor_exists(&asm, &good_node).await,
+            "the node that answered must be kept"
+        );
+        assert!(
+            !actor_exists(&asm, &bad_node).await,
+            "the silent node must be disconnected"
+        );
+        assert!(
+            !actor_exists(&asm, &bad_adapter).await,
+            "the disconnected node's adapters must cascade away"
+        );
+        assert!(
+            bad_revokes.lock().unwrap().is_empty(),
+            "no separate adapter revoke may be sent through the disconnected node"
+        );
+        assert!(good_revokes.lock().unwrap().is_empty());
+    }
+
+    /// Revocation waits for a positive ack: an erroring VSS defers the stale
+    /// adapter to the next pass rather than half-removing it, and a later
+    /// acking pass removes it.
+    #[tokio::test]
+    async fn test_reauth_revocation_waits_for_positive_ack() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter: IpAddr = ADAPTER.parse().unwrap();
+        add_adapter_with_vinst(&asm, ADAPTER, &node, 1).await;
+        record_obligation(&asm, 2, -5).await;
+
+        // Pass 1: the VSS answers Err — the actor must survive.
+        let (revokes_err, _) = install_fake_vss_with_requests(&asm, node, false);
+        let stats = sweep_reauth_obligations(&asm).await;
+        assert_eq!(stats.revoked, 0);
+        assert_eq!(stats.deferred, 1, "an Err ack must defer, not remove");
+        assert_eq!(revokes_err.lock().unwrap().len(), 1, "the revoke was attempted");
+        assert!(
+            actor_exists(&asm, &adapter).await,
+            "actor must survive an unacked revoke"
+        );
+
+        // Pass 2: an acking handle finally removes it.
+        let (revokes_ok, _) = install_fake_vss_with_requests(&asm, node, true);
+        let stats = sweep_reauth_obligations(&asm).await;
+        assert_eq!(stats.revoked, 1);
+        assert_eq!(revokes_ok.lock().unwrap().as_slice(), &[vec![adapter]]);
+        assert!(!actor_exists(&asm, &adapter).await);
+    }
+
+    /// Pending `(V, T)` survives a VS restart: a fresh repo over the same
+    /// state DB — what a restarted VS constructs — still sees the obligation,
+    /// and the sweep enforces it.
+    #[tokio::test]
+    async fn test_reauth_obligation_survives_restart() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter: IpAddr = ADAPTER.parse().unwrap();
+        add_adapter_with_vinst(&asm, ADAPTER, &node, 1).await;
+        record_obligation(&asm, 2, -5).await;
+
+        // "Restart": a brand-new repo instance over the same state DB reads
+        // the persisted obligation back.
+        let fresh = ReauthRepo::new(asm.state_db.clone());
+        let obligations = fresh.list_obligations().await.unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].vinst, 2);
+
+        // And the sweep — which builds its own repo from asm.state_db, as the
+        // restarted process would — enforces it.
+        let (revokes, _) = install_fake_vss_with_requests(&asm, node, true);
+        let stats = sweep_reauth_obligations(&asm).await;
+        assert_eq!(stats.revoked, 1, "the persisted obligation must be enforced");
+        assert_eq!(revokes.lock().unwrap().as_slice(), &[vec![adapter]]);
+        assert!(!actor_exists(&asm, &adapter).await);
     }
 }
