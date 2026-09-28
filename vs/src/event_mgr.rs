@@ -315,6 +315,14 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     // means "started" (contract K1); outcomes are judged by each actor's
     // `zpr.vinst`, and enforcement is the deadline rule in
     // `auth_sweep::sweep_reauth_obligations`.
+    //
+    // A failed obligation write is FATAL to this handler (PR #41 review,
+    // Codex P1): the sweep discovers obligations only from the state DB, so
+    // an unrecorded obligation means non-reauthenticating actors would never
+    // be revoked for this generation. Propagating the error means the update
+    // is not reported as successfully enforced; the event worker logs it, and
+    // the next policy-updated event (or VS restart, which replays the current
+    // policy) retries the write against the same snapshot vinst.
     let deadline_secs = asm
         .config
         .core
@@ -329,6 +337,7 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         .await
     {
         error!(target: EVENT, "failed to record reauth obligation for vinst {snapshot_vinst}: {e}");
+        return Err(e.into());
     }
     request_auths_all_nodes(asm, &valid_node_addrs).await;
 
@@ -883,6 +892,41 @@ mod tests {
             repo.get_zpr_addr_for_hostname("keep-name").await.unwrap(),
             Some(addr),
             "reconciliation must not cost the actor its other names"
+        );
+    }
+
+    /// PR #41 review (Codex P1, zipline#123): a policy update whose reauth
+    /// obligation cannot be persisted must FAIL, not return Ok. The sweep
+    /// discovers obligations only from the state DB, so an unrecorded
+    /// obligation means non-reauthenticating actors are never revoked for
+    /// that generation — the update must not be treated as enforced.
+    #[tokio::test]
+    async fn test_policy_update_fails_when_obligation_persist_fails() {
+        use crate::assembly::tests::new_assembly_with_event_rx_and_db;
+        use crate::db::FaultMode;
+
+        let (asm, event_rx, db) = new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        let asm = Arc::new(asm);
+
+        // No nodes connected: everything before the obligation write is a
+        // no-op, so the injected hset fault hits exactly the obligation add.
+        db.set_hset_fault(FaultMode::Reject);
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        let result = handle_policy_updated(&asm, vinst).await;
+        db.set_hset_fault(FaultMode::None);
+
+        assert!(
+            result.is_err(),
+            "a policy update whose reauth obligation was not persisted must not report success"
+        );
+        assert!(
+            crate::db::ReauthRepo::new(asm.state_db.clone())
+                .list_obligations()
+                .await
+                .unwrap()
+                .is_empty(),
+            "precondition check: the obligation must not have been recorded"
         );
     }
 }

@@ -124,6 +124,15 @@ pub mod tests {
     pub async fn new_assembly_with_event_rx(
         vreq_tx_chan: Option<mpsc::Sender<VisaRequestJob>>,
     ) -> (Assembly, mpsc::Receiver<VsEvent>) {
+        let (asm, event_rx, _db) = new_assembly_with_event_rx_and_db(vreq_tx_chan).await;
+        (asm, event_rx)
+    }
+
+    /// As [new_assembly_with_event_rx], but also hands back the [FakeDb] so a
+    /// test can inject state-DB faults (see [crate::db::FaultMode]).
+    pub async fn new_assembly_with_event_rx_and_db(
+        vreq_tx_chan: Option<mpsc::Sender<VisaRequestJob>>,
+    ) -> (Assembly, mpsc::Receiver<VsEvent>, Arc<FakeDb>) {
         let vreq_tx = if let Some(tx) = vreq_tx_chan {
             tx
         } else {
@@ -132,6 +141,7 @@ pub mod tests {
         };
 
         let db_handle = Arc::new(FakeDb::new());
+        let db_handle_for_tests = db_handle.clone();
 
         let policy_repo = PolicyRepo::new(db_handle.clone());
         let policy_container_bytes = make_policy("2024-01-01T00:00:00Z", 1, Some("meta"));
@@ -177,6 +187,6 @@ pub mod tests {
             ts_mgr,
             deny_log: Default::default(),
         };
-        (asm, event_rx)
+        (asm, event_rx, db_handle_for_tests)
     }
 }
