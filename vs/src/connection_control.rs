@@ -905,16 +905,117 @@ impl ConnectionControl {
         })
     }
 
-    /// The whole VSAPI `reauthorize` operation (zipline#43): resolve the live
-    /// actor behind `zpr_addr`, renew its OIDC authentication with
-    /// [Self::reauthenticate_oidc_blob], re-run policy under the same pinned
-    /// snapshot, and persist the renewed actor — its ZPR address unchanged.
+    /// Renew one SS (bootstrap RSA) device authentication (zipline#120): the
+    /// counterpart of [Self::reauthenticate_oidc_blob] for the device
+    /// namespace. Reuses [Self::authenticate_ss_blob] against the pinned
+    /// snapshot's bootstrap key, with the reauth-specific checks from the
+    /// zipline#118 plan's *Decisions*:
     ///
-    /// Request-shape problems (blob count, non-OIDC arm, unknown address,
-    /// wrong calling node) are caller bugs and reject `ParamError` with
-    /// explicit text; credential and session-binding failures come back from
-    /// the blob arm as `AuthError`/Contract-2 codes, deliberately
-    /// indistinguishable to a probing caller.
+    /// - the live actor holds `device.zpr.authority = zpr-bootstrap` (only a
+    ///   bootstrap-authenticated device has an SS renewal semantics);
+    /// - `ssb.cn` equals the actor's AUTHENTICATED CN — a valid blob for a
+    ///   different device never renews this actor;
+    /// - `|now − ssb.timestamp| ≤ MAX_CLOCK_SKEW_SECS` (180 s). There is no
+    ///   monotonic-timestamp rule: freshness comes from the node-minted,
+    ///   HMAC'd challenge, and only the docking node could replay
+    ///   (SECURITY_MODEL Case 2);
+    /// - the signature verifies against the snapshot's bootstrap key for the
+    ///   CN — a key removed from policy (the bootstrap revocation path) or
+    ///   rotated fails here.
+    ///
+    /// Every failure is the same generic `AuthError` as OIDC's `reject()`, so
+    /// a probing caller learns only "rejected"; the classified detail goes to
+    /// the log. On success the outcome re-stamps the far-future bootstrap
+    /// device authority (zipline#119) and the authenticated CN, exactly as
+    /// the connect arm does.
+    pub(crate) fn reauthenticate_ss_blob(
+        &self,
+        psnap: &PolicySnapshot,
+        actor: &Actor,
+        ssb: &SelfSignedBlob,
+    ) -> Result<BlobOutcome, ServiceError> {
+        /// The uniform credential rejection: `authError`, generic message,
+        /// nothing echoed — same shape as the OIDC arm's `reject()`.
+        fn reject() -> ServiceError {
+            ApiResponseError::new_code_msg(ErrorCode::AuthError, "authentication rejected").into()
+        }
+
+        // Only a bootstrap-admitted device authority is renewable by an SS
+        // blob (the exact-set check in reauthorize_actor already required
+        // SOME device authority; this pins the method).
+        let bootstrap_admitted = actor
+            .get_attribute(key::DEVICE_AUTHORITY)
+            .and_then(|a| a.get_single_value().ok())
+            .is_some_and(|method| method == key::AUTHORITY_METHOD_BOOTSTRAP);
+        if !bootstrap_admitted {
+            info!(target: CC, "SS reauth rejected: the actor's device authority is not bootstrap");
+            return Err(reject());
+        }
+
+        // The blob must renew THIS actor's device identity: its CN is the
+        // authenticated CN the bootstrap connect established.
+        let Some(actor_cn) = actor.get_cn() else {
+            info!(target: CC, "SS reauth rejected: actor has no authenticated cn");
+            return Err(reject());
+        };
+        if actor_cn != ssb.cn {
+            info!(target: CC, "SS reauth rejected: blob cn does not match the actor's cn");
+            return Err(reject());
+        }
+
+        // Clock-skew window on the blob timestamp. Freshness rides on the
+        // node-minted challenge; this only bounds drift.
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now_secs.abs_diff(ssb.timestamp) > config::MAX_CLOCK_SKEW_SECS {
+            info!(target: CC, "SS reauth rejected: blob timestamp outside the clock-skew window");
+            return Err(reject());
+        }
+
+        // Signature against the PINNED snapshot's bootstrap key: key removed
+        // from policy or rotated fails here. The connect arm's classified
+        // errors collapse to the generic rejection on the reauth path.
+        let cn_claim = vec![Attribute::builder(key::CN).value(actor_cn)];
+        let authd = self
+            .authenticate_ss_blob(psnap.policy(), ssb, &cn_claim)
+            .map_err(|e| {
+                info!(target: CC, "SS reauth rejected: {e}");
+                reject()
+            })?;
+
+        // Re-stamp the far-future bootstrap device authority (zipline#119),
+        // exactly as the connect arm does.
+        let mut outcome_authd = vec![
+            Attribute::builder(key::DEVICE_AUTHORITY)
+                .expires_in(bootstrap_authority_expiration())
+                .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+        ];
+        outcome_authd.extend(authd);
+        Ok(BlobOutcome {
+            authd: outcome_authd,
+            namespace: Namespace::Device,
+            session: None,
+        })
+    }
+
+    /// The whole VSAPI `reauthorize` operation (zipline#43, widened by
+    /// zipline#120 to contract K3): resolve the live actor behind `zpr_addr`,
+    /// renew EVERY authority it holds — one blob per namespace, the namespace
+    /// set exactly equal to the actor's `zpr.authority` namespaces — re-run
+    /// policy under the same pinned snapshot (stamping the current
+    /// `zpr.vinst`), and persist the renewed actor, its ZPR address
+    /// unchanged. The SS (bootstrap RSA) arm is
+    /// [Self::reauthenticate_ss_blob]; the OIDC arm is
+    /// [Self::reauthenticate_oidc_blob].
+    ///
+    /// Request-shape problems (no blobs, duplicate namespace, namespace set ≠
+    /// the actor's authorities, unknown address, wrong calling node) are
+    /// caller bugs and reject `ParamError` with explicit text; credential and
+    /// session-binding failures come back from the blob arms as
+    /// `AuthError`/Contract-2 codes, deliberately indistinguishable to a
+    /// probing caller.
     pub(crate) async fn reauthorize_actor(
         &self,
         asm: Arc<Assembly>,
@@ -922,26 +1023,48 @@ impl ConnectionControl {
         blobs: Vec<AuthBlob>,
         connect_via: &IpAddr,
     ) -> Result<Actor, ServiceError> {
-        // Exactly one blob, and it must be the OIDC arm: only an IdP-issued
-        // expiring token has renewal semantics today (the SS bootstrap stamp
-        // is VS-chosen and fixed-lifetime; AC is legacy and cannot connect).
-        if blobs.len() != 1 {
+        if blobs.is_empty() {
             return Err(ApiResponseError::new_code_msg(
                 ErrorCode::ParamError,
-                format!(
-                    "reauthorize requires exactly one auth blob, got {}",
-                    blobs.len()
-                ),
+                "reauthorize requires at least one auth blob",
             )
             .into());
         }
-        let Some(AuthBlob::Oidc(blob)) = blobs.into_iter().next() else {
-            return Err(ApiResponseError::new_code_msg(
-                ErrorCode::ParamError,
-                "reauthorize supports oidc blobs only",
-            )
-            .into());
-        };
+
+        // Group the blobs by the identity namespace each arm renews: SS =
+        // device, OIDC = user. At most one blob per namespace (K3); AC is
+        // legacy and cannot connect, so it cannot renew either.
+        let mut ss_blob: Option<SelfSignedBlob> = None;
+        let mut oidc_blob: Option<OidcBlob> = None;
+        for blob in blobs {
+            match blob {
+                AuthBlob::SS(ssb) => {
+                    if ss_blob.replace(ssb).is_some() {
+                        return Err(ApiResponseError::new_code_msg(
+                            ErrorCode::ParamError,
+                            "duplicate device auth blob in reauthorize",
+                        )
+                        .into());
+                    }
+                }
+                AuthBlob::Oidc(ob) => {
+                    if oidc_blob.replace(ob).is_some() {
+                        return Err(ApiResponseError::new_code_msg(
+                            ErrorCode::ParamError,
+                            "duplicate user auth blob in reauthorize",
+                        )
+                        .into());
+                    }
+                }
+                AuthBlob::AC(_) => {
+                    return Err(ApiResponseError::new_code_msg(
+                        ErrorCode::ParamError,
+                        "reauthorize does not support ac blobs",
+                    )
+                    .into());
+                }
+            }
+        }
 
         // The renewal target must be a live actor admitted through the
         // calling node. An unknown address or one behind a different node is
@@ -965,39 +1088,76 @@ impl ConnectionControl {
             .into());
         }
 
+        // Exact-set rule (K3): the namespaces the blobs renew must equal the
+        // namespaces the live actor authenticated with — every authority is
+        // re-proved, none silently dropped, none invented. A subset or
+        // superset is a caller bug.
+        let actor_has_device = actor.get_attribute(key::DEVICE_AUTHORITY).is_some();
+        let actor_has_user = actor.get_attribute(key::USER_AUTHORITY).is_some();
+        if ss_blob.is_some() != actor_has_device || oidc_blob.is_some() != actor_has_user {
+            return Err(ApiResponseError::new_code_msg(
+                ErrorCode::ParamError,
+                "reauthorize blobs must cover exactly the actor's authenticated namespaces",
+            )
+            .into());
+        }
+
         // One coherent policy view for the whole renewal (PR #6 review):
-        // session validation and re-authorization read this snapshot, so a
+        // blob validation and re-authorization read this snapshot, so a
         // concurrent policy update cannot admit a credential under one
         // revision and authorize it under another.
         let psnap = asm.policy_mgr.get_current_snapshot();
-        let outcome = self.reauthenticate_oidc_blob(&psnap, &actor, &blob).await?;
-        let renewed_session = outcome.session;
+        let mut outcomes: Vec<BlobOutcome> = Vec::new();
+        if let Some(ssb) = &ss_blob {
+            outcomes.push(self.reauthenticate_ss_blob(&psnap, &actor, ssb)?);
+        }
+        if let Some(ob) = &oidc_blob {
+            outcomes.push(self.reauthenticate_oidc_blob(&psnap, &actor, ob).await?);
+        }
 
         // Rebuild the authenticated claim set: everything the actor already
         // carries, minus what policy re-stamps ([key::ROLE], [key::SERVICES],
-        // [key::VINST], [key::CONFIG_ID]) and minus EVERY attribute the
-        // provider previously vouched for — not just the keys the renewal
-        // re-asserts (PR #19 review). A refreshed token may omit a formerly
-        // mapped claim (e.g. `email_verified` flips false, so `user.email` is
-        // no longer admitted); the stale source-stamped attribute must not
-        // survive into policy evaluation, and the trusted-service lookup
-        // cannot overwrite a key it no longer returns. Every attribute the
-        // provider vends carries its service id as the source, so the source
-        // is the complete prior set.
+        // [key::VINST], [key::CONFIG_ID]) and minus what each renewing arm
+        // replaces. For a provider-backed arm (OIDC) that is EVERY attribute
+        // the provider previously vouched for — by source, not just the keys
+        // the renewal re-asserts (PR #19 review): a refreshed token may omit
+        // a formerly mapped claim (e.g. `email_verified` flips false, so
+        // `user.email` is no longer admitted); the stale source-stamped
+        // attribute must not survive into policy evaluation. The SS arm
+        // vends fixed internal-source attributes (the bootstrap device
+        // authority and the CN), so for it the outcome's keys ARE the
+        // complete prior set, and subtracting them is what re-stamps
+        // `device.zpr.authority` with a fresh far-future expiry (zipline#120).
         // The ZPR address rides along as an authenticated claim — the VS
         // assigned it at connect, and reauth never re-allocates it.
-        let provider_src = outcome
-            .authd
-            .first()
+        let renewed_sources: Vec<String> = outcomes
+            .iter()
+            .flat_map(|o| o.authd.iter())
             .map(|a| a.get_source().to_string())
-            .unwrap_or_default();
+            .filter(|s| s != libeval::attribute::SOURCE_ZPR)
+            .collect();
+        let renewed_keys: Vec<&str> = outcomes
+            .iter()
+            .flat_map(|o| o.authd.iter())
+            .map(|a| a.get_key())
+            .collect();
         let policy_stamped = [key::ROLE, key::SERVICES, key::VINST, key::CONFIG_ID];
         let mut authd_claims: Vec<Attribute> = actor
             .attrs_iter()
-            .filter(|a| a.get_source() != provider_src && !policy_stamped.contains(&a.get_key()))
+            .filter(|a| {
+                !renewed_sources.contains(&a.get_source().to_string())
+                    && !renewed_keys.contains(&a.get_key())
+                    && !policy_stamped.contains(&a.get_key())
+            })
             .cloned()
             .collect();
-        authd_claims.extend(outcome.authd);
+        let renewed_sessions: Vec<OidcSessionRecord> = outcomes
+            .iter_mut()
+            .filter_map(|o| o.session.take())
+            .collect();
+        for outcome in outcomes {
+            authd_claims.extend(outcome.authd);
+        }
 
         // Re-run policy under the same snapshot: a policy change since
         // connect is applied now, exactly as on a fresh connect. An
@@ -1067,8 +1227,9 @@ impl ConnectionControl {
         // The whole renewal succeeded: advance this session's anchors to the
         // fresh token (per actor session — PR #19 review). Recording only on
         // success means a failed policy re-run does not consume the token's
-        // strictly-increasing `iat`.
-        if let Some(session) = renewed_session {
+        // strictly-increasing `iat`. Only the OIDC arm carries anchors; the
+        // SS arm has no session state.
+        for session in renewed_sessions {
             session.record(&zpr_addr);
         }
         Ok(renewed)
@@ -4616,12 +4777,14 @@ mod tests {
     }
 
     /// zipline#119 bug test: an RSA+OIDC actor's authentication window after
-    /// an OIDC `reauthorize` must extend beyond connect +
-    /// `DEFAULT_AUTH_EXPIRATION`. Today it cannot: the claim-rebuild filter
-    /// (`reauthorize_actor`) passes `device.zpr.authority` through unchanged,
-    /// so the bootstrap stamp minted at connect with
-    /// `DEFAULT_AUTH_EXPIRATION` pins `get_authentication_expiration()` at
-    /// connect + 4 h no matter how often the user authority renews.
+    /// a `reauthorize` must extend beyond connect +
+    /// `DEFAULT_AUTH_EXPIRATION`. Before #119 it could not: the claim-rebuild
+    /// filter (`reauthorize_actor`) passed `device.zpr.authority` through
+    /// unchanged, so the bootstrap stamp minted at connect with
+    /// `DEFAULT_AUTH_EXPIRATION` pinned `get_authentication_expiration()` at
+    /// connect + 4 h no matter how often the user authority renewed.
+    /// (zipline#120: the renewal now presents both blobs, since the K3
+    /// exact-set rule requires every authenticated namespace re-proved.)
     #[tokio::test]
     async fn test_reauth_rsa_oidc_not_pinned_to_default_window() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
@@ -4662,10 +4825,13 @@ mod tests {
             .expect("fixture actor must persist");
         let addr = *actor.get_zpr_addr().unwrap();
 
-        let blobs = vec![AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
-            unix_now(),
-            iat1,
-        ))))];
+        let blobs = vec![
+            make_fresh_ss_blob(&privkey, cn),
+            AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
+                unix_now(),
+                iat1,
+            )))),
+        ];
         let renewed = cc
             .reauthorize_actor(asm, addr, blobs, &connect_via)
             .await
