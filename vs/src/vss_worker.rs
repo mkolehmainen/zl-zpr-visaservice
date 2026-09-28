@@ -166,6 +166,12 @@ pub async fn vss_worker_loop(
                                 asm.counters.incr(CounterType::VssErrors);
                             }
                         }
+                        VssCmd::RequestAuthsByZprAddr(zpr_addrs, resp_tx) => {
+                            if let Err(e) = resp_tx.send(vss_do_request_auths(&vss_handle, &zpr_addrs).await) {
+                                error!(target: VSS, "failed to send response for request-auths command: {:?}", e);
+                                asm.counters.incr(CounterType::VssErrors);
+                            }
+                        }
                         VssCmd::SetServices(services, resp_tx) => {
                             state.mark_services_updated();
                             if let Err(e) = resp_tx.send(vss_do_set_services(&vss_handle, services).await) {
@@ -674,6 +680,47 @@ async fn vss_do_revoke_auths(
         Ok(processed)
     } else {
         // No revocations were processed.
+        let err_rdr = ack_response.get_error()?;
+        let err_obj = ApiResponseError::try_from(err_rdr)?;
+        Err(err_obj.into())
+    }
+}
+
+/// Ask the node to start re-authentication for the given ZPR addresses via
+/// the `requestAuthentication` RPC, returning the number positively ack'd
+/// (contract K1, zipline#123). Ack handling mirrors [vss_do_revoke_auths]:
+/// the ack means the node *started* re-auth for `processed` addresses —
+/// unknown addresses are skipped and not counted; outcomes are judged later
+/// by `zpr.vinst`, never by this ack.
+async fn vss_do_request_auths(
+    vss_handle: &v1::v_s_s_handle::Client,
+    addrs: &[IpAddr],
+) -> Result<usize, VssSyncError> {
+    let mut req = vss_handle.request_authentication_request();
+    let req_builder = req.get();
+    let mut addrs_list_builder = req_builder.init_addrs(addrs.len() as u32);
+    for (i, addr) in addrs.iter().enumerate() {
+        let mut addr_builder = addrs_list_builder.reborrow().get(i as u32);
+        addr.write_to(&mut addr_builder);
+    }
+
+    let request_response_rdr =
+        rpc_with_timeout("request-auths", DEFAULT_RPC_TIMEOUT, req.send().promise).await?;
+
+    let ack_response = request_response_rdr.get()?.get_ack()?;
+    if ack_response.get_ok() {
+        // At least one request was accepted. Return the number accepted and
+        // log the error (if any) for a partial acceptance.
+        let processed = ack_response.get_processed() as usize;
+        if processed < addrs.len() {
+            let err_rdr = ack_response.get_error()?;
+            let err_obj = ApiResponseError::try_from(err_rdr)?;
+            error!(target: VSS, "request-auths partially accepted: {} of {} processed, error code={:?} msg={}",
+            processed, addrs.len(), err_obj.code, err_obj.message);
+        }
+        Ok(processed)
+    } else {
+        // No requests were accepted.
         let err_rdr = ack_response.get_error()?;
         let err_obj = ApiResponseError::try_from(err_rdr)?;
         Err(err_obj.into())

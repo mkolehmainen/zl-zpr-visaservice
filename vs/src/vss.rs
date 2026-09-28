@@ -12,6 +12,7 @@ use crate::policy_mgr::ResolvedPeer;
 
 pub type VssPushResponse = Result<usize, VssSyncError>; // usize is number items pushed.
 pub type VssRevokeAuthResponse = Result<usize, VssSyncError>; // usize is number of items revoked.
+pub type VssRequestAuthResponse = Result<usize, VssSyncError>; // usize is number of re-auth requests accepted.
 pub type VssSetServicesResponse = Result<(), VssSyncError>;
 pub type VssConfigureResponse = Result<(), VssSyncError>;
 pub type VssSetTopologyResponse = Result<(), VssSyncError>;
@@ -23,6 +24,12 @@ pub enum VssCmd {
     PushVisas(Vec<Visa>, oneshot::Sender<VssPushResponse>),
     RevokeVisasById(Vec<u64>, oneshot::Sender<VssPushResponse>),
     RevokeAuthsByZprAddr(Vec<IpAddr>, oneshot::Sender<VssRevokeAuthResponse>),
+    /// Ask the node to start re-authentication for the listed actors (its own
+    /// address means "re-authenticate yourself to the VS"). Contract K1
+    /// (zipline#123): the ack reports that re-auth was *started* for each
+    /// accepted address, not its outcome — outcomes arrive as
+    /// `authenticate`/`reauthorize` calls and are judged by `zpr.vinst`.
+    RequestAuthsByZprAddr(Vec<IpAddr>, oneshot::Sender<VssRequestAuthResponse>),
     SetServices(
         Vec<ServiceDescriptor>,
         oneshot::Sender<VssSetServicesResponse>,

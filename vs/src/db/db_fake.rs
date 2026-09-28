@@ -410,6 +410,25 @@ impl DbConnection for FakeDb {
         self.hset_with_lock(key, field, value).await
     }
 
+    /// Remove a field from a hash. Absent field or key is a no-op (HDEL).
+    async fn hdel(&self, key: &str, field: &str) -> DbResult<()> {
+        let _rlock = self.lock.read().await;
+        if let Some(entry) = self.store.get(key) {
+            match &entry.value {
+                FakeDbValue::Hash(h) => {
+                    h.remove(field);
+                    Ok(())
+                }
+                _ => Err(redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "value is not a hash",
+                ))),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     /// Set the hash field only if the field with that name does not already exist.
     /// Returns true when this call set it (mirrors redis HSETNX).
     async fn hset_nx(&self, key: &str, field: &str, value: &str) -> DbResult<bool> {

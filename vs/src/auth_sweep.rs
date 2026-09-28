@@ -17,7 +17,12 @@ use std::time::{Duration, SystemTime};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use libeval::actor::Actor;
+use libeval::attribute::key;
+use zpr::vsapi::v1::DisconnectReason;
+
 use crate::assembly::Assembly;
+use crate::config;
 use crate::db;
 use crate::event_mgr;
 use crate::logging::targets::ACTOR;
@@ -32,6 +37,37 @@ pub(crate) struct SweepStats {
     /// Expired actors left in place for the next pass (no VSS handle, or the
     /// revocation was not positively acked).
     pub deferred: usize,
+}
+
+/// What one reauth-obligation sweep pass did (zipline#123), for logging and tests.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReauthSweepStats {
+    /// Pending obligations considered.
+    pub obligations: usize,
+    /// Obligations pruned as satisfied (every connected actor at or past V).
+    pub pruned: usize,
+    /// Actors still inside their window that were asked (again) to re-auth.
+    pub requested: usize,
+    /// Actors revoked for missing the deadline (nodes disconnected, adapters
+    /// revoked-and-removed).
+    pub revoked: usize,
+    /// Overdue actors left in place for the next pass (no VSS handle, or the
+    /// revocation was not positively acked).
+    pub deferred: usize,
+}
+
+/// Enforce pending policy-install re-authentication obligations (zipline#123):
+/// for every recorded `(V, T)`, an actor whose `zpr.vinst` is below `V` is
+/// re-asked to authenticate while `now <= T` and revoked once `now > T` —
+/// adapters through the batched per-node `revokeAuthentication` (removed only
+/// on a positive ack), nodes through `cc.disconnect(.., Admin)`, which also
+/// drops their docked adapters. With several obligations the earliest unmet
+/// deadline applies, authenticating under the newest generation satisfies all
+/// older ones, and satisfied obligations are pruned.
+pub(crate) async fn sweep_reauth_obligations(asm: &Arc<Assembly>) -> ReauthSweepStats {
+    let stats = ReauthSweepStats::default();
+    let _ = asm;
+    stats
 }
 
 /// One sweep pass over the connected adapters, in two phases. Phase 1 walks
@@ -286,24 +322,49 @@ mod tests {
         node: IpAddr,
         ok: bool,
     ) -> Arc<Mutex<Vec<Vec<IpAddr>>>> {
+        let (revokes, _requests) = install_fake_vss_with_requests(asm, node, ok);
+        revokes
+    }
+
+    /// As [install_fake_vss], but also recording (and acking) the
+    /// `RequestAuthsByZprAddr` batches — returns `(revokes, requests)`.
+    fn install_fake_vss_with_requests(
+        asm: &Arc<Assembly>,
+        node: IpAddr,
+        ok: bool,
+    ) -> (Arc<Mutex<Vec<Vec<IpAddr>>>>, Arc<Mutex<Vec<Vec<IpAddr>>>>) {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<VssCmd>(8);
         asm.vss_mgr.insert_test_handle(node, cmd_tx);
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let seen_task = seen.clone();
+        let revokes = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let revokes_task = revokes.clone();
+        let requests_task = requests.clone();
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
-                if let VssCmd::RevokeAuthsByZprAddr(addrs, resp_tx) = cmd {
-                    seen_task.lock().unwrap().push(addrs.clone());
-                    let resp = if ok {
-                        Ok(addrs.len())
-                    } else {
-                        Err(crate::error::VssSyncError::Timeout("test".to_string()))
-                    };
-                    let _ = resp_tx.send(resp);
+                match cmd {
+                    VssCmd::RevokeAuthsByZprAddr(addrs, resp_tx) => {
+                        revokes_task.lock().unwrap().push(addrs.clone());
+                        let resp = if ok {
+                            Ok(addrs.len())
+                        } else {
+                            Err(crate::error::VssSyncError::Timeout("test".to_string()))
+                        };
+                        let _ = resp_tx.send(resp);
+                    }
+                    VssCmd::RequestAuthsByZprAddr(addrs, resp_tx) => {
+                        requests_task.lock().unwrap().push(addrs.clone());
+                        let resp = if ok {
+                            Ok(addrs.len())
+                        } else {
+                            Err(crate::error::VssSyncError::Timeout("test".to_string()))
+                        };
+                        let _ = resp_tx.send(resp);
+                    }
+                    _ => {}
                 }
             }
         });
-        seen
+        (revokes, requests)
     }
 
     /// An adapter past its authentication expiry is revoked by one pass —
@@ -663,6 +724,91 @@ mod tests {
         assert!(
             removed.is_ok(),
             "the periodic sweeper must remove the expired actor within the timeout"
+        );
+    }
+
+    // ---- policy-install reauth obligation sweep (zipline#123) ----
+
+    use crate::db::{ReauthObligation, ReauthRepo};
+    use std::time::SystemTime;
+
+    /// Add an adapter docked at `node` with far-future bootstrap auth (so the
+    /// expiry sweep never touches it) and `zpr.vinst = vinst` — the shape of a
+    /// bootstrap actor authenticated under policy generation `vinst`.
+    async fn add_adapter_with_vinst(
+        asm: &Arc<Assembly>,
+        zpr_addr: &str,
+        node: &IpAddr,
+        vinst: u64,
+    ) {
+        let mut actor = make_adapter_actor(zpr_addr, "reauth-test", Duration::from_secs(3600));
+        actor
+            .add_attribute(
+                Attribute::builder(key::DEVICE_AUTHORITY)
+                    .expires_in(config::VS_AUTH_EXPIRATION)
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+        actor
+            .add_attribute(Attribute::builder(key::VINST).value(vinst.to_string()))
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, node, &Default::default())
+            .await
+            .unwrap();
+    }
+
+    /// Record the obligation `(vinst, now + offset)`; a negative offset is a
+    /// deadline already in the past.
+    async fn record_obligation(asm: &Arc<Assembly>, vinst: u64, offset_secs: i64) {
+        let deadline = if offset_secs >= 0 {
+            SystemTime::now() + Duration::from_secs(offset_secs as u64)
+        } else {
+            SystemTime::now() - Duration::from_secs((-offset_secs) as u64)
+        };
+        ReauthRepo::new(asm.state_db.clone())
+            .add_obligation(&ReauthObligation { vinst, deadline })
+            .await
+            .unwrap();
+    }
+
+    /// The stored actor at `addr` exists.
+    async fn actor_exists(asm: &Arc<Assembly>, addr: &IpAddr) -> bool {
+        asm.actor_mgr
+            .get_actor_by_zpr_addr(addr)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    /// STEP-1 end-to-end (zipline#123): an adapter whose bootstrap key was
+    /// removed by a policy install — so it cannot re-authenticate and its
+    /// `zpr.vinst` stays below the new generation — is revoked once
+    /// `reauth_deadline` has passed: the docking node's VSS sees the batched
+    /// `revokeAuthentication`, and the actor is removed from the store.
+    /// This fails today because nothing enforces the obligation.
+    #[tokio::test]
+    async fn test_reauth_stale_actor_revoked_after_deadline() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter: IpAddr = ADAPTER.parse().unwrap();
+        // Authenticated under generation 1; obligation demands generation 2
+        // and its deadline has already passed.
+        add_adapter_with_vinst(&asm, ADAPTER, &node, 1).await;
+        record_obligation(&asm, 2, -5).await;
+        let (revokes, _requests) = install_fake_vss_with_requests(&asm, node, true);
+
+        let stats = sweep_reauth_obligations(&asm).await;
+
+        assert_eq!(stats.revoked, 1, "the stale actor must be revoked");
+        assert_eq!(
+            revokes.lock().unwrap().as_slice(),
+            &[vec![adapter]],
+            "the docking node's VSS must see the batched revoke"
+        );
+        assert!(
+            !actor_exists(&asm, &adapter).await,
+            "the actor must be gone after the deadline"
         );
     }
 }

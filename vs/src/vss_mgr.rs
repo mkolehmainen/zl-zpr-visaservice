@@ -206,6 +206,17 @@ impl VssHandle {
         resp_rx.await.map_err(|_| VssSyncError::ConnClosed)?
     }
 
+    /// Ask the node to start re-authentication for the given zpr addresses
+    /// (contract K1, zipline#123). The node's own address means
+    /// "re-authenticate yourself to the VS". Returns the number of addresses
+    /// the node accepted the request for; outcomes are judged by `zpr.vinst`.
+    pub async fn request_auths(&self, addrs: Vec<IpAddr>) -> Result<usize, VssSyncError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VssCmd::RequestAuthsByZprAddr(addrs, resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VssSyncError::ConnClosed)?
+    }
+
     /// Tell the node about authentication services connected to the ZPRnet.
     pub async fn set_services(&self, services: Vec<ServiceDescriptor>) -> Result<(), VssSyncError> {
         let (resp_tx, resp_rx) = oneshot::channel();
