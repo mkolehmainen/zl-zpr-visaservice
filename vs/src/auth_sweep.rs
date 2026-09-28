@@ -62,12 +62,273 @@ pub(crate) struct ReauthSweepStats {
 /// adapters through the batched per-node `revokeAuthentication` (removed only
 /// on a positive ack), nodes through `cc.disconnect(.., Admin)`, which also
 /// drops their docked adapters. With several obligations the earliest unmet
-/// deadline applies, authenticating under the newest generation satisfies all
-/// older ones, and satisfied obligations are pruned.
+/// deadline applies (an actor is revoked as soon as ANY obligation it has not
+/// met is overdue), authenticating under the newest generation satisfies all
+/// older ones (the checks compare `zpr.vinst` against each obligation's own
+/// `V`), and satisfied obligations are pruned.
 pub(crate) async fn sweep_reauth_obligations(asm: &Arc<Assembly>) -> ReauthSweepStats {
-    let stats = ReauthSweepStats::default();
-    let _ = asm;
+    let mut stats = ReauthSweepStats::default();
+
+    let repo = db::ReauthRepo::new(asm.state_db.clone());
+    let obligations = match repo.list_obligations().await {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(target: ACTOR, "reauth sweep: failed to list obligations: {e}");
+            return stats;
+        }
+    };
+    if obligations.is_empty() {
+        return stats;
+    }
+    stats.obligations = obligations.len();
+
+    /// A connected actor as the sweep sees it: its address, the policy
+    /// generation it was last authenticated under, whether it is a node, and
+    /// (for adapters) its docking node.
+    struct Entry {
+        addr: IpAddr,
+        vinst: u64,
+        is_node: bool,
+        dock: Option<IpAddr>,
+    }
+
+    // Snapshot every connected actor (nodes and adapters) with its vinst.
+    let listed = match asm.actor_mgr.list_actors(None).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(target: ACTOR, "reauth sweep: failed to list actors: {e}");
+            return stats;
+        }
+    };
+    let mut entries: Vec<Entry> = Vec::new();
+    for (addr, _cn) in listed {
+        let actor = match asm.actor_mgr.get_actor_by_zpr_addr(&addr).await {
+            Ok(Some(actor)) => actor,
+            Ok(None) => continue, // Removed between list and fetch.
+            Err(e) => {
+                warn!(target: ACTOR, "reauth sweep: failed to load actor {addr}: {e}");
+                continue;
+            }
+        };
+        // The visa service's own adapter authenticates by construction at
+        // startup (authenticate_visa_service), not through a node, so no
+        // requestAuthentication can ever renew its vinst — enforcing the
+        // obligation on it would make every install revoke the VS itself.
+        // It is exempt for the same reason its authentication never expires.
+        if actor.get_cn() == Some(config::VS_CN)
+            && addr == std::net::IpAddr::V6(config::VS_ZPR_ADDR)
+        {
+            continue;
+        }
+        entries.push(Entry {
+            addr,
+            vinst: actor_vinst(&actor),
+            is_node: actor.is_node(),
+            dock: asm.actor_mgr.get_docking_node_for_actor(&actor),
+        });
+    }
+
+    // Prune obligations every connected actor already satisfies. With the
+    // stale actors gone (below), the remaining obligations are pruned by a
+    // later pass.
+    let mut unmet = Vec::new();
+    for ob in obligations {
+        if entries.iter().all(|e| e.vinst >= ob.vinst) {
+            info!(target: ACTOR, "reauth sweep: obligation vinst={} satisfied by all connected actors, pruning", ob.vinst);
+            if let Err(e) = repo.remove_obligation(ob.vinst).await {
+                warn!(target: ACTOR, "reauth sweep: failed to prune obligation vinst={}: {e}", ob.vinst);
+            } else {
+                stats.pruned += 1;
+            }
+        } else {
+            unmet.push(ob);
+        }
+    }
+
+    // The generation each phase enforces: an actor owes a re-auth when its
+    // vinst is below an unmet obligation's V; it is revoked when that
+    // obligation is also overdue. Taking the max V per phase implements both
+    // rules at once — earliest unmet deadline (any overdue obligation
+    // suffices) and newest-satisfies-older (one comparison per phase).
+    let now = SystemTime::now();
+    let overdue_v = unmet
+        .iter()
+        .filter(|ob| now > ob.deadline)
+        .map(|ob| ob.vinst)
+        .max();
+    let pending_v = unmet.iter().map(|ob| ob.vinst).max();
+
+    // Phase 1: revoke actors that missed an overdue deadline. Nodes first —
+    // `cc.disconnect` also drops their docked adapters, so those adapters
+    // never need their own revoke.
+    let mut disconnected_nodes: Vec<IpAddr> = Vec::new();
+    if let Some(required_v) = overdue_v {
+        for entry in entries.iter().filter(|e| e.is_node && e.vinst < required_v) {
+            // Serialize against a concurrent re-auth: re-load and re-check the
+            // stored vinst right before disconnecting, so a node that made the
+            // deadline while this pass ran is kept.
+            match asm.actor_mgr.get_actor_by_zpr_addr(&entry.addr).await {
+                Ok(Some(actor)) if actor_vinst(&actor) >= required_v => {
+                    info!(target: ACTOR, "reauth sweep: node {} re-authenticated while the sweep ran; keeping it", entry.addr);
+                    continue;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => continue, // Already gone.
+                Err(e) => {
+                    warn!(target: ACTOR, "reauth sweep: failed to re-load node {}: {e}; deferring", entry.addr);
+                    stats.deferred += 1;
+                    continue;
+                }
+            }
+            info!(
+                target: ACTOR,
+                "reauth sweep: node {} did not re-authenticate under vinst {} by the deadline; disconnecting it (and its adapters)",
+                entry.addr, required_v
+            );
+            match asm
+                .cc
+                .disconnect(asm.clone(), entry.addr, DisconnectReason::Admin)
+                .await
+            {
+                Ok(()) => {
+                    disconnected_nodes.push(entry.addr);
+                    stats.revoked += 1;
+                }
+                Err(e) => {
+                    warn!(target: ACTOR, "reauth sweep: failed to disconnect node {}: {e}; deferring", entry.addr);
+                    stats.deferred += 1;
+                }
+            }
+        }
+
+        // Overdue adapters, batched per docking node — skipping adapters whose
+        // node was just disconnected (the cascade already removed them).
+        let mut by_node: BTreeMap<IpAddr, Vec<IpAddr>> = BTreeMap::new();
+        for entry in entries.iter().filter(|e| !e.is_node && e.vinst < required_v) {
+            let Some(dock) = entry.dock else {
+                warn!(target: ACTOR, "reauth sweep: no docking node for stale adapter {}; deferring", entry.addr);
+                stats.deferred += 1;
+                continue;
+            };
+            if disconnected_nodes.contains(&dock) {
+                continue;
+            }
+            by_node.entry(dock).or_default().push(entry.addr);
+        }
+        for (node_addr, addrs) in by_node {
+            let Some(vss_handle) = asm.vss_mgr.get_handle(&node_addr) else {
+                warn!(
+                    target: ACTOR,
+                    "reauth sweep: no VSS handle for node {node_addr} ({} stale adapter(s)); deferring",
+                    addrs.len()
+                );
+                stats.deferred += addrs.len();
+                continue;
+            };
+            match vss_handle.revoke_auths(addrs.clone()).await {
+                Ok(_processed) => {
+                    for addr in addrs {
+                        // Same re-check as above: a concurrent reauthorize that
+                        // landed while the revoke was in flight wins, and the
+                        // renewed actor's node-side auth is re-established by
+                        // its own reauth flow.
+                        match asm.actor_mgr.get_actor_by_zpr_addr(&addr).await {
+                            Ok(Some(actor)) if actor_vinst(&actor) >= required_v => {
+                                info!(target: ACTOR, "reauth sweep: adapter {addr} re-authenticated while the revoke was in flight; keeping it");
+                                continue;
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) => continue, // Already removed concurrently.
+                            Err(e) => {
+                                warn!(target: ACTOR, "reauth sweep: revoked {addr} but failed to re-load actor: {e}; deferring");
+                                stats.deferred += 1;
+                                continue;
+                            }
+                        }
+                        info!(
+                            target: ACTOR,
+                            "reauth sweep: adapter {addr} did not re-authenticate under vinst {required_v} by the deadline; revoked on node {node_addr}, removing actor"
+                        );
+                        // Mirror the expiry sweep: detect an auth-service
+                        // provider while the actor is still in the DB, record
+                        // the change after removal.
+                        let was_auth_provider = matches!(
+                            asm.actor_mgr.has_auth_services(asm.clone(), &addr).await,
+                            Ok(true)
+                        );
+                        if let Err(e) = asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await {
+                            warn!(target: ACTOR, "reauth sweep: revoked {addr} but failed to remove actor: {e}");
+                            continue;
+                        }
+                        if was_auth_provider {
+                            event_mgr::record_auth_service_change(asm).await;
+                        }
+                        stats.revoked += 1;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        target: ACTOR,
+                        "reauth sweep: failed to revoke {} stale adapter(s) on node {node_addr}: {e}; deferring",
+                        addrs.len()
+                    );
+                    stats.deferred += addrs.len();
+                }
+            }
+        }
+    }
+
+    // Phase 2: re-send requestAuthentication to actors that still owe a
+    // re-auth inside their window (the node dedups via `renewal_in_flight`).
+    // Actors already revoked above are gone from the store, but the snapshot
+    // may still list them — the node skips unknown addresses (K1), so a stale
+    // entry costs nothing.
+    if let Some(required_v) = pending_v {
+        let mut by_node: BTreeMap<IpAddr, Vec<IpAddr>> = BTreeMap::new();
+        for entry in entries.iter().filter(|e| e.vinst < required_v) {
+            let Some(dock) = entry.dock else {
+                continue; // Logged in phase 1 when overdue; nothing to send to.
+            };
+            if disconnected_nodes.contains(&dock) {
+                continue;
+            }
+            by_node.entry(dock).or_default().push(entry.addr);
+        }
+        for (node_addr, addrs) in by_node {
+            let Some(vss_handle) = asm.vss_mgr.get_handle(&node_addr) else {
+                debug!(target: ACTOR, "reauth sweep: no VSS handle for node {node_addr}; re-send skipped this pass");
+                continue;
+            };
+            let count = addrs.len();
+            match vss_handle.request_auths(addrs).await {
+                Ok(_accepted) => stats.requested += count,
+                Err(e) => {
+                    warn!(target: ACTOR, "reauth sweep: failed to request_auths on node {node_addr}: {e}");
+                }
+            }
+        }
+    }
+
+    if stats.revoked > 0 || stats.deferred > 0 || stats.requested > 0 || stats.pruned > 0 {
+        debug!(
+            target: ACTOR,
+            "reauth sweep: obligations {}, pruned {}, requested {}, revoked {}, deferred {}",
+            stats.obligations, stats.pruned, stats.requested, stats.revoked, stats.deferred
+        );
+    }
     stats
+}
+
+/// The policy generation the actor was last authenticated under: its
+/// `zpr.vinst` attribute, stamped by `approve_connection` on connect and
+/// reauthorize. A missing or unparseable value is 0 — such an actor owes a
+/// re-auth against every obligation (fail closed).
+fn actor_vinst(actor: &Actor) -> u64 {
+    actor
+        .get_attribute(key::VINST)
+        .and_then(|a| a.get_single_value().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// One sweep pass over the connected adapters, in two phases. Phase 1 walks
@@ -221,16 +482,19 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
     stats
 }
 
-/// Run [sweep_expired_auths] every `period` in a background task, mirroring
-/// `KeySource::spawn_refresher` (`oidc/jwks.rs`). A pass never fails as such —
-/// per-actor trouble is logged and deferred inside the sweep — so the loop just
-/// sleeps and sweeps. Callers pass [crate::config::MIN_VISA_LIFETIME]: fine-
-/// grained enough that a revocation lands inside the shortest visa lifetime.
+/// Run [sweep_expired_auths] and [sweep_reauth_obligations] every `period` in
+/// a background task, mirroring `KeySource::spawn_refresher` (`oidc/jwks.rs`).
+/// A pass never fails as such — per-actor trouble is logged and deferred
+/// inside each sweep — so the loop just sleeps and sweeps. Callers pass
+/// [crate::config::MIN_VISA_LIFETIME]: fine-grained enough that a revocation
+/// lands inside the shortest visa lifetime, and well inside any sane
+/// `reauth_deadline`.
 pub(crate) fn spawn_auth_expiry_sweeper(asm: Arc<Assembly>, period: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(period).await;
             sweep_expired_auths(&asm).await;
+            sweep_reauth_obligations(&asm).await;
         }
     })
 }
