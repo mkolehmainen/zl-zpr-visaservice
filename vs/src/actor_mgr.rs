@@ -67,14 +67,20 @@ impl ActorMgr {
     /// When we start VS with state in the DB, we are primarily concerned about any nodes
     /// that were connected.
     ///
-    /// For each node we find in here we check to make sure that the node auth has not
-    /// expired.  Expired nodes are removed (along with any connected adapters).
+    /// For each node we find in here we check how long ago it was last seen. Nodes
+    /// last seen more than [config::DEFAULT_AUTH_EXPIRATION] ago are removed (along
+    /// with any connected adapters). Culling by last-seen age instead of
+    /// authentication expiry (zipline#119): bootstrap authentication no longer
+    /// expires, so an auth-expiry check would keep dead nodes forever; the 4 h
+    /// window this preserves is the same one the old auth-expiry check gave a
+    /// bootstrap node. A node with no recorded last-seen time is treated as stale
+    /// and removed — its record predates last-seen tracking or never carried one.
     ///
-    /// For non-expired nodes, we wipe their vss info.
+    /// For nodes seen recently enough, we wipe their vss info.
     pub async fn refresh_state(&self) -> Result<(), ServiceError> {
         for node_addr in &self.node_db.list_node_addrs().await? {
-            let node_actor = match self.actor_db.get_actor_by_zpr_addr(node_addr).await {
-                Ok(actor) => actor,
+            match self.actor_db.get_actor_by_zpr_addr(node_addr).await {
+                Ok(_actor) => {}
                 Err(StoreError::NotFound(_)) => {
                     debug!(target: ACTOR, "refresh_state: node at {} not found in actor DB, removing from node DB", node_addr);
                     self.remove_actor_by_zpr_addr(node_addr).await?;
@@ -83,12 +89,18 @@ impl ActorMgr {
                 Err(e) => return Err(ServiceError::from(e)),
             };
 
-            if let Some(exp) = node_actor.get_authentication_expiration() {
-                if exp < SystemTime::now() {
-                    info!(target: ACTOR, "refresh_state: node at {node_addr} has expired auth, removing");
-                    self.remove_actor_by_zpr_addr(node_addr).await?;
-                    continue;
-                }
+            let stale = match self.node_db.get_last_seen_time(node_addr).await? {
+                Some(last_seen) => match SystemTime::now().duration_since(last_seen) {
+                    Ok(age) => age > config::DEFAULT_AUTH_EXPIRATION,
+                    // A last-seen in the future is clock skew, not staleness.
+                    Err(_) => false,
+                },
+                None => true,
+            };
+            if stale {
+                info!(target: ACTOR, "refresh_state: node at {node_addr} last seen too long ago, removing");
+                self.remove_actor_by_zpr_addr(node_addr).await?;
+                continue;
             }
 
             if let Err(e) = self.node_db.clear_node_vss(node_addr).await {

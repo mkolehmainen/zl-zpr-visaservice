@@ -52,6 +52,33 @@ const CLASS_SERVICE: &str = "service";
 
 const ATTR_KEY_VS_IDENT: &str = "zpr.vs.bootstrap.ident";
 
+/// Expiration window for every bootstrap (RSA-verified) `device.zpr.authority`
+/// stamp (zipline#119): bootstrap authentication does not expire, so every
+/// bootstrap stamp gets the same far-future window the visa service's own
+/// self-authentication always got ([config::VS_AUTH_EXPIRATION]). A bootstrap
+/// key is policy state, not a session credential — removing the key from
+/// policy is the revocation path — and dead nodes are culled by last-seen age
+/// at startup (`actor_mgr::refresh_state`), not by authentication expiry.
+fn bootstrap_authority_expiration() -> Duration {
+    config::VS_AUTH_EXPIRATION
+}
+
+/// Expiration for the `zpr.vs.bootstrap.ident` identity token (zipline#119):
+/// the minimum of the actor's device/user authority expiries. The token is a
+/// proxy for those credentials, so it must never gate the actor's
+/// authentication window on its own — `get_authentication_expiration()` takes
+/// the minimum across authority AND identity attributes, and an ident stamped
+/// shorter than the authorities would cap the actor at its own lifetime.
+/// Falls back to [config::DEFAULT_AUTH_EXPIRATION] when the actor carries no
+/// authority attribute at all.
+fn vs_ident_expiration(actor: &Actor) -> SystemTime {
+    [key::DEVICE_AUTHORITY, key::USER_AUTHORITY]
+        .iter()
+        .filter_map(|k| actor.get_attribute(k).map(|a| a.get_expires()))
+        .min()
+        .unwrap_or_else(|| SystemTime::now() + config::DEFAULT_AUTH_EXPIRATION)
+}
+
 /// Identity namespace one auth blob authenticates. A connection may present at most
 /// one blob per namespace (zipline#7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,10 +307,11 @@ impl ConnectionControl {
         };
 
         // Built-in RSA verification is the device authority
-        // (OIDC.md: the `<ns>.zpr.authority` invariant).
+        // (OIDC.md: the `<ns>.zpr.authority` invariant). Bootstrap
+        // authentication does not expire (zipline#119).
         authd_claims.push(
             Attribute::builder(key::DEVICE_AUTHORITY)
-                .expires_in(config::DEFAULT_AUTH_EXPIRATION)
+                .expires_in(bootstrap_authority_expiration())
                 .value(key::AUTHORITY_METHOD_BOOTSTRAP),
         );
 
@@ -357,9 +385,10 @@ impl ConnectionControl {
                     ChallengeAlg::RsaSha256Pkcs1v15 => {
                         // Built-in RSA verification is the device authority
                         // (OIDC.md: the `<ns>.zpr.authority` invariant).
+                        // Bootstrap authentication does not expire (zipline#119).
                         let mut authd = vec![
                             Attribute::builder(key::DEVICE_AUTHORITY)
-                                .expires_in(config::DEFAULT_AUTH_EXPIRATION)
+                                .expires_in(bootstrap_authority_expiration())
                                 .value(key::AUTHORITY_METHOD_BOOTSTRAP),
                         ];
                         authd.extend(self.authenticate_ss_blob(
@@ -417,19 +446,21 @@ impl ConnectionControl {
             }
         }
 
-        let auth_expiration = if endpoint_cn == config::VS_CN {
-            config::VS_AUTH_EXPIRATION
-        } else {
-            config::DEFAULT_AUTH_EXPIRATION
-        };
+        // The `zpr.vs.bootstrap.ident` token follows the actor's authority
+        // expiries (zipline#119): it is a proxy credential and must not gate
+        // the authentication window on its own.
+        let ident_expires = vs_ident_expiration(&actor);
+        let jwt_lifetime = ident_expires
+            .duration_since(SystemTime::now())
+            .unwrap_or(config::DEFAULT_AUTH_EXPIRATION);
         let actor_jwt = if actor.is_node() {
-            self.gen_jwt(format!("node/{}", endpoint_cn), auth_expiration)?
+            self.gen_jwt(format!("node/{}", endpoint_cn), jwt_lifetime)?
         } else {
-            self.gen_jwt(format!("adapter/{}", endpoint_cn), auth_expiration)?
+            self.gen_jwt(format!("adapter/{}", endpoint_cn), jwt_lifetime)?
         };
         let _ = actor.add_attribute(
             Attribute::builder(ATTR_KEY_VS_IDENT)
-                .expires(SystemTime::now() + auth_expiration)
+                .expires(ident_expires)
                 .value(actor_jwt),
         );
         let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
@@ -444,12 +475,13 @@ impl ConnectionControl {
                     actor.get_zpr_addr()
                 )));
             }
-            // The ordinary adapter path already stamped DEVICE_AUTHORITY with the default
-            // (4 hour) expiration; re-add it with the VS expiration so the VS does not
-            // expire itself.
+            // The ordinary adapter path already stamped DEVICE_AUTHORITY with the
+            // bootstrap expiration; re-add it so the (single-valued) attribute is
+            // not duplicated. Both stamps share bootstrap_authority_expiration()
+            // since zipline#119.
             actor.add_attribute(
                 Attribute::builder(key::DEVICE_AUTHORITY)
-                    .expires_in(config::VS_AUTH_EXPIRATION)
+                    .expires_in(bootstrap_authority_expiration())
                     .value(key::AUTHORITY_METHOD_BOOTSTRAP),
             )?;
         }
@@ -465,9 +497,10 @@ impl ConnectionControl {
         let mut authd_claims = Vec::new();
 
         // The VS authenticates itself by construction; that is the device authority.
+        // Bootstrap authentication does not expire (zipline#119).
         authd_claims.push(
             Attribute::builder(key::DEVICE_AUTHORITY)
-                .expires_in(config::VS_AUTH_EXPIRATION)
+                .expires_in(bootstrap_authority_expiration())
                 .value(key::AUTHORITY_METHOD_BOOTSTRAP),
         );
         // The VS authorizes itself: its own CN is authenticated by construction, so it
@@ -999,19 +1032,20 @@ impl ConnectionControl {
         // connect; re-registered as the first identity key, exactly as
         // connect does.
         if renewed.get_attribute(ATTR_KEY_VS_IDENT).is_some() {
-            let auth_expiration = if endpoint_cn == config::VS_CN {
-                config::VS_AUTH_EXPIRATION
-            } else {
-                config::DEFAULT_AUTH_EXPIRATION
-            };
+            // The token follows the renewed actor's authority expiries
+            // (zipline#119) — same minting rule as connect.
+            let ident_expires = vs_ident_expiration(&renewed);
+            let jwt_lifetime = ident_expires
+                .duration_since(SystemTime::now())
+                .unwrap_or(config::DEFAULT_AUTH_EXPIRATION);
             let actor_jwt = if renewed.is_node() {
-                self.gen_jwt(format!("node/{}", endpoint_cn), auth_expiration)?
+                self.gen_jwt(format!("node/{}", endpoint_cn), jwt_lifetime)?
             } else {
-                self.gen_jwt(format!("adapter/{}", endpoint_cn), auth_expiration)?
+                self.gen_jwt(format!("adapter/{}", endpoint_cn), jwt_lifetime)?
             };
             let _ = renewed.add_attribute(
                 Attribute::builder(ATTR_KEY_VS_IDENT)
-                    .expires(SystemTime::now() + auth_expiration)
+                    .expires(ident_expires)
                     .value(actor_jwt),
             );
             let _ = renewed.add_identity_key(0, ATTR_KEY_VS_IDENT);
@@ -1093,19 +1127,20 @@ impl ConnectionControl {
 
         // The visa service's own token gets the VS expiration. A 4 hour token would expire its
         // own authentication and it would start denying its own visas.
-        let auth_expiration = if ssb.cn == config::VS_CN {
-            config::VS_AUTH_EXPIRATION
-        } else {
-            config::DEFAULT_AUTH_EXPIRATION
-        };
+        // The `zpr.vs.bootstrap.ident` token follows the actor's authority
+        // expiries (zipline#119) — same minting rule as connect.
+        let ident_expires = vs_ident_expiration(&actor);
+        let jwt_lifetime = ident_expires
+            .duration_since(SystemTime::now())
+            .unwrap_or(config::DEFAULT_AUTH_EXPIRATION);
         let actor_jwt = if actor.is_node() {
-            self.gen_jwt(format!("node/{}", ssb.cn), auth_expiration)?
+            self.gen_jwt(format!("node/{}", ssb.cn), jwt_lifetime)?
         } else {
-            self.gen_jwt(format!("adapter/{}", ssb.cn), auth_expiration)?
+            self.gen_jwt(format!("adapter/{}", ssb.cn), jwt_lifetime)?
         };
         let _ = actor.add_attribute(
             Attribute::builder(ATTR_KEY_VS_IDENT)
-                .expires(SystemTime::now() + auth_expiration)
+                .expires(ident_expires)
                 .value(actor_jwt),
         );
         let _ = actor.add_identity_key(0, ATTR_KEY_VS_IDENT);
