@@ -4827,10 +4827,7 @@ mod tests {
 
         let blobs = vec![
             make_fresh_ss_blob(&privkey, cn),
-            AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
-                unix_now(),
-                iat1,
-            )))),
+            AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)))),
         ];
         let renewed = cc
             .reauthorize_actor(asm, addr, blobs, &connect_via)
@@ -5160,7 +5157,10 @@ mod tests {
             .await
             .expect("second policy install");
         let new_vinst = asm.policy_mgr.get_current_snapshot().vinst().to_string();
-        assert_ne!(old_vinst, new_vinst, "the install must advance the generation");
+        assert_ne!(
+            old_vinst, new_vinst,
+            "the install must advance the generation"
+        );
 
         let renewed = cc
             .reauthorize_actor(
@@ -5212,10 +5212,7 @@ mod tests {
 
         let blobs = vec![
             make_fresh_ss_blob(&privkey, cn),
-            AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
-                unix_now(),
-                iat1,
-            )))),
+            AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)))),
         ];
         let renewed = cc
             .reauthorize_actor(asm, addr, blobs, &connect_via)
@@ -5303,10 +5300,7 @@ mod tests {
         let (privkey, _) = gen_rsa_test_keypair();
         let blobs = vec![
             make_fresh_ss_blob(&privkey, "some.cn"),
-            AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(
-                unix_now(),
-                iat1,
-            )))),
+            AuthBlob::Oidc(oidc_raw_blob(mint_signed(renewal_claims(unix_now(), iat1)))),
         ];
 
         let api = api_err(cc.reauthorize_actor(asm, addr, blobs, &connect_via).await);
