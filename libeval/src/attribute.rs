@@ -24,6 +24,12 @@ pub mod key {
 
     pub const ACTOR_HASH: &str = "zpr.actor_hash";
 
+    /// Per-connection session id, minted by the VS at authenticate/reconnect
+    /// time (zipline#123, PR #41 review): binds a VS-API handle to the exact
+    /// authenticated session so a revoked capability cannot ride address
+    /// reuse or a reconnect back to life.
+    pub const SESSION: &str = "zpr.session";
+
     /// CN value
     pub const CN: &str = "device.zpr.adapter.cn";
 

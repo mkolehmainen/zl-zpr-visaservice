@@ -173,6 +173,13 @@ struct VSGateImpl {
 struct VSHandleImpl {
     asm: Arc<Assembly>,
     node: Actor,
+    /// The session generation this handle is bound to, captured from the
+    /// node actor's [key::SESSION] attribute at construction (zipline#123,
+    /// PR #41 review): [Self::node_is_live] compares it against the STORED
+    /// actor's session on every gated call, so a handle minted before a
+    /// disconnect/reconnect (or before the address was reused) goes dead
+    /// even though some node still occupies the address.
+    session: Option<String>,
 }
 
 impl VSGateImpl {
@@ -201,24 +208,49 @@ impl VSGateImpl {
 
 impl VSHandleImpl {
     fn new(asm: Arc<Assembly>, node: Actor) -> Self {
-        VSHandleImpl { asm, node }
+        let session = node
+            .get_attribute(key::SESSION)
+            .and_then(|a| a.get_single_value().ok().map(str::to_string));
+        VSHandleImpl { asm, node, session }
+    }
+
+    /// Mint a fresh session id and stamp it on `actor` (zipline#123, PR #41
+    /// review). The authenticate and reconnect paths call this BEFORE
+    /// persisting the actor and before building its handle: the persisted
+    /// session is the current generation, the handle captures it, and every
+    /// handle bound to an earlier generation fails [Self::node_is_live].
+    fn stamp_new_session(actor: &mut Actor) {
+        actor
+            .add_attribute(Attribute::builder(key::SESSION).value(uuid::Uuid::new_v4().to_string()))
+            .expect("session attribute is unvalidated and cannot fail");
     }
 
     /// Capability-liveness gate (zipline#123, K2): a `VSHandleImpl` holds a
     /// snapshot of the node actor, and capnp keeps the capability alive for as
     /// long as the client holds it — so a node dropped by `cc.disconnect`
     /// could keep using its old handle indefinitely. Every handler consults
-    /// this first: the stored actor must still exist at the handle's address
-    /// and still be a node. A dropped node gets `authRequired` and must
+    /// this first: the stored actor must still exist at the handle's address,
+    /// still be a node, and — because an address can be reused or reconnected
+    /// at (PR #41 review, Codex P1) — carry the SAME session generation this
+    /// handle was minted under. A dropped node gets `authRequired` and must
     /// re-authenticate through `connect`.
     async fn node_is_live(&self) -> bool {
         let Some(addr) = self.node.get_zpr_addr() else {
             return false;
         };
-        matches!(
-            self.asm.actor_mgr.get_actor_by_zpr_addr(addr).await,
-            Ok(Some(actor)) if actor.is_node()
-        )
+        let stored = match self.asm.actor_mgr.get_actor_by_zpr_addr(addr).await {
+            Ok(Some(actor)) if actor.is_node() => actor,
+            _ => return false,
+        };
+        // Session binding: the stored actor's generation must match the one
+        // captured at handle construction. A mismatch means the address was
+        // re-authenticated (reuse or reconnect) after this handle was minted.
+        // Two `None`s compare equal deliberately: an actor persisted before
+        // this attribute existed keeps its live handle working.
+        let stored_session = stored
+            .get_attribute(key::SESSION)
+            .and_then(|a| a.get_single_value().ok().map(str::to_string));
+        stored_session == self.session
     }
 
     /// Squash (but log) any errors.
@@ -806,6 +838,25 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
         }
 
+        // A reconnect mints a NEW session generation (zipline#123, PR #41
+        // review): stamp and persist it before building the handle, so every
+        // handle from before this open fails the liveness gate — an old
+        // revoked capability cannot ride the reconnect back to life.
+        VSHandleImpl::stamp_new_session(&mut existing_actor);
+        if let Err(e) = self
+            .asm
+            .actor_mgr
+            .update_actor(&existing_actor, &self.asm.policy_service_names())
+            .await
+        {
+            error!(target: API, "failed to persist session for {}: {}", vs_connect_request.cn, e);
+            return self.ok_with_open_error(
+                results,
+                vsapi::ErrorCode::Internal,
+                "internal error during open",
+            );
+        }
+
         // Skip ahead to the handle:
         let vs_handle: vsapi::v_s_handle::Client =
             capnp_rpc::new_client(VSHandleImpl::new(self.asm.clone(), existing_actor));
@@ -1014,6 +1065,12 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         node_actor
             .add_attribute(Attribute::builder(key::AAA_NET).value(node_aaa_net.to_string()))
             .unwrap();
+
+        // Bind the handle we are about to mint to THIS authentication
+        // (zipline#123, PR #41 review): a fresh session generation is stamped
+        // before the actor is persisted, so any handle from a previous
+        // session at this address fails the liveness gate from here on.
+        VSHandleImpl::stamp_new_session(&mut node_actor);
 
         // TODO: The policy may have changed since started the authentication. Once we add the node
         // it is part of the ZPRnet.  The add_node should check the visa vinst used to grant access
@@ -2418,6 +2475,88 @@ mod tests {
                     );
                 })
                 .await;
+        }
+
+        /// PR #41 review (Codex P1, zipline#123): liveness must be bound to
+        /// the authenticated session, not address+role. If a revoked node's
+        /// address is reused by a DIFFERENT node, the old retained capability
+        /// must stay dead — some node occupying the address is not enough.
+        #[tokio::test]
+        async fn test_address_reuse_does_not_revive_old_handle() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node_addr: std::net::IpAddr = NODE.parse().unwrap();
+
+            let mut node_a = make_node_actor_defexp(NODE, "node-a", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut node_a);
+            asm.actor_mgr
+                .add_node(&node_a, false, &Default::default())
+                .await
+                .unwrap();
+            let handle_a = VSHandleImpl::new(asm.clone(), node_a);
+            assert!(handle_a.node_is_live().await, "precondition: A is live");
+
+            // A is revoked; its address goes back to the pool.
+            asm.cc
+                .disconnect(asm.clone(), node_addr, DisconnectReason::Admin)
+                .await
+                .unwrap();
+            assert!(!handle_a.node_is_live().await);
+
+            // A different node authenticates at the reused address (fresh
+            // session stamped, as the authenticate path does).
+            let mut node_b = make_node_actor_defexp(NODE, "node-b", "[fd5a:5052:3000::102]:1234");
+            VSHandleImpl::stamp_new_session(&mut node_b);
+            asm.actor_mgr
+                .add_node(&node_b, false, &Default::default())
+                .await
+                .unwrap();
+
+            assert!(
+                !handle_a.node_is_live().await,
+                "address reuse must not revive a revoked handle"
+            );
+            let handle_b = VSHandleImpl::new(asm.clone(), node_b);
+            assert!(
+                handle_b.node_is_live().await,
+                "the current occupant's own handle must be live"
+            );
+        }
+
+        /// PR #41 review (Codex P1, zipline#123): a reconnect at the same
+        /// pinned address mints a new session generation, so every handle
+        /// from before the reconnect goes dead — only the handle returned by
+        /// the reconnect is live.
+        #[tokio::test]
+        async fn test_reconnect_kills_pre_reconnect_handle() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+
+            let mut node = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut node);
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            let old_handle = VSHandleImpl::new(asm.clone(), node);
+            assert!(old_handle.node_is_live().await, "precondition: live");
+
+            // The node reconnects at its pinned address: same CN, fresh
+            // session stamped and persisted (what authenticate/open do).
+            let mut renewed = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut renewed);
+            asm.actor_mgr
+                .add_node(&renewed, true, &Default::default())
+                .await
+                .unwrap();
+
+            assert!(
+                !old_handle.node_is_live().await,
+                "a reconnect must invalidate every pre-reconnect handle"
+            );
+            let new_handle = VSHandleImpl::new(asm.clone(), renewed);
+            assert!(
+                new_handle.node_is_live().await,
+                "the reconnect's own handle must be live"
+            );
         }
     }
 }
