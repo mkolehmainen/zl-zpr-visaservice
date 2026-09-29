@@ -1826,6 +1826,44 @@ impl ConnectionControl {
         Ok(authd_actor)
     }
 
+    /// Remove departed adapters: each one's actor record, its recorded trusted-service
+    /// revisions and, if it came from our pool, its ZPR address. The docking node's
+    /// record (and so its connected-adapters set) is left for the caller.
+    ///
+    /// Returns the addresses whose actor records were removed, for the caller to pass
+    /// to [crate::visa_mgr::VisaMgr::remove_visas_for_actors]. Failures are logged and
+    /// skipped so one bad adapter cannot strand the rest.
+    ///
+    /// Used by [ConnectionControl::disconnect] for the adapters of a departing node,
+    /// and by a node's fresh (`ctype=Reset`) connect, whose previously docked adapters
+    /// are gone with the node's state (zipline#138).
+    pub async fn remove_departed_adapters(
+        &self,
+        asm: &Assembly,
+        adapter_addrs: &[IpAddr],
+    ) -> Vec<IpAddr> {
+        let mut removed = Vec::with_capacity(adapter_addrs.len());
+        for &adapter_addr in adapter_addrs {
+            if let Err(e) = asm.actor_mgr.remove_actor_by_zpr_addr(&adapter_addr).await {
+                // Caller can't do anything with this. So just log and continue. The
+                // address stays allocated: the actor record may have survived, and a
+                // recycled address would collide with it (PR #45 review).
+                error!(target: CC, "failed to remove docked adapter with addr {adapter_addr} from actor db: {e}");
+                continue;
+            }
+            // Purge before the adapter's address can be recycled: a later actor at
+            // this address must not inherit its revision records.
+            asm.ts_mgr.forget_actor_revisions(&adapter_addr);
+            removed.push(adapter_addr);
+            if asm.net_mgr.is_managed_address(&adapter_addr) {
+                if let Err(s) = asm.net_mgr.release_zpr_addr(adapter_addr) {
+                    error!(target: CC, "failed to release ZPR addr {adapter_addr} for orphaned adapter: {s}");
+                }
+            }
+        }
+        removed
+    }
+
     /// Disconnect logic. Cleans up actor database, visas, and our view of topology. Updates router.
     ///
     /// This is used only for policy disconnect calls over the VSAPI or for a policy instigated disconnect.
@@ -1888,25 +1926,10 @@ impl ConnectionControl {
                         Vec::new()
                     }
                 };
-                for adapter_addr in connected_adapters {
-                    match asm.actor_mgr.remove_actor_by_zpr_addr(&adapter_addr).await {
-                        Ok(()) => {
-                            // Same as the main actor above: purge before the cascaded
-                            // adapter's address can be recycled.
-                            asm.ts_mgr.forget_actor_revisions(&adapter_addr);
-                            removed_zpr_addrs.push(adapter_addr);
-                        }
-                        Err(e) => {
-                            // Caller can't do anything with this. So just log and continue.
-                            error!(target: CC, "failed to remove disconnected adapter with addr {adapter_addr} from actor db: {e}");
-                        }
-                    };
-                    if asm.net_mgr.is_managed_address(&adapter_addr) {
-                        if let Err(s) = asm.net_mgr.release_zpr_addr(adapter_addr) {
-                            error!(target: CC, "failed to release ZPR addr {adapter_addr} for orphaned adapter: {s}");
-                        }
-                    }
-                }
+                removed_zpr_addrs.extend(
+                    self.remove_departed_adapters(&asm, &connected_adapters)
+                        .await,
+                );
                 asm.actor_mgr.remove_node(&zpr_addr).await?;
                 if let Err(e) = asm.visa_mgr.remove_visas_for_node(&zpr_addr).await {
                     error!(target: CC, "failed to remove visas for disconnected node at addr {zpr_addr}: {e}");
@@ -3216,6 +3239,50 @@ mod tests {
         // recycled address starts from scratch.
         assert_eq!(asm.ts_mgr.stale_sources_for_actor(&node_addr).len(), 1);
         assert_eq!(asm.ts_mgr.stale_sources_for_actor(&adapter_addr).len(), 1);
+    }
+
+    /// PR #45 review (Codex P2): if an adapter's actor record cannot be removed,
+    /// its pool address must stay allocated -- recycling it would collide with the
+    /// surviving record -- and it is not reported as removed.
+    #[tokio::test]
+    async fn remove_departed_adapters_keeps_address_when_removal_fails() {
+        use crate::db::FaultMode;
+        use crate::test_helpers::{make_adapter_actor_defexp, make_node_actor_defexp};
+        use libeval::actor::Role;
+
+        let (asm, _rx, db) = crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let pooled = asm.net_mgr.get_next_zpr_addr(&Role::Adapter).unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234"),
+                false,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &make_adapter_actor_defexp(&pooled.to_string(), "pooled"),
+                &node_addr,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // A rejected pipeline makes the actor-record removal fail.
+        db.set_set_ex_fault(FaultMode::Reject);
+        let removed = asm.cc.remove_departed_adapters(&asm, &[pooled]).await;
+        db.set_set_ex_fault(FaultMode::None);
+
+        assert!(
+            removed.is_empty(),
+            "a failed removal must not be reported as removed"
+        );
+        assert!(
+            asm.net_mgr.take_zpr_addr(&pooled).is_err(),
+            "the address of a surviving actor must stay allocated"
+        );
     }
 
     // ---- multi-blob authentication (zipline#7) ----

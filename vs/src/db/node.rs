@@ -153,6 +153,20 @@ impl NodeRepo {
         Ok(())
     }
 
+    /// Remove the state that an adapter is connected to a node.
+    pub async fn remove_connected_adapter(
+        &self,
+        node_addr: &IpAddr,
+        adapter_addr: &IpAddr,
+    ) -> Result<(), StoreError> {
+        let ops = vec![DbOp::SRem {
+            set_key: connections_key_for_node(node_addr),
+            member: adapter_addr.to_string(),
+        }];
+        self.db.atomic_pipeline(&ops).await?;
+        Ok(())
+    }
+
     /// Get the list of adapter addresses connected to the given node.
     pub async fn get_connected_adapters(
         &self,
