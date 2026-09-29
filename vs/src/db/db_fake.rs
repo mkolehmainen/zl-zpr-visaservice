@@ -34,6 +34,7 @@ pub struct FakeDb {
     // fine: no await is held across it.
     set_ex_fault: std::sync::Mutex<FaultMode>,
     del_fault: std::sync::Mutex<FaultMode>,
+    hset_fault: std::sync::Mutex<FaultMode>,
 }
 
 #[allow(dead_code)]
@@ -58,6 +59,7 @@ impl FakeDb {
             lock: RwLock::new(()),
             set_ex_fault: std::sync::Mutex::new(FaultMode::None),
             del_fault: std::sync::Mutex::new(FaultMode::None),
+            hset_fault: std::sync::Mutex::new(FaultMode::None),
         }
     }
 
@@ -71,6 +73,12 @@ impl FakeDb {
     #[allow(dead_code)]
     pub fn set_del_fault(&self, mode: FaultMode) {
         *self.del_fault.lock().unwrap() = mode;
+    }
+
+    /// Inject a fault mode on the next (and subsequent) `hset` calls.
+    #[allow(dead_code)]
+    pub fn set_hset_fault(&self, mode: FaultMode) {
+        *self.hset_fault.lock().unwrap() = mode;
     }
 }
 
@@ -406,8 +414,35 @@ impl DbConnection for FakeDb {
 
     /// Set a field in a hash.
     async fn hset(&self, key: &str, field: &str, value: &str) -> DbResult<()> {
+        let fault = *self.hset_fault.lock().unwrap();
+        if fault == FaultMode::Reject {
+            return Err(injected_fault_err());
+        }
         let _rlock = self.lock.read().await;
-        self.hset_with_lock(key, field, value).await
+        self.hset_with_lock(key, field, value).await?;
+        if fault == FaultMode::ApplyThenError {
+            return Err(injected_fault_err());
+        }
+        Ok(())
+    }
+
+    /// Remove a field from a hash. Absent field or key is a no-op (HDEL).
+    async fn hdel(&self, key: &str, field: &str) -> DbResult<()> {
+        let _rlock = self.lock.read().await;
+        if let Some(entry) = self.store.get(key) {
+            match &entry.value {
+                FakeDbValue::Hash(h) => {
+                    h.remove(field);
+                    Ok(())
+                }
+                _ => Err(redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "value is not a hash",
+                ))),
+            }
+        } else {
+            Ok(())
+        }
     }
 
     /// Set the hash field only if the field with that name does not already exist.

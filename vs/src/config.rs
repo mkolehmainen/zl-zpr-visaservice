@@ -118,6 +118,11 @@ pub const MAX_NUM_VISA_REQUEST: usize = 20;
 /// Size of the in-memory recent-denies window kept by the deny log.
 pub const DENY_LOG_SIZE: usize = 500;
 
+/// Default for the `reauth_deadline` setting (zipline#123): how long a
+/// connected actor has, after a policy install, to re-authenticate under the
+/// new policy generation before it is revoked.
+pub const DEFAULT_REAUTH_DEADLINE_SECS: u64 = 300;
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields, default)]
 pub struct VSConfig {
@@ -172,6 +177,11 @@ pub struct CoreSection {
     /// visa-service default: the compiler-emitted `OidcConfig` carries no
     /// refresh interval today, so any period is an explicit operator choice.
     pub oidc_refresh_seconds: Option<u64>,
+
+    /// Seconds a connected actor has, after a policy install, to
+    /// re-authenticate under the new policy generation before it is revoked
+    /// (zipline#123). Default [DEFAULT_REAUTH_DEADLINE_SECS].
+    pub reauth_deadline: Option<u64>,
 }
 
 impl Default for VSConfig {
@@ -195,6 +205,7 @@ impl Default for CoreSection {
             file_ts_dir: Some(PathBuf::from(".")),
             ts_secrets_dir: Some(PathBuf::from(".")),
             oidc_refresh_seconds: None,
+            reauth_deadline: Some(DEFAULT_REAUTH_DEADLINE_SECS),
         }
     }
 }

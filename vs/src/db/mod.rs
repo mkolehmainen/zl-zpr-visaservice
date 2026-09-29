@@ -6,6 +6,7 @@ mod db_redis;
 mod link;
 mod node;
 mod policy;
+mod reauth;
 mod visa;
 
 pub use actor::{ActorRepo, Role, ServiceEntry};
@@ -13,6 +14,7 @@ pub use db_redis::RedisDb;
 pub use link::LinkRepo;
 pub use node::{Node, NodeRepo};
 pub use policy::PolicyRepo;
+pub use reauth::{ReauthObligation, ReauthRepo};
 pub use visa::{NodeVisaState, VisaMetadata, VisaRepo};
 
 #[cfg(test)]
@@ -62,6 +64,9 @@ pub trait DbConnection: Send + Sync {
     /// the atomic claim primitive for a uniquely-owned name.
     async fn hset_nx(&self, key: &str, field: &str, value: &str) -> DbResult<bool>;
     async fn hset_multiple(&self, key: &str, field_values: &[(&str, &str)]) -> DbResult<()>;
+    /// Remove `field` from the hash at `key`. Removing an absent field (or an
+    /// absent key) is a no-op, mirroring redis HDEL.
+    async fn hdel(&self, key: &str, field: &str) -> DbResult<()>;
     async fn sadd(&self, key: &str, member: &str) -> DbResult<()>;
     async fn incr(&self, key: &str, by: u64) -> DbResult<u64>;
     async fn expire(&self, key: &str, seconds: i64) -> DbResult<()>;

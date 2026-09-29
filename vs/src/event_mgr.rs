@@ -8,6 +8,7 @@ use futures::stream::{self, StreamExt};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -179,8 +180,6 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
     /*
     When we get here we have already updated policy.
 
-    - TODO: request re-auth all nodes.
-
     - clear revocation list? May make more sense to keep it and make admin clear manually.
 
     - services -> ensure all services being offered are still allowed by policy.
@@ -309,11 +308,73 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         }
     }
 
+    // Policy install obliges every connected actor to re-authenticate under
+    // the new generation (zipline#123). Record the obligation `(V, T)` durably
+    // FIRST — it must survive a VS restart — then ask every surviving node to
+    // start re-authentication for itself and its docked adapters. The ack only
+    // means "started" (contract K1); outcomes are judged by each actor's
+    // `zpr.vinst`, and enforcement is the deadline rule in
+    // `auth_sweep::sweep_reauth_obligations`.
+    //
+    // A failed obligation write is FATAL to this handler (PR #41 review,
+    // Codex P1): the sweep discovers obligations only from the state DB, so
+    // an unrecorded obligation means non-reauthenticating actors would never
+    // be revoked for this generation. Propagating the error means the update
+    // is not reported as successfully enforced; the event worker logs it, and
+    // the next policy-updated event (or VS restart, which replays the current
+    // policy) retries the write against the same snapshot vinst.
+    let deadline_secs = asm
+        .config
+        .core
+        .reauth_deadline
+        .unwrap_or(crate::config::DEFAULT_REAUTH_DEADLINE_SECS);
+    let obligation = crate::db::ReauthObligation {
+        vinst: snapshot_vinst,
+        deadline: SystemTime::now() + Duration::from_secs(deadline_secs),
+    };
+    if let Err(e) = crate::db::ReauthRepo::new(asm.state_db.clone())
+        .add_obligation(&obligation)
+        .await
+    {
+        error!(target: EVENT, "failed to record reauth obligation for vinst {snapshot_vinst}: {e}");
+        return Err(e.into());
+    }
+    request_auths_all_nodes(asm, &valid_node_addrs).await;
+
     // Re-check existing visas against the new policy. Runs last so route checks
     // and the nodes' own link state already reflect the updated topology.
     revalidate_visas(asm, &psnap, SweepReason::PolicyUpdate).await;
 
     Ok(())
+}
+
+/// Fan the `requestAuthentication` VSS call out to every listed node
+/// (zipline#123), mirroring [set_services_all_nodes]. Each node's address list
+/// is its own address (meaning "re-authenticate yourself to the VS") plus its
+/// docked adapters. Failures are logged: the deadline rule in `auth_sweep`
+/// re-sends to whoever still owes, so a missed request costs one sweep period,
+/// not the obligation.
+async fn request_auths_all_nodes(asm: &Arc<Assembly>, node_addrs: &[IpAddr]) {
+    stream::iter(node_addrs)
+        .for_each_concurrent(None, |naddr| {
+            let asm = asm.clone();
+            async move {
+                let mut addrs = vec![*naddr];
+                match asm.actor_mgr.get_adapters_connected_to_node(naddr).await {
+                    Ok(adapters) => addrs.extend(adapters),
+                    Err(e) => {
+                        error!(target: EVENT, "failed to list adapters of node {naddr} for reauth fan-out: {e}");
+                    }
+                }
+                debug!(target: EVENT, "requesting re-authentication of {} actor(s) via node {naddr}", addrs.len());
+                if let Some(vss_h) = asm.vss_mgr.get_handle(naddr) {
+                    if let Err(e) = vss_h.request_auths(addrs).await {
+                        error!(target: EVENT, "failed to request_auths on node {naddr}: {e}");
+                    }
+                }
+            }
+        })
+        .await;
 }
 
 /// A trusted service's attribute data changed (eg, an admin refreshed it). The
@@ -360,8 +421,10 @@ async fn live_visa_actor_addrs(asm: &Arc<Assembly>) -> HashSet<IpAddr> {
 /// The caller supplies the address list because it also needs it to reconcile those
 /// nodes' attributes first; the evaluation below reads the actors as stored.
 ///
-/// Note that the best way to revalidate a node is to prompt it to
-/// re-authenticate. (TODO).
+/// This is the attribute-side check only. The authentication side is handled by
+/// the policy-install re-auth obligation (zipline#123): `handle_policy_updated`
+/// records `(V, T)` and fans out `requestAuthentication`, and `auth_sweep`
+/// revokes whoever has not re-authenticated under the new generation by `T`.
 async fn revalidate_nodes(
     asm: &Arc<Assembly>,
     psnap: &PolicySnapshot,
@@ -829,6 +892,41 @@ mod tests {
             repo.get_zpr_addr_for_hostname("keep-name").await.unwrap(),
             Some(addr),
             "reconciliation must not cost the actor its other names"
+        );
+    }
+
+    /// PR #41 review (Codex P1, zipline#123): a policy update whose reauth
+    /// obligation cannot be persisted must FAIL, not return Ok. The sweep
+    /// discovers obligations only from the state DB, so an unrecorded
+    /// obligation means non-reauthenticating actors are never revoked for
+    /// that generation — the update must not be treated as enforced.
+    #[tokio::test]
+    async fn test_policy_update_fails_when_obligation_persist_fails() {
+        use crate::assembly::tests::new_assembly_with_event_rx_and_db;
+        use crate::db::FaultMode;
+
+        let (asm, event_rx, db) = new_assembly_with_event_rx_and_db(None).await;
+        std::mem::forget(event_rx);
+        let asm = Arc::new(asm);
+
+        // No nodes connected: everything before the obligation write is a
+        // no-op, so the injected hset fault hits exactly the obligation add.
+        db.set_hset_fault(FaultMode::Reject);
+        let vinst = asm.policy_mgr.get_current_snapshot().vinst();
+        let result = handle_policy_updated(&asm, vinst).await;
+        db.set_hset_fault(FaultMode::None);
+
+        assert!(
+            result.is_err(),
+            "a policy update whose reauth obligation was not persisted must not report success"
+        );
+        assert!(
+            crate::db::ReauthRepo::new(asm.state_db.clone())
+                .list_obligations()
+                .await
+                .unwrap()
+                .is_empty(),
+            "precondition check: the obligation must not have been recorded"
         );
     }
 }

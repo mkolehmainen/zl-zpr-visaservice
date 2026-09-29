@@ -173,6 +173,13 @@ struct VSGateImpl {
 struct VSHandleImpl {
     asm: Arc<Assembly>,
     node: Actor,
+    /// The session generation this handle is bound to, captured from the
+    /// node actor's [key::SESSION] attribute at construction (zipline#123,
+    /// PR #41 review): [Self::node_is_live] compares it against the STORED
+    /// actor's session on every gated call, so a handle minted before a
+    /// disconnect/reconnect (or before the address was reused) goes dead
+    /// even though some node still occupies the address.
+    session: Option<String>,
 }
 
 impl VSGateImpl {
@@ -201,7 +208,49 @@ impl VSGateImpl {
 
 impl VSHandleImpl {
     fn new(asm: Arc<Assembly>, node: Actor) -> Self {
-        VSHandleImpl { asm, node }
+        let session = node
+            .get_attribute(key::SESSION)
+            .and_then(|a| a.get_single_value().ok().map(str::to_string));
+        VSHandleImpl { asm, node, session }
+    }
+
+    /// Mint a fresh session id and stamp it on `actor` (zipline#123, PR #41
+    /// review). The authenticate and reconnect paths call this BEFORE
+    /// persisting the actor and before building its handle: the persisted
+    /// session is the current generation, the handle captures it, and every
+    /// handle bound to an earlier generation fails [Self::node_is_live].
+    fn stamp_new_session(actor: &mut Actor) {
+        actor
+            .add_attribute(Attribute::builder(key::SESSION).value(uuid::Uuid::new_v4().to_string()))
+            .expect("session attribute is unvalidated and cannot fail");
+    }
+
+    /// Capability-liveness gate (zipline#123, K2): a `VSHandleImpl` holds a
+    /// snapshot of the node actor, and capnp keeps the capability alive for as
+    /// long as the client holds it — so a node dropped by `cc.disconnect`
+    /// could keep using its old handle indefinitely. Every handler consults
+    /// this first: the stored actor must still exist at the handle's address,
+    /// still be a node, and — because an address can be reused or reconnected
+    /// at (PR #41 review, Codex P1) — carry the SAME session generation this
+    /// handle was minted under. A dropped node gets `authRequired` and must
+    /// re-authenticate through `connect`.
+    async fn node_is_live(&self) -> bool {
+        let Some(addr) = self.node.get_zpr_addr() else {
+            return false;
+        };
+        let stored = match self.asm.actor_mgr.get_actor_by_zpr_addr(addr).await {
+            Ok(Some(actor)) if actor.is_node() => actor,
+            _ => return false,
+        };
+        // Session binding: the stored actor's generation must match the one
+        // captured at handle construction. A mismatch means the address was
+        // re-authenticated (reuse or reconnect) after this handle was minted.
+        // Two `None`s compare equal deliberately: an actor persisted before
+        // this attribute existed keeps its live handle working.
+        let stored_session = stored
+            .get_attribute(key::SESSION)
+            .and_then(|a| a.get_single_value().ok().map(str::to_string));
+        stored_session == self.session
     }
 
     /// Squash (but log) any errors.
@@ -789,6 +838,25 @@ impl vsapi::visa_service::Server for VisaServiceImpl {
             warn!(target: API, "{} requests RESET: not yet implemented", vs_connect_request.cn);
         }
 
+        // A reconnect mints a NEW session generation (zipline#123, PR #41
+        // review): stamp and persist it before building the handle, so every
+        // handle from before this open fails the liveness gate — an old
+        // revoked capability cannot ride the reconnect back to life.
+        VSHandleImpl::stamp_new_session(&mut existing_actor);
+        if let Err(e) = self
+            .asm
+            .actor_mgr
+            .update_actor(&existing_actor, &self.asm.policy_service_names())
+            .await
+        {
+            error!(target: API, "failed to persist session for {}: {}", vs_connect_request.cn, e);
+            return self.ok_with_open_error(
+                results,
+                vsapi::ErrorCode::Internal,
+                "internal error during open",
+            );
+        }
+
         // Skip ahead to the handle:
         let vs_handle: vsapi::v_s_handle::Client =
             capnp_rpc::new_client(VSHandleImpl::new(self.asm.clone(), existing_actor));
@@ -998,6 +1066,12 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
             .add_attribute(Attribute::builder(key::AAA_NET).value(node_aaa_net.to_string()))
             .unwrap();
 
+        // Bind the handle we are about to mint to THIS authentication
+        // (zipline#123, PR #41 review): a fresh session generation is stamped
+        // before the actor is persisted, so any handle from a previous
+        // session at this address fails the liveness gate from here on.
+        VSHandleImpl::stamp_new_session(&mut node_actor);
+
         // TODO: The policy may have changed since started the authentication. Once we add the node
         // it is part of the ZPRnet.  The add_node should check the visa vinst used to grant access
         // and we should make sure we do not allow add_node and update_policy to run concurrently.
@@ -1126,6 +1200,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut res: vsapi::v_s_handle::RegisterVssResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "register_vss from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "register_vss from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = res.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
         let saddr_rdr = params.get()?.get_addr()?;
 
         let node_zpr_addr = self.node.get_zpr_addr().unwrap();
@@ -1223,14 +1308,31 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
 
         // As we return we kick off the vss worker for this node which will send config and list of services.
         // but will not work until visas are installed... So start it with small delay.
-        if let Err(e) = self.asm.vss_mgr.start_vss_worker(
-            self.asm.clone(),
-            &self.node.get_zpr_addr().unwrap(),
-            &saddr,
-            config::VSS_START_DELAY,
-        ) {
+        //
+        // A worker may already be running for this node — a reconnecting node
+        // re-registers its VSS while the previous session's worker is still
+        // around (zipline#123, K2). The node just restarted its listener, so
+        // the old worker's connection is dead: replace it rather than warn and
+        // leave the node without a live VSS channel.
+        let node_zpr_addr = self.node.get_zpr_addr().unwrap();
+        let start_result = if self.asm.vss_mgr.get_handle(node_zpr_addr).is_some() {
+            info!(target: API, "VSS worker already running for node {:?}; restarting it for the re-registered VSS", self.node.get_cn());
+            self.asm.vss_mgr.restart_vss_worker(
+                self.asm.clone(),
+                node_zpr_addr,
+                &saddr,
+                config::VSS_START_DELAY,
+            )
+        } else {
+            self.asm.vss_mgr.start_vss_worker(
+                self.asm.clone(),
+                node_zpr_addr,
+                &saddr,
+                config::VSS_START_DELAY,
+            )
+        };
+        if let Err(e) = start_result {
             warn!(target: API, "failed to start VSS worker for node {:?}: {}", self.node.get_cn(), e);
-            // TODO: handle the duplicate error here - if worker already running we are ok, I think.
         }
 
         Ok(())
@@ -1247,6 +1349,16 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut results: vsapi::v_s_handle::AuthorizeConnectResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "authorize_connect from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "authorize_connect from disconnected node {:?}: refused", self.node.get_cn());
+            let mut err_builder = results.get().init_resp().init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         let cr_rdr = params.get()?.get_req()?;
         let creq = ConnectRequest::try_from(cr_rdr).map_err(|e| {
@@ -1404,6 +1516,16 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut results: vsapi::v_s_handle::ReauthorizeResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "reauthorize from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "reauthorize from disconnected node {:?}: refused", self.node.get_cn());
+            let mut err_builder = results.get().init_resp().init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         let req = ReauthRequest::try_from(params.get()?.get_req()?)
             .map_err(|e| capnp::Error::failed(format!("failed to parse ReauthRequest: {}", e)))?;
@@ -1464,6 +1586,22 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         req: vsapi::v_s_handle::NotifyDisconnectParams,
         mut resp: vsapi::v_s_handle::NotifyDisconnectResults,
     ) -> Result<(), capnp::Error> {
+        debug!(target: API, "notify_disconnect from {:?}", self.node.get_cn());
+        // Liveness gate BEFORE parsing or acting on the notice (PR #41 review,
+        // Codex P1): a node dropped by `cc.disconnect` retains its capnp
+        // capability, and without this gate that dead handle could still
+        // drive `cc.disconnect` for any address and remove live actor state.
+        if !self.node_is_live().await {
+            warn!(target: API, "notify_disconnect from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = resp.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
         let dnotice = req.get()?.get_req()?;
 
         // If no ZPR address is specified that means that the node itself is disconnecting.
@@ -1545,6 +1683,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut response: vsapi::v_s_handle::VisaRequestResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "visa_request from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "visa_request from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = response.get().init_resp();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         self.asm.counters.incr(CounterType::VsApiVisaRequests);
 
@@ -1599,6 +1748,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
     ) -> Result<(), capnp::Error> {
         let node_cn = self.node.get_cn().unwrap_or("<unknown>");
         trace!(target: API, "ping from {node_cn}");
+        if !self.node_is_live().await {
+            warn!(target: API, "ping from disconnected node {node_cn}: refused");
+            let res_builder = results.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
         if let Some(addr) = self.node.get_zpr_addr() {
             self.update_last_seen_time(addr).await;
         }
@@ -1642,6 +1802,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut res: vsapi::v_s_handle::VisaIdsRequestResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "visa_ids_request from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "visa_ids_request from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = res.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         let requestor_addr = self
             .node
@@ -1684,6 +1855,17 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         mut res: vsapi::v_s_handle::VisaRequestByIdResults,
     ) -> Result<(), capnp::Error> {
         debug!(target: API, "visa_request_by_id from {:?}", self.node.get_cn());
+        if !self.node_is_live().await {
+            warn!(target: API, "visa_request_by_id from disconnected node {:?}: refused", self.node.get_cn());
+            let res_builder = res.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthRequired,
+                "node is no longer connected; re-authenticate",
+            );
+            return Ok(());
+        }
 
         let requestor_addr = self
             .node
@@ -2105,6 +2287,275 @@ mod tests {
             assert!(
                 asm.net_mgr.take_zpr_addr(&addr).is_ok(),
                 "zpr address should have been released"
+            );
+        }
+    }
+
+    // ---- K2 VS side (zipline#123) ----
+
+    mod k2_reconnect {
+        use super::*;
+        use crate::assembly::tests::new_assembly_for_tests;
+        use crate::test_helpers::{make_adapter_actor_defexp, make_node_actor_defexp};
+        use std::sync::Arc;
+        use zpr::vsapi::v1::DisconnectReason;
+
+        const NODE: &str = "fd5a:5052:3000::1";
+        const ADAPTER: &str = "fd5a:5052:4000::a";
+
+        /// A node's `Reconnect` re-approval must not disturb its docked
+        /// adapters (K2): `add_node(reconnect = true)` — the store update the
+        /// authenticate handler performs for `ctype=Reconnect` — updates the
+        /// stored node actor (here its `zpr.vinst`) while the adapter stays
+        /// connected to it.
+        #[tokio::test]
+        async fn test_reconnect_add_node_updates_vinst_and_keeps_adapters() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node_addr: std::net::IpAddr = NODE.parse().unwrap();
+
+            let mut node = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            node.add_attribute(Attribute::builder(key::VINST).value("1"))
+                .unwrap();
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            asm.actor_mgr
+                .add_adapter_via_node(
+                    &make_adapter_actor_defexp(ADAPTER, "adapter-k2"),
+                    &node_addr,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+
+            // The reconnect re-approval under the new snapshot: same node,
+            // fresh vinst stamp, updated in place.
+            let mut renewed = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            renewed
+                .add_attribute(Attribute::builder(key::VINST).value("2"))
+                .unwrap();
+            asm.actor_mgr
+                .add_node(&renewed, true, &Default::default())
+                .await
+                .unwrap();
+
+            let stored = asm
+                .actor_mgr
+                .get_actor_by_zpr_addr(&node_addr)
+                .await
+                .unwrap()
+                .expect("node must still exist after reconnect");
+            assert_eq!(
+                stored
+                    .get_attribute(key::VINST)
+                    .and_then(|a| a.get_single_value().ok().map(str::to_string)),
+                Some("2".to_string()),
+                "reconnect must stamp the new zpr.vinst"
+            );
+            let adapters = asm
+                .actor_mgr
+                .get_adapters_connected_to_node(&node_addr)
+                .await
+                .unwrap();
+            assert_eq!(
+                adapters,
+                vec![ADAPTER.parse::<std::net::IpAddr>().unwrap()],
+                "docked adapters must be untouched by the reconnect"
+            );
+        }
+
+        /// A node dropped by `cc.disconnect` is refused on its next VS-API
+        /// call (K2): the handle's liveness gate goes false, so every
+        /// `VSHandleImpl` method answers `authRequired` instead of serving
+        /// the stale capability.
+        #[tokio::test]
+        async fn test_disconnected_node_handle_is_refused() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node_addr: std::net::IpAddr = NODE.parse().unwrap();
+
+            let node = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+
+            // The handle the node held from its authenticate call.
+            let handle = VSHandleImpl::new(asm.clone(), node);
+            assert!(
+                handle.node_is_live().await,
+                "a connected node's handle must be live"
+            );
+
+            asm.cc
+                .disconnect(asm.clone(), node_addr, DisconnectReason::Admin)
+                .await
+                .unwrap();
+
+            assert!(
+                !handle.node_is_live().await,
+                "a disconnected node's handle must be refused"
+            );
+        }
+
+        /// PR #41 review (Codex P1, zipline#123): `notify_disconnect` must apply
+        /// the same liveness gate as every other `VSHandleImpl` handler. A node
+        /// dropped by `cc.disconnect` retains its capnp capability; without the
+        /// gate that dead handle can still submit a disconnect notice for any
+        /// address and remove live actor state.
+        #[tokio::test]
+        async fn test_disconnected_node_handle_notify_disconnect_refused() {
+            const VICTIM: &str = "fd5a:5052:3000::2";
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let asm = Arc::new(new_assembly_for_tests(None).await);
+                    let node_addr: std::net::IpAddr = NODE.parse().unwrap();
+                    let victim_addr: std::net::IpAddr = VICTIM.parse().unwrap();
+
+                    let node =
+                        make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+                    asm.actor_mgr
+                        .add_node(&node, false, &Default::default())
+                        .await
+                        .unwrap();
+                    // An independent second node: disconnecting the first must not
+                    // touch it, so any removal below is the dead handle's doing.
+                    asm.actor_mgr
+                        .add_node(
+                            &make_node_actor_defexp(
+                                VICTIM,
+                                "node-k2b",
+                                "[fd5a:5052:3000::102]:1234",
+                            ),
+                            false,
+                            &Default::default(),
+                        )
+                        .await
+                        .unwrap();
+
+                    // The capability the first node held from its authenticate call.
+                    let handle: vsapi::v_s_handle::Client =
+                        capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), node));
+
+                    // Drop the first node; its retained capability must go dead.
+                    asm.cc
+                        .disconnect(asm.clone(), node_addr, DisconnectReason::Admin)
+                        .await
+                        .unwrap();
+
+                    let mut req = handle.notify_disconnect_request();
+                    {
+                        let mut dnotice = req.get().init_req();
+                        let mut addr_bldr = dnotice.reborrow().init_zpr_addr();
+                        victim_addr.write_to(&mut addr_bldr);
+                        dnotice.set_reason_code(DisconnectReason::RemoteDisconnect);
+                    }
+                    let resp = req.send().promise.await.unwrap();
+                    let res = resp.get().unwrap().get_res().unwrap();
+                    match res.which().unwrap() {
+                        vsapi::ok_or_error::Which::Error(err) => {
+                            assert_eq!(
+                                err.unwrap().get_code().unwrap(),
+                                vsapi::ErrorCode::AuthRequired,
+                                "a revoked handle must be told to re-authenticate"
+                            );
+                        }
+                        vsapi::ok_or_error::Which::Ok(_) => {
+                            panic!("a revoked handle must not drive notify_disconnect")
+                        }
+                    }
+                    assert!(
+                        asm.actor_mgr
+                            .get_actor_by_zpr_addr(&victim_addr)
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "live actor state must survive a revoked handle's disconnect notice"
+                    );
+                })
+                .await;
+        }
+
+        /// PR #41 review (Codex P1, zipline#123): liveness must be bound to
+        /// the authenticated session, not address+role. If a revoked node's
+        /// address is reused by a DIFFERENT node, the old retained capability
+        /// must stay dead — some node occupying the address is not enough.
+        #[tokio::test]
+        async fn test_address_reuse_does_not_revive_old_handle() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let node_addr: std::net::IpAddr = NODE.parse().unwrap();
+
+            let mut node_a = make_node_actor_defexp(NODE, "node-a", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut node_a);
+            asm.actor_mgr
+                .add_node(&node_a, false, &Default::default())
+                .await
+                .unwrap();
+            let handle_a = VSHandleImpl::new(asm.clone(), node_a);
+            assert!(handle_a.node_is_live().await, "precondition: A is live");
+
+            // A is revoked; its address goes back to the pool.
+            asm.cc
+                .disconnect(asm.clone(), node_addr, DisconnectReason::Admin)
+                .await
+                .unwrap();
+            assert!(!handle_a.node_is_live().await);
+
+            // A different node authenticates at the reused address (fresh
+            // session stamped, as the authenticate path does).
+            let mut node_b = make_node_actor_defexp(NODE, "node-b", "[fd5a:5052:3000::102]:1234");
+            VSHandleImpl::stamp_new_session(&mut node_b);
+            asm.actor_mgr
+                .add_node(&node_b, false, &Default::default())
+                .await
+                .unwrap();
+
+            assert!(
+                !handle_a.node_is_live().await,
+                "address reuse must not revive a revoked handle"
+            );
+            let handle_b = VSHandleImpl::new(asm.clone(), node_b);
+            assert!(
+                handle_b.node_is_live().await,
+                "the current occupant's own handle must be live"
+            );
+        }
+
+        /// PR #41 review (Codex P1, zipline#123): a reconnect at the same
+        /// pinned address mints a new session generation, so every handle
+        /// from before the reconnect goes dead — only the handle returned by
+        /// the reconnect is live.
+        #[tokio::test]
+        async fn test_reconnect_kills_pre_reconnect_handle() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+
+            let mut node = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut node);
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            let old_handle = VSHandleImpl::new(asm.clone(), node);
+            assert!(old_handle.node_is_live().await, "precondition: live");
+
+            // The node reconnects at its pinned address: same CN, fresh
+            // session stamped and persisted (what authenticate/open do).
+            let mut renewed = make_node_actor_defexp(NODE, "node-k2", "[fd5a:5052:3000::101]:1234");
+            VSHandleImpl::stamp_new_session(&mut renewed);
+            asm.actor_mgr
+                .add_node(&renewed, true, &Default::default())
+                .await
+                .unwrap();
+
+            assert!(
+                !old_handle.node_is_live().await,
+                "a reconnect must invalidate every pre-reconnect handle"
+            );
+            let new_handle = VSHandleImpl::new(asm.clone(), renewed);
+            assert!(
+                new_handle.node_is_live().await,
+                "the reconnect's own handle must be live"
             );
         }
     }

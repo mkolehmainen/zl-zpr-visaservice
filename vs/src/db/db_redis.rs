@@ -143,6 +143,12 @@ impl DbConnection for RedisDb {
         Ok(())
     }
 
+    async fn hdel(&self, key: &str, field: &str) -> DbResult<()> {
+        let mut conn = self.mgr.clone();
+        let _: () = conn.hdel(key, field).await?;
+        Ok(())
+    }
+
     async fn sadd(&self, key: &str, member: &str) -> DbResult<()> {
         let mut conn = self.mgr.clone();
         let _: () = conn.sadd(key, member).await?;
