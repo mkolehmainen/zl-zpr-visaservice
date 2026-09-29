@@ -530,10 +530,18 @@ impl ConnectionControl {
     }
 
     /// Verify one self-signed (RSA bootstrap) auth blob: the claimed CN must match
-    /// the blob's CN, and the blob signature must verify against the policy's
-    /// bootstrap key for that CN. On success returns the claims this blob
-    /// authenticated -- the CN, promoted at the point where the authentication
-    /// actually happened (authorize_connection never promotes it).
+    /// the blob's CN, `ssb.timestamp` must be within the
+    /// ±[config::MAX_CLOCK_SKEW_SECS] window (zipline#137), and the blob signature
+    /// must verify against the policy's bootstrap key for that CN. On success
+    /// returns the claims this blob authenticated -- the CN, promoted at the point
+    /// where the authentication actually happened (authorize_connection never
+    /// promotes it).
+    ///
+    /// The skew bound here is the ONE implementation for every SS path -- the
+    /// adapter connect path, the node connect path, and the zipline#120 reauth arm
+    /// all reach it through this function. There is no monotonic-timestamp rule:
+    /// freshness comes from the node-minted challenge; this only bounds
+    /// drift/replay-window. The rejection is generic -- no timestamp echo.
     fn authenticate_ss_blob(
         &self,
         policy: &Policy,
@@ -561,6 +569,23 @@ impl ConnectionControl {
                     "cn mismatch between claim and blob".into(),
                 ));
             }
+        }
+
+        // Clock-skew window on the blob timestamp (zipline#137): the single
+        // enforcement point for every SS path. Checked before any signature
+        // work; generic rejection, timestamp goes to the log only.
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now_secs.abs_diff(ssb.timestamp) > config::MAX_CLOCK_SKEW_SECS {
+            info!(
+                target: CC,
+                "ss blob rejected for cn {}: timestamp outside the clock-skew window", ssb.cn
+            );
+            return Err(ServiceError::AuthenticationFailed(
+                "authentication rejected".into(),
+            ));
         }
 
         let pubkey = policy.get_bootstrap_key_by_cn(&ssb.cn).ok_or_else(|| {
@@ -920,7 +945,9 @@ impl ConnectionControl {
     ///   bootstrap-authenticated device has an SS renewal semantics);
     /// - `ssb.cn` equals the actor's AUTHENTICATED CN — a valid blob for a
     ///   different device never renews this actor;
-    /// - `|now − ssb.timestamp| ≤ MAX_CLOCK_SKEW_SECS` (180 s). There is no
+    /// - `|now − ssb.timestamp| ≤ MAX_CLOCK_SKEW_SECS` (180 s) — enforced
+    ///   inside [Self::authenticate_ss_blob] since zipline#137, the single
+    ///   skew check for every SS path. There is no
     ///   monotonic-timestamp rule: freshness comes from the node-minted,
     ///   HMAC'd challenge, and only the docking node could replay
     ///   (SECURITY_MODEL Case 2);
@@ -968,16 +995,9 @@ impl ConnectionControl {
             return Err(reject());
         }
 
-        // Clock-skew window on the blob timestamp. Freshness rides on the
-        // node-minted challenge; this only bounds drift.
-        let now_secs = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if now_secs.abs_diff(ssb.timestamp) > config::MAX_CLOCK_SKEW_SECS {
-            info!(target: CC, "SS reauth rejected: blob timestamp outside the clock-skew window");
-            return Err(reject());
-        }
+        // Clock-skew enforcement moved into authenticate_ss_blob (zipline#137):
+        // that single check now covers this path too, before signature work,
+        // and its failure collapses to the generic rejection below.
 
         // Signature against the PINNED snapshot's bootstrap key: key removed
         // from policy or rotated fails here. The connect arm's classified
@@ -2297,7 +2317,7 @@ mod tests {
             .authenticate_node(
                 asm,
                 b"challenge",
-                12345678,
+                unix_now(),
                 "unknown.zpr",
                 &[],
                 "fd5a:5052::1".parse().unwrap(),
@@ -2327,7 +2347,7 @@ mod tests {
             .authenticate_node(
                 asm,
                 b"challenge",
-                12345678,
+                unix_now(),
                 cn,
                 b"not-a-valid-rsa-sig",
                 "fd5a:5052::1".parse().unwrap(),
@@ -2349,7 +2369,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let bad_sig = sign_node_challenge(&privkey, timestamp + 1, cn, challenge);
         let result = cc
             .authenticate_node(
@@ -2467,7 +2487,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
         let result = cc
             .authenticate_node(
@@ -2551,7 +2571,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let actor = cc
@@ -2605,7 +2625,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
         let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap();
 
@@ -2654,7 +2674,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
         let reported: SocketAddr = "192.0.2.10:7000".parse().unwrap(); // != policy's [b]:0
 
@@ -2690,7 +2710,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
         let reported = SocketAddr::new(b, 0); // matches make_peering's declaration
 
@@ -2718,7 +2738,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let actor = cc
@@ -3194,10 +3214,13 @@ mod tests {
         }
     }
 
-    /// An SS blob whose signature verifies against the keypair's policy bootstrap key.
+    /// An SS blob whose signature verifies against the keypair's policy bootstrap key,
+    /// stamped `now`: since zipline#137 every SS path enforces the
+    /// ±[config::MAX_CLOCK_SKEW_SECS] window, so a fixed timestamp would never
+    /// authenticate. Tests that need a specific timestamp use [make_ss_blob_at].
     fn make_valid_ss_blob(privkey: &PKey<Private>, cn: &str) -> AuthBlob {
         let challenge = b"multi-blob-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let signature = sign_node_challenge(privkey, timestamp, cn, challenge);
         AuthBlob::SS(SelfSignedBlob {
             alg: ChallengeAlg::RsaSha256Pkcs1v15,
@@ -3222,9 +3245,9 @@ mod tests {
         })
     }
 
-    /// As [make_valid_ss_blob], but stamped `now`: the SS reauth arm enforces
-    /// a ±[config::MAX_CLOCK_SKEW_SECS] window on the blob timestamp
-    /// (zipline#120), which the fixed connect-fixture timestamp fails.
+    /// As [make_valid_ss_blob], kept as an alias from before zipline#137
+    /// (when `make_valid_ss_blob` still signed a fixed timestamp and only
+    /// the reauth arm enforced the skew window).
     fn make_fresh_ss_blob(privkey: &PKey<Private>, cn: &str) -> AuthBlob {
         make_ss_blob_at(
             privkey,
@@ -5131,7 +5154,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let actor = cc
@@ -6152,7 +6175,7 @@ mod tests {
 
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let actor = cc
@@ -6720,7 +6743,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let result = cc
@@ -6766,7 +6789,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let actor = cc
@@ -6865,7 +6888,7 @@ mod tests {
             .unwrap();
         let cc = make_cc("test-vs");
         let challenge = b"my-challenge";
-        let timestamp = 12345678u64;
+        let timestamp = unix_now();
         let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
 
         let result = cc
