@@ -2374,6 +2374,7 @@ mod tests {
         use super::*;
         use crate::test_helpers::{build_sweep_asm, create_sweep_visa, make_adapter_actor_defexp};
         use libeval::actor::Role;
+        use zpr::vsapi::v1::DisconnectReason;
 
         /// Node B resets. Before the fix its adapter actor records survived
         /// `add_node`'s replacement of the node record, so re-docking them was
@@ -2454,6 +2455,45 @@ mod tests {
                 .add_adapter_via_node(&pooled_actor, &node_b, &Default::default())
                 .await
                 .expect("re-dock of pooled adapter after reset");
+        }
+
+        /// PR #45 review (Codex P1): an adapter that departed node A on its own
+        /// and re-docked at node B (same address -- a static claim, or a
+        /// recycled pool address) must survive a later Reset of node A.
+        #[tokio::test]
+        async fn test_reset_spares_adapter_redocked_elsewhere() {
+            let (asm, node_a) = build_sweep_asm(false).await;
+            let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+            let src: IpAddr = "fd5a:5052:4000::a".parse().unwrap();
+
+            // The adapter leaves node A alone, then docks at node B.
+            asm.cc
+                .disconnect(asm.clone(), src, DisconnectReason::Admin)
+                .await
+                .unwrap();
+            asm.actor_mgr
+                .add_adapter_via_node(
+                    &make_adapter_actor_defexp("fd5a:5052:4000::a", "src"),
+                    &node_b,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+
+            reset_node_state(&asm, &node_a).await.unwrap();
+
+            assert!(
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&src)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "an adapter now docked at another node must survive this node's reset"
+            );
+            assert_eq!(
+                asm.actor_mgr.get_docking_node_for_adapter(&src),
+                Some(node_b)
+            );
         }
 
         /// The visa service's own adapter is recorded as docked at its node

@@ -371,9 +371,24 @@ impl ActorMgr {
     }
 
     /// Remove actor state from the database. If removing a node, also call [ActorMgr::remove_node].
+    ///
+    /// An adapter is also dropped from its docking node's persisted connections set, so
+    /// that set lists only adapters still docked there. A stale entry would let a later
+    /// teardown of that node (a Reset or a disconnect cascade) remove whichever actor
+    /// holds the address next, even one docked at another node (PR #45 review).
     pub async fn remove_actor_by_zpr_addr(&self, zpra: &IpAddr) -> Result<(), ServiceError> {
         self.actor_db.rm_actor_by_zpr_addr(zpra).await?;
-        self.connection_table.remove(zpra);
+        if let Some((_, node_addr)) = self.connection_table.remove(zpra) {
+            // The actor record is already gone, so report success either way; a
+            // leftover entry is logged rather than failing the removal.
+            if let Err(e) = self
+                .node_db
+                .remove_connected_adapter(&node_addr, zpra)
+                .await
+            {
+                warn!(target: ACTOR, "failed to drop adapter {zpra} from connections of node {node_addr}: {e}");
+            }
+        }
         Ok(())
     }
 
@@ -1305,11 +1320,11 @@ mod test {
 
     #[tokio::test]
     async fn test_get_adapters_connected_to_node_after_removal() {
-        // The adapter list is the node_db connections view: removing the actor
-        // record alone does not scrub the node's connections set (only the node's
-        // own removal or reconnect does), so the address remains listed. This
-        // documents the surviving API's semantics -- the old CN-mapping wrapper
-        // hid the stale entry only as a side effect of its CN filter.
+        // Removing an adapter's actor record also drops it from its docking
+        // node's persisted connections set (PR #45 review, Codex P1): a stale
+        // entry there would let a later teardown of this node -- a Reset or a
+        // disconnect cascade -- remove whatever actor holds the address next,
+        // even one docked at a different node.
         let mgr = make_mgr();
         let node_actor =
             make_node_actor_defexp("fd5a:5052::20", "node-cn-rm", "[fd5a:5052::120]:1234");
@@ -1336,23 +1351,14 @@ mod test {
         addrs.sort();
         assert_eq!(addrs.len(), 2);
 
-        // Remove the actor record for adapter2; the connections set is untouched.
+        // Remove the actor record for adapter2; it leaves the connections set too.
         mgr.remove_actor_by_zpr_addr(&remove_addr).await.unwrap();
 
-        let mut addrs = mgr
+        let addrs = mgr
             .get_adapters_connected_to_node(&node_addr)
             .await
             .unwrap();
-        addrs.sort();
-        assert_eq!(
-            addrs,
-            vec![
-                "fd5a:5052::21".parse::<IpAddr>().unwrap(),
-                "fd5a:5052::22".parse::<IpAddr>().unwrap(),
-            ]
-        );
-        // The removed adapter's actor record is gone even though its address is
-        // still in the node's connections set.
+        assert_eq!(addrs, vec!["fd5a:5052::21".parse::<IpAddr>().unwrap()]);
         assert!(
             mgr.get_actor_by_zpr_addr(&remove_addr)
                 .await

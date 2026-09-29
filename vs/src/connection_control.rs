@@ -1808,18 +1808,17 @@ impl ConnectionControl {
     ) -> Vec<IpAddr> {
         let mut removed = Vec::with_capacity(adapter_addrs.len());
         for &adapter_addr in adapter_addrs {
-            match asm.actor_mgr.remove_actor_by_zpr_addr(&adapter_addr).await {
-                Ok(()) => {
-                    // Purge before the adapter's address can be recycled: a later actor
-                    // at this address must not inherit its revision records.
-                    asm.ts_mgr.forget_actor_revisions(&adapter_addr);
-                    removed.push(adapter_addr);
-                }
-                Err(e) => {
-                    // Caller can't do anything with this. So just log and continue.
-                    error!(target: CC, "failed to remove docked adapter with addr {adapter_addr} from actor db: {e}");
-                }
-            };
+            if let Err(e) = asm.actor_mgr.remove_actor_by_zpr_addr(&adapter_addr).await {
+                // Caller can't do anything with this. So just log and continue. The
+                // address stays allocated: the actor record may have survived, and a
+                // recycled address would collide with it (PR #45 review).
+                error!(target: CC, "failed to remove docked adapter with addr {adapter_addr} from actor db: {e}");
+                continue;
+            }
+            // Purge before the adapter's address can be recycled: a later actor at
+            // this address must not inherit its revision records.
+            asm.ts_mgr.forget_actor_revisions(&adapter_addr);
+            removed.push(adapter_addr);
             if asm.net_mgr.is_managed_address(&adapter_addr) {
                 if let Err(s) = asm.net_mgr.release_zpr_addr(adapter_addr) {
                     error!(target: CC, "failed to release ZPR addr {adapter_addr} for orphaned adapter: {s}");
@@ -3204,6 +3203,50 @@ mod tests {
         // recycled address starts from scratch.
         assert_eq!(asm.ts_mgr.stale_sources_for_actor(&node_addr).len(), 1);
         assert_eq!(asm.ts_mgr.stale_sources_for_actor(&adapter_addr).len(), 1);
+    }
+
+    /// PR #45 review (Codex P2): if an adapter's actor record cannot be removed,
+    /// its pool address must stay allocated -- recycling it would collide with the
+    /// surviving record -- and it is not reported as removed.
+    #[tokio::test]
+    async fn remove_departed_adapters_keeps_address_when_removal_fails() {
+        use crate::db::FaultMode;
+        use crate::test_helpers::{make_adapter_actor_defexp, make_node_actor_defexp};
+        use libeval::actor::Role;
+
+        let (asm, _rx, db) = crate::assembly::tests::new_assembly_with_event_rx_and_db(None).await;
+        let node_addr: IpAddr = "fd5a:5052::10".parse().unwrap();
+        let pooled = asm.net_mgr.get_next_zpr_addr(&Role::Adapter).unwrap();
+        asm.actor_mgr
+            .add_node(
+                &make_node_actor_defexp("fd5a:5052::10", "node-1", "[fd5a:5052::100]:1234"),
+                false,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &make_adapter_actor_defexp(&pooled.to_string(), "pooled"),
+                &node_addr,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // A rejected pipeline makes the actor-record removal fail.
+        db.set_set_ex_fault(FaultMode::Reject);
+        let removed = asm.cc.remove_departed_adapters(&asm, &[pooled]).await;
+        db.set_set_ex_fault(FaultMode::None);
+
+        assert!(
+            removed.is_empty(),
+            "a failed removal must not be reported as removed"
+        );
+        assert!(
+            asm.net_mgr.take_zpr_addr(&pooled).is_err(),
+            "the address of a surviving actor must stay allocated"
+        );
     }
 
     // ---- multi-blob authentication (zipline#7) ----
