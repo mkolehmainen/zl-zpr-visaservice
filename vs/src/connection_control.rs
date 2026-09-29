@@ -3285,9 +3285,9 @@ mod tests {
                     "the rejection must not echo the blob timestamp: {msg}"
                 );
             }
-            other => panic!(
-                "a stale SS blob timestamp must fail connect authentication, got {other:?}"
-            ),
+            other => {
+                panic!("a stale SS blob timestamp must fail connect authentication, got {other:?}")
+            }
         }
     }
 
@@ -3314,9 +3314,9 @@ mod tests {
                     "the rejection must not echo the blob timestamp: {msg}"
                 );
             }
-            other => panic!(
-                "a future SS blob timestamp must fail connect authentication, got {other:?}"
-            ),
+            other => {
+                panic!("a future SS blob timestamp must fail connect authentication, got {other:?}")
+            }
         }
     }
 
