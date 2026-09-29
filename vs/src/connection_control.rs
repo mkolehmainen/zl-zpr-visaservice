@@ -548,6 +548,22 @@ impl ConnectionControl {
         ssb: &SelfSignedBlob,
         unauthd_claims: &[Attribute],
     ) -> Result<Vec<Attribute>, ServiceError> {
+        self.authenticate_ss_blob_at(policy, ssb, unauthd_claims, SystemTime::now())
+    }
+
+    /// [Self::authenticate_ss_blob] with the verifier's clock injected. The
+    /// production path always passes `SystemTime::now()`; the parameter exists
+    /// so the skew-boundary test can pin `now` and deterministically tell the
+    /// intended `>` comparison from `>=` — sampling the wall clock twice (once
+    /// to stamp the blob, once here) leaves a window in which a clock tick
+    /// turns a skew of exactly [config::MAX_CLOCK_SKEW_SECS] into MAX+1.
+    fn authenticate_ss_blob_at(
+        &self,
+        policy: &Policy,
+        ssb: &SelfSignedBlob,
+        unauthd_claims: &[Attribute],
+        now: SystemTime,
+    ) -> Result<Vec<Attribute>, ServiceError> {
         {
             // Make sure there is a CN attribute.
             if !unauthd_claims.iter().any(|c| c.get_key() == key::CN) {
@@ -574,7 +590,7 @@ impl ConnectionControl {
         // Clock-skew window on the blob timestamp (zipline#137): the single
         // enforcement point for every SS path. Checked before any signature
         // work; generic rejection, timestamp goes to the log only.
-        let now_secs = SystemTime::now()
+        let now_secs = now
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
@@ -3323,19 +3339,53 @@ mod tests {
     /// zipline#137: the bound is `>`, not `>=` — a blob stamped exactly
     /// `now − MAX_CLOCK_SKEW_SECS` still authenticates, mirroring the reauth
     /// arm at the boundary.
+    ///
+    /// Review fix (vs#44): the verifier's clock is PINNED via
+    /// [ConnectionControl::authenticate_ss_blob_at]. Sampling the wall clock
+    /// twice — once here to stamp the blob and once inside the skew check —
+    /// leaves a window where a tick to the next second turns a skew of exactly
+    /// MAX into MAX+1, so the earlier connect-path version of this test could
+    /// intermittently fail even though the implementation was correct. With a
+    /// fixed `now` the test deterministically distinguishes `>` from `>=`:
+    /// skew == MAX authenticates, skew == MAX+1 is rejected, on both sides.
     #[tokio::test]
-    async fn test_connect_accepts_ss_blob_at_skew_boundary() {
+    async fn test_ss_blob_skew_boundary_fixed_clock() {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cn = "test-adapter.zpr";
         let (privkey, pubkey_der) = gen_rsa_test_keypair();
         install_bootstrap_policy(&asm, cn, &pubkey_der).await;
         let cc = make_cc("test-vs");
-        let boundary = unix_now() - crate::config::MAX_CLOCK_SKEW_SECS;
-        let req = make_connect_request(vec![make_ss_blob_at(&privkey, cn, boundary)], cn);
+        let psnap = asm.policy_mgr.get_current_snapshot();
+        let cn_claim = vec![Attribute::builder(key::CN).value(cn)];
 
-        cc.authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
-            .await
-            .expect("a blob at the exact skew boundary must authenticate (the bound is `>`)");
+        let now_secs = unix_now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(now_secs);
+        let max = crate::config::MAX_CLOCK_SKEW_SECS;
+        let ssb_at = |ts: u64| match make_ss_blob_at(&privkey, cn, ts) {
+            AuthBlob::SS(ssb) => ssb,
+            other => panic!("make_ss_blob_at must yield an SS blob, got {other:?}"),
+        };
+
+        // skew == MAX, past and future side: authenticates (the bound is `>`).
+        for ts in [now_secs - max, now_secs + max] {
+            cc.authenticate_ss_blob_at(psnap.policy(), &ssb_at(ts), &cn_claim, now)
+                .expect("a blob at the exact skew boundary must authenticate (the bound is `>`)");
+        }
+
+        // skew == MAX + 1, past and future side: rejected.
+        for ts in [now_secs - max - 1, now_secs + max + 1] {
+            match cc.authenticate_ss_blob_at(psnap.policy(), &ssb_at(ts), &cn_claim, now) {
+                Err(ServiceError::AuthenticationFailed(msg)) => {
+                    assert!(
+                        !msg.contains(&ts.to_string()),
+                        "the rejection must not echo the blob timestamp: {msg}"
+                    );
+                }
+                other => panic!(
+                    "a blob one second past the skew boundary must be rejected, got {other:?}"
+                ),
+            }
+        }
     }
 
     /// A syntactically-present OIDC blob naming an issuer no trusted service
