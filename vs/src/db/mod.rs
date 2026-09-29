@@ -3,6 +3,7 @@
 mod actor;
 mod db_fake;
 mod db_redis;
+mod denylist;
 mod link;
 mod node;
 mod policy;
@@ -11,6 +12,7 @@ mod visa;
 
 pub use actor::{ActorRepo, Role, ServiceEntry};
 pub use db_redis::RedisDb;
+pub use denylist::BootstrapDenylist;
 pub use link::LinkRepo;
 pub use node::{Node, NodeRepo};
 pub use policy::PolicyRepo;
