@@ -49,6 +49,21 @@ pub struct ServiceDetail {
     pub connect_via: Option<IpAddr>,
 }
 
+/// A stale node removed by [ActorMgr::refresh_state], with the adapter
+/// addresses that were docked through it. `refresh_state` runs before the
+/// `Assembly` exists, so the adapters' teardown (actor records, visas, pool
+/// addresses — zipline#138's `remove_departed_adapters` plus
+/// `remove_visas_for_actors`) is the caller's job once the Assembly is up
+/// (zipline#145).
+pub struct CulledNode {
+    /// The culled node's ZPR address.
+    pub node_addr: IpAddr,
+    /// ZPR addresses of the adapters that were docked through the node,
+    /// captured before the node record (and with it the connected-adapters
+    /// set) was removed.
+    pub adapter_addrs: Vec<IpAddr>,
+}
+
 impl ActorMgr {
     pub fn new(
         actor_repo: db::ActorRepo,
@@ -68,8 +83,13 @@ impl ActorMgr {
     /// that were connected.
     ///
     /// For each node we find in here we check how long ago it was last seen. Nodes
-    /// last seen more than [config::DEFAULT_AUTH_EXPIRATION] ago are removed (along
-    /// with any connected adapters). Culling by last-seen age instead of
+    /// last seen more than [config::DEFAULT_AUTH_EXPIRATION] ago are culled: their
+    /// actor record AND node DB record are removed here, and each culled node is
+    /// returned with the adapter addresses that were docked through it. This runs
+    /// before the `Assembly` exists, so the adapters' own teardown (actor records,
+    /// visas, pool addresses — the zipline#138 teardown) cannot happen here: the
+    /// caller (`main`, via `synchronize_state`) runs it right after Assembly
+    /// construction (zipline#145). Culling by last-seen age instead of
     /// authentication expiry (zipline#119): bootstrap authentication no longer
     /// expires, so an auth-expiry check would keep dead nodes forever; the 4 h
     /// window this preserves is the same one the old auth-expiry check gave a
@@ -77,13 +97,14 @@ impl ActorMgr {
     /// and removed — its record predates last-seen tracking or never carried one.
     ///
     /// For nodes seen recently enough, we wipe their vss info.
-    pub async fn refresh_state(&self) -> Result<(), ServiceError> {
+    pub async fn refresh_state(&self) -> Result<Vec<CulledNode>, ServiceError> {
+        let mut culled = Vec::new();
         for node_addr in &self.node_db.list_node_addrs().await? {
             match self.actor_db.get_actor_by_zpr_addr(node_addr).await {
                 Ok(_actor) => {}
                 Err(StoreError::NotFound(_)) => {
                     debug!(target: ACTOR, "refresh_state: node at {} not found in actor DB, removing from node DB", node_addr);
-                    self.remove_actor_by_zpr_addr(node_addr).await?;
+                    culled.push(self.cull_node(node_addr).await?);
                     continue;
                 }
                 Err(e) => return Err(ServiceError::from(e)),
@@ -99,7 +120,7 @@ impl ActorMgr {
             };
             if stale {
                 info!(target: ACTOR, "refresh_state: node at {node_addr} last seen too long ago, removing");
-                self.remove_actor_by_zpr_addr(node_addr).await?;
+                culled.push(self.cull_node(node_addr).await?);
                 continue;
             }
 
@@ -122,7 +143,25 @@ impl ActorMgr {
             }
         }
 
-        Ok(())
+        Ok(culled)
+    }
+
+    /// Remove a stale node's actor record and node DB record, returning the
+    /// [CulledNode] naming the adapters that were docked through it. The
+    /// adapters must be read BEFORE the removal: [ActorMgr::remove_node] drops
+    /// the node's connected-adapters set with the node record (zipline#145).
+    async fn cull_node(&self, node_addr: &IpAddr) -> Result<CulledNode, ServiceError> {
+        let adapter_addrs = match self.node_db.get_connected_adapters(node_addr).await {
+            Ok(adapters) => adapters.into_iter().collect(),
+            Err(StoreError::NotFound(_)) => Vec::new(),
+            Err(e) => return Err(ServiceError::from(e)),
+        };
+        self.remove_actor_by_zpr_addr(node_addr).await?;
+        self.remove_node(node_addr).await?;
+        Ok(CulledNode {
+            node_addr: *node_addr,
+            adapter_addrs,
+        })
     }
 
     pub async fn add_node(

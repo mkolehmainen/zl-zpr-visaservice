@@ -316,6 +316,9 @@ async fn main() -> std::process::ExitCode {
 
     let net_mgr = NetMgr::new_v6().expect("failed to create NetMgr");
 
+    // Nodes culled at startup; adapter/visa teardown deferred until the
+    // Assembly exists (zipline#145).
+    let mut culled_nodes = Vec::new();
     if !cli.clear_state {
         // The policy's service-name set gates hostname-claim reconciliation
         // (zipline#53): a persisted claim colliding with a policy service is
@@ -326,10 +329,13 @@ async fn main() -> std::process::ExitCode {
             .iter()
             .map(|svc| svc.id.clone())
             .collect();
-        if let Err(e) = synchronize_state(&actor_mgr, &net_mgr, &policy_service_names).await {
-            error!(target: MAIN, "error during state synchronization: {}", e);
-            // For now treat this as a fail.  Force user to reset state.
-            return std::process::ExitCode::FAILURE;
+        match synchronize_state(&actor_mgr, &net_mgr, &policy_service_names).await {
+            Ok(culled) => culled_nodes = culled,
+            Err(e) => {
+                error!(target: MAIN, "error during state synchronization: {}", e);
+                // For now treat this as a fail.  Force user to reset state.
+                return std::process::ExitCode::FAILURE;
+            }
         }
     }
 
@@ -379,6 +385,12 @@ async fn main() -> std::process::ExitCode {
         ts_mgr,
         deny_log: Default::default(),
     });
+
+    // Tear down what the startup cull left for us, now that the Assembly
+    // exists: the culled nodes' adapters (records, visas, pool addresses),
+    // their visa refs and router entries (zipline#145). Runs before the
+    // topology restore below so a culled node's persisted edges are GC'd.
+    teardown_culled_nodes(&asm, &culled_nodes).await;
 
     // Rebuild the in-memory router topology from persisted state. This runs after
     // synchronize_state/refresh_state (above) has pruned expired nodes, so those nodes
@@ -576,14 +588,20 @@ fn initialize_identity(
 ///
 /// Loading of visa state happens in [db::VisaRepo::new].
 ///
+/// Returns the stale nodes [ActorMgr::refresh_state] culled: their node-side
+/// records are already gone, but their adapters' teardown needs the `Assembly`,
+/// so the caller runs [teardown_culled_nodes] right after constructing it
+/// (zipline#145). Note the pool-grab below reserves the orphaned adapters'
+/// addresses first; the teardown then releases them.
+///
 /// TODO: If we have state in the db, and we are loading a policy that differs from
 /// the saved "curent" policy, we may have visas that are not longer valid.
 async fn synchronize_state(
     actor_mgr: &ActorMgr,
     net_mgr: &NetMgr,
     policy_service_names: &std::collections::HashSet<String>,
-) -> Result<(), ServiceError> {
-    actor_mgr.refresh_state().await?;
+) -> Result<Vec<crate::actor_mgr::CulledNode>, ServiceError> {
+    let culled = actor_mgr.refresh_state().await?;
 
     // Rebuild the `host:<NAME>` hostname-claim index from persisted actor
     // attributes (zipline#53, PR #24 review): actors persisted before the
@@ -605,7 +623,42 @@ async fn synchronize_state(
             net_mgr.take_zpr_addr(&zpr_addr)?;
         }
     }
-    Ok(())
+    Ok(culled)
+}
+
+/// Tear down what a node culled by [ActorMgr::refresh_state] leaves behind,
+/// once the `Assembly` exists (zipline#145). The node's own records are
+/// already gone; this handles its docked adapters and the node's visa/router
+/// state, mirroring `reset_node_state` (vsapi_worker.rs) — the same
+/// zipline#138 teardown a `ctype=Reset` connect runs:
+/// - the adapters' actor records, trusted-service revisions and pool
+///   addresses (`ConnectionControl::remove_departed_adapters`), sparing the
+///   VS's own adapter: the VS is running right now, and its record is
+///   re-created only at startup or when its adapter re-docks;
+/// - the removed adapters' visas (`VisaMgr::remove_visas_for_actors`);
+/// - the node's visa refs (`VisaMgr::clear_node_state`) and its router entry
+///   (`TopologyMgr::remove_node`).
+///
+/// Failures are logged, not fatal: startup proceeds with whatever teardown
+/// succeeded, same as the disconnect path.
+async fn teardown_culled_nodes(asm: &Assembly, culled: &[crate::actor_mgr::CulledNode]) {
+    let vs_addr = IpAddr::V6(config::VS_ZPR_ADDR);
+    for node in culled {
+        let departed: Vec<IpAddr> = node
+            .adapter_addrs
+            .iter()
+            .copied()
+            .filter(|addr| *addr != vs_addr)
+            .collect();
+        let removed = asm.cc.remove_departed_adapters(asm, &departed).await;
+        if let Err(e) = asm.visa_mgr.remove_visas_for_actors(&removed).await {
+            error!(target: MAIN, "failed to remove visas for adapters of culled node {}: {e}", node.node_addr);
+        }
+        if let Err(e) = asm.visa_mgr.clear_node_state(&node.node_addr).await {
+            error!(target: MAIN, "failed to clear visa state for culled node {}: {e}", node.node_addr);
+        }
+        asm.topo_mgr.remove_node(&node.node_addr).await;
+    }
 }
 
 #[cfg(test)]
