@@ -229,8 +229,22 @@ pub(crate) async fn sweep_reauth_obligations(asm: &Arc<Assembly>) -> ReauthSweep
                 continue;
             };
             match vss_handle.revoke_auths(addrs.clone()).await {
-                Ok(_processed) => {
-                    for addr in addrs {
+                Ok(processed) => {
+                    // A short count is PARTIAL success (PR #41 review, Codex
+                    // P2): the VSS processes the batch in order and stops
+                    // counting at the first failure, so exactly the first
+                    // `processed` entries had their node-side auth revoked.
+                    // Remove only those; the rest keep their node-side auth
+                    // and are deferred to the next sweep tick.
+                    if processed < addrs.len() {
+                        warn!(
+                            target: ACTOR,
+                            "reauth sweep: node {node_addr} revoked {processed} of {} stale adapter(s); deferring the rest",
+                            addrs.len()
+                        );
+                        stats.deferred += addrs.len() - processed;
+                    }
+                    for addr in addrs.into_iter().take(processed) {
                         // Same re-check as above: a concurrent reauthorize that
                         // landed while the revoke was in flight wins, and the
                         // renewed actor's node-side auth is re-established by
@@ -1296,5 +1310,66 @@ mod tests {
         );
         assert_eq!(revokes.lock().unwrap().as_slice(), &[vec![adapter]]);
         assert!(!actor_exists(&asm, &adapter).await);
+    }
+
+    /// PR #41 review (Codex P2, zipline#123): `revoke_auths` represents
+    /// partial success as `Ok(processed)` with `processed < addrs.len()`,
+    /// and the VSS processes the batch in order. The sweep must remove only
+    /// the first `processed` actors — deleting an actor whose node-side auth
+    /// was NOT revoked leaves the two sides inconsistent. The remainder is
+    /// deferred to the next tick.
+    #[tokio::test]
+    async fn test_reauth_partial_revoke_ack_removes_only_processed() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let adapter_a: IpAddr = ADAPTER.parse().unwrap();
+        let adapter_b: IpAddr = "fd5a:5052:4000::b".parse().unwrap();
+        add_adapter_with_vinst(&asm, ADAPTER, &node, 1).await;
+        add_adapter_with_vinst(&asm, "fd5a:5052:4000::b", &node, 1).await;
+        record_obligation(&asm, 2, -5).await;
+
+        // A VSS that acks only ONE item of whatever batch it receives.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VssCmd>(8);
+        asm.vss_mgr.insert_test_handle(node, cmd_tx);
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let batches_task = batches.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    VssCmd::RevokeAuthsByZprAddr(addrs, resp_tx) => {
+                        batches_task.lock().unwrap().push(addrs.clone());
+                        let _ = resp_tx.send(Ok(1)); // partial: first item only
+                    }
+                    VssCmd::RequestAuthsByZprAddr(addrs, resp_tx) => {
+                        let _ = resp_tx.send(Ok(addrs.len()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let stats = sweep_reauth_obligations(&asm).await;
+
+        assert_eq!(stats.revoked, 1, "only the acked entry may be revoked");
+        assert_eq!(stats.deferred, 1, "the unacked entry must be deferred");
+        let batch = batches.lock().unwrap()[0].clone();
+        assert_eq!(batch.len(), 2, "both stale adapters were in the batch");
+        // VSS processes in order: the first batch entry was revoked, the
+        // second was not. Exactly the unprocessed one must survive.
+        let (revoked_addr, kept_addr) = (batch[0], batch[1]);
+        assert!(
+            !actor_exists(&asm, &revoked_addr).await,
+            "the acked adapter must be removed"
+        );
+        assert!(
+            actor_exists(&asm, &kept_addr).await,
+            "an adapter beyond the processed count must survive for the next tick"
+        );
+        // Sanity: the two are the adapters we added.
+        let mut both = vec![revoked_addr, kept_addr];
+        both.sort();
+        let mut expected = vec![adapter_a, adapter_b];
+        expected.sort();
+        assert_eq!(both, expected);
     }
 }
