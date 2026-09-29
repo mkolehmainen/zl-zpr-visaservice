@@ -1790,6 +1790,45 @@ impl ConnectionControl {
         Ok(authd_actor)
     }
 
+    /// Remove departed adapters: each one's actor record, its recorded trusted-service
+    /// revisions and, if it came from our pool, its ZPR address. The docking node's
+    /// record (and so its connected-adapters set) is left for the caller.
+    ///
+    /// Returns the addresses whose actor records were removed, for the caller to pass
+    /// to [crate::visa_mgr::VisaMgr::remove_visas_for_actors]. Failures are logged and
+    /// skipped so one bad adapter cannot strand the rest.
+    ///
+    /// Used by [ConnectionControl::disconnect] for the adapters of a departing node,
+    /// and by a node's fresh (`ctype=Reset`) connect, whose previously docked adapters
+    /// are gone with the node's state (zipline#138).
+    pub async fn remove_departed_adapters(
+        &self,
+        asm: &Assembly,
+        adapter_addrs: &[IpAddr],
+    ) -> Vec<IpAddr> {
+        let mut removed = Vec::with_capacity(adapter_addrs.len());
+        for &adapter_addr in adapter_addrs {
+            match asm.actor_mgr.remove_actor_by_zpr_addr(&adapter_addr).await {
+                Ok(()) => {
+                    // Purge before the adapter's address can be recycled: a later actor
+                    // at this address must not inherit its revision records.
+                    asm.ts_mgr.forget_actor_revisions(&adapter_addr);
+                    removed.push(adapter_addr);
+                }
+                Err(e) => {
+                    // Caller can't do anything with this. So just log and continue.
+                    error!(target: CC, "failed to remove docked adapter with addr {adapter_addr} from actor db: {e}");
+                }
+            };
+            if asm.net_mgr.is_managed_address(&adapter_addr) {
+                if let Err(s) = asm.net_mgr.release_zpr_addr(adapter_addr) {
+                    error!(target: CC, "failed to release ZPR addr {adapter_addr} for orphaned adapter: {s}");
+                }
+            }
+        }
+        removed
+    }
+
     /// Disconnect logic. Cleans up actor database, visas, and our view of topology. Updates router.
     ///
     /// This is used only for policy disconnect calls over the VSAPI or for a policy instigated disconnect.
@@ -1852,25 +1891,10 @@ impl ConnectionControl {
                         Vec::new()
                     }
                 };
-                for adapter_addr in connected_adapters {
-                    match asm.actor_mgr.remove_actor_by_zpr_addr(&adapter_addr).await {
-                        Ok(()) => {
-                            // Same as the main actor above: purge before the cascaded
-                            // adapter's address can be recycled.
-                            asm.ts_mgr.forget_actor_revisions(&adapter_addr);
-                            removed_zpr_addrs.push(adapter_addr);
-                        }
-                        Err(e) => {
-                            // Caller can't do anything with this. So just log and continue.
-                            error!(target: CC, "failed to remove disconnected adapter with addr {adapter_addr} from actor db: {e}");
-                        }
-                    };
-                    if asm.net_mgr.is_managed_address(&adapter_addr) {
-                        if let Err(s) = asm.net_mgr.release_zpr_addr(adapter_addr) {
-                            error!(target: CC, "failed to release ZPR addr {adapter_addr} for orphaned adapter: {s}");
-                        }
-                    }
-                }
+                removed_zpr_addrs.extend(
+                    self.remove_departed_adapters(&asm, &connected_adapters)
+                        .await,
+                );
                 asm.actor_mgr.remove_node(&zpr_addr).await?;
                 if let Err(e) = asm.visa_mgr.remove_visas_for_node(&zpr_addr).await {
                     error!(target: CC, "failed to remove visas for disconnected node at addr {zpr_addr}: {e}");

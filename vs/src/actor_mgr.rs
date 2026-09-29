@@ -158,14 +158,10 @@ impl ActorMgr {
                 .update_actor(actor, policy_service_names, &self.counters)
                 .await
             {
-                // Update failed? Make the node try a fresh connect.
-                if let Err(ee) = self
-                    .node_db
-                    .remove_node(actor.get_zpr_addr().unwrap())
-                    .await
-                {
-                    warn!(target: ACTOR, "add_node: failed to remove node at {} after failed update during reconnect: {}", actor.get_zpr_addr().unwrap(), ee);
-                }
+                // Update failed? Make the node try a fresh connect. The node record is
+                // deliberately left in place: the fresh connect's Reset teardown reads
+                // the node's connected-adapters set to remove its docked adapters, and
+                // the replacing add below then supersedes the record (zipline#138).
                 return Err(e.into());
             }
         }
@@ -1501,6 +1497,45 @@ mod test {
         // Both adapter entries must be purged from the connection table.
         assert_eq!(mgr.get_docking_node_for_actor(&adapter1), None);
         assert_eq!(mgr.get_docking_node_for_actor(&adapter2), None);
+    }
+
+    /// zipline#138: a reconnect whose actor update fails tells the node to do a
+    /// fresh connect, whose Reset teardown finds the node's docked adapters in
+    /// its connected-adapters set. So the failed reconnect must leave that set
+    /// intact, or the Reset finds nothing and orphans the adapters.
+    #[tokio::test]
+    async fn test_failed_reconnect_keeps_connected_adapters() {
+        let mgr = make_mgr();
+        let node_addr: IpAddr = "fd5a:5052::3a".parse().unwrap();
+        let adapter_addr: IpAddr = "fd5a:5052::3b".parse().unwrap();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::3a", "node-reconn", "[fd5a:5052::13a]:1234");
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052::3b", "adapter-reconn"),
+            &node_addr,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        // Losing the node's actor record makes the reconnect's update fail.
+        mgr.actor_db.rm_actor_by_zpr_addr(&node_addr).await.unwrap();
+        assert!(
+            mgr.add_node(&node_actor, true, &Default::default())
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            mgr.get_adapters_connected_to_node(&node_addr)
+                .await
+                .unwrap(),
+            vec![adapter_addr],
+            "a failed reconnect must not erase the node's docked adapters"
+        );
     }
 
     #[tokio::test]

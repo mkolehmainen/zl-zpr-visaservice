@@ -350,6 +350,44 @@ fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message
     bldr.set_retry_in(0);
 }
 
+/// Tear down the state a node held before a fresh (`ctype=Reset`) connect.
+///
+/// A resetting node has discarded everything it knew, so what we recorded for
+/// it is stale:
+/// - the adapters docked through it are removed and their visas revoked from
+///   every other node (zipline#138: previously their actor records were
+///   orphaned, blocking a re-dock at the same address). The visa service's own
+///   adapter is spared, as before this change: the VS keeps running across its
+///   docking node's reset, and its record is otherwise re-created only at VS
+///   startup or when its adapter re-docks;
+/// - its own visa refs are cleared;
+/// - it is removed from the router, persisted edges included.
+///
+/// Must run before [crate::actor_mgr::ActorMgr::add_node] replaces the node
+/// record, which drops the node's connected-adapters set.
+async fn reset_node_state(asm: &Assembly, node_addr: &IpAddr) -> Result<(), ServiceError> {
+    let vs_addr = IpAddr::V6(config::VS_ZPR_ADDR);
+    let departed: Vec<IpAddr> = asm
+        .actor_mgr
+        .get_adapters_connected_to_node(node_addr)
+        .await?
+        .into_iter()
+        .filter(|addr| *addr != vs_addr)
+        .collect();
+    let removed_adapters = asm.cc.remove_departed_adapters(asm, &departed).await;
+    if let Err(e) = asm
+        .visa_mgr
+        .remove_visas_for_actors(&removed_adapters)
+        .await
+    {
+        // Same as disconnect: log, the teardown proceeds regardless.
+        error!(target: API, "failed to remove visas for adapters of reset node {node_addr}: {e}");
+    }
+    asm.visa_mgr.clear_node_state(node_addr).await?;
+    asm.topo_mgr.remove_node(node_addr).await;
+    Ok(())
+}
+
 /// Install router edges for every policy-declared peering between `node_addr` and a node
 /// that is already connected, persisting each edge.
 ///
@@ -1081,7 +1119,7 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // Note that the node may have services on it in addition to its node-ness.
 
         if !self.reconnect {
-            if let Err(e) = self.asm.visa_mgr.clear_node_state(&node_zpr_addr).await {
+            if let Err(e) = reset_node_state(&self.asm, &node_zpr_addr).await {
                 error!(target: API, "failed to clear node state for {:?}: {}", &node_cn, e);
                 undo.undo(&self.asm).await;
                 return self.ok_with_authenticate_error(
@@ -1090,8 +1128,6 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
                     "failed to clear node state",
                 );
             }
-            // A fresh connect explicitly clears stale router topology, including persisted edges.
-            self.asm.topo_mgr.remove_node(&node_zpr_addr).await;
         }
 
         // The add_node call will clean up after ifself if it fails.
@@ -2331,6 +2367,134 @@ mod tests {
     }
 
     // ---- K2 VS side (zipline#123) ----
+
+    /// zipline#138: a fresh (`ctype=Reset`) connect must tear down the
+    /// adapters docked through the node, not orphan their actor records.
+    mod reset_teardown {
+        use super::*;
+        use crate::test_helpers::{build_sweep_asm, create_sweep_visa, make_adapter_actor_defexp};
+        use libeval::actor::Role;
+
+        /// Node B resets. Before the fix its adapter actor records survived
+        /// `add_node`'s replacement of the node record, so re-docking them was
+        /// refused (occupied address), their visas stayed live on node A and
+        /// their pool addresses were never released.
+        #[tokio::test]
+        async fn test_reset_tears_down_docked_adapters() {
+            let (asm, node_a) = build_sweep_asm(true).await;
+            let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+            let dst: IpAddr = "fd5a:5052:4000::b".parse().unwrap();
+
+            // A second adapter on node B, on a managed pool address.
+            let pooled = asm.net_mgr.get_next_zpr_addr(&Role::Adapter).unwrap();
+            let pooled_actor = make_adapter_actor_defexp(&pooled.to_string(), "pooled");
+            asm.actor_mgr
+                .add_adapter_via_node(&pooled_actor, &node_b, &Default::default())
+                .await
+                .unwrap();
+
+            // A visa held by node A from its adapter to node B's adapter.
+            let visa_id = create_sweep_visa(&asm, &node_a, 0).await;
+
+            // What the authenticate handler does for a Reset connect.
+            reset_node_state(&asm, &node_b).await.unwrap();
+            let node_b_actor = asm
+                .actor_mgr
+                .get_actor_by_zpr_addr(&node_b)
+                .await
+                .unwrap()
+                .unwrap();
+            asm.actor_mgr
+                .add_node(&node_b_actor, false, &Default::default())
+                .await
+                .unwrap();
+
+            for addr in [dst, pooled] {
+                assert!(
+                    asm.actor_mgr
+                        .get_actor_by_zpr_addr(&addr)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "adapter {addr} must not survive its node's reset"
+                );
+            }
+            assert!(
+                asm.actor_mgr
+                    .get_adapters_connected_to_node(&node_b)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the reset node must have no docked adapters"
+            );
+            assert!(
+                asm.net_mgr.take_zpr_addr(&pooled).is_ok(),
+                "the pooled adapter's address must be released"
+            );
+            asm.net_mgr.release_zpr_addr(pooled).unwrap();
+            assert_eq!(
+                asm.visa_mgr
+                    .get_pending_revoke_visa_ids_for_node(&node_a)
+                    .await
+                    .unwrap(),
+                vec![visa_id],
+                "the visa to the departed adapter must be revoked from node A"
+            );
+
+            // The same adapters re-dock cleanly.
+            asm.actor_mgr
+                .add_adapter_via_node(
+                    &make_adapter_actor_defexp("fd5a:5052:4000::b", "dst"),
+                    &node_b,
+                    &Default::default(),
+                )
+                .await
+                .expect("re-dock of dst after reset");
+            asm.actor_mgr
+                .add_adapter_via_node(&pooled_actor, &node_b, &Default::default())
+                .await
+                .expect("re-dock of pooled adapter after reset");
+        }
+
+        /// The visa service's own adapter is recorded as docked at its node
+        /// (`hack_set_vs_docking_node`). A Reset of that node must not remove
+        /// the VS's own actor record: the VS keeps running across the reset.
+        #[tokio::test]
+        async fn test_reset_spares_vs_own_adapter() {
+            let (asm, node_a) = build_sweep_asm(false).await;
+            let vs_addr = IpAddr::V6(config::VS_ZPR_ADDR);
+            asm.actor_mgr
+                .hack_add_adapter_no_node(
+                    &make_adapter_actor_defexp(&vs_addr.to_string(), config::VS_CN),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            asm.actor_mgr
+                .hack_set_vs_docking_node(&node_a)
+                .await
+                .unwrap();
+
+            reset_node_state(&asm, &node_a).await.unwrap();
+
+            assert!(
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&vs_addr)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the VS's own actor record must survive a reset of its docking node"
+            );
+            assert!(
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&"fd5a:5052:4000::a".parse().unwrap())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "other adapters on the node are still torn down"
+            );
+        }
+    }
 
     mod k2_reconnect {
         use super::*;
