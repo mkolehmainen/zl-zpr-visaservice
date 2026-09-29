@@ -1786,4 +1786,103 @@ mod test {
             "a node with no recorded last-seen time must be treated as stale"
         );
     }
+
+    /// zipline#145: culling a stale node must remove its node DB record too,
+    /// not only its actor record — a surviving record means `list_node_addrs`
+    /// keeps returning the ghost on every restart, and its connected-adapters
+    /// set survives with it.
+    #[tokio::test]
+    async fn test_refresh_state_stale_node_cull_removes_node_record() {
+        let db = Arc::new(crate::db::FakeDb::new());
+        let mgr = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+
+        let node_addr: IpAddr = "fd5a:5052::49".parse().unwrap();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::49", "node-cull", "[fd5a:5052::149]:1234");
+        let adapter_a = make_adapter_actor_defexp("fd5a:5052::4a", "cull-adapter-a");
+        let adapter_b = make_adapter_actor_defexp("fd5a:5052::4b", "cull-adapter-b");
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_a, &node_addr, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_b, &node_addr, &Default::default())
+            .await
+            .unwrap();
+
+        backdate_last_seen(
+            &db,
+            &node_addr,
+            crate::config::DEFAULT_AUTH_EXPIRATION + Duration::from_secs(60),
+        )
+        .await;
+
+        mgr.refresh_state().await.unwrap();
+
+        assert!(
+            !mgr.list_node_addrs().await.unwrap().contains(&node_addr),
+            "a culled node must leave no node DB record: list_node_addrs must not return it"
+        );
+    }
+
+    /// zipline#145: `refresh_state` runs before the `Assembly` exists, so it
+    /// cannot tear the adapters down itself — it must return each culled node
+    /// with the adapter addresses that were docked through it, for main to
+    /// tear down right after Assembly construction.
+    #[tokio::test]
+    async fn test_refresh_state_returns_stale_nodes_adapters() {
+        let db = Arc::new(crate::db::FakeDb::new());
+        let mgr = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+
+        let node_addr: IpAddr = "fd5a:5052::4c".parse().unwrap();
+        let adapter_a_addr: IpAddr = "fd5a:5052::4d".parse().unwrap();
+        let adapter_b_addr: IpAddr = "fd5a:5052::4e".parse().unwrap();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::4c", "node-ret", "[fd5a:5052::14c]:1234");
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052::4d", "ret-adapter-a"),
+            &node_addr,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        mgr.add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052::4e", "ret-adapter-b"),
+            &node_addr,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        backdate_last_seen(
+            &db,
+            &node_addr,
+            crate::config::DEFAULT_AUTH_EXPIRATION + Duration::from_secs(60),
+        )
+        .await;
+
+        let culled = mgr.refresh_state().await.unwrap();
+
+        assert_eq!(culled.len(), 1, "exactly one node must be culled");
+        assert_eq!(culled[0].node_addr, node_addr);
+        let mut adapters = culled[0].adapter_addrs.clone();
+        adapters.sort();
+        assert_eq!(
+            adapters,
+            vec![adapter_a_addr, adapter_b_addr],
+            "the culled node's docked adapters must be reported for teardown"
+        );
+    }
 }
