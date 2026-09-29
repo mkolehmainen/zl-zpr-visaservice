@@ -36,9 +36,8 @@ API KEY
 
 Notes
 -----
-  - Some endpoints in admin_service still return placeholder or fixed data
-    (the authrevoke endpoints, DELETE visas, and DELETE actors). These are
-    marked "placeholder" below.
+  - DELETE /admin/visas and DELETE /admin/actors still return placeholder or
+    fixed data; they are marked "placeholder" below.
   - A few fields are hardcoded or not tracked yet; see endpoint notes.
   - All timestamps are integer seconds since the Unix epoch. Nullable
     timestamps serialize as JSON null.
@@ -502,53 +501,79 @@ POST /admin/policies
 GET /admin/authrevoke
 ---------------------
   Summary
-    Returns authorization revokes. Placeholder: returns a fixed list.
+    Lists the bootstrap-key denylist (zipline#136): the ids of every
+    revoked-credential entry, ascending. Resolve an id to its descriptor
+    with GET /admin/authrevoke/{id}.
   Request
     (none)
   Response
     200: ListEntry[]
-  Notes
-    Not sure yet what type of thing is returned here. Probably will be a
-    string identifier.
+    403: permission denied (read permission required)
 
 GET /admin/authrevoke/{id}
 --------------------------
   Summary
-    Returns a specific auth revoke. Placeholder: returns a fixed response.
+    Returns the descriptor behind one denylist entry.
   Request
     (none)
   Response
-    200: AuthRevokeDescriptor
-  Notes
-    Type of {id} is TBD.
+    200: AuthRevokeDescriptor ({ "ty": "bootstrap", "cn": string })
+    400: non-numeric id
+    403: permission denied
+    404: no such entry
 
-POST /admin/authrevoke/{id}
+POST /admin/authrevoke/{cn}
 ---------------------------
   Summary
-    Adds an auth revoke. Placeholder: returns a fixed response.
+    Revokes a bootstrap authentication root (zipline#136): the CN named in
+    the path. The CN is recorded on a persisted denylist and every connected
+    actor the key admitted is revoked immediately through the revoke
+    pipeline -- no policy install and no reauth_deadline wait. Nodes admitted
+    under the CN are disconnected together with their docked adapters;
+    adapters are revoked on their docking node and removed on the positive
+    ack. A revocation the node did not ack is retried by the periodic sweep;
+    the response lists only what was revoked now.
+
+    The denylist is consulted on the connect and SS-renewal paths, so a
+    re-connect presenting the revoked key is refused even while a stale
+    policy still carries it. Unlike admin actor disconnects (which clear on
+    the next policy install), denylist entries deliberately PERSIST across
+    policy installs -- a compromised key is not un-compromised by an
+    install -- until explicitly removed (DELETE /admin/authrevoke/{id}) or
+    the list is cleared (POST /admin/authrevoke/clear).
   Request
-    (none)
+    Body: AuthRevokeDesc -- { "ty": "bootstrap", "cn": string }. ty must be
+    "bootstrap" (the only revocable credential type here; OIDC roots are
+    revoked at the provider) and cn must equal the path CN.
   Response
-    200: ListEntry
+    200: AuthRevokeResult -- { "id": number, "ty": "bootstrap",
+         "cn": string, "revoked": [zpr_addr, ...] }
+    400: malformed body, ty != "bootstrap", or body/path cn mismatch
+    403: permission denied (write permission required)
   Notes
-    Type of {id} is TBD.
+    Adding an already-denylisted CN is idempotent: the existing entry id is
+    returned and enforcement re-runs (which retries deferred revocations).
 
 POST /admin/authrevoke/clear
 ----------------------------
   Summary
-    Clears auth revokes. Placeholder: returns a fixed list.
+    Empties the denylist. Every revoked bootstrap key becomes connectable
+    again wherever policy still carries it.
   Request
     (none)
   Response
-    200: ListEntry[]
+    200: ListEntry[] (the removed entry ids)
+    403: permission denied (write permission required)
 
 DELETE /admin/authrevoke/{id}
 -----------------------------
   Summary
-    Removes a specific auth revoke. Placeholder: returns a fixed response.
+    Removes one denylist entry -- the explicit un-revocation. The entry's
+    key becomes connectable again wherever policy still carries it.
   Request
     (none)
   Response
-    200: ListEntry
-  Notes
-    Type of {id} is TBD.
+    200: ListEntry (the removed id)
+    400: non-numeric id
+    403: permission denied (write permission required)
+    404: no such entry

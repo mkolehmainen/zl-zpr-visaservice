@@ -1178,6 +1178,24 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         // nodes must be updated. Detect it now while the actor is still in the DB.
         event_mgr::record_auth_change_if_provider(&self.asm, &node_zpr_addr).await;
 
+        // PR #42 review (P1): the node is persisted — re-check the denylist to
+        // close the check-then-persist race with an admin revocation. The gate
+        // disconnects the node (its state teardown is the full disconnect
+        // path, which the undo tracker does not model), so no undo here.
+        if let Err(e) = self
+            .asm
+            .cc
+            .enforce_denylist_after_persist(&self.asm, &node_actor)
+            .await
+        {
+            warn!(target: API, "node authentication revoked post-persist for {}: {}", node_cn, e);
+            return self.ok_with_authenticate_error(
+                results,
+                vsapi::ErrorCode::AuthError,
+                "authentication failed: not authorized",
+            );
+        }
+
         let vs_handle: vsapi::v_s_handle::Client =
             capnp_rpc::new_client(VSHandleImpl::new(self.asm.clone(), node_actor));
         let mut res_builder = results.get().init_res();
@@ -1467,6 +1485,27 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
                 self.asm.counters.incr(CounterType::AuthorizeConnectFailed);
                 return Ok(());
             }
+        }
+
+        // PR #42 review (P1): the actor is persisted — re-check the denylist
+        // to close the check-then-persist race with an admin revocation. On a
+        // hit the gate has already disconnected the actor; report the same
+        // uniform credential rejection a pre-check hit gets.
+        if let Err(e) = self
+            .asm
+            .cc
+            .enforce_denylist_after_persist(&self.asm, &actor)
+            .await
+        {
+            warn!(target: API, "connection authorization revoked post-persist for node {:?}: {}", connect_via, e);
+            let mut err_builder = results.get().init_resp().init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::AuthError,
+                "adapter authorization failed: not authorized",
+            );
+            self.asm.counters.incr(CounterType::AuthorizeConnectFailed);
+            return Ok(());
         }
 
         {
