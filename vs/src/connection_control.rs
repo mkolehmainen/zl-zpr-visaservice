@@ -3236,6 +3236,85 @@ mod tests {
         )
     }
 
+    /// zipline#137: a stale SS blob timestamp — outside the
+    /// ±[config::MAX_CLOCK_SKEW_SECS] window on the past side — is rejected on
+    /// the adapter CONNECT path with a generic `AuthenticationFailed` that
+    /// echoes no timestamp, mirroring the reauthorize SS arm's bound
+    /// (zipline#120).
+    #[tokio::test]
+    async fn test_connect_rejects_stale_ss_blob_timestamp() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-adapter.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        install_bootstrap_policy(&asm, cn, &pubkey_der).await;
+        let cc = make_cc("test-vs");
+        let stale = unix_now() - (crate::config::MAX_CLOCK_SKEW_SECS + 60);
+        let req = make_connect_request(vec![make_ss_blob_at(&privkey, cn, stale)], cn);
+
+        let result = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+
+        match result {
+            Err(ServiceError::AuthenticationFailed(msg)) => {
+                assert!(
+                    !msg.contains(&stale.to_string()),
+                    "the rejection must not echo the blob timestamp: {msg}"
+                );
+            }
+            other => panic!(
+                "a stale SS blob timestamp must fail connect authentication, got {other:?}"
+            ),
+        }
+    }
+
+    /// zipline#137: the connect-path skew bound is symmetric (`abs_diff`) — a
+    /// FUTURE timestamp beyond the window is rejected the same way.
+    #[tokio::test]
+    async fn test_connect_rejects_future_ss_blob_timestamp() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-adapter.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        install_bootstrap_policy(&asm, cn, &pubkey_der).await;
+        let cc = make_cc("test-vs");
+        let future = unix_now() + crate::config::MAX_CLOCK_SKEW_SECS + 60;
+        let req = make_connect_request(vec![make_ss_blob_at(&privkey, cn, future)], cn);
+
+        let result = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+
+        match result {
+            Err(ServiceError::AuthenticationFailed(msg)) => {
+                assert!(
+                    !msg.contains(&future.to_string()),
+                    "the rejection must not echo the blob timestamp: {msg}"
+                );
+            }
+            other => panic!(
+                "a future SS blob timestamp must fail connect authentication, got {other:?}"
+            ),
+        }
+    }
+
+    /// zipline#137: the bound is `>`, not `>=` — a blob stamped exactly
+    /// `now − MAX_CLOCK_SKEW_SECS` still authenticates, mirroring the reauth
+    /// arm at the boundary.
+    #[tokio::test]
+    async fn test_connect_accepts_ss_blob_at_skew_boundary() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-adapter.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        install_bootstrap_policy(&asm, cn, &pubkey_der).await;
+        let cc = make_cc("test-vs");
+        let boundary = unix_now() - crate::config::MAX_CLOCK_SKEW_SECS;
+        let req = make_connect_request(vec![make_ss_blob_at(&privkey, cn, boundary)], cn);
+
+        cc.authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("a blob at the exact skew boundary must authenticate (the bound is `>`)");
+    }
+
     /// A syntactically-present OIDC blob naming an issuer no trusted service
     /// declares. Under zipline#11 this is a real validation failure (paramError), which
     /// keeps this fixture useful for the fail-closed property below.
