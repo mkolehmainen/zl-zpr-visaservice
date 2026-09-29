@@ -39,16 +39,47 @@ impl BootstrapDenylist {
 
     /// Add `cn` to the denylist and return its entry id. Adding a CN that is
     /// already denylisted is idempotent: the existing entry (and id) is kept.
+    ///
+    /// Concurrency (PR #42 review, P2): the insert is an atomic set-if-absent
+    /// ([DbConnection::hset_nx]), so two racing adds of the same absent CN
+    /// cannot overwrite each other — one claims the field, the loser reads
+    /// back the winner's stored id and returns that. A pre-allocated id that
+    /// lost the claim is simply abandoned (the counter only ever moves
+    /// forward, so ids stay unique; gaps are fine).
     pub async fn add(&self, cn: &str) -> Result<u64, StoreError> {
         if let Some(existing) = self.db.hget(KEY_DENYLIST, cn).await? {
             if let Ok(id) = existing.parse::<u64>() {
                 return Ok(id);
             }
-            // Unparseable id: fall through and overwrite with a fresh one.
+            // Unparseable id: this entry has no usable removal handle
+            // (`remove()` is id-keyed), so re-mint it. hdel-then-claim keeps
+            // the window where the CN is briefly absent, but revocation
+            // enforcement re-reads the store (contains(), the sweep), and
+            // this path only runs on an already-corrupt record.
+            self.db.hdel(KEY_DENYLIST, cn).await?;
         }
         let id = self.db.incr(KEY_NEXT_ID, 1).await?;
-        self.db.hset(KEY_DENYLIST, cn, &id.to_string()).await?;
-        Ok(id)
+        if self.db.hset_nx(KEY_DENYLIST, cn, &id.to_string()).await? {
+            return Ok(id);
+        }
+        // Lost the claim to a concurrent add: return the id the store kept.
+        match self.db.hget(KEY_DENYLIST, cn).await? {
+            Some(stored) => stored.parse::<u64>().map_err(|_| {
+                StoreError::InvalidData(format!("denylist entry for {cn} has a non-numeric id"))
+            }),
+            // Claim lost, then the entry vanished: a concurrent remove/clear.
+            // One more claim attempt with our id; a second loss is contention
+            // beyond anything the admin surface can generate.
+            None => {
+                if self.db.hset_nx(KEY_DENYLIST, cn, &id.to_string()).await? {
+                    Ok(id)
+                } else {
+                    Err(StoreError::InvalidData(format!(
+                        "denylist add for {cn} lost two consecutive claim races"
+                    )))
+                }
+            }
+        }
     }
 
     /// Whether `cn` is denylisted — the connect / SS-renewal check.
@@ -162,6 +193,51 @@ mod tests {
         let id2 = deny.add("laptop-7.zpr").await.unwrap();
         assert_eq!(id1, id2, "re-adding the same CN keeps the entry id");
         assert_eq!(deny.list().await.unwrap().len(), 1);
+    }
+
+    /// PR #42 review (P2): idempotency must hold under CONCURRENT adds too.
+    /// Two adds of the same absent CN can both pass the exists-check, allocate
+    /// distinct ids, and overwrite each other — one caller is then handed an
+    /// id that no entry carries, so its GET/DELETE 404s. Every concurrent add
+    /// must return the id the store actually kept. Multi-threaded flavor: the
+    /// race needs true parallelism to interleave FakeDb operations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_denylist_concurrent_adds_agree_on_one_entry() {
+        const TASKS: usize = 8;
+        for round in 0..200 {
+            let db: Arc<dyn DbConnection> = Arc::new(FakeDb::new());
+            let barrier = Arc::new(tokio::sync::Barrier::new(TASKS));
+            let mut handles = Vec::with_capacity(TASKS);
+            for _ in 0..TASKS {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                handles.push(tokio::spawn(async move {
+                    let deny = BootstrapDenylist::new(db);
+                    barrier.wait().await;
+                    deny.add("raced.zpr").await.unwrap()
+                }));
+            }
+            let mut returned = Vec::with_capacity(TASKS);
+            for handle in handles {
+                returned.push(handle.await.unwrap());
+            }
+
+            let deny = BootstrapDenylist::new(db);
+            let entries = deny.list().await.unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "round {round}: concurrent adds of one CN must leave one entry"
+            );
+            let stored = entries[0].0;
+            for id in returned {
+                assert_eq!(
+                    id, stored,
+                    "round {round}: an add returned id {id} but the store kept \
+                     {stored} — that id 404s on GET/DELETE"
+                );
+            }
+        }
     }
 
     /// Clear empties the list; contains goes false for every former entry.
