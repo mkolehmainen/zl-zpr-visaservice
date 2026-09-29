@@ -125,11 +125,13 @@ impl BootstrapDenylist {
         Ok(Some(cn))
     }
 
-    /// Remove every entry.
+    /// Remove every entry. Deletes the raw hash key rather than iterating
+    /// [Self::list]: a malformed record (unparseable id) is invisible to
+    /// `list()` but still blocks connects via [Self::contains], and clear is
+    /// the only removal path that can reach it — `remove()` is id-keyed
+    /// (PR #42 review, P2).
     pub async fn clear(&self) -> Result<(), StoreError> {
-        for (_, cn) in self.list().await? {
-            self.db.hdel(KEY_DENYLIST, &cn).await?;
-        }
+        self.db.del(KEY_DENYLIST).await?;
         Ok(())
     }
 }
@@ -250,6 +252,36 @@ mod tests {
         assert!(deny.list().await.unwrap().is_empty());
         assert!(!deny.contains("a.zpr").await.unwrap());
         assert!(!deny.contains("b.zpr").await.unwrap());
+    }
+
+    /// PR #42 review (P2): a hash field whose id does not parse must not
+    /// survive `clear()`. `list()` drops such an entry, but `contains()` reads
+    /// the raw field — so a clear that only walks `list()` leaves the CN
+    /// permanently revoked with no removal path (`remove()` is id-keyed and
+    /// the id is unusable).
+    #[tokio::test]
+    async fn test_denylist_clear_removes_malformed_entries() {
+        let db: Arc<dyn DbConnection> = Arc::new(FakeDb::new());
+        let deny = BootstrapDenylist::new(db.clone());
+        deny.add("good.zpr").await.unwrap();
+        // A malformed record, written behind the repo's back (a corrupted
+        // store, or a different code version): unparseable id.
+        db.hset(KEY_DENYLIST, "stuck.zpr", "not-a-number")
+            .await
+            .unwrap();
+        assert!(
+            deny.contains("stuck.zpr").await.unwrap(),
+            "precondition: contains() sees the malformed entry"
+        );
+
+        deny.clear().await.unwrap();
+
+        assert!(
+            !deny.contains("stuck.zpr").await.unwrap(),
+            "clear() must remove entries list() cannot parse"
+        );
+        assert!(!deny.contains("good.zpr").await.unwrap());
+        assert!(deny.list().await.unwrap().is_empty());
     }
 
     /// Entries survive rehydration: a fresh repo over the same DB sees them —
