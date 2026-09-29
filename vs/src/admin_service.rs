@@ -49,9 +49,10 @@ use crate::visa_mgr::VisaMgr;
 use zpr::vsapi_types::vsapi_ip_number as ip_proto;
 
 use admin_api_types::{
-    ActorDescriptor, ActorEntry, ApiAttribute, ApiKeyFormat, ApiKeySet, ConnectionType, DenyRecord,
-    HostDescriptor, ListEntry, NamedListEntry, NetworkDetails, NodeConnection, NodeRecordBrief,
-    Revokes, ServiceDescriptor, Stats, VisaDescriptor,
+    ActorDescriptor, ActorEntry, ApiAttribute, ApiKeyFormat, ApiKeySet, AuthRevokeDescriptor,
+    AuthRevokeResult, ConnectionType, DenyRecord, HostDescriptor, ListEntry, NamedListEntry,
+    NetworkDetails, NodeConnection, NodeRecordBrief, Revokes, ServiceDescriptor, Stats,
+    VisaDescriptor,
 };
 
 // Must use tokio RwLock here becuase we need state to be Send.
@@ -1228,53 +1229,200 @@ fn service_endpoints_to_string(endpoints: &[Scope]) -> String {
     ep_strs.join(",")
 }
 
-async fn get_revokes(Extension(perm): Extension<Permission>) -> impl IntoResponse {
+/// GET /admin/authrevoke (zipline#136): the bootstrap-key denylist as
+/// `ListEntry` ids, ascending. Resolve an id with GET /admin/authrevoke/{id}.
+async fn get_revokes(
+    State(state): State<SharedState>,
+    Extension(perm): Extension<Permission>,
+) -> impl IntoResponse {
     if !perm.can_read() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    debug!(target: ADMIN, "GET /admin/authrevoke - NOT IMPLEMENTED");
-    (StatusCode::OK, Json(Vec::<ListEntry>::new())).into_response()
+    debug!(target: ADMIN, "GET /admin/authrevoke");
+    let asm = state.read().await.asm.clone();
+    match crate::db::BootstrapDenylist::new(asm.state_db.clone())
+        .list()
+        .await
+    {
+        Ok(mut entries) => {
+            entries.sort();
+            let list: Vec<ListEntry> = entries
+                .into_iter()
+                .map(|(id, _cn)| ListEntry { id })
+                .collect();
+            (StatusCode::OK, Json(list)).into_response()
+        }
+        Err(e) => {
+            error!(target: ADMIN, "failed to list the bootstrap denylist: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
+/// GET /admin/authrevoke/{id} (zipline#136): the descriptor behind one
+/// denylist entry. 400 for a non-numeric id, 404 for an unknown one.
 async fn get_revoke(
+    State(state): State<SharedState>,
     Extension(perm): Extension<Permission>,
     EPath(id): EPath<String>,
 ) -> impl IntoResponse {
     if !perm.can_read() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    debug!(target: ADMIN, "GET /admin/authrevoke/{} - NOT IMPLEMENTED", id);
-    (StatusCode::NOT_FOUND, Json(()).into_response()).into_response()
+    debug!(target: ADMIN, "GET /admin/authrevoke/{}", id);
+    let Ok(id) = id.parse::<u64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let asm = state.read().await.asm.clone();
+    match crate::db::BootstrapDenylist::new(asm.state_db.clone())
+        .cn_by_id(id)
+        .await
+    {
+        Ok(Some(cn)) => (
+            StatusCode::OK,
+            Json(AuthRevokeDescriptor {
+                ty: AUTHREVOKE_TYPE_BOOTSTRAP.to_string(),
+                cn,
+            }),
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            error!(target: ADMIN, "failed to read the bootstrap denylist: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
-async fn clear_revokes(Extension(perm): Extension<Permission>) -> impl IntoResponse {
+/// POST /admin/authrevoke/clear (zipline#136): empty the denylist. Returns
+/// the removed entries as `ListEntry` ids. Revoked keys become connectable
+/// again wherever policy still carries them.
+async fn clear_revokes(
+    State(state): State<SharedState>,
+    Extension(perm): Extension<Permission>,
+) -> impl IntoResponse {
     if !perm.can_write() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    debug!(target: ADMIN, "POST /admin/authrevoke/clear - NOT IMPLEMENTED");
-    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response()).into_response()
+    debug!(target: ADMIN, "POST /admin/authrevoke/clear");
+    let asm = state.read().await.asm.clone();
+    let denylist = crate::db::BootstrapDenylist::new(asm.state_db.clone());
+    let entries = match denylist.list().await {
+        Ok(entries) => entries,
+        Err(e) => {
+            error!(target: ADMIN, "failed to list the bootstrap denylist: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if let Err(e) = denylist.clear().await {
+        error!(target: ADMIN, "failed to clear the bootstrap denylist: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let mut removed: Vec<ListEntry> = entries
+        .into_iter()
+        .map(|(id, cn)| {
+            info!(target: ADMIN, "bootstrap denylist cleared: cn {cn} may authenticate again");
+            ListEntry { id }
+        })
+        .collect();
+    removed.sort_by_key(|e| e.id);
+    (StatusCode::OK, Json(removed)).into_response()
 }
 
+/// DELETE /admin/authrevoke/{id} (zipline#136): remove one denylist entry —
+/// the explicit un-revocation. 400 for a non-numeric id, 404 for an unknown
+/// one.
 async fn remove_revoke(
+    State(state): State<SharedState>,
     Extension(perm): Extension<Permission>,
     EPath(id): EPath<String>,
 ) -> impl IntoResponse {
     if !perm.can_write() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    debug!(target: ADMIN, "DELETE /admin/authrevoke/{} - NOT IMPLEMENTED", id);
-    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response()).into_response()
+    debug!(target: ADMIN, "DELETE /admin/authrevoke/{}", id);
+    let Ok(id) = id.parse::<u64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let asm = state.read().await.asm.clone();
+    match crate::db::BootstrapDenylist::new(asm.state_db.clone())
+        .remove(id)
+        .await
+    {
+        Ok(Some(cn)) => {
+            info!(target: ADMIN, "bootstrap denylist entry {id} removed: cn {cn} may authenticate again");
+            (StatusCode::OK, Json(ListEntry { id })).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            error!(target: ADMIN, "failed to remove bootstrap denylist entry {id}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
+/// The only `ty` the revocation surface accepts (zipline#136): the built-in
+/// RSA bootstrap authentication root. Other roots (OIDC) are revoked at the
+/// provider, not here.
+const AUTHREVOKE_TYPE_BOOTSTRAP: &str = "bootstrap";
+
+/// POST /admin/authrevoke/{cn} (zipline#136): revoke a bootstrap
+/// authentication root. The CN goes on the persisted denylist — consulted by
+/// the connect and SS-renewal paths, surviving policy installs until
+/// explicitly removed — and every connected actor the key admitted is revoked
+/// immediately through the zipline#123 pipeline: nodes are disconnected with
+/// their docked adapters, adapters are revoked on their docking node and
+/// removed on the positive ack. A revocation the node did not ack is retried
+/// by the periodic sweep; the response lists only what was revoked now.
 async fn add_revoke(
+    State(state): State<SharedState>,
     Extension(perm): Extension<Permission>,
-    EPath(id): EPath<String>,
-) -> impl IntoResponse {
+    EPath(cn): EPath<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<AuthRevokeResult>, StatusCode> {
     if !perm.can_write() {
-        return StatusCode::FORBIDDEN.into_response();
+        return Err(StatusCode::FORBIDDEN);
     }
-    debug!(target: ADMIN, "POST /admin/authrevoke/{} - NOT IMPLEMENTED", id);
-    (StatusCode::NOT_IMPLEMENTED, Json(()).into_response()).into_response()
+    debug!(target: ADMIN, "POST /admin/authrevoke/{}", cn);
+    // Body parsed after the permission gate, so a bad body on a forbidden key
+    // is still a 403 (matches the zipline#36 permission sweep).
+    let desc: AuthRevokeDescriptor =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if desc.ty != AUTHREVOKE_TYPE_BOOTSTRAP {
+        warn!(target: ADMIN, "authrevoke: unsupported credential type {:?}", desc.ty);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if desc.cn != cn {
+        warn!(target: ADMIN, "authrevoke: body cn {:?} does not match path cn {:?}", desc.cn, cn);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let asm = state.read().await.asm.clone();
+    let id = crate::db::BootstrapDenylist::new(asm.state_db.clone())
+        .add(&cn)
+        .await
+        .map_err(|e| {
+            error!(target: ADMIN, "failed to add {cn} to the bootstrap denylist: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    info!(target: ADMIN, "bootstrap key revoked for cn {cn} (denylist entry {id}); revoking admitted actors");
+
+    // Enforce immediately — no policy install, no reauth_deadline wait. The
+    // sweep covers every denylisted CN; report the actors revoked under THIS
+    // one. Deferred entries (VSS outage) are retried by the periodic sweep.
+    let stats = crate::auth_sweep::sweep_denylisted_actors(&asm).await;
+    let revoked: Vec<String> = stats
+        .revoked
+        .into_iter()
+        .filter(|(_, revoked_cn)| revoked_cn == &cn)
+        .map(|(addr, _)| addr.to_string())
+        .collect();
+    Ok(Json(AuthRevokeResult {
+        id,
+        ty: AUTHREVOKE_TYPE_BOOTSTRAP.to_string(),
+        cn,
+        revoked,
+    }))
 }
 
 /// Stringify a substrate address as a parseable `host:port`. IPv6 hosts get bracketed
@@ -3709,6 +3857,317 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 "for {method} {path}"
             );
+        }
+    }
+
+    // ---- bootstrap-key revocation endpoints (zipline#136) ----
+
+    use crate::db::BootstrapDenylist;
+    use crate::test_helpers::make_adapter_actor;
+    use crate::vss::VssCmd;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// Add an adapter docked at `node`, admitted by bootstrap under `cn`.
+    async fn add_bootstrap_adapter(asm: &Arc<Assembly>, zpr_addr: &str, node: &IpAddr, cn: &str) {
+        let mut actor = make_adapter_actor(zpr_addr, cn, Duration::from_secs(3600));
+        actor
+            .add_attribute(
+                Attribute::builder(key::DEVICE_AUTHORITY)
+                    .expires_in(crate::config::VS_AUTH_EXPIRATION)
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, node, &Default::default())
+            .await
+            .unwrap();
+    }
+
+    /// Install a fake VSS handle for `node` that acks every revoke, recording
+    /// the address batches it saw.
+    fn install_acking_vss(asm: &Arc<Assembly>, node: IpAddr) -> Arc<Mutex<Vec<Vec<IpAddr>>>> {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VssCmd>(8);
+        asm.vss_mgr.insert_test_handle(node, cmd_tx);
+        let revokes = Arc::new(Mutex::new(Vec::new()));
+        let revokes_task = revokes.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    VssCmd::RevokeAuthsByZprAddr(addrs, resp_tx) => {
+                        revokes_task.lock().unwrap().push(addrs.clone());
+                        let _ = resp_tx.send(Ok(addrs.len()));
+                    }
+                    VssCmd::RequestAuthsByZprAddr(addrs, resp_tx) => {
+                        let _ = resp_tx.send(Ok(addrs.len()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        revokes
+    }
+
+    /// One admin request with an optional JSON body; returns the response.
+    async fn admin_request(
+        app: &Router,
+        method: &str,
+        path: &str,
+        api_key: &str,
+        body: Option<serde_json::Value>,
+    ) -> axum::response::Response {
+        let builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("X-API-Key", api_key);
+        let request = match body {
+            Some(json) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(json.to_string()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        app.clone().oneshot(request).await.unwrap()
+    }
+
+    /// POST /admin/authrevoke/{cn} (zipline#136): the CN lands on the
+    /// persisted denylist, every actor it admitted is revoked immediately
+    /// through the revoke pipeline (the docking node's VSS sees the batch,
+    /// the actors are gone), actors under other CNs are untouched, and the
+    /// response names the revoked actors.
+    #[tokio::test]
+    async fn test_authrevoke_add_revokes_actors_immediately() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_rw_key(&asm);
+        let node: IpAddr = "fd5a:5052::61".parse().unwrap();
+        let bad: IpAddr = "fd5a:5052::62".parse().unwrap();
+        let good: IpAddr = "fd5a:5052::63".parse().unwrap();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::61", "node-ar", "[fd5a:5052::161]:1234");
+        asm.actor_mgr
+            .add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        add_bootstrap_adapter(&asm, "fd5a:5052::62", &node, "laptop-7.zpr").await;
+        add_bootstrap_adapter(&asm, "fd5a:5052::63", &node, "innocent.zpr").await;
+        let revokes = install_acking_vss(&asm, node);
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = admin_request(
+            &app,
+            "POST",
+            "/admin/authrevoke/laptop-7.zpr",
+            &api_key,
+            Some(serde_json::json!({"ty": "bootstrap", "cn": "laptop-7.zpr"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["cn"], "laptop-7.zpr");
+        assert_eq!(resp["ty"], "bootstrap");
+        assert!(resp["id"].as_u64().is_some(), "the entry id is numeric");
+        let revoked: Vec<String> = resp["revoked"]
+            .as_array()
+            .expect("revoked is an array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            revoked,
+            vec![bad.to_string()],
+            "the response lists exactly the actors the CN admitted"
+        );
+
+        // The revoke went through the pipeline (no deadline wait) and only
+        // the denylisted CN's actor is gone.
+        assert_eq!(revokes.lock().unwrap().as_slice(), &[vec![bad]]);
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&bad)
+                .await
+                .unwrap()
+                .is_none(),
+            "the revoked actor must be gone"
+        );
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&good)
+                .await
+                .unwrap()
+                .is_some(),
+            "an actor under another CN must survive"
+        );
+
+        // And the CN is persisted on the denylist.
+        assert!(
+            BootstrapDenylist::new(asm.state_db.clone())
+                .contains("laptop-7.zpr")
+                .await
+                .unwrap(),
+            "the CN must be on the persisted denylist"
+        );
+    }
+
+    /// The denylist read surface (zipline#136): GET lists the entry ids, GET
+    /// {id} returns the descriptor, DELETE {id} removes exactly that entry,
+    /// and POST clear empties the list.
+    #[tokio::test]
+    async fn test_authrevoke_list_get_delete_clear_lifecycle() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_rw_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        // Two entries via the API (no connected actors needed).
+        for cn in ["laptop-7.zpr", "sensor-3.zpr"] {
+            let response = admin_request(
+                &app,
+                "POST",
+                &format!("/admin/authrevoke/{cn}"),
+                &api_key,
+                Some(serde_json::json!({"ty": "bootstrap", "cn": cn})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "add {cn}");
+        }
+
+        // GET /admin/authrevoke lists both ids.
+        let response = admin_request(&app, "GET", "/admin/authrevoke", &api_key, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 2, "both entries are listed");
+        let ids: Vec<u64> = entries.iter().map(|e| e["id"].as_u64().unwrap()).collect();
+
+        // GET /admin/authrevoke/{id} returns the descriptor.
+        let response = admin_request(
+            &app,
+            "GET",
+            &format!("/admin/authrevoke/{}", ids[0]),
+            &api_key,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let desc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(desc["ty"], "bootstrap");
+        assert!(
+            desc["cn"]
+                .as_str()
+                .is_some_and(|cn| cn == "laptop-7.zpr" || cn == "sensor-3.zpr"),
+            "the descriptor names a denylisted cn, got {desc}"
+        );
+
+        // DELETE removes exactly that entry.
+        let response = admin_request(
+            &app,
+            "DELETE",
+            &format!("/admin/authrevoke/{}", ids[0]),
+            &api_key,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = admin_request(
+            &app,
+            "GET",
+            &format!("/admin/authrevoke/{}", ids[0]),
+            &api_key,
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a removed entry is gone"
+        );
+        let response = admin_request(&app, "GET", "/admin/authrevoke", &api_key, None).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 1, "the other entry survives");
+
+        // Clear empties the list.
+        let response = admin_request(&app, "POST", "/admin/authrevoke/clear", &api_key, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = admin_request(&app, "GET", "/admin/authrevoke", &api_key, None).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(entries.is_empty(), "clear must empty the denylist");
+        assert!(
+            !BootstrapDenylist::new(asm.state_db.clone())
+                .contains("sensor-3.zpr")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Error shapes (zipline#136): a body whose `ty` is not `bootstrap` or
+    /// whose `cn` disagrees with the path is a 400; a non-numeric id on
+    /// GET/DELETE is a 400; an unknown id is a 404.
+    #[tokio::test]
+    async fn test_authrevoke_bad_requests() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_rw_key(&asm);
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+
+        // ty must be "bootstrap".
+        let response = admin_request(
+            &app,
+            "POST",
+            "/admin/authrevoke/laptop-7.zpr",
+            &api_key,
+            Some(serde_json::json!({"ty": "oidc", "cn": "laptop-7.zpr"})),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "ty != bootstrap"
+        );
+
+        // The body cn must match the path.
+        let response = admin_request(
+            &app,
+            "POST",
+            "/admin/authrevoke/laptop-7.zpr",
+            &api_key,
+            Some(serde_json::json!({"ty": "bootstrap", "cn": "other.zpr"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "cn mismatch");
+
+        // Nothing was added by the rejected requests.
+        assert!(
+            BootstrapDenylist::new(asm.state_db.clone())
+                .list()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected add must not touch the denylist"
+        );
+
+        for (method, path, expected) in [
+            (
+                "GET",
+                "/admin/authrevoke/not-a-number",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "DELETE",
+                "/admin/authrevoke/not-a-number",
+                StatusCode::BAD_REQUEST,
+            ),
+            ("GET", "/admin/authrevoke/9999", StatusCode::NOT_FOUND),
+            ("DELETE", "/admin/authrevoke/9999", StatusCode::NOT_FOUND),
+        ] {
+            let response = admin_request(&app, method, path, &api_key, None).await;
+            assert_eq!(response.status(), expected, "for {method} {path}");
         }
     }
 }

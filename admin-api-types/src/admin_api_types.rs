@@ -225,6 +225,18 @@ pub struct AuthRevokeDescriptor {
     pub cn: String,
 }
 
+/// Response to `POST /admin/authrevoke/{cn}` (zipline#136): the denylist
+/// entry id, the descriptor it recorded, and the ZPR addresses of the actors
+/// that were revoked immediately (admitted under the revoked CN and
+/// positively acked; deferred revocations complete on the sweep tick).
+#[derive(Serialize, Deserialize)]
+pub struct AuthRevokeResult {
+    pub id: u64,
+    pub ty: String,
+    pub cn: String,
+    pub revoked: Vec<String>,
+}
+
 /// One actor in the `GET /admin/actors` listing. The ZPR address identifies the
 /// actor; the CN is a display label that may be absent.
 #[derive(Serialize, Deserialize, Debug)]
