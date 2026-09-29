@@ -56,6 +56,221 @@ pub(crate) struct ReauthSweepStats {
     pub deferred: usize,
 }
 
+/// What one denylist enforcement pass did (zipline#136), for logging, tests,
+/// and the admin `Revokes` response.
+#[derive(Debug, Default)]
+pub(crate) struct DenylistSweepStats {
+    /// Connected actors examined.
+    pub checked: usize,
+    /// Actors revoked, with the denylisted CN that matched each: nodes
+    /// disconnected (their docked adapters cascade), adapters revoked on
+    /// their docking node and removed only on a positive ack.
+    pub revoked: Vec<(IpAddr, String)>,
+    /// Matched actors left in place for the next pass (no VSS handle, or the
+    /// revocation was not positively acked).
+    pub deferred: usize,
+}
+
+/// Enforce the bootstrap-key denylist (zipline#136): every connected actor
+/// whose `device.zpr.authority` is `zpr-bootstrap` and whose authenticated CN
+/// is denylisted is revoked immediately — no policy install, no
+/// `reauth_deadline` wait — through the zipline#123 revoke machinery. Nodes
+/// admitted under a denylisted CN are disconnected (`cc.disconnect(.., Admin)`),
+/// which also drops their docked adapters (operator answer Q2 on zipline#136);
+/// adapters go through the batched per-node `revokeAuthentication` and are
+/// removed only on a positive ack, so a VSS outage defers the removal to the
+/// next pass. Runs on every add to the denylist and on the periodic sweep
+/// tick (to retry deferrals).
+pub(crate) async fn sweep_denylisted_actors(asm: &Arc<Assembly>) -> DenylistSweepStats {
+    let mut stats = DenylistSweepStats::default();
+
+    let denylist = db::BootstrapDenylist::new(asm.state_db.clone());
+    let denied: std::collections::HashSet<String> = match denylist.list().await {
+        Ok(entries) => entries.into_iter().map(|(_, cn)| cn).collect(),
+        Err(e) => {
+            warn!(target: ACTOR, "denylist sweep: failed to list denylist: {e}");
+            return stats;
+        }
+    };
+    if denied.is_empty() {
+        return stats;
+    }
+
+    /// A matched actor: its address, the denylisted CN that admitted it,
+    /// whether it is a node, and (for adapters) its docking node.
+    struct Entry {
+        addr: IpAddr,
+        cn: String,
+        is_node: bool,
+        dock: Option<IpAddr>,
+    }
+
+    // Snapshot every connected actor and keep the bootstrap-admitted ones
+    // whose authenticated CN is denylisted. The VS's own actor is exempt for
+    // the same reason as in the reauth sweep — and its CN is not policy data
+    // anyway.
+    let listed = match asm.actor_mgr.list_actors(None).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(target: ACTOR, "denylist sweep: failed to list actors: {e}");
+            return stats;
+        }
+    };
+    let mut matched: Vec<Entry> = Vec::new();
+    for (addr, _cn) in listed {
+        let actor = match asm.actor_mgr.get_actor_by_zpr_addr(&addr).await {
+            Ok(Some(actor)) => actor,
+            Ok(None) => continue, // Removed between list and fetch.
+            Err(e) => {
+                warn!(target: ACTOR, "denylist sweep: failed to load actor {addr}: {e}");
+                continue;
+            }
+        };
+        stats.checked += 1;
+        if actor.get_cn() == Some(config::VS_CN)
+            && addr == std::net::IpAddr::V6(config::VS_ZPR_ADDR)
+        {
+            continue;
+        }
+        // Only a bootstrap-admitted device authority is subject to the
+        // bootstrap-key denylist: the CN of an OIDC-only actor is a display
+        // label, not an authenticated key binding.
+        let bootstrap_admitted = actor
+            .get_attribute(key::DEVICE_AUTHORITY)
+            .and_then(|a| a.get_single_value().ok())
+            .is_some_and(|method| method == key::AUTHORITY_METHOD_BOOTSTRAP);
+        if !bootstrap_admitted {
+            continue;
+        }
+        let Some(cn) = actor.get_cn() else { continue };
+        if !denied.contains(cn) {
+            continue;
+        }
+        matched.push(Entry {
+            addr,
+            cn: cn.to_string(),
+            is_node: actor.is_node(),
+            dock: asm.actor_mgr.get_docking_node_for_actor(&actor),
+        });
+    }
+    if matched.is_empty() {
+        return stats;
+    }
+
+    // Nodes first — `cc.disconnect` also drops their docked adapters
+    // (operator answer Q2 on zipline#136), so those adapters never need
+    // their own revoke.
+    let mut disconnected_nodes: Vec<IpAddr> = Vec::new();
+    for entry in matched.iter().filter(|e| e.is_node) {
+        info!(
+            target: ACTOR,
+            "denylist sweep: node {} was admitted under revoked bootstrap CN {}; disconnecting it (and its adapters)",
+            entry.addr, entry.cn
+        );
+        match asm
+            .cc
+            .disconnect(asm.clone(), entry.addr, DisconnectReason::Admin)
+            .await
+        {
+            Ok(()) => {
+                disconnected_nodes.push(entry.addr);
+                stats.revoked.push((entry.addr, entry.cn.clone()));
+            }
+            Err(e) => {
+                warn!(target: ACTOR, "denylist sweep: failed to disconnect node {}: {e}; deferring", entry.addr);
+                stats.deferred += 1;
+            }
+        }
+    }
+
+    // Matched adapters, batched per docking node — skipping adapters whose
+    // node was just disconnected (the cascade already removed them).
+    let mut by_node: BTreeMap<IpAddr, Vec<(IpAddr, String)>> = BTreeMap::new();
+    for entry in matched.iter().filter(|e| !e.is_node) {
+        let Some(dock) = entry.dock else {
+            warn!(target: ACTOR, "denylist sweep: no docking node for denylisted adapter {}; deferring", entry.addr);
+            stats.deferred += 1;
+            continue;
+        };
+        if disconnected_nodes.contains(&dock) {
+            continue;
+        }
+        by_node
+            .entry(dock)
+            .or_default()
+            .push((entry.addr, entry.cn.clone()));
+    }
+    for (node_addr, entries) in by_node {
+        let addrs: Vec<IpAddr> = entries.iter().map(|(a, _)| *a).collect();
+        let Some(vss_handle) = asm.vss_mgr.get_handle(&node_addr) else {
+            warn!(
+                target: ACTOR,
+                "denylist sweep: no VSS handle for node {node_addr} ({} denylisted adapter(s)); deferring",
+                addrs.len()
+            );
+            stats.deferred += addrs.len();
+            continue;
+        };
+        match vss_handle.revoke_auths(addrs.clone()).await {
+            Ok(processed) => {
+                // Same partial-success contract as the reauth sweep (PR #41
+                // review): the VSS processes the batch in order and stops
+                // counting at the first failure. Remove only the processed
+                // prefix; the rest keep their node-side auth and are
+                // deferred to the next pass.
+                if processed < entries.len() {
+                    warn!(
+                        target: ACTOR,
+                        "denylist sweep: node {node_addr} revoked {processed} of {} denylisted adapter(s); deferring the rest",
+                        entries.len()
+                    );
+                    stats.deferred += entries.len() - processed;
+                }
+                for (addr, cn) in entries.into_iter().take(processed) {
+                    info!(
+                        target: ACTOR,
+                        "denylist sweep: adapter {addr} was admitted under revoked bootstrap CN {cn}; revoked on node {node_addr}, removing actor"
+                    );
+                    // Mirror the reauth sweep: detect an auth-service
+                    // provider while the actor is still in the DB, record
+                    // the change after removal.
+                    let was_auth_provider = matches!(
+                        asm.actor_mgr.has_auth_services(asm.clone(), &addr).await,
+                        Ok(true)
+                    );
+                    if let Err(e) = asm.actor_mgr.remove_actor_by_zpr_addr(&addr).await {
+                        warn!(target: ACTOR, "denylist sweep: revoked {addr} but failed to remove actor: {e}");
+                        continue;
+                    }
+                    if was_auth_provider {
+                        event_mgr::record_auth_service_change(asm).await;
+                    }
+                    stats.revoked.push((addr, cn));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    target: ACTOR,
+                    "denylist sweep: failed to revoke {} denylisted adapter(s) on node {node_addr}: {e}; deferring",
+                    addrs.len()
+                );
+                stats.deferred += addrs.len();
+            }
+        }
+    }
+
+    if !stats.revoked.is_empty() || stats.deferred > 0 {
+        debug!(
+            target: ACTOR,
+            "denylist sweep: checked {}, revoked {}, deferred {}",
+            stats.checked,
+            stats.revoked.len(),
+            stats.deferred
+        );
+    }
+    stats
+}
+
 /// Enforce pending policy-install re-authentication obligations (zipline#123):
 /// for every recorded `(V, T)`, an actor whose `zpr.vinst` is below `V` is
 /// re-asked to authenticate while `now <= T` and revoked once `now > T` —
@@ -499,19 +714,22 @@ pub(crate) async fn sweep_expired_auths(asm: &Arc<Assembly>) -> SweepStats {
     stats
 }
 
-/// Run [sweep_expired_auths] and [sweep_reauth_obligations] every `period` in
+/// Run [sweep_expired_auths], [sweep_reauth_obligations] and
+/// [sweep_denylisted_actors] every `period` in
 /// a background task, mirroring `KeySource::spawn_refresher` (`oidc/jwks.rs`).
 /// A pass never fails as such — per-actor trouble is logged and deferred
 /// inside each sweep — so the loop just sleeps and sweeps. Callers pass
 /// [crate::config::MIN_VISA_LIFETIME]: fine-grained enough that a revocation
 /// lands inside the shortest visa lifetime, and well inside any sane
-/// `reauth_deadline`.
+/// `reauth_deadline`. The denylist pass here is the retry path for
+/// revocations the admin add deferred (zipline#136).
 pub(crate) fn spawn_auth_expiry_sweeper(asm: Arc<Assembly>, period: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(period).await;
             sweep_expired_auths(&asm).await;
             sweep_reauth_obligations(&asm).await;
+            sweep_denylisted_actors(&asm).await;
         }
     })
 }
@@ -1371,5 +1589,195 @@ mod tests {
         let mut expected = vec![adapter_a, adapter_b];
         expected.sort();
         assert_eq!(both, expected);
+    }
+
+    // ---- bootstrap-key denylist enforcement (zipline#136) ----
+
+    use crate::db::BootstrapDenylist;
+
+    /// Add an adapter docked at `node`, admitted by bootstrap under `cn`
+    /// (`device.zpr.authority = zpr-bootstrap`, authenticated CN = `cn`).
+    async fn add_bootstrap_adapter(asm: &Arc<Assembly>, zpr_addr: &str, node: &IpAddr, cn: &str) {
+        let mut actor = make_adapter_actor(zpr_addr, cn, Duration::from_secs(3600));
+        actor
+            .add_attribute(
+                Attribute::builder(key::DEVICE_AUTHORITY)
+                    .expires_in(config::VS_AUTH_EXPIRATION)
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, node, &Default::default())
+            .await
+            .unwrap();
+    }
+
+    /// A denylisted CN's adapters are revoked in one pass — the docking
+    /// node's VSS sees the batched revoke, the actors are gone — while an
+    /// adapter under a different CN survives untouched.
+    #[tokio::test]
+    async fn test_denylist_sweep_revokes_adapters_under_cn() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let bad_a: IpAddr = ADAPTER.parse().unwrap();
+        let bad_b: IpAddr = "fd5a:5052:4000::b".parse().unwrap();
+        let good: IpAddr = "fd5a:5052:4000::c".parse().unwrap();
+        add_bootstrap_adapter(&asm, ADAPTER, &node, "laptop-7.zpr").await;
+        add_bootstrap_adapter(&asm, "fd5a:5052:4000::b", &node, "laptop-7.zpr").await;
+        add_bootstrap_adapter(&asm, "fd5a:5052:4000::c", &node, "innocent.zpr").await;
+        BootstrapDenylist::new(asm.state_db.clone())
+            .add("laptop-7.zpr")
+            .await
+            .unwrap();
+        let (revokes, _requests) = install_fake_vss_with_requests(&asm, node, true);
+
+        let stats = sweep_denylisted_actors(&asm).await;
+
+        assert_eq!(
+            stats.revoked.len(),
+            2,
+            "both actors under the denylisted CN must be revoked"
+        );
+        assert!(
+            stats.revoked.iter().all(|(_, cn)| cn == "laptop-7.zpr"),
+            "every revocation must be attributed to the denylisted CN"
+        );
+        let mut revoked_addrs: Vec<IpAddr> = stats.revoked.iter().map(|(a, _)| *a).collect();
+        revoked_addrs.sort();
+        assert_eq!(revoked_addrs, vec![bad_a, bad_b]);
+        let batch = {
+            let seen = revokes.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one batched revoke per docking node");
+            seen[0].clone()
+        };
+        assert_eq!(batch.len(), 2, "the batch carries both denylisted actors");
+        assert!(!actor_exists(&asm, &bad_a).await);
+        assert!(!actor_exists(&asm, &bad_b).await);
+        assert!(
+            actor_exists(&asm, &good).await,
+            "an actor under another CN must survive"
+        );
+    }
+
+    /// A NODE admitted under a denylisted CN is disconnected — and its docked
+    /// adapters go with it (operator answer Q2 on zipline#136), with no
+    /// separate adapter revoke needed.
+    #[tokio::test]
+    async fn test_denylist_sweep_disconnects_node_with_its_adapters() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let bad_node: IpAddr = NODE.parse().unwrap();
+        let docked: IpAddr = ADAPTER.parse().unwrap();
+
+        let mut node_actor =
+            make_node_actor_defexp(NODE, "node-bad.zpr", "[fd5a:5052:3000::101]:1234");
+        node_actor
+            .add_attribute(
+                Attribute::builder(key::DEVICE_AUTHORITY)
+                    .expires_in(config::VS_AUTH_EXPIRATION)
+                    .value(key::AUTHORITY_METHOD_BOOTSTRAP),
+            )
+            .unwrap();
+        asm.actor_mgr
+            .add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        // The docked adapter is under a DIFFERENT, innocent CN: it goes down
+        // with its node anyway (the cascade), which is the Q2 blast radius.
+        add_bootstrap_adapter(&asm, ADAPTER, &bad_node, "innocent.zpr").await;
+        BootstrapDenylist::new(asm.state_db.clone())
+            .add("node-bad.zpr")
+            .await
+            .unwrap();
+        let (revokes, _requests) = install_fake_vss_with_requests(&asm, bad_node, true);
+
+        let stats = sweep_denylisted_actors(&asm).await;
+
+        assert_eq!(
+            stats.revoked,
+            vec![(bad_node, "node-bad.zpr".to_string())],
+            "the node is revoked under the denylisted CN"
+        );
+        assert!(
+            !actor_exists(&asm, &bad_node).await,
+            "the node must be gone"
+        );
+        assert!(
+            !actor_exists(&asm, &docked).await,
+            "the docked adapter must cascade with its node"
+        );
+        assert!(
+            revokes.lock().unwrap().is_empty(),
+            "no separate adapter revoke: the disconnect cascade covers it"
+        );
+    }
+
+    /// The denylist gates on the BOOTSTRAP authority: an actor with the same
+    /// CN whose device authority is not `zpr-bootstrap` (e.g. an OIDC-only
+    /// actor with a display CN) is untouched.
+    #[tokio::test]
+    async fn test_denylist_sweep_ignores_non_bootstrap_actor() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let addr: IpAddr = ADAPTER.parse().unwrap();
+        // Same CN, but NO bootstrap device authority.
+        let actor = make_adapter_actor(ADAPTER, "laptop-7.zpr", Duration::from_secs(3600));
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, &node, &Default::default())
+            .await
+            .unwrap();
+        BootstrapDenylist::new(asm.state_db.clone())
+            .add("laptop-7.zpr")
+            .await
+            .unwrap();
+        let (revokes, _requests) = install_fake_vss_with_requests(&asm, node, true);
+
+        let stats = sweep_denylisted_actors(&asm).await;
+
+        assert!(
+            stats.revoked.is_empty(),
+            "a non-bootstrap actor must not match the bootstrap denylist"
+        );
+        assert!(revokes.lock().unwrap().is_empty());
+        assert!(actor_exists(&asm, &addr).await);
+    }
+
+    /// No positive ack, no removal: a VSS that fails the revoke leaves the
+    /// denylisted adapter in place for the next pass (deferred), exactly like
+    /// the zipline#123 sweep.
+    #[tokio::test]
+    async fn test_denylist_sweep_defers_without_positive_ack() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        let addr: IpAddr = ADAPTER.parse().unwrap();
+        add_bootstrap_adapter(&asm, ADAPTER, &node, "laptop-7.zpr").await;
+        BootstrapDenylist::new(asm.state_db.clone())
+            .add("laptop-7.zpr")
+            .await
+            .unwrap();
+        let (_revokes, _requests) = install_fake_vss_with_requests(&asm, node, false);
+
+        let stats = sweep_denylisted_actors(&asm).await;
+
+        assert!(stats.revoked.is_empty(), "no ack, no revocation");
+        assert_eq!(stats.deferred, 1, "the failure must be deferred, not lost");
+        assert!(
+            actor_exists(&asm, &addr).await,
+            "the actor survives until a positive ack"
+        );
+    }
+
+    /// An empty denylist is a no-op pass: nothing revoked, nothing deferred.
+    #[tokio::test]
+    async fn test_denylist_sweep_empty_is_noop() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let node: IpAddr = NODE.parse().unwrap();
+        add_bootstrap_adapter(&asm, ADAPTER, &node, "laptop-7.zpr").await;
+        let (revokes, _requests) = install_fake_vss_with_requests(&asm, node, true);
+
+        let stats = sweep_denylisted_actors(&asm).await;
+
+        assert!(stats.revoked.is_empty());
+        assert_eq!(stats.deferred, 0);
+        assert!(revokes.lock().unwrap().is_empty());
     }
 }
