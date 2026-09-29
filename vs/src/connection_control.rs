@@ -1252,6 +1252,20 @@ impl ConnectionControl {
             .update_actor(&renewed, &asm.policy_service_names())
             .await?;
 
+        // PR #42 review (P1): re-check the denylist now that the renewal is
+        // persisted. A revocation landing between the pre-check above and
+        // update_actor could race the enforcement sweep's removal (the sweep
+        // revokes the OLD record while this write re-persists the actor);
+        // this closes that window. Same uniform rejection as the pre-check.
+        if let Err(e) = self.enforce_denylist_after_persist(&asm, &renewed).await {
+            info!(target: CC, "SS reauth rejected post-persist: {e}");
+            return Err(ApiResponseError::new_code_msg(
+                ErrorCode::AuthError,
+                "authentication rejected",
+            )
+            .into());
+        }
+
         // The whole renewal succeeded: advance this session's anchors to the
         // fresh token (per actor session — PR #19 review). Recording only on
         // success means a failed policy re-run does not consume the token's
@@ -1301,6 +1315,68 @@ impl ConnectionControl {
             return Err(ServiceError::AuthenticationFailed("not authorized".into()));
         }
         Ok(())
+    }
+
+    /// PR #42 review (P1): re-check the denylist AFTER the actor is
+    /// persisted, and undo the admission on a hit.
+    ///
+    /// An admin revocation can land between [Self::check_bootstrap_denylist]
+    /// on an auth path and the moment the caller persists the actor. The
+    /// revocation's inline enforcement sweep enumerates PERSISTED actors, so
+    /// it finds nothing to revoke, and without this gate the in-flight
+    /// connect would stand until the next periodic sweep tick. The ordering
+    /// argument that closes the window: revocation writes the denylist and
+    /// then reads the actor store; admission writes the actor store and then
+    /// (here) reads the denylist — whichever ran second sees the other's
+    /// write, so either the sweep revokes the persisted actor or this
+    /// re-check sees the denylist entry.
+    ///
+    /// Gated exactly like the sweep: only a bootstrap-admitted actor
+    /// (`device.zpr.authority == zpr-bootstrap`) with an authenticated CN is
+    /// subject to the bootstrap denylist, and the VS's own actor is exempt.
+    /// A hit (or an unreadable denylist — fail closed, as everywhere on this
+    /// path) disconnects the just-persisted actor ([Self::disconnect] with
+    /// the Admin reason, the same teardown the sweep uses for nodes) and
+    /// returns the uniform credential rejection.
+    pub(crate) async fn enforce_denylist_after_persist(
+        &self,
+        asm: &Arc<Assembly>,
+        actor: &Actor,
+    ) -> Result<(), ServiceError> {
+        // Same gating as sweep_denylisted_actors: only a bootstrap-admitted
+        // device authority is subject to the bootstrap-key denylist, and the
+        // VS's own actor is exempt.
+        let bootstrap_admitted = actor
+            .get_attribute(key::DEVICE_AUTHORITY)
+            .and_then(|a| a.get_single_value().ok())
+            .is_some_and(|method| method == key::AUTHORITY_METHOD_BOOTSTRAP);
+        if !bootstrap_admitted {
+            return Ok(());
+        }
+        let Some(cn) = actor.get_cn() else {
+            return Ok(());
+        };
+        if cn == config::VS_CN {
+            return Ok(());
+        }
+        if Self::check_bootstrap_denylist(asm, cn).await.is_ok() {
+            return Ok(());
+        }
+        // Revoked mid-connect: undo the admission. The actor is persisted, so
+        // the full disconnect teardown applies (actor record, visas, topology
+        // for a node, managed-address release) — the same path the sweep uses.
+        warn!(target: CC, "cn {cn} was revoked during connection setup; undoing the admission (zipline#136, PR #42 review)");
+        if let Some(addr) = actor.get_zpr_addr() {
+            if let Err(e) = self
+                .disconnect(asm.clone(), *addr, vsapi::DisconnectReason::Admin)
+                .await
+            {
+                // The refusal stands either way; the periodic sweep retries
+                // the cleanup ([crate::auth_sweep::spawn_auth_expiry_sweeper]).
+                error!(target: CC, "failed to disconnect revoked actor {addr} after persist: {e}; the denylist sweep will retry");
+            }
+        }
+        Err(ServiceError::AuthenticationFailed("not authorized".into()))
     }
 
     /// Preform authentication of an adapter or a node, then run through policy.
@@ -6779,5 +6855,99 @@ mod tests {
             .await,
         );
         assert_auth_rejected(api);
+    }
+
+    /// PR #42 review (P1), the exact reported race: a revocation lands AFTER
+    /// the connect path's early denylist check but BEFORE the caller persists
+    /// the actor. The revocation's inline sweep finds no actor to revoke (it
+    /// is not persisted yet), so without a post-persist gate the connect
+    /// stands until the next periodic sweep tick. The post-persist re-check
+    /// must refuse the admission and remove the just-persisted actor.
+    #[tokio::test]
+    async fn test_revocation_landing_before_persist_cannot_stay_connected() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-adapter.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        install_bootstrap_policy(&asm, cn, &pubkey_der).await;
+        let cc = make_cc("test-vs");
+        let connect_via: IpAddr = "fd5a:5052::1".parse().unwrap();
+
+        // 1. Authentication passes: the denylist is empty at check time.
+        let req = make_connect_request(vec![make_valid_ss_blob(&privkey, cn)], cn);
+        let actor = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &connect_via)
+            .await
+            .expect("connect must authorize before the revocation lands");
+
+        // 2. The revocation lands in the window before the caller persists:
+        //    the admin add's inline sweep runs and finds nothing to revoke.
+        crate::db::BootstrapDenylist::new(asm.state_db.clone())
+            .add(cn)
+            .await
+            .unwrap();
+        let stats = crate::auth_sweep::sweep_denylisted_actors(&asm).await;
+        assert!(
+            stats.revoked.is_empty(),
+            "precondition: the inline sweep ran before the actor was persisted"
+        );
+
+        // 3. The caller persists, exactly as vsapi_worker::authorize_connect does.
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, &connect_via, &Default::default())
+            .await
+            .expect("fixture actor must persist");
+        let addr = *actor.get_zpr_addr().unwrap();
+
+        // 4. The post-persist gate — the next thing authorize_connect runs —
+        //    must catch the revocation: admission refused, actor removed, NOT
+        //    left connected until the next periodic sweep.
+        let res = cc.enforce_denylist_after_persist(&asm, &actor).await;
+        assert!(
+            res.is_err(),
+            "the post-persist re-check must refuse a CN revoked mid-connect"
+        );
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_none(),
+            "the revoked actor must not stay connected until the periodic sweep"
+        );
+    }
+
+    /// The post-persist re-check is a no-op for a clean CN: admission stands,
+    /// the actor stays.
+    #[tokio::test]
+    async fn test_post_persist_recheck_passes_clean_cn() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-adapter.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        install_bootstrap_policy(&asm, cn, &pubkey_der).await;
+        let cc = make_cc("test-vs");
+        let connect_via: IpAddr = "fd5a:5052::1".parse().unwrap();
+
+        let req = make_connect_request(vec![make_valid_ss_blob(&privkey, cn)], cn);
+        let actor = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &connect_via)
+            .await
+            .expect("connect must authorize");
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, &connect_via, &Default::default())
+            .await
+            .expect("fixture actor must persist");
+        let addr = *actor.get_zpr_addr().unwrap();
+
+        cc.enforce_denylist_after_persist(&asm, &actor)
+            .await
+            .expect("a clean CN must pass the post-persist re-check");
+        assert!(
+            asm.actor_mgr
+                .get_actor_by_zpr_addr(&addr)
+                .await
+                .unwrap()
+                .is_some(),
+            "a clean actor must stay connected"
+        );
     }
 }
