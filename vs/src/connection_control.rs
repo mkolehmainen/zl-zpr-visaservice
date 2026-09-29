@@ -383,6 +383,11 @@ impl ConnectionControl {
             let outcome = match blob {
                 AuthBlob::SS(ssb) => match ssb.alg {
                     ChallengeAlg::RsaSha256Pkcs1v15 => {
+                        // A revoked bootstrap root never authenticates, even
+                        // while a stale policy still carries the key
+                        // (zipline#136). Checked before signature work: the
+                        // credential is administratively dead.
+                        Self::check_bootstrap_denylist(&asm, &ssb.cn).await?;
                         // Built-in RSA verification is the device authority
                         // (OIDC.md: the `<ns>.zpr.authority` invariant).
                         // Bootstrap authentication does not expire (zipline#119).
@@ -1122,6 +1127,16 @@ impl ConnectionControl {
 
         let mut outcomes: Vec<BlobOutcome> = Vec::new();
         if let Some(ssb) = &ss_blob {
+            // A revoked bootstrap root never renews (zipline#136): denylist
+            // check before the blob checks, same uniform rejection.
+            if let Err(e) = Self::check_bootstrap_denylist(&asm, &ssb.cn).await {
+                info!(target: CC, "SS reauth rejected: {e}");
+                return Err(ApiResponseError::new_code_msg(
+                    ErrorCode::AuthError,
+                    "authentication rejected",
+                )
+                .into());
+            }
             outcomes.push(self.reauthenticate_ss_blob(&psnap, &actor, ssb)?);
         }
         if let Some(ob) = &oidc_blob {
@@ -1267,6 +1282,27 @@ impl ConnectionControl {
         }
     }
 
+    /// Refuse a bootstrap CN on the administrative denylist (zipline#136).
+    /// Checked on every bootstrap authentication path — adapter connect, node
+    /// connect, SS renewal — BEFORE the policy key lookup, so a revoked key is
+    /// refused even while a stale policy still carries it. A store read
+    /// failure fails closed: an unreadable denylist must not readmit a
+    /// revoked key.
+    async fn check_bootstrap_denylist(asm: &Arc<Assembly>, cn: &str) -> Result<(), ServiceError> {
+        let denylisted = crate::db::BootstrapDenylist::new(asm.state_db.clone())
+            .contains(cn)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(target: CC, "bootstrap denylist read failed for cn {cn}: {e}; failing closed");
+                true
+            });
+        if denylisted {
+            info!(target: CC, "bootstrap authentication refused: cn {cn} is administratively revoked (zipline#136)");
+            return Err(ServiceError::AuthenticationFailed("not authorized".into()));
+        }
+        Ok(())
+    }
+
     /// Preform authentication of an adapter or a node, then run through policy.
     /// `unauthed_claims` - must include CN.
     async fn authenticate_zpr_entity_rsa(
@@ -1281,6 +1317,9 @@ impl ConnectionControl {
         // b) is connection allowed by policy?
         //
         // Note that (b) is also needed for the AC type auth.
+
+        // A revoked bootstrap root never authenticates (zipline#136).
+        Self::check_bootstrap_denylist(&asm, &ssb.cn).await?;
 
         // One coherent policy view for validation and authorization (PR #6 review).
         let psnap = asm.policy_mgr.get_current_snapshot();
@@ -6591,5 +6630,154 @@ mod tests {
 
         assert!(actor.is_node());
         assert_eq!(actor.get_zpr_addr(), Some(&addr));
+    }
+
+    // ---- bootstrap-key denylist on connect and renewal (zipline#136) ----
+
+    /// Install a join-any policy carrying `cn`'s bootstrap key (no Node flag:
+    /// SS-only connects yield adapters).
+    async fn install_bootstrap_policy(asm: &Arc<Assembly>, cn: &str, pubkey_der: &[u8]) {
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_oidc_connect_policy(
+                "google",
+                OIDC_LIFETIME_SECS,
+                OIDC_MAPPINGS,
+                &["sub"],
+                make_test_oidc_config(),
+                &[(cn, pubkey_der)],
+                &[],
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// A valid SS blob whose CN is on the bootstrap denylist is refused on
+    /// CONNECT, even though `get_bootstrap_key_by_cn` still finds the key in
+    /// policy — the denylist outranks a stale policy (zipline#136). The same
+    /// blob connects fine before the CN is denylisted, so the refusal is the
+    /// denylist's doing and nothing else's.
+    #[tokio::test]
+    async fn test_denylisted_cn_refused_on_connect() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-adapter.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        install_bootstrap_policy(&asm, cn, &pubkey_der).await;
+        let cc = make_cc("test-vs");
+
+        // Sanity: the key works before revocation.
+        let req = make_connect_request(vec![make_valid_ss_blob(&privkey, cn)], cn);
+        cc.authenticate_adapter_or_node(asm.clone(), req, &"fd5a:5052::1".parse().unwrap())
+            .await
+            .expect("the key must connect before revocation");
+
+        // Revoke the CN; the policy still carries the key.
+        crate::db::BootstrapDenylist::new(asm.state_db.clone())
+            .add(cn)
+            .await
+            .unwrap();
+        assert!(
+            asm.policy_mgr
+                .get_current()
+                .get_bootstrap_key_by_cn(cn)
+                .is_some(),
+            "precondition: the stale policy still carries the key"
+        );
+
+        let req = make_connect_request(vec![make_valid_ss_blob(&privkey, cn)], cn);
+        let result = cc
+            .authenticate_adapter_or_node(asm, req, &"fd5a:5052::1".parse().unwrap())
+            .await;
+        assert!(
+            result.is_err(),
+            "a denylisted CN must not connect while a stale policy still carries its key"
+        );
+    }
+
+    /// The node connect arm refuses a denylisted CN too — a compromised NODE
+    /// key cannot re-join the fabric (zipline#136).
+    #[tokio::test]
+    async fn test_denylisted_cn_refused_on_node_connect() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-node.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_policy_with_node_join_policy(cn, &pubkey_der))
+            .await
+            .unwrap();
+        crate::db::BootstrapDenylist::new(asm.state_db.clone())
+            .add(cn)
+            .await
+            .unwrap();
+        let cc = make_cc("test-vs");
+        let challenge = b"my-challenge";
+        let timestamp = 12345678u64;
+        let sig = sign_node_challenge(&privkey, timestamp, cn, challenge);
+
+        let result = cc
+            .authenticate_node(
+                asm,
+                challenge,
+                timestamp,
+                cn,
+                &sig,
+                "fd5a:5052::1".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a denylisted node CN must not authenticate"
+        );
+    }
+
+    /// The SS RENEWAL path refuses a denylisted CN with the generic
+    /// credential rejection: a live actor whose key was revoked between
+    /// renewals cannot renew, even though the pinned snapshot still carries
+    /// the key (zipline#136).
+    #[tokio::test]
+    async fn test_denylisted_cn_refused_on_ss_renewal() {
+        let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
+        let cn = "test-adapter.zpr";
+        let (privkey, pubkey_der) = gen_rsa_test_keypair();
+        install_bootstrap_policy(&asm, cn, &pubkey_der).await;
+        let cc = make_cc("test-vs");
+        let connect_via: IpAddr = "fd5a:5052::1".parse().unwrap();
+        let req = make_connect_request(vec![make_valid_ss_blob(&privkey, cn)], cn);
+        let actor = cc
+            .authenticate_adapter_or_node(asm.clone(), req, &connect_via)
+            .await
+            .expect("fixture connect must authorize");
+        asm.actor_mgr
+            .add_adapter_via_node(&actor, &connect_via, &Default::default())
+            .await
+            .expect("fixture actor must persist");
+        let addr = *actor.get_zpr_addr().unwrap();
+
+        // Sanity: the renewal works before revocation.
+        cc.reauthorize_actor(
+            asm.clone(),
+            addr,
+            vec![make_fresh_ss_blob(&privkey, cn)],
+            &connect_via,
+        )
+        .await
+        .expect("renewal must succeed before revocation");
+
+        crate::db::BootstrapDenylist::new(asm.state_db.clone())
+            .add(cn)
+            .await
+            .unwrap();
+
+        let api = api_err(
+            cc.reauthorize_actor(
+                asm,
+                addr,
+                vec![make_fresh_ss_blob(&privkey, cn)],
+                &connect_via,
+            )
+            .await,
+        );
+        assert_auth_rejected(api);
     }
 }
