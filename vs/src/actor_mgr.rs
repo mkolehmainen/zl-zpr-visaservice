@@ -1924,4 +1924,81 @@ mod test {
             "the culled node's docked adapters must be reported for teardown"
         );
     }
+
+    /// PR #46 review (P1): the startup cull must be restart-recoverable.
+    /// `refresh_state` runs before the `Assembly` exists, and `main` can still
+    /// exit between it and `teardown_culled_nodes` (`VisaRepo::new`, API-key
+    /// loading). If the node's records were already deleted at that point, the
+    /// only copy of its docked-adapter addresses is the in-memory `culled`
+    /// vector, and the next startup can never find the orphaned adapters. So
+    /// `refresh_state` must not delete anything: a second `refresh_state` over
+    /// the same DB — a restart whose predecessor died before teardown — must
+    /// report the same node with the same adapters.
+    #[tokio::test]
+    async fn test_refresh_state_cull_is_restart_recoverable() {
+        let db = Arc::new(crate::db::FakeDb::new());
+        let mgr = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+
+        let node_addr: IpAddr = "fd5a:5052::4f".parse().unwrap();
+        let adapter_a_addr: IpAddr = "fd5a:5052::50".parse().unwrap();
+        let adapter_b_addr: IpAddr = "fd5a:5052::51".parse().unwrap();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::4f", "node-recover", "[fd5a:5052::14f]:1234");
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052::50", "recover-adapter-a"),
+            &node_addr,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        mgr.add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052::51", "recover-adapter-b"),
+            &node_addr,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        backdate_last_seen(
+            &db,
+            &node_addr,
+            crate::config::DEFAULT_AUTH_EXPIRATION + Duration::from_secs(60),
+        )
+        .await;
+
+        let culled1 = mgr.refresh_state().await.unwrap();
+        assert_eq!(culled1.len(), 1);
+        assert_eq!(culled1[0].node_addr, node_addr);
+
+        // Crash before teardown_culled_nodes: nothing else runs. A restart is
+        // a fresh manager over the same DB.
+        let mgr2 = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+        let culled2 = mgr2.refresh_state().await.unwrap();
+
+        assert_eq!(
+            culled2.len(),
+            1,
+            "a culled node whose teardown never ran must be re-culled on the next startup"
+        );
+        assert_eq!(culled2[0].node_addr, node_addr);
+        let mut adapters = culled2[0].adapter_addrs.clone();
+        adapters.sort();
+        assert_eq!(
+            adapters,
+            vec![adapter_a_addr, adapter_b_addr],
+            "the re-culled node must still name its docked adapters — deleting the \
+             connected-adapters set before teardown makes the orphans unfindable"
+        );
+    }
 }
