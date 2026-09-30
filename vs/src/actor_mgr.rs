@@ -49,6 +49,23 @@ pub struct ServiceDetail {
     pub connect_via: Option<IpAddr>,
 }
 
+/// A stale node identified by [ActorMgr::refresh_state], with the adapter
+/// addresses that were docked through it. `refresh_state` runs before the
+/// `Assembly` exists and deletes NOTHING (PR #46 review): the node's records —
+/// and with them the connected-adapters set this was read from — are removed
+/// by the caller's teardown ([main]'s `teardown_culled_nodes`) only after the
+/// adapters' own teardown (zipline#138's `remove_departed_adapters` plus
+/// `remove_visas_for_actors`) has run, so a crash anywhere before that leaves
+/// the node discoverable and the next startup re-culls it (zipline#145).
+pub struct CulledNode {
+    /// The culled node's ZPR address.
+    pub node_addr: IpAddr,
+    /// ZPR addresses of the adapters that were docked through the node, read
+    /// from the node's connected-adapters set (which is still in the DB: the
+    /// teardown deletes it last).
+    pub adapter_addrs: Vec<IpAddr>,
+}
+
 impl ActorMgr {
     pub fn new(
         actor_repo: db::ActorRepo,
@@ -68,8 +85,17 @@ impl ActorMgr {
     /// that were connected.
     ///
     /// For each node we find in here we check how long ago it was last seen. Nodes
-    /// last seen more than [config::DEFAULT_AUTH_EXPIRATION] ago are removed (along
-    /// with any connected adapters). Culling by last-seen age instead of
+    /// last seen more than [config::DEFAULT_AUTH_EXPIRATION] ago are culled: each is
+    /// returned with the adapter addresses that were docked through it. **Nothing is
+    /// deleted here** (PR #46 review): this runs before the `Assembly` exists, and
+    /// `main` can still exit before the teardown runs (`VisaRepo::new`, API-key
+    /// loading) — deleting the node record now would strand its docked adapters,
+    /// since the connected-adapters set is the only place they are recorded. The
+    /// caller (`main`, via `synchronize_state`) runs `teardown_culled_nodes` right
+    /// after Assembly construction (zipline#145), which tears the adapters down and
+    /// only then removes the node's records ([ActorMgr::finish_cull]); a crash
+    /// anywhere in between leaves the node discoverable and this cull re-reports it
+    /// on the next startup. Culling by last-seen age instead of
     /// authentication expiry (zipline#119): bootstrap authentication no longer
     /// expires, so an auth-expiry check would keep dead nodes forever; the 4 h
     /// window this preserves is the same one the old auth-expiry check gave a
@@ -77,13 +103,14 @@ impl ActorMgr {
     /// and removed — its record predates last-seen tracking or never carried one.
     ///
     /// For nodes seen recently enough, we wipe their vss info.
-    pub async fn refresh_state(&self) -> Result<(), ServiceError> {
+    pub async fn refresh_state(&self) -> Result<Vec<CulledNode>, ServiceError> {
+        let mut culled = Vec::new();
         for node_addr in &self.node_db.list_node_addrs().await? {
             match self.actor_db.get_actor_by_zpr_addr(node_addr).await {
                 Ok(_actor) => {}
                 Err(StoreError::NotFound(_)) => {
                     debug!(target: ACTOR, "refresh_state: node at {} not found in actor DB, removing from node DB", node_addr);
-                    self.remove_actor_by_zpr_addr(node_addr).await?;
+                    culled.push(self.cull_node(node_addr).await?);
                     continue;
                 }
                 Err(e) => return Err(ServiceError::from(e)),
@@ -99,7 +126,7 @@ impl ActorMgr {
             };
             if stale {
                 info!(target: ACTOR, "refresh_state: node at {node_addr} last seen too long ago, removing");
-                self.remove_actor_by_zpr_addr(node_addr).await?;
+                culled.push(self.cull_node(node_addr).await?);
                 continue;
             }
 
@@ -122,6 +149,37 @@ impl ActorMgr {
             }
         }
 
+        Ok(culled)
+    }
+
+    /// Read a stale node into its [CulledNode] — the node's ZPR address plus
+    /// the adapters recorded in its connected-adapters set. **Deletes
+    /// nothing** (PR #46 review): the node's records stay in the DB until
+    /// [ActorMgr::finish_cull] runs from the post-Assembly teardown, so a
+    /// crash before then leaves the node discoverable for the next startup.
+    async fn cull_node(&self, node_addr: &IpAddr) -> Result<CulledNode, ServiceError> {
+        let adapter_addrs = match self.node_db.get_connected_adapters(node_addr).await {
+            Ok(adapters) => adapters.into_iter().collect(),
+            Err(StoreError::NotFound(_)) => Vec::new(),
+            Err(e) => return Err(ServiceError::from(e)),
+        };
+        Ok(CulledNode {
+            node_addr: *node_addr,
+            adapter_addrs,
+        })
+    }
+
+    /// Complete a startup cull: remove the culled node's actor record and its
+    /// node DB record (and with it the connected-adapters set). Called from
+    /// `main`'s `teardown_culled_nodes` only AFTER the node's docked adapters
+    /// have been torn down (PR #46 review) — the connected-adapters set is the
+    /// only durable record of those adapters, so deleting it earlier would
+    /// strand them if startup crashed before the teardown. Idempotent: both
+    /// removals are key deletions, so re-running after a partial failure is
+    /// safe.
+    pub async fn finish_cull(&self, node_addr: &IpAddr) -> Result<(), ServiceError> {
+        self.remove_actor_by_zpr_addr(node_addr).await?;
+        self.remove_node(node_addr).await?;
         Ok(())
     }
 
@@ -1661,8 +1719,10 @@ mod test {
     }
 
     /// refresh_state culls a node by LAST-SEEN age (zipline#119): a node last
-    /// seen longer than DEFAULT_AUTH_EXPIRATION ago is removed at startup even
-    /// though its (non-expiring) bootstrap authentication is still valid.
+    /// seen longer than DEFAULT_AUTH_EXPIRATION ago is reported for culling at
+    /// startup even though its (non-expiring) bootstrap authentication is
+    /// still valid. The record removal itself happens in [ActorMgr::finish_cull],
+    /// run from the post-Assembly teardown (PR #46 review).
     #[tokio::test]
     async fn test_refresh_state_culls_node_last_seen_too_long_ago() {
         let db = Arc::new(crate::db::FakeDb::new());
@@ -1696,15 +1756,22 @@ mod test {
         )
         .await;
 
-        mgr.refresh_state().await.unwrap();
+        let culled = mgr.refresh_state().await.unwrap();
 
+        assert_eq!(
+            culled.iter().map(|c| c.node_addr).collect::<Vec<_>>(),
+            vec![node_addr],
+            "a node last seen more than DEFAULT_AUTH_EXPIRATION ago must be culled \
+             regardless of its authentication expiry"
+        );
+        // The record removal is finish_cull's job, run from the teardown.
+        mgr.finish_cull(&node_addr).await.unwrap();
         assert!(
             mgr.get_actor_by_zpr_addr(&node_addr)
                 .await
                 .unwrap()
                 .is_none(),
-            "a node last seen more than DEFAULT_AUTH_EXPIRATION ago must be culled \
-             regardless of its authentication expiry"
+            "finish_cull must remove the culled node's actor record"
         );
     }
 
@@ -1776,14 +1843,192 @@ mod test {
             .unwrap();
         }
 
-        mgr.refresh_state().await.unwrap();
+        let culled = mgr.refresh_state().await.unwrap();
+
+        assert_eq!(
+            culled.iter().map(|c| c.node_addr).collect::<Vec<_>>(),
+            vec![node_addr],
+            "a node with no recorded last-seen time must be treated as stale"
+        );
+    }
+
+    /// zipline#145: completing a stale-node cull must remove its node DB
+    /// record too, not only its actor record — a surviving record means
+    /// `list_node_addrs` keeps returning the ghost on every restart, and its
+    /// connected-adapters set survives with it. The removal is `finish_cull`'s
+    /// (the post-Assembly teardown's), not `refresh_state`'s: `refresh_state`
+    /// deletes nothing so the cull stays restart-recoverable (PR #46 review).
+    #[tokio::test]
+    async fn test_refresh_state_stale_node_cull_removes_node_record() {
+        let db = Arc::new(crate::db::FakeDb::new());
+        let mgr = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+
+        let node_addr: IpAddr = "fd5a:5052::49".parse().unwrap();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::49", "node-cull", "[fd5a:5052::149]:1234");
+        let adapter_a = make_adapter_actor_defexp("fd5a:5052::4a", "cull-adapter-a");
+        let adapter_b = make_adapter_actor_defexp("fd5a:5052::4b", "cull-adapter-b");
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_a, &node_addr, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(&adapter_b, &node_addr, &Default::default())
+            .await
+            .unwrap();
+
+        backdate_last_seen(
+            &db,
+            &node_addr,
+            crate::config::DEFAULT_AUTH_EXPIRATION + Duration::from_secs(60),
+        )
+        .await;
+
+        let culled = mgr.refresh_state().await.unwrap();
+        assert_eq!(culled.len(), 1);
+        mgr.finish_cull(&node_addr).await.unwrap();
 
         assert!(
-            mgr.get_actor_by_zpr_addr(&node_addr)
-                .await
-                .unwrap()
-                .is_none(),
-            "a node with no recorded last-seen time must be treated as stale"
+            !mgr.list_node_addrs().await.unwrap().contains(&node_addr),
+            "a culled node must leave no node DB record: list_node_addrs must not return it"
+        );
+    }
+
+    /// zipline#145: `refresh_state` runs before the `Assembly` exists, so it
+    /// cannot tear the adapters down itself — it must return each culled node
+    /// with the adapter addresses that were docked through it, for main to
+    /// tear down right after Assembly construction.
+    #[tokio::test]
+    async fn test_refresh_state_returns_stale_nodes_adapters() {
+        let db = Arc::new(crate::db::FakeDb::new());
+        let mgr = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+
+        let node_addr: IpAddr = "fd5a:5052::4c".parse().unwrap();
+        let adapter_a_addr: IpAddr = "fd5a:5052::4d".parse().unwrap();
+        let adapter_b_addr: IpAddr = "fd5a:5052::4e".parse().unwrap();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::4c", "node-ret", "[fd5a:5052::14c]:1234");
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052::4d", "ret-adapter-a"),
+            &node_addr,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        mgr.add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052::4e", "ret-adapter-b"),
+            &node_addr,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        backdate_last_seen(
+            &db,
+            &node_addr,
+            crate::config::DEFAULT_AUTH_EXPIRATION + Duration::from_secs(60),
+        )
+        .await;
+
+        let culled = mgr.refresh_state().await.unwrap();
+
+        assert_eq!(culled.len(), 1, "exactly one node must be culled");
+        assert_eq!(culled[0].node_addr, node_addr);
+        let mut adapters = culled[0].adapter_addrs.clone();
+        adapters.sort();
+        assert_eq!(
+            adapters,
+            vec![adapter_a_addr, adapter_b_addr],
+            "the culled node's docked adapters must be reported for teardown"
+        );
+    }
+
+    /// PR #46 review (P1): the startup cull must be restart-recoverable.
+    /// `refresh_state` runs before the `Assembly` exists, and `main` can still
+    /// exit between it and `teardown_culled_nodes` (`VisaRepo::new`, API-key
+    /// loading). If the node's records were already deleted at that point, the
+    /// only copy of its docked-adapter addresses is the in-memory `culled`
+    /// vector, and the next startup can never find the orphaned adapters. So
+    /// `refresh_state` must not delete anything: a second `refresh_state` over
+    /// the same DB — a restart whose predecessor died before teardown — must
+    /// report the same node with the same adapters.
+    #[tokio::test]
+    async fn test_refresh_state_cull_is_restart_recoverable() {
+        let db = Arc::new(crate::db::FakeDb::new());
+        let mgr = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+
+        let node_addr: IpAddr = "fd5a:5052::4f".parse().unwrap();
+        let adapter_a_addr: IpAddr = "fd5a:5052::50".parse().unwrap();
+        let adapter_b_addr: IpAddr = "fd5a:5052::51".parse().unwrap();
+        let node_actor =
+            make_node_actor_defexp("fd5a:5052::4f", "node-recover", "[fd5a:5052::14f]:1234");
+        mgr.add_node(&node_actor, false, &Default::default())
+            .await
+            .unwrap();
+        mgr.add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052::50", "recover-adapter-a"),
+            &node_addr,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        mgr.add_adapter_via_node(
+            &make_adapter_actor_defexp("fd5a:5052::51", "recover-adapter-b"),
+            &node_addr,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        backdate_last_seen(
+            &db,
+            &node_addr,
+            crate::config::DEFAULT_AUTH_EXPIRATION + Duration::from_secs(60),
+        )
+        .await;
+
+        let culled1 = mgr.refresh_state().await.unwrap();
+        assert_eq!(culled1.len(), 1);
+        assert_eq!(culled1[0].node_addr, node_addr);
+
+        // Crash before teardown_culled_nodes: nothing else runs. A restart is
+        // a fresh manager over the same DB.
+        let mgr2 = ActorMgr::new(
+            crate::db::ActorRepo::new(db.clone()),
+            crate::db::NodeRepo::new(db.clone()),
+            Arc::new(Counters::default()),
+        );
+        let culled2 = mgr2.refresh_state().await.unwrap();
+
+        assert_eq!(
+            culled2.len(),
+            1,
+            "a culled node whose teardown never ran must be re-culled on the next startup"
+        );
+        assert_eq!(culled2[0].node_addr, node_addr);
+        let mut adapters = culled2[0].adapter_addrs.clone();
+        adapters.sort();
+        assert_eq!(
+            adapters,
+            vec![adapter_a_addr, adapter_b_addr],
+            "the re-culled node must still name its docked adapters — deleting the \
+             connected-adapters set before teardown makes the orphans unfindable"
         );
     }
 }
