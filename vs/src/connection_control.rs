@@ -1830,20 +1830,34 @@ impl ConnectionControl {
     /// revisions and, if it came from our pool, its ZPR address. The docking node's
     /// record (and so its connected-adapters set) is left for the caller.
     ///
+    /// **The visa service's own adapter is always spared** (zipline#167): the VS keeps
+    /// running across its docking node's departure, and its actor record is re-created
+    /// only at VS startup or when its adapter re-docks — so removing it here would
+    /// leave the VS unable to mint its own VS→VSS visa until that re-dock, losing the
+    /// race against a restarting node's `register_vss`. This filter used to live in
+    /// each caller (and the disconnect path was missing it); it lives here so every
+    /// teardown path gets it.
+    ///
     /// Returns the addresses whose actor records were removed, for the caller to pass
     /// to [crate::visa_mgr::VisaMgr::remove_visas_for_actors]. Failures are logged and
     /// skipped so one bad adapter cannot strand the rest.
     ///
     /// Used by [ConnectionControl::disconnect] for the adapters of a departing node,
-    /// and by a node's fresh (`ctype=Reset`) connect, whose previously docked adapters
-    /// are gone with the node's state (zipline#138).
+    /// by a node's fresh (`ctype=Reset`) connect, whose previously docked adapters
+    /// are gone with the node's state (zipline#138), and by the startup cull's
+    /// teardown (`teardown_culled_nodes`, zipline#145).
     pub async fn remove_departed_adapters(
         &self,
         asm: &Assembly,
         adapter_addrs: &[IpAddr],
     ) -> Vec<IpAddr> {
+        let vs_addr = asm.config.get_vs_addr();
         let mut removed = Vec::with_capacity(adapter_addrs.len());
         for &adapter_addr in adapter_addrs {
+            if adapter_addr == vs_addr {
+                debug!(target: CC, "sparing the visa service's own adapter {adapter_addr} in departed-adapter teardown");
+                continue;
+            }
             if let Err(e) = asm.actor_mgr.remove_actor_by_zpr_addr(&adapter_addr).await {
                 // Caller can't do anything with this. So just log and continue. The
                 // address stays allocated: the actor record may have survived, and a
@@ -7181,7 +7195,7 @@ mod tests {
     mod node_disconnect_reregister_race {
         use super::*;
         use crate::assembly::tests::new_assembly_for_tests;
-        use crate::test_helpers::{make_adapter_actor_defexp, make_actor_with_services_defexp};
+        use crate::test_helpers::{make_actor_with_services_defexp, make_adapter_actor_defexp};
         use libeval::attribute::ROLE_NODE;
         use std::net::SocketAddr;
         use tokio::sync::mpsc;
@@ -7299,11 +7313,7 @@ mod tests {
             .await
             .unwrap();
             let asm = Arc::new(asm_inner);
-            let arena = tokio::spawn(crate::visareq_worker::launch_arena(
-                asm.clone(),
-                vreq_rx,
-                1,
-            ));
+            let arena = tokio::spawn(crate::visareq_worker::launch_arena(asm.clone(), vreq_rx, 1));
             let cc = make_cc("test-vs");
 
             let node_addr: IpAddr = NODE.parse().unwrap();
@@ -7333,6 +7343,20 @@ mod tests {
                 .await
                 .unwrap();
 
+            // Operator concern (zipline#167 amendment): does the spared VS
+            // actor's in-memory connection_table entry stay pointing at the
+            // old node? No — `disconnect` ends in `actor_mgr.remove_node`,
+            // whose retain() purges every connection-table entry pointing at
+            // the departed node, the VS adapter's included. Nothing stale
+            // survives; the authenticate handler re-docks the VS to whatever
+            // node connects next.
+            assert_eq!(
+                asm.actor_mgr.get_docking_node_for_adapter(&vs_addr),
+                None,
+                "the VS adapter's connection-table entry must be purged by \
+                 the node disconnect, not left pointing at the dead node"
+            );
+
             // The restarted node re-authenticates FIRST — the VS adapter has
             // not re-docked. Mirror what the authenticate handler does
             // (vsapi_worker.rs): add the node, re-add it to the router, and
@@ -7345,7 +7369,11 @@ mod tests {
                 .unwrap();
             asm.topo_mgr.add_node(node_addr).unwrap();
             if let Some(vs_actor) = asm.actor_mgr.get_actor_by_zpr_addr(&vs_addr).await.unwrap() {
-                if asm.actor_mgr.get_docking_node_for_actor(&vs_actor).is_none() {
+                if asm
+                    .actor_mgr
+                    .get_docking_node_for_actor(&vs_actor)
+                    .is_none()
+                {
                     asm.actor_mgr
                         .hack_set_vs_docking_node(&node_addr)
                         .await

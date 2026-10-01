@@ -636,9 +636,10 @@ async fn synchronize_state(
 /// once the `Assembly` exists (zipline#145). `refresh_state` deleted nothing
 /// (PR #46 review), so this owns the whole removal, adapters first:
 /// - the adapters' actor records, trusted-service revisions and pool
-///   addresses (`ConnectionControl::remove_departed_adapters`), sparing the
-///   VS's own adapter: the VS is running right now, and its record is
-///   re-created only at startup or when its adapter re-docks;
+///   addresses (`ConnectionControl::remove_departed_adapters`); that helper
+///   itself spares the VS's own adapter (zipline#167): the VS is running
+///   right now, and its record is re-created only at startup or when its
+///   adapter re-docks;
 /// - the removed adapters' visas (`VisaMgr::remove_visas_for_actors`);
 /// - the node's visa refs (`VisaMgr::clear_node_state`) and its router entry
 ///   (`TopologyMgr::remove_node`);
@@ -657,15 +658,11 @@ async fn synchronize_state(
 /// deletions and logged-and-skipped releases), so a partial run is completed
 /// by the re-cull on the next startup.
 async fn teardown_culled_nodes(asm: &Assembly, culled: &[crate::actor_mgr::CulledNode]) {
-    let vs_addr = IpAddr::V6(config::VS_ZPR_ADDR);
     for node in culled {
-        let departed: Vec<IpAddr> = node
-            .adapter_addrs
-            .iter()
-            .copied()
-            .filter(|addr| *addr != vs_addr)
-            .collect();
-        let removed = asm.cc.remove_departed_adapters(asm, &departed).await;
+        let removed = asm
+            .cc
+            .remove_departed_adapters(asm, &node.adapter_addrs)
+            .await;
         if let Err(e) = asm.visa_mgr.remove_visas_for_actors(&removed).await {
             error!(target: MAIN, "failed to remove visas for adapters of culled node {}: {e}", node.node_addr);
         }
