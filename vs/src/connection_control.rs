@@ -7169,4 +7169,206 @@ mod tests {
             "a clean actor must stay connected"
         );
     }
+
+    /// zipline#167: the node-disconnect teardown must spare the visa service's
+    /// own adapter, exactly as the other two teardown paths (`reset_node_state`
+    /// in vsapi_worker.rs, `teardown_culled_nodes` in main.rs) already do. The
+    /// VS keeps running across its docking node's disconnect; its actor record
+    /// is re-created only at VS startup or when its adapter re-docks, so
+    /// removing it here opens the re-register race: a restarted node that
+    /// connects and calls register_vss before the VS adapter re-docks is denied
+    /// SourceNotFound and torn down again.
+    mod node_disconnect_reregister_race {
+        use super::*;
+        use crate::assembly::tests::new_assembly_for_tests;
+        use crate::test_helpers::{make_adapter_actor_defexp, make_actor_with_services_defexp};
+        use libeval::attribute::ROLE_NODE;
+        use std::net::SocketAddr;
+        use tokio::sync::mpsc;
+
+        const NODE: &str = "fd5a:5052:3000::2";
+        const OTHER_ADAPTER: &str = "fd5a:5052:4000::a";
+        const VSS_PORT: u16 = 8183;
+        /// The service id the test policy allows and the node actor provides,
+        /// standing in for the compiled policy's VSS service.
+        const VSS_SERVICE: &str = "vss";
+
+        /// A node actor providing [VSS_SERVICE], with the substrate address a
+        /// node record requires.
+        fn make_vss_node_actor() -> libeval::actor::Actor {
+            let mut node =
+                make_actor_with_services_defexp(ROLE_NODE, NODE, &[VSS_SERVICE], "node-1");
+            node.add_attribute(
+                Attribute::builder(key::SUBSTRATE_ADDR).value("[fd5a:5052:3000::102]:1234"),
+            )
+            .unwrap();
+            node
+        }
+
+        /// The focused fix assertion: a node disconnect cascade tears down the
+        /// adapters docked through the node but spares the VS's own adapter,
+        /// mirroring `test_reset_spares_vs_own_adapter` (vsapi_worker.rs) and
+        /// `test_teardown_culled_nodes_spares_vs_own_adapter` (main.rs).
+        #[tokio::test]
+        async fn disconnect_spares_vs_own_adapter() {
+            let asm = Arc::new(new_assembly_for_tests(None).await);
+            let cc = make_cc("test-vs");
+            let node_addr: IpAddr = NODE.parse().unwrap();
+            let other_addr: IpAddr = OTHER_ADAPTER.parse().unwrap();
+            let vs_addr = IpAddr::V6(config::VS_ZPR_ADDR);
+
+            let node = make_vss_node_actor();
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            asm.actor_mgr
+                .add_adapter_via_node(
+                    &make_adapter_actor_defexp(OTHER_ADAPTER, "other-adapter"),
+                    &node_addr,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            // The VS's own adapter, docked at the node the way startup +
+            // the authenticate handler record it.
+            asm.actor_mgr
+                .hack_add_adapter_no_node(
+                    &make_adapter_actor_defexp(&vs_addr.to_string(), config::VS_CN),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            asm.actor_mgr
+                .hack_set_vs_docking_node(&node_addr)
+                .await
+                .unwrap();
+
+            cc.disconnect(asm.clone(), node_addr, vsapi::DisconnectReason::LinkError)
+                .await
+                .unwrap();
+
+            assert!(
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&vs_addr)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the VS's own actor record must survive its docking node's disconnect"
+            );
+            assert!(
+                asm.actor_mgr
+                    .get_actor_by_zpr_addr(&other_addr)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "other adapters docked through the node are still torn down"
+            );
+        }
+
+        /// The defect-1 ordering from the issue, without timing: node
+        /// disconnects (tearing down the actors docked to it), then the
+        /// restarted node re-authenticates and calls register_vss BEFORE the
+        /// VS adapter re-docks. The VS→VSS visa mint must succeed — before
+        /// the fix the disconnect cascade removed the VS's own actor, so
+        /// `post_register_vss_visas_for_node` denied SourceNotFound
+        /// ("has no actor and is not a registered AAA address",
+        /// visareq_worker.rs) and the node was disconnected again.
+        #[tokio::test]
+        async fn register_vss_succeeds_when_node_wins_reregister_race() {
+            use crate::db::PolicyRepo;
+            use crate::policy_mgr::PolicyMgr;
+            use crate::test_helpers::{FakeResolver, make_allow_policy_for_tcp_service};
+            use crate::trusted_services::TrustedServicesMgr;
+            use std::path::PathBuf;
+
+            let (vreq_tx, vreq_rx) = mpsc::channel(8);
+            let mut asm_inner = new_assembly_for_tests(Some(vreq_tx)).await;
+            // A policy that allows the VS→VSS flow: TCP to VSS_PORT, provider
+            // must provide VSS_SERVICE. No conditions.
+            asm_inner.policy_mgr = PolicyMgr::new_with_initial_policy(
+                make_allow_policy_for_tcp_service(VSS_SERVICE, VSS_PORT),
+                PolicyRepo::new(asm_inner.state_db.clone()),
+                Arc::new(FakeResolver::ip_only()),
+                Arc::new(TrustedServicesMgr::new()),
+                PathBuf::from("."),
+                PathBuf::from("."),
+                Arc::new(crate::db::ActorRepo::new(asm_inner.state_db.clone())),
+                None,
+            )
+            .await
+            .unwrap();
+            let asm = Arc::new(asm_inner);
+            let arena = tokio::spawn(crate::visareq_worker::launch_arena(
+                asm.clone(),
+                vreq_rx,
+                1,
+            ));
+            let cc = make_cc("test-vs");
+
+            let node_addr: IpAddr = NODE.parse().unwrap();
+            let vs_addr = IpAddr::V6(config::VS_ZPR_ADDR);
+            let node = make_vss_node_actor();
+
+            // Initial session: node connected, VS adapter docked at it.
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            asm.topo_mgr.add_node(node_addr).unwrap();
+            asm.actor_mgr
+                .hack_add_adapter_no_node(
+                    &make_adapter_actor_defexp(&vs_addr.to_string(), config::VS_CN),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            asm.actor_mgr
+                .hack_set_vs_docking_node(&node_addr)
+                .await
+                .unwrap();
+
+            // The node goes away (LinkError disconnect, as in the issue log).
+            cc.disconnect(asm.clone(), node_addr, vsapi::DisconnectReason::LinkError)
+                .await
+                .unwrap();
+
+            // The restarted node re-authenticates FIRST — the VS adapter has
+            // not re-docked. Mirror what the authenticate handler does
+            // (vsapi_worker.rs): add the node, re-add it to the router, and
+            // re-dock the VS adapter only if its actor record exists with no
+            // docking node — in the broken state the record is gone, so
+            // production skips the re-dock exactly like this does.
+            asm.actor_mgr
+                .add_node(&node, false, &Default::default())
+                .await
+                .unwrap();
+            asm.topo_mgr.add_node(node_addr).unwrap();
+            if let Some(vs_actor) = asm.actor_mgr.get_actor_by_zpr_addr(&vs_addr).await.unwrap() {
+                if asm.actor_mgr.get_docking_node_for_actor(&vs_actor).is_none() {
+                    asm.actor_mgr
+                        .hack_set_vs_docking_node(&node_addr)
+                        .await
+                        .unwrap();
+                }
+            }
+
+            // ... and registers its VSS before any VS-adapter re-dock.
+            let vss_sockaddr = SocketAddr::new(node_addr, VSS_PORT);
+            let visas = asm
+                .visa_mgr
+                .post_register_vss_visas_for_node(asm.clone(), &node_addr, &vss_sockaddr)
+                .await
+                .expect(
+                    "register_vss must not depend on the VS adapter's re-auth \
+                     winning the race against the restarted node",
+                );
+            assert!(
+                !visas.is_empty(),
+                "the VS→VSS visa must be minted for the re-registering node"
+            );
+
+            arena.abort();
+        }
+    }
 }
