@@ -4,13 +4,13 @@
 use dashmap::DashMap;
 use libeval::actor::Actor;
 use libeval::attribute::key;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
-use zpr::policy_types::{OidcConfig, Scope, ServiceType};
+use zpr::policy_types::ServiceType;
 use zpr::vsapi_types::{OidcClientConfig, PublicKey, ServiceDescriptor};
 
 use crate::assembly::Assembly;
@@ -518,51 +518,17 @@ impl ActorMgr {
         }
     }
 
-    /// Get the list of authentication services: connected on-net actor-authentication
-    /// services, plus policy-declared off-net OIDC identity providers (which never
-    /// appear in the actor DB — they are not on the ZPR network).
+    /// Get the list of authentication services to advertise to nodes: the
+    /// policy-declared off-net OIDC identity providers. They never appear in the
+    /// actor DB — they are not on the ZPR network — so the list comes from policy
+    /// alone.
     pub async fn get_auth_services_list(
         &self,
         asm: Arc<Assembly>,
     ) -> Result<Vec<ServiceDescriptor>, ServiceError> {
         let mut services = Vec::new();
-
-        // From the DB we can get the (service_name, zpr_addr) for each connected service.
-        let service_entries = self.actor_db.list_services().await?;
-
-        // Then we need to consult policy to get the service details.
         let pol = asm.policy_mgr.get_current();
 
-        let mut svc_map = HashMap::new();
-        for svc in pol.list_services_by_kind(ServiceType::Authentication) {
-            svc_map.insert(svc.id.clone(), svc);
-        }
-
-        if !svc_map.is_empty() {
-            for s_ent in &service_entries {
-                if let Some(svc) = svc_map.get(&s_ent.name) {
-                    let sdesc = ServiceDescriptor {
-                        // This path only lists policy `ServiceType::Authentication`
-                        // services, which are on-net actor-authentication services;
-                        // off-net OIDC providers are handled below.
-                        stype: zpr::vsapi_types::ServiceT::ActorAuthentication,
-                        service_id: svc.id.clone(),
-                        service_uri: uri_for_service(
-                            &svc.kind,
-                            &s_ent.zpr_addr,
-                            svc.endpoints.as_slice(),
-                            None,
-                        )?,
-                        zpr_addr: s_ent.zpr_addr.clone(),
-                        oidc: None,
-                    };
-                    services.push(sdesc);
-                }
-            }
-        }
-
-        // Off-net OIDC identity providers come straight from policy: they are
-        // never connected actors, so the DB join above can never surface them.
         for svc in pol.list_services_by_kind(ServiceType::Trusted(TS_API_OIDC.to_string())) {
             let Some(record) = pol.trusted_service_by_id(&svc.id) else {
                 // trusted_service_definitions validated this at policy install.
@@ -574,12 +540,8 @@ impl ActorMgr {
             services.push(ServiceDescriptor {
                 stype: zpr::vsapi_types::ServiceT::OidcAuthentication,
                 service_id: svc.id.clone(),
-                service_uri: uri_for_service(
-                    &svc.kind,
-                    &IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    svc.endpoints.as_slice(),
-                    Some(cfg),
-                )?,
+                // An off-net identity provider is addressed by its issuer URL.
+                service_uri: cfg.issuer.clone(),
                 // Off-net services carry the unspecified address.
                 zpr_addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
                 oidc: Some(OidcClientConfig {
@@ -696,10 +658,16 @@ impl ActorMgr {
         Ok(addrs)
     }
 
-    /// Return true if the actor exists and offers at least one authentication service.
-    /// Note that this consults the **current** policy to determine if the service is an auth service.
+    /// Return true if the actor exists and offers at least one on-net authentication
+    /// service (`ServiceType::Authentication` in the **current** policy). This is the
+    /// gate that lets an unauthenticated adapter on an AAA address reach the actor
+    /// (see `visareq_worker::try_aaa_actor`).
     ///
-    /// TODO: May be better to keep that cached with the actor.
+    /// No policy compiler currently emits `ServiceType::Authentication`: the on-net
+    /// authentication service it described was retired, and OIDC identity providers
+    /// are off-net. The check stays so the AAA path has a well-defined gate if an
+    /// on-net authentication service returns; until then it answers `false` for any
+    /// compiled policy.
     pub async fn has_auth_services(
         &self,
         asm: Arc<Assembly>,
@@ -730,73 +698,6 @@ impl ActorMgr {
     }
 }
 
-// The auth service URI is of the form: <ZPR_AUTH_SCHEME>://<addr>:<port>/path
-//
-// Example: 'zpr-oauthrsa://[fd5a:5052:9090::88]:4000'
-//
-// The 'zpr-oauthrsa' scheme implies "https" and "/preauthorize" and "/authorize" endpoints.
-//
-// For an off-net OIDC identity provider (`ServiceType::Trusted("oidc")`) the URI is
-// the provider's issuer URL, straight from the policy `OidcConfig` — no on-net
-// address or endpoint scope is involved, so `addr` and `endpoints` are ignored.
-//
-// TODO: Eventually we need to expand zplc and the compiler to have richer set of
-// auth service types.
-//
-// TODO: The ph is passing the ASA info to the adapters as a socket-addr and the
-// mechanics of zpr-oauthrsa are built in or something.  This all needs a clean up.
-//
-// Errors:
-// - The only supported on-net auth service type requires a single scope, so you get an
-//   error if there are none or more than one.
-// - An oidc service without its `OidcConfig` is an internal error (policy install
-//   validates the record exists).
-fn uri_for_service(
-    skind: &ServiceType,
-    addr: &IpAddr,
-    endpoints: &[Scope],
-    oidc: Option<&OidcConfig>,
-) -> Result<String, ServiceError> {
-    let scheme = match skind {
-        ServiceType::Authentication => "zpr-oauthrsa",
-        ServiceType::Trusted(api) if api == TS_API_OIDC => {
-            let Some(cfg) = oidc else {
-                return Err(ServiceError::Internal(
-                    "oidc auth service has no oidc config".into(),
-                ));
-            };
-            return Ok(cfg.issuer.clone());
-        }
-        _ => {
-            return Err(ServiceError::Internal(
-                format!("unsupported service type for auth service URI: {skind:?}").into(),
-            ));
-        }
-    };
-
-    if endpoints.len() != 1 {
-        return Err(ServiceError::Internal(
-            format!(
-                "auth service must have exactly one scope endpoint, not {}",
-                endpoints.len()
-            )
-            .into(),
-        ));
-    }
-
-    if let Some(portnum) = endpoints[0].port.as_ref() {
-        let url = match addr {
-            IpAddr::V4(a) => format!("{scheme}://{a}:{portnum}"),
-            IpAddr::V6(a) => format!("{scheme}://[{a}]:{portnum}"),
-        };
-        Ok(url)
-    } else {
-        Err(ServiceError::Internal(
-            "auth service scope must have a single port defined".into(),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -804,12 +705,11 @@ mod test {
     use crate::counters::Counters;
     use crate::db::{ActorRepo, FakeDb, NodeRepo};
     use crate::test_helpers::{
-        make_actor_defexp, make_actor_with_services_defexp, make_adapter_actor_defexp,
-        make_container_bytes, make_node_actor_defexp, make_oidc_only_adapter_defexp,
+        make_actor_defexp, make_adapter_actor_defexp, make_container_bytes, make_node_actor_defexp,
+        make_oidc_only_adapter_defexp,
     };
 
     use bytes::Bytes;
-    use libeval::attribute::ROLE_ADAPTER;
     use libeval::policy::Policy;
     use std::net::{IpAddr, SocketAddr};
     use std::sync::Arc;
@@ -999,178 +899,6 @@ mod test {
             ServiceError::Store(StoreError::NotFound(_)) => {}
             other => panic!("unexpected error: {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_uri_for_service_ipv6_auth() {
-        let addr: IpAddr = "fd5a:5052::9".parse().unwrap();
-        let endpoints = [Scope {
-            protocol: 0,
-            flag: None,
-            port: Some(4000),
-            port_range: None,
-        }];
-
-        let uri = uri_for_service(&ServiceType::Authentication, &addr, &endpoints, None).unwrap();
-        assert_eq!(uri, "zpr-oauthrsa://[fd5a:5052::9]:4000");
-    }
-
-    /// The oidc arm: an `api = "oidc"` trusted service's URI is its issuer, straight
-    /// from the policy `OidcConfig` (no endpoints, no on-net address involved).
-    #[test]
-    fn test_uri_for_service_oidc_returns_issuer() {
-        let addr: IpAddr = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
-        let cfg = crate::test_helpers::make_test_oidc_config();
-
-        let uri = uri_for_service(
-            &ServiceType::Trusted("oidc".to_string()),
-            &addr,
-            &[],
-            Some(&cfg),
-        )
-        .unwrap();
-        assert_eq!(uri, "https://accounts.google.com");
-
-        // An oidc service without its config is an internal error, not a panic.
-        let err = uri_for_service(&ServiceType::Trusted("oidc".to_string()), &addr, &[], None)
-            .unwrap_err();
-        assert!(matches!(err, ServiceError::Internal(_)), "{err:?}");
-    }
-
-    #[test]
-    fn test_uri_for_service_errors() {
-        let addr: IpAddr = "fd5a:5052::10".parse().unwrap();
-        let endpoints = [Scope {
-            protocol: 0,
-            flag: None,
-            port: Some(4000),
-            port_range: None,
-        }];
-
-        // Non-auth service types are not supported for auth service URIs.
-        let err = uri_for_service(&ServiceType::Regular, &addr, &endpoints, None).unwrap_err();
-        match err {
-            ServiceError::Internal(_) => {}
-            other => panic!("unexpected error: {:?}", other),
-        }
-
-        // Auth services must declare exactly one endpoint scope.
-        let err = uri_for_service(&ServiceType::Authentication, &addr, &[], None).unwrap_err();
-        match err {
-            ServiceError::Internal(_) => {}
-            other => panic!("unexpected error: {:?}", other),
-        }
-
-        let endpoints_missing_port = [Scope {
-            protocol: 0,
-            flag: None,
-            port: None,
-            port_range: None,
-        }];
-        // Auth service scope must include a concrete port number.
-        let err = uri_for_service(
-            &ServiceType::Authentication,
-            &addr,
-            &endpoints_missing_port,
-            None,
-        )
-        .unwrap_err();
-        match err {
-            ServiceError::Internal(_) => {}
-            other => panic!("unexpected error: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_auth_services_list_filters_and_formats() {
-        let mgr = make_mgr();
-        let actor = make_actor_with_services_defexp(
-            ROLE_ADAPTER,
-            "fd5a:5052::11",
-            &["svc:auth", "svc:regular", "svc:unknown"],
-            "adapter-auth",
-        );
-        mgr.hack_add_adapter_no_node(&actor, &Default::default())
-            .await
-            .unwrap();
-
-        let auth_service = Service {
-            id: "svc:auth".to_string(),
-            endpoints: vec![Scope {
-                protocol: 0,
-                flag: None,
-                port: Some(4000),
-                port_range: None,
-            }],
-            kind: ServiceType::Authentication,
-        };
-        let regular_service = Service {
-            id: "svc:regular".to_string(),
-            endpoints: vec![Scope {
-                protocol: 0,
-                flag: None,
-                port: Some(8080),
-                port_range: None,
-            }],
-            kind: ServiceType::Regular,
-        };
-        let (_policy, container_bytes) =
-            make_policy_with_services(vec![auth_service, regular_service]);
-
-        let asm = new_assembly_for_tests(None).await;
-        asm.policy_mgr
-            .update_policy_from_container_bytes(container_bytes)
-            .await
-            .unwrap();
-        let asm = Arc::new(asm);
-
-        let mut services = mgr.get_auth_services_list(asm).await.unwrap();
-        services.sort_by(|a, b| a.service_id.cmp(&b.service_id));
-
-        assert_eq!(services.len(), 1);
-        assert_eq!(services[0].service_id, "svc:auth");
-        assert_eq!(
-            services[0].service_uri,
-            "zpr-oauthrsa://[fd5a:5052::11]:4000"
-        );
-        let addr: IpAddr = "fd5a:5052::11".parse().unwrap();
-        assert_eq!(services[0].zpr_addr, addr);
-    }
-
-    #[tokio::test]
-    async fn test_get_auth_services_list_returns_empty_without_policy_auth() {
-        let mgr = make_mgr();
-        let actor = make_actor_with_services_defexp(
-            ROLE_ADAPTER,
-            "fd5a:5052::12",
-            &["svc:auth"],
-            "adapter-regular",
-        );
-        mgr.hack_add_adapter_no_node(&actor, &Default::default())
-            .await
-            .unwrap();
-
-        let regular_service = Service {
-            id: "svc:auth".to_string(),
-            endpoints: vec![Scope {
-                protocol: 0,
-                flag: None,
-                port: Some(8080),
-                port_range: None,
-            }],
-            kind: ServiceType::Regular, // NOT an auth service
-        };
-        let (_policy, container_bytes) = make_policy_with_services(vec![regular_service]);
-
-        let asm = new_assembly_for_tests(None).await;
-        asm.policy_mgr
-            .update_policy_from_container_bytes(container_bytes)
-            .await
-            .unwrap();
-        let asm = Arc::new(asm);
-
-        let services = mgr.get_auth_services_list(asm).await.unwrap();
-        assert!(services.is_empty());
     }
 
     /// A policy declaring an `api = "oidc"` trusted service yields an off-net IdP

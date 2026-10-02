@@ -3,19 +3,12 @@
 provider = [["device.zpr.adapter.cn", "node.zpr.org"]]
 zpr_address = "fd5a:5052:90de::1"
 
-
-[trusted_services.bas]
-api = "validation/2"
-client = "AuthService"
-cert_path = "include/bas-tls.crt"
-returns_attributes = [ "tint -> device.tint", "color -> user.color", "bas_id -> user.bas_id", "hard -> #device.hardened" ]
-identity_attributes = [ "bas_id" ]
-provider = [[ "device.zpr.adapter.cn", "bas.zpr.org" ]]
+[trusted_services.hr]
+api = "file"
+returns_attributes = [ "tint -> device.tint", "color -> user.color", "employee_id -> user.employee_id", "hard -> #device.hardened" ]
 
 [bootstrap]
-"bas.zpr.org" = "include/rsa-pub-key.pem"
 "node.zpr.org" = "include/node-public-key.pem"
-
 
 [protocols.http]
 l4protocol = "TCP"
@@ -26,28 +19,28 @@ l4protocol = "ICMP6"
 icmp_type = "request-response"
 icmp_codes = [128, 129]
 
-
 [services.database]
 protocol = "http"
-provider = [[ "user.bas_id", "1233" ]]
+provider = [[ "user.employee_id", "1233" ]]
 
 [services.signalService]
 protocol = "http"
-provider = [[ "user.bas_id", "1234" ]]
-
-[services.bas-vs]
-protocol = "zpr-validation2"
-port = 3999
+provider = [[ "user.employee_id", "1234" ]]
 
 [services.pingy]
 protocol = "ping"
-provider = [[ "user.bas_id", "1233" ]]
+provider = [[ "user.employee_id", "1233" ]]
+
+# Provided by adapter CN rather than a trusted-service attribute, so a plain
+# authenticated adapter can join as its provider.
+[services.Intranet]
+protocol = "http"
+provider = [[ "device.zpr.adapter.cn", "intranet.zpr.org" ]]
 
 [services.web1]
 protocol = "http"
-provider = [[ "user.bas_id", "4567" ]]
+provider = [[ "user.employee_id", "4567" ]]
 
 [services.Webby]
 protocol = "http"
-provider = [[ "user.bas_id", "4567" ]]
-
+provider = [[ "user.employee_id", "4567" ]]

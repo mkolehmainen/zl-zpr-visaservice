@@ -159,14 +159,14 @@ mod derive_tests {
     #[test]
     fn test_derive_user_authority_from_user_attrs() {
         let attrs = vec![
-            attr("bas", "user.clearance", "classified", 600),
-            attr("bas", "user.dept", "engineering", 300),
-            attr("bas", "device.zpr.location", "hq", 60),
+            attr("hr", "user.clearance", "classified", 600),
+            attr("hr", "user.dept", "engineering", 300),
+            attr("hr", "device.zpr.location", "hq", 60),
         ];
-        let authority = derive_user_authority("bas", &attrs, None).expect("authority expected");
+        let authority = derive_user_authority("hr", &attrs, None).expect("authority expected");
         assert_eq!(authority.get_key(), key::USER_AUTHORITY);
-        assert_eq!(authority.get_value(), ["bas".to_string()]);
-        assert_eq!(authority.get_source(), "bas");
+        assert_eq!(authority.get_value(), ["hr".to_string()]);
+        assert_eq!(authority.get_source(), "hr");
         // Tracks the earliest user.* expiration (user.dept at ~300s), not the
         // device attribute's 60s and not user.clearance's 600s.
         assert_eq!(
@@ -181,9 +181,9 @@ mod derive_tests {
     /// `allow users ...` rules.
     #[test]
     fn test_derive_user_authority_none_without_user_attrs() {
-        let device_only = vec![attr("bas", "device.zpr.location", "hq", 600)];
-        assert!(derive_user_authority("bas", &device_only, None).is_none());
-        assert!(derive_user_authority("bas", &[], None).is_none());
+        let device_only = vec![attr("hr", "device.zpr.location", "hq", 600)];
+        assert!(derive_user_authority("hr", &device_only, None).is_none());
+        assert!(derive_user_authority("hr", &[], None).is_none());
     }
 
     /// Guard against the zipline#24 defect: the service that verified the
@@ -232,9 +232,9 @@ mod derive_tests {
     /// the single-file-store case (#144 / #324) must not regress.
     #[test]
     fn test_derive_user_authority_without_existing_authority() {
-        let attrs = vec![attr("bas", "user.dept", "engineering", 300)];
-        let authority = derive_user_authority("bas", &attrs, None).expect("authority expected");
-        assert_eq!(authority.get_value(), ["bas".to_string()]);
+        let attrs = vec![attr("hr", "user.dept", "engineering", 300)];
+        let authority = derive_user_authority("hr", &attrs, None).expect("authority expected");
+        assert_eq!(authority.get_value(), ["hr".to_string()]);
         assert_eq!(authority.get_expires(), attrs[0].get_expires());
     }
 
@@ -243,10 +243,10 @@ mod derive_tests {
     #[test]
     fn test_derive_user_authority_defers_to_explicit() {
         let attrs = vec![
-            attr("bas", key::USER_AUTHORITY, "custom-authority", 600),
-            attr("bas", "user.dept", "engineering", 300),
+            attr("hr", key::USER_AUTHORITY, "custom-authority", 600),
+            attr("hr", "user.dept", "engineering", 300),
         ];
-        assert!(derive_user_authority("bas", &attrs, None).is_none());
+        assert!(derive_user_authority("hr", &attrs, None).is_none());
     }
 
     /// `user.zpr.authority` is always part of the lookup-identity set when the
@@ -258,7 +258,7 @@ mod derive_tests {
         let attrs = vec![
             attr("google", key::USER_AUTHORITY, "google", 600),
             attr("google", "user.oidc-subject", "s-123", 600),
-            attr("bas", "user.dept", "engineering", 600),
+            attr("hr", "user.dept", "engineering", 600),
         ];
         let identities = lookup_identities(&["user.oidc-subject"], attrs.iter());
         assert!(

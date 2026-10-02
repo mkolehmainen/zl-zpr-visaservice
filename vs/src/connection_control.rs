@@ -1143,7 +1143,7 @@ impl ConnectionControl {
         // superset is a caller bug. A `user.zpr.authority` synthesized from
         // trusted-service enrichment ([derive_user_authority]) is excluded
         // (PR #40 review, Codex P1): the device never presented an OIDC
-        // credential — the authority names a file/BAS store, not an OIDC
+        // credential — the authority names a file or attribute-service store, not an OIDC
         // provider — so demanding a user blob for it would make the actor's
         // only valid renewal (its SS blob) permanently rejected after a
         // policy update. Such authorities are recreated by re-enrichment
@@ -3095,13 +3095,13 @@ mod tests {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cc = make_cc("test-vs");
         let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
-            "bas",
+            "hr",
             "file",
             Some(3600),
             &["dept -> user.dept"],
         ));
         let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> =
-            vec![named_ts("bas", &[("user.dept", "engineering")])];
+            vec![named_ts("hr", &[("user.dept", "engineering")])];
 
         let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
         let actor = cc
@@ -3119,7 +3119,7 @@ mod tests {
         let authority = actor
             .get_attribute(key::USER_AUTHORITY)
             .expect("user.zpr.authority should be installed");
-        assert_eq!(authority.get_value(), ["bas".to_string()]);
+        assert_eq!(authority.get_value(), ["hr".to_string()]);
         // Expires with the vended user attributes, so the authority never outlives
         // the user record it vouches for.
         assert_eq!(
@@ -3142,13 +3142,13 @@ mod tests {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cc = make_cc("test-vs");
         let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
-            "bas",
+            "hr",
             "file",
             Some(3600),
             &["location -> device.zpr.location"],
         ));
         let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> =
-            vec![named_ts("bas", &[("device.zpr.location", "hq")])];
+            vec![named_ts("hr", &[("device.zpr.location", "hq")])];
 
         let authd = vec![Attribute::builder(key::CN).value("device-1.zpr.org")];
         let actor = cc
@@ -3177,13 +3177,13 @@ mod tests {
         let asm = Arc::new(crate::assembly::tests::new_assembly_for_tests(None).await);
         let cc = make_cc("test-vs");
         let policy = policy_from_container(crate::test_helpers::make_trusted_service_policy(
-            "bas",
+            "hr",
             "file",
             Some(3600),
             &["dept -> user.dept"],
         ));
         let stores: Vec<Arc<dyn crate::trusted_services::TrustedServiceInterface>> = vec![
-            named_ts("bas", &[("user.dept", "engineering")]),
+            named_ts("hr", &[("user.dept", "engineering")]),
             named_ts("inventory", &[("device.zpr.location", "hq")]),
         ];
 
@@ -3205,7 +3205,7 @@ mod tests {
             .expect("user.zpr.authority should be installed");
         assert_eq!(
             authority.get_value(),
-            ["bas".to_string()],
+            ["hr".to_string()],
             "exactly the user-vending source names the authority"
         );
     }
@@ -5618,7 +5618,7 @@ mod tests {
         let (asm, cc, mut actor, connect_via, privkey, _pubkey_der) = ss_reauth_fixture(cn).await;
         let addr = *actor.get_zpr_addr().unwrap();
 
-        // What enrichment does when a file/BAS store vends a `user.*`
+        // What enrichment does when a file or attribute-service store vends a `user.*`
         // attribute for this device: the vended attribute lands on the actor
         // together with the derived authority (source = the store's id).
         let vended = AttributeSource::new("happyfile")

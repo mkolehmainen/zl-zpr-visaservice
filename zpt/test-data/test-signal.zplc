@@ -4,24 +4,9 @@
 provider = [["device.zpr.adapter.cn", "node.zpr.org"]]
 zpr_address = "fd5a:5052:90de::1"
 
-
-[trusted_services.bas]
-api = "validation/2"
-client = "AuthService"
-cert_path = "include/bas-tls.crt"
-returns_attributes = [ "tint -> device.tint", "color -> user.color", "bas_id -> user.bas_id", "hard -> #device.hardened" ]
-identity_attributes = [ "bas_id" ]
-provider = [[ "device.zpr.adapter.cn", "bas.zpr.org" ]]
-# Will expect to find two service definitions later:
-#    bas-vs and bas-client
-
-[bootstrap]
-"bas.zpr.org" = "include/rsa-pub-key.pem"
-
-
-# There are pre-defiend "protocols":
-# zpr-validation2
-# zpr-authrsa
+[trusted_services.hr]
+api = "file"
+returns_attributes = [ "tint -> device.tint", "color -> user.color", "employee_id -> user.employee_id", "hard -> #device.hardened" ]
 
 [protocols.http]
 l4protocol = "TCP"
@@ -29,20 +14,8 @@ port = 80
 
 [services.database]
 protocol = "http"
-provider = [[ "user.bas_id", "1233" ]]
+provider = [[ "user.employee_id", "1233" ]]
 
 [services.signalService]
 protocol = "http"
-provider = [[ "user.bas_id", "1234" ]]
-
-[services.bas-vs]
-protocol = "zpr-validation2"
-port = 3999
-
-
-# BAS has two access points:
-# - one for adapters
-# - one for visa services
-#
-# Policy needs to allow adapters to access the adapter port
-# and must allow visa service to access the vs port
+provider = [[ "user.employee_id", "1234" ]]

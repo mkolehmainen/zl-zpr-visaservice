@@ -846,11 +846,11 @@ mod test {
     #[test]
     fn test_identity_attr_keys_resolves_service_side_name() {
         let record = ts(
-            "bas",
-            &["tint -> device.tint", "bas_id -> user.bas_id"],
-            &["bas_id"],
+            "hr",
+            &["tint -> device.tint", "employee_id -> user.employee_id"],
+            &["employee_id"],
         );
-        assert_eq!(keys_for(&[record]), vec!["user.bas_id"]);
+        assert_eq!(keys_for(&[record]), vec!["user.employee_id"]);
     }
 
     /// No identity declarations means no identity keys, on both a built and an empty policy.
@@ -865,7 +865,7 @@ mod test {
     /// failing the policy load.
     #[test]
     fn test_identity_attr_keys_unresolvable_entry_ignored() {
-        let record = ts("bas", &["bas_id -> user.bas_id"], &["nope"]);
+        let record = ts("hr", &["employee_id -> user.employee_id"], &["nope"]);
         assert!(keys_for(&[record]).is_empty());
     }
 
@@ -874,7 +874,7 @@ mod test {
     #[test]
     fn test_identity_attr_keys_skips_tag_and_multi_valued() {
         let record = ts(
-            "bas",
+            "hr",
             &[
                 "gov -> #user.government",
                 "roles -> user.role{}",
@@ -888,7 +888,7 @@ mod test {
     /// Within one service, keys keep the declared identity order, not alphabetical order.
     #[test]
     fn test_identity_attr_keys_preserves_declared_order() {
-        let record = ts("bas", &["a -> user.a", "b -> user.b"], &["b", "a"]);
+        let record = ts("hr", &["a -> user.a", "b -> user.b"], &["b", "a"]);
         assert_eq!(keys_for(&[record]), vec!["user.b", "user.a"]);
     }
 
@@ -901,7 +901,7 @@ mod test {
         assert_eq!(Policy::new_empty().lookup_identity_keys(), vec![key::CN]);
 
         // Declared keys follow CN in policy order.
-        let record = ts("bas", &["a -> user.a", "b -> user.b"], &["b", "a"]);
+        let record = ts("hr", &["a -> user.a", "b -> user.b"], &["b", "a"]);
         let policy =
             Policy::new_from_policy_bytes(policy_bytes_with_trusted_services(&[record])).unwrap();
         assert_eq!(
@@ -911,7 +911,7 @@ mod test {
 
         // A mapping re-declaring CN as identity is deduped, not repeated.
         let record = ts(
-            "bas",
+            "hr",
             &[&format!("cn -> {}", key::CN), "id -> user.id"],
             &["cn", "id"],
         );

@@ -805,6 +805,17 @@ mod test {
         Policy::new_from_policy_bytes(Bytes::copy_from_slice(policy_bytes)).unwrap()
     }
 
+    /// A user actor as the visa service would hold it after a trusted service
+    /// vended its user record: compilers >= 0.16 guard every user rule with
+    /// `has user.zpr.authority` (#144), so a fixture user needs the authority
+    /// (here the fixtures' `hr` trusted service) to match any user rule.
+    fn new_user_actor() -> Actor {
+        let mut user = Actor::new();
+        user.add_attr_from_parts(key::USER_AUTHORITY, "hr", Duration::from_secs(60))
+            .unwrap();
+        user
+    }
+
     #[test]
     fn test_basic_eval() {
         setup();
@@ -812,7 +823,7 @@ mod test {
         let ctx = EvalContext::new(Arc::new(pol));
 
         // should let red users access content:red databases.
-        let mut user = Actor::new();
+        let mut user = new_user_actor();
         user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
 
@@ -830,7 +841,7 @@ mod test {
         match decision {
             PartialEvalResult::AllowWithoutRoute(hits) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 3);
+                assert_eq!(hits[0].match_idx, 2);
                 assert!(hits[0].direction == Direction::Forward);
             }
             _ => panic!("expected allow decision, not {:?}", decision),
@@ -845,7 +856,7 @@ mod test {
         match decision {
             PartialEvalResult::Deny(FinalDeny::Deny(hits)) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 2);
+                assert_eq!(hits[0].match_idx, 1);
                 assert!(hits[0].direction == Direction::Forward);
             }
             _ => panic!("expected deny decision, not {:?}", decision),
@@ -859,7 +870,7 @@ mod test {
         let ctx = EvalContext::new(Arc::new(pol));
 
         // should let red users access content:red databases.
-        let mut user = Actor::new();
+        let mut user = new_user_actor();
         user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
 
@@ -900,11 +911,11 @@ mod test {
         let pol = load_policy("test-signal.bin2");
         let ctx = EvalContext::new(Arc::new(pol));
 
-        // User with bas_id and color:red should be able to access database service.
-        let mut user = Actor::new();
+        // User with employee_id and color:red should be able to access database service.
+        let mut user = new_user_actor();
         user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
-        user.add_attr_from_parts("user.bas_id", "1000", Duration::from_secs(60))
+        user.add_attr_from_parts("user.employee_id", "1000", Duration::from_secs(60))
             .unwrap();
 
         let mut service = Actor::new();
@@ -912,7 +923,7 @@ mod test {
             .add_attr_from_parts(key::SERVICES, "database", Duration::from_secs(60))
             .unwrap();
         service
-            .add_attr_from_parts("user.bas_id", "1233", Duration::from_secs(60))
+            .add_attr_from_parts("user.employee_id", "1233", Duration::from_secs(60))
             .unwrap();
         let packet =
             PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80).unwrap();
@@ -921,7 +932,7 @@ mod test {
         match decision {
             PartialEvalResult::AllowWithoutRoute(hits) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 4);
+                assert_eq!(hits[0].match_idx, 3);
                 assert!(hits[0].direction == Direction::Forward);
             }
             _ => panic!("expected allow decision, not {:?}", decision),
@@ -936,10 +947,10 @@ mod test {
 
         // Set user with color:green so it does not match color:red since in that
         // case we would match two policies.
-        let mut user = Actor::new();
+        let mut user = new_user_actor();
         user.add_attr_from_parts("user.color", "green", Duration::from_secs(60))
             .unwrap();
-        user.add_attr_from_parts("user.bas_id", "1000", Duration::from_secs(60))
+        user.add_attr_from_parts("user.employee_id", "1000", Duration::from_secs(60))
             .unwrap();
 
         let mut service = Actor::new();
@@ -947,7 +958,7 @@ mod test {
             .add_attr_from_parts(key::SERVICES, "database", Duration::from_secs(60))
             .unwrap();
         service
-            .add_attr_from_parts("user.bas_id", "1233", Duration::from_secs(60))
+            .add_attr_from_parts("user.employee_id", "1233", Duration::from_secs(60))
             .unwrap();
         let packet =
             PacketDesc::new_tcp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 12345, 80).unwrap();
@@ -956,7 +967,7 @@ mod test {
         match decision {
             PartialEvalResult::AllowWithoutRoute(hits) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 4);
+                assert_eq!(hits[0].match_idx, 3);
                 assert!(hits[0].direction == Direction::Forward);
                 assert!(hits[0].signal.is_some());
                 let signal = hits[0].signal.as_ref().unwrap();
@@ -974,7 +985,7 @@ mod test {
         let ctx = EvalContext::new(Arc::new(pol));
 
         // should let red users ping pingdb
-        let mut user = Actor::new();
+        let mut user = new_user_actor();
         user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
 
@@ -983,7 +994,7 @@ mod test {
             .add_attr_from_parts(key::SERVICES, "pingdb", Duration::from_secs(60))
             .unwrap();
         service
-            .add_attr_from_parts("user.bas_id", "1233", Duration::from_secs(60))
+            .add_attr_from_parts("user.employee_id", "1233", Duration::from_secs(60))
             .unwrap();
         let packet =
             PacketDesc::new_icmp("fd5a:5052:3000::1", "fd5a:5052:3000::2", 0x80, 0).unwrap();
@@ -1011,7 +1022,7 @@ mod test {
         let ctx = EvalContext::new(Arc::new(pol));
 
         // should let red users ping pingdb
-        let mut user = Actor::new();
+        let mut user = new_user_actor();
         user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
             .unwrap();
 
@@ -1020,7 +1031,7 @@ mod test {
             .add_attr_from_parts(key::SERVICES, "pingdb", Duration::from_secs(60))
             .unwrap();
         service
-            .add_attr_from_parts("user.bas_id", "1233", Duration::from_secs(60))
+            .add_attr_from_parts("user.employee_id", "1233", Duration::from_secs(60))
             .unwrap();
 
         // We picked up an echo reply packet.
@@ -1060,7 +1071,7 @@ mod test {
             .add_attr_from_parts(key::SERVICES, "foo", Duration::from_secs(60))
             .unwrap();
         service
-            .add_attr_from_parts("user.bas_id", "1000", Duration::from_secs(60))
+            .add_attr_from_parts("user.employee_id", "1000", Duration::from_secs(60))
             .unwrap();
 
         // Echo reply to a red user
@@ -1609,7 +1620,7 @@ mod test {
         match decision {
             PartialEvalResult::Deny(FinalDeny::Deny(hits)) => {
                 assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].match_idx, 2);
+                assert_eq!(hits[0].match_idx, 1);
             }
             _ => panic!("expected deny decision, not {:?}", decision),
         }
@@ -1768,18 +1779,22 @@ mod test {
     #[test]
     fn test_policy_identity_attr_unions_with_cn() {
         setup();
-        let ctx = ctx_with_trusted_services(&[ts("bas", &["bas_id -> user.bas_id"], &["bas_id"])]);
+        let ctx = ctx_with_trusted_services(&[ts(
+            "hr",
+            &["employee_id -> user.employee_id"],
+            &["employee_id"],
+        )]);
 
         let authenticated_claims = vec![
             Attribute::builder(key::CN).value("a.zpr"),
-            Attribute::builder("user.bas_id").value("1233"),
+            Attribute::builder("user.employee_id").value("1233"),
         ];
         let actor = ctx
             .approve_connection(Some(authenticated_claims.as_slice()), None)
             .unwrap();
 
         let keys: Vec<&String> = actor.identity_keys_iter().collect();
-        assert_eq!(keys, vec![key::CN, "user.bas_id"]);
+        assert_eq!(keys, vec![key::CN, "user.employee_id"]);
         assert_eq!(
             actor.get_identity(),
             Some(vec!["a.zpr".to_string(), "1233".to_string()])
@@ -1791,15 +1806,19 @@ mod test {
     #[test]
     fn test_policy_identity_attr_without_cn_is_not_hashed() {
         setup();
-        let ctx = ctx_with_trusted_services(&[ts("bas", &["bas_id -> user.bas_id"], &["bas_id"])]);
+        let ctx = ctx_with_trusted_services(&[ts(
+            "hr",
+            &["employee_id -> user.employee_id"],
+            &["employee_id"],
+        )]);
 
-        let authenticated_claims = vec![Attribute::builder("user.bas_id").value("1233")];
+        let authenticated_claims = vec![Attribute::builder("user.employee_id").value("1233")];
         let actor = ctx
             .approve_connection(Some(authenticated_claims.as_slice()), None)
             .unwrap();
 
         let keys: Vec<&String> = actor.identity_keys_iter().collect();
-        assert_eq!(keys, vec!["user.bas_id"]);
+        assert_eq!(keys, vec!["user.employee_id"]);
         assert!(actor.get_attribute(key::ACTOR_HASH).is_none());
     }
 
@@ -1808,7 +1827,11 @@ mod test {
     #[test]
     fn test_policy_identity_attr_absent_from_actor_leaves_cn() {
         setup();
-        let ctx = ctx_with_trusted_services(&[ts("bas", &["bas_id -> user.bas_id"], &["bas_id"])]);
+        let ctx = ctx_with_trusted_services(&[ts(
+            "hr",
+            &["employee_id -> user.employee_id"],
+            &["employee_id"],
+        )]);
 
         let authenticated_claims = vec![Attribute::builder(key::CN).value("a.zpr")];
         let actor = ctx
@@ -1824,7 +1847,11 @@ mod test {
     #[test]
     fn test_no_identity_attr_present_still_hashes() {
         setup();
-        let ctx = ctx_with_trusted_services(&[ts("bas", &["bas_id -> user.bas_id"], &["bas_id"])]);
+        let ctx = ctx_with_trusted_services(&[ts(
+            "hr",
+            &["employee_id -> user.employee_id"],
+            &["employee_id"],
+        )]);
 
         let authenticated_claims = vec![Attribute::builder("user.color").value("red")];
         let actor = ctx
@@ -1841,7 +1868,7 @@ mod test {
     fn test_policy_identity_keys_follow_policy_order() {
         setup();
         let ctx =
-            ctx_with_trusted_services(&[ts("bas", &["a -> user.a", "z -> user.z"], &["z", "a"])]);
+            ctx_with_trusted_services(&[ts("hr", &["a -> user.a", "z -> user.z"], &["z", "a"])]);
 
         let authenticated_claims = vec![
             Attribute::builder(key::CN).value("a.zpr"),
@@ -1861,8 +1888,7 @@ mod test {
     #[test]
     fn test_policy_identity_cn_is_not_duplicated() {
         setup();
-        let ctx =
-            ctx_with_trusted_services(&[ts("bas", &["cn -> device.zpr.adapter.cn"], &["cn"])]);
+        let ctx = ctx_with_trusted_services(&[ts("hr", &["cn -> device.zpr.adapter.cn"], &["cn"])]);
 
         let authenticated_claims = vec![Attribute::builder(key::CN).value("a.zpr")];
         let actor = ctx
@@ -1878,7 +1904,7 @@ mod test {
     #[test]
     fn test_policy_identity_tag_spec_is_not_an_identity_key() {
         setup();
-        let ctx = ctx_with_trusted_services(&[ts("bas", &["gov -> #user.government"], &["gov"])]);
+        let ctx = ctx_with_trusted_services(&[ts("hr", &["gov -> #user.government"], &["gov"])]);
 
         let authenticated_claims = vec![
             Attribute::builder(key::CN).value("a.zpr"),

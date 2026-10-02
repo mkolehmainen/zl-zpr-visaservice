@@ -69,8 +69,7 @@ impl TrustedServiceDefinition {
 
 /// The port the ActorDb-backed JWKS proxy resolver would dial for
 /// `service_id`: the policy must declare it with exactly one single-port
-/// endpoint scope (the same shape `uri_for_service` enforces for on-net auth
-/// services); anything else yields `None`.
+/// endpoint scope; anything else yields `None`.
 fn jwks_proxy_port_from_policy(policy: &Policy, service_id: &str) -> Option<u16> {
     policy
         .list_services()
