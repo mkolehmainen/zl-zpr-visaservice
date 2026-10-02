@@ -519,6 +519,37 @@ pub fn make_oidc_policy_with_proxy_service(
     )
 }
 
+/// Build a policy container with one ALLOW communication policy for `service_id`
+/// on TCP `port`, with no client/service/link conditions. The minimal policy that
+/// drives the visa request pipeline to an Allow: the provider actor must carry
+/// `service_id` in its [key::SERVICES] attribute, and the flow's dest port must
+/// be `port` (zipline#167 regression test).
+pub fn make_allow_policy_for_tcp_service(service_id: &str, port: u16) -> Vec<u8> {
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
+        policy_bldr.set_created("2024-01-01T00:00:00Z");
+        policy_bldr.set_version(1);
+        policy_bldr.set_metadata("");
+        let mut coms = policy_bldr.reborrow().init_com_policies(1);
+        let mut com = coms.reborrow().get(0);
+        com.set_allow(true);
+        com.set_service_id(service_id);
+        let mut scopes = com.reborrow().init_scope(1);
+        let mut scope = scopes.reborrow().get(0);
+        scope.set_protocol(6); // TCP
+        scope.init_port().set_port_num(port);
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+    make_container_bytes(
+        crate::config::POLICY_MIN_COMPILER_MAJOR,
+        crate::config::POLICY_MIN_COMPILER_MINOR,
+        crate::config::POLICY_MIN_COMPILER_PATCH,
+        &bytes,
+    )
+}
+
 /// Build a `Peering` between two ZPR addresses, each reachable at its own address as
 /// substrate so a `FakeResolver::ip_only()` resolves it. `describe_link(node_a, node_b)`
 /// on the resulting policy finds this link.

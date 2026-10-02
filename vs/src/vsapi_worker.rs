@@ -357,7 +357,8 @@ fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message
 /// - the adapters docked through it are removed and their visas revoked from
 ///   every other node (zipline#138: previously their actor records were
 ///   orphaned, blocking a re-dock at the same address). The visa service's own
-///   adapter is spared, as before this change: the VS keeps running across its
+///   adapter is spared by [crate::connection_control::ConnectionControl::remove_departed_adapters]
+///   itself (zipline#167): the VS keeps running across its
 ///   docking node's reset, and its record is otherwise re-created only at VS
 ///   startup or when its adapter re-docks;
 /// - its own visa refs are cleared;
@@ -366,14 +367,10 @@ fn write_error(bldr: &mut vsapi::error::Builder, code: vsapi::ErrorCode, message
 /// Must run before [crate::actor_mgr::ActorMgr::add_node] replaces the node
 /// record, which drops the node's connected-adapters set.
 async fn reset_node_state(asm: &Assembly, node_addr: &IpAddr) -> Result<(), ServiceError> {
-    let vs_addr = IpAddr::V6(config::VS_ZPR_ADDR);
     let departed: Vec<IpAddr> = asm
         .actor_mgr
         .get_adapters_connected_to_node(node_addr)
-        .await?
-        .into_iter()
-        .filter(|addr| *addr != vs_addr)
-        .collect();
+        .await?;
     let removed_adapters = asm.cc.remove_departed_adapters(asm, &departed).await;
     if let Err(e) = asm
         .visa_mgr
