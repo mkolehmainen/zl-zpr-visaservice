@@ -1,9 +1,10 @@
 define database as a service.
-define employee as a user with user.bas_id.
+define employee as a user with user.employee_id.
 define signalService as a service.
 define pingy as a service.
 define web1 as a service.
 define Webby as a service.
+define Intranet as a service.
 
 allow color:red employees to access databases and signal "red employee" to signalService.
 
@@ -18,3 +19,5 @@ allow color:red employees to access pingy.
 allow color:red employees on hardened devices to access web1.
 
 allow users to access Webby.
+
+allow employees to access Intranet.

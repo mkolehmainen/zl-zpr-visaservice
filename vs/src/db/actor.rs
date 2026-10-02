@@ -53,6 +53,10 @@ pub struct ActorRepo {
 pub struct ServiceEntry {
     /// Name of service (sometimes called "id")
     pub name: String,
+    /// ZPR address of the actor providing the service. No production caller reads
+    /// it since the on-net auth-service listing was retired, but it is part of the
+    /// stored record `list_services` validates, so the entry keeps describing it.
+    #[allow(dead_code)]
     pub zpr_addr: IpAddr,
 }
 

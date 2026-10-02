@@ -238,7 +238,7 @@ impl PolicySnapshot {
     /// id `id`. The reauth exact-set check resolves whether an actor's
     /// `user.zpr.authority` is credential-backed through this (PR #40 review,
     /// Codex P1): an authority synthesized from trusted-service enrichment
-    /// names a file/BAS store, which no OIDC declaration matches, so no user
+    /// names a file or attribute-service store, which no OIDC declaration matches, so no user
     /// blob is demanded — or accepted — for it.
     pub fn declares_oidc_service(&self, id: &str) -> bool {
         self.0
@@ -752,8 +752,7 @@ impl PolicyResolver {
 /// invocation — one per refresh, per the C3 re-resolution guardrail — looks up
 /// the actor currently providing that service in the actor database and pairs
 /// its ZPR address with `port`, the port pinned by the policy
-/// `Service.endpoints` scope (the same exactly-one-scope-with-port shape
-/// `uri_for_service` enforces for on-net auth services), pre-captured into the
+/// `Service.endpoints` scope (exactly one scope, with a port), pre-captured into the
 /// [TrustedServiceDefinition] so it also participates in store-reuse equality
 /// (PR #7 review, P1). No connected provider, a missing or port-less service
 /// declaration, or a DB error all resolve to `None`: the refresh then fails

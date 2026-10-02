@@ -24,7 +24,7 @@ use crate::assembly::Assembly;
 use crate::config;
 use crate::counters::CounterType;
 use crate::error::ServiceError;
-use crate::event_mgr::{self, VsEvent};
+use crate::event_mgr::VsEvent;
 use crate::logging::targets::API;
 use crate::net_mgr;
 use crate::packet::describe_five_tuple;
@@ -1207,10 +1207,6 @@ impl vsapi::v_s_gate::Server for VSGateImpl {
         }
         self.asm.counters.incr(CounterType::NodeConnectionsSuccess);
 
-        // If this node provides an auth service, the authorized-services list grew and
-        // nodes must be updated. Detect it now while the actor is still in the DB.
-        event_mgr::record_auth_change_if_provider(&self.asm, &node_zpr_addr).await;
-
         // PR #42 review (P1): the node is persisted — re-check the denylist to
         // close the check-then-persist race with an admin revocation. The gate
         // disconnects the node (its state teardown is the full disconnect
@@ -1564,9 +1560,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         if let Err(e) = self.asm.event_mgr.record_event(evt).await {
             warn!(target: API, "failed to record actor joins event for adapter {:?}: {}", actor.get_cn(), e);
         }
-        // If this actor provides an auth service, the authorized-services list grew and
-        // nodes must be updated. Detect it now while the actor is still in the DB.
-        event_mgr::record_auth_change_if_provider(&self.asm, &actor_addr).await;
 
         // If a node just connected, the next thing it will try to do is open a connection
         // to VSAPI. We do not generate a visa since we currently have no mechanism to
@@ -1706,17 +1699,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
             self.node.get_cn(), zpr_addr, reason
         );
 
-        // Check whether this actor provides an auth service *before* the disconnect
-        // removes it from the state DB; if so, we emit AuthServiceChange afterwards so
-        // nodes drop it from their authorized-services list.
-        let was_auth_provider = matches!(
-            self.asm
-                .actor_mgr
-                .has_auth_services(self.asm.clone(), &zpr_addr)
-                .await,
-            Ok(true)
-        );
-
         // The disconnect call updates our state database.
         match self
             .asm
@@ -1740,9 +1722,6 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let evt = VsEvent::ActorLeaves(zpr_addr, reason);
         if let Err(e) = self.asm.event_mgr.record_event(evt).await {
             warn!(target: API, "failed to record actor leaves event for {}: {}", zpr_addr, e);
-        }
-        if was_auth_provider {
-            event_mgr::record_auth_service_change(&self.asm).await;
         }
         let mut res_builder = resp.get().init_res();
         res_builder.set_ok(());

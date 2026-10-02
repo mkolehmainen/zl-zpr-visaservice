@@ -33,10 +33,6 @@ pub enum VsEvent {
     /// EventManager takes care of state updates.
     ActorLeaves(IpAddr, DisconnectReason),
 
-    /// The set of authorized services may have changed (an auth-service provider
-    /// joined or left). Handler re-pushes the current auth-services list to all nodes.
-    AuthServiceChange,
-
     /// Indicates that policy has been successfully updated. Pass the new `vinst`.
     PolicyUpdated(u64),
 
@@ -82,11 +78,6 @@ pub async fn launch(asm: Arc<Assembly>, mut event_rx: mpsc::Receiver<VsEvent>) {
                     error!(target: EVENT, "failed to handle actor leave event: {}", e);
                 }
             }
-            VsEvent::AuthServiceChange => {
-                if let Err(e) = handle_auth_service_change(&asm).await {
-                    error!(target: EVENT, "failed to handle auth service change event: {}", e);
-                }
-            }
             VsEvent::PolicyUpdated(vinst) => {
                 if let Err(e) = handle_policy_updated(&asm, vinst).await {
                     error!(target: EVENT, "failed to handle policy updated event: {}", e);
@@ -116,30 +107,12 @@ async fn handle_actor_leaves(
     Ok(())
 }
 
-// Re-push the current authorized-services list to all connected nodes. Triggered by
-// `AuthServiceChange` when an auth-service provider has joined or left, so nodes always
-// see the up-to-date list.
-async fn handle_auth_service_change(asm: &Arc<Assembly>) -> Result<(), ServiceError> {
+/// Re-push the current auth-services list to all connected nodes. The list is the
+/// policy's OIDC identity providers (see `ActorMgr::get_auth_services_list`), so it
+/// can only change when policy does.
+async fn push_auth_services_all_nodes(asm: &Arc<Assembly>) -> Result<(), ServiceError> {
     let auth_services = asm.actor_mgr.get_auth_services_list(asm.clone()).await?;
     set_services_all_nodes(asm, &auth_services).await
-}
-
-/// Record an `AuthServiceChange` event, logging on failure. Call when the authorized
-/// service set may have changed so the current list gets re-pushed to all nodes.
-pub async fn record_auth_service_change(asm: &Arc<Assembly>) {
-    if let Err(e) = asm.event_mgr.record_event(VsEvent::AuthServiceChange).await {
-        error!(target: EVENT, "failed to record AuthServiceChange event: {}", e);
-    }
-}
-
-/// If `addr` provides an auth service (per current policy and DB state), record an
-/// `AuthServiceChange` event. Must be called while the actor is still present in the DB.
-pub async fn record_auth_change_if_provider(asm: &Arc<Assembly>, addr: &IpAddr) {
-    match asm.actor_mgr.has_auth_services(asm.clone(), addr).await {
-        Ok(true) => record_auth_service_change(asm).await,
-        Ok(false) => {}
-        Err(e) => error!(target: EVENT, "has_auth_services check failed for {}: {}", addr, e),
-    }
 }
 
 /// Helper to use the VSS on all connected nodes to update the auth services list.
@@ -300,10 +273,10 @@ async fn handle_policy_updated(asm: &Arc<Assembly>, vinst: u64) -> Result<(), Se
         });
         join_all(futs).await;
 
-        // A policy update can change the authorized-service set (a provider was
-        // disconnected above, or policy reclassified a service). Re-push the current
-        // list so surviving nodes stay in sync.
-        if let Err(e) = handle_auth_service_change(asm).await {
+        // A policy update can change the auth-services list (OIDC providers are
+        // declared in policy). Re-push the current list so surviving nodes stay in
+        // sync.
+        if let Err(e) = push_auth_services_all_nodes(asm).await {
             error!(target: EVENT, "failed to refresh auth services after policy update: {e}");
         }
     }
