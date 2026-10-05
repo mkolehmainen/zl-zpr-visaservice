@@ -453,24 +453,16 @@ impl EvalContext {
                 debug!(target: EVAL, "trying to match deny policy #{i}");
             }
             let service_id = com_policy.get_service_id().unwrap().to_str().unwrap();
-            let maybe_direction = match self.try_match_scope(request, &com_policy) {
-                Some(ScopeMatchType::Forward) => {
-                    // Source -> Dest match
-                    // So requesting dest port matches a service.
-                    // Proceed only if the destination provides a service.
-                    if !dst_actor.is_provider() {
-                        debug!(target: EVAL, "policy #{i} matches FWD but dest actor is not a provider");
-                        continue;
-                    }
-                    // This policy only applies if the provider is providing the service referenced in the policy.
-                    if !dst_actor.provides(service_id) {
-                        debug!(
-                            target: EVAL,
-                            "policy #{i} matches FWD on ports but dest actor does not provide service {}",
-                            service_id
-                        );
-                        continue;
-                    }
+            // Work out which way the packet flows relative to this policy's
+            // service. Forward (a request): the destination port is in one of the
+            // policy's scopes and the destination actor provides the service.
+            // Reverse (a reply): the same for the source side. Forward is checked
+            // against every scope before reverse is tried, so a client port that
+            // happens to fall in one scope cannot hide a service port in another.
+            let maybe_direction =
+                if self.policy_scope_matches(request, &com_policy, ScopeMatchType::Forward)
+                    && actor_provides_service(i, "FWD", dst_actor, service_id)
+                {
                     debug!(target: EVAL, "policy #{i} matches FWD scope");
                     // This policy matches only if all conditions match.
                     if self.match_policy_conditions(src_actor, dst_actor, &com_policy, allows) {
@@ -478,24 +470,9 @@ impl EvalContext {
                     } else {
                         None
                     }
-                }
-                Some(ScopeMatchType::Reverse) => {
-                    // Dest -> Source match
-                    // So requesting source port matches a service (is this a reply?)
-                    // Proceed only if the source provides a service.
-                    if !src_actor.is_provider() {
-                        debug!(target: EVAL, "policy #{i} matches REV but src actor is not a provider");
-                        continue;
-                    }
-                    // This policy only applies if the provider is providing the service referenced in the policy.
-                    if !src_actor.provides(service_id) {
-                        debug!(
-                            target: EVAL,
-                            "policy #{i} matches REV on ports but src actor does not provide service {}",
-                            service_id
-                        );
-                        continue;
-                    }
+                } else if self.policy_scope_matches(request, &com_policy, ScopeMatchType::Reverse)
+                    && actor_provides_service(i, "REV", src_actor, service_id)
+                {
                     debug!(target: EVAL, "policy #{i} matches REV scope");
                     // This policy matches only if all conditions match.
                     if self.match_policy_conditions(dst_actor, src_actor, &com_policy, allows) {
@@ -503,9 +480,9 @@ impl EvalContext {
                     } else {
                         None
                     }
-                }
-                None => None,
-            };
+                } else {
+                    None
+                };
             if let Some(direction) = maybe_direction {
                 if com_policy.has_signal() {
                     let signal_rdr = com_policy.get_signal().unwrap();
@@ -673,87 +650,84 @@ impl EvalContext {
         true
     }
 
-    fn try_match_scope<'a>(
+    /// True if any scope of `com_policy` matches `request` in direction `want`.
+    fn policy_scope_matches(
         &self,
         request: &PacketDesc,
-        com_policy: &policy_capnp::c_policy::Reader<'a>,
-    ) -> Option<ScopeMatchType> {
-        // Each policy line describes access to a service.
-        for scope in com_policy.get_scope().unwrap().iter() {
-            if scope.get_protocol() != request.protocol() {
-                continue;
-            }
-            let scope_match_type = match scope.which() {
-                Ok(policy_capnp::scope::Port(pnum)) => {
-                    if request.protocol() == ip_proto::IPV6_ICMP {
-                        let allow_icmp_type = pnum.get_port_num();
-                        if request.source_port() == allow_icmp_type {
-                            Some(ScopeMatchType::Forward)
-                        } else {
-                            None
-                        }
-                    } else {
-                        let allow_service_port_num = pnum.get_port_num();
-                        if request.dest_port() == allow_service_port_num {
-                            Some(ScopeMatchType::Forward)
-                        } else if request.source_port() == allow_service_port_num {
-                            Some(ScopeMatchType::Reverse)
-                        } else {
-                            None
-                        }
-                    }
-                }
-                Ok(policy_capnp::scope::PortRange(pr)) => {
-                    if request.protocol() == ip_proto::IPV6_ICMP {
-                        let icmp_type_request = pr.get_low();
-                        let icmp_type_response = pr.get_high();
-
-                        // Forward match if SRC->DST using the REQUEST type.
-                        // Reverse match is SRC->DST using the RESPONSE type.
-                        if request.source_port() == icmp_type_request {
-                            Some(ScopeMatchType::Forward)
-                        } else if request.source_port() == icmp_type_response {
-                            Some(ScopeMatchType::Reverse)
-                        } else {
-                            None
-                        }
-                    } else {
-                        let lowport = pr.get_low();
-                        let highport = pr.get_high();
-                        if request.dest_port() >= lowport && request.dest_port() <= highport {
-                            Some(ScopeMatchType::Forward)
-                        } else if request.source_port() >= lowport
-                            && request.source_port() <= highport
-                        {
-                            Some(ScopeMatchType::Reverse)
-                        } else {
-                            None
-                        }
-                    }
-                }
-                Err(::capnp::NotInSchema(_)) => None,
-            };
-            if scope_match_type.is_none() {
-                continue;
-            }
-            let scope_match_type = scope_match_type.unwrap();
-
-            // If we are UDP and the UDP-one-way flag is set, then reverse match is not permitted.
-            if request.protocol() == ip_proto::UDP && scope_match_type == ScopeMatchType::Reverse {
-                match scope.get_flag() {
-                    Ok(policy_capnp::ScopeFlag::UdpOneWay) => {
-                        // Reverse not allowed, this is a one-way UDP service.
-                        continue;
-                    }
-                    _ => (),
-                }
-            }
-
-            // I don't think we need to check all the scopes once we get a match.
-            return Some(scope_match_type);
-        }
-        None
+        com_policy: &policy_capnp::c_policy::Reader,
+        want: ScopeMatchType,
+    ) -> bool {
+        com_policy
+            .get_scope()
+            .unwrap()
+            .iter()
+            .any(|scope| scope_matches(request, &scope, &want))
     }
+}
+
+/// True if `actor` provides `service_id`, the service named by policy #`idx`.
+/// `dir` ("FWD" or "REV") only labels the debug message when it does not.
+fn actor_provides_service(idx: usize, dir: &str, actor: &Actor, service_id: &str) -> bool {
+    if actor.provides(service_id) {
+        return true;
+    }
+    debug!(
+        target: EVAL,
+        "policy #{idx} matches {dir} on ports but actor does not provide service {service_id}"
+    );
+    false
+}
+
+/// True if a single policy `scope` matches `request` in direction `want`.
+///
+/// For TCP/UDP, a forward match means the destination port is the scope's port
+/// (or inside its range): a request to the service. A reverse match means the
+/// source port is: a reply from the service. A UDP scope flagged one-way never
+/// matches in reverse.
+///
+/// For ICMP the "port" fields carry ICMP types. A single-type scope only matches
+/// forward, on that type. A two-type scope (stored as a range) matches forward on
+/// its low (request) type and reverse on its high (response) type.
+fn scope_matches(
+    request: &PacketDesc,
+    scope: &policy_capnp::scope::Reader,
+    want: &ScopeMatchType,
+) -> bool {
+    if scope.get_protocol() != request.protocol() {
+        return false;
+    }
+    let is_icmp = request.protocol() == ip_proto::IPV6_ICMP;
+    let port_matches = match scope.which() {
+        Ok(policy_capnp::scope::Port(pnum)) => {
+            let allowed = pnum.get_port_num();
+            match (is_icmp, want) {
+                (true, ScopeMatchType::Forward) => request.source_port() == allowed,
+                (true, ScopeMatchType::Reverse) => false,
+                (false, ScopeMatchType::Forward) => request.dest_port() == allowed,
+                (false, ScopeMatchType::Reverse) => request.source_port() == allowed,
+            }
+        }
+        Ok(policy_capnp::scope::PortRange(pr)) => {
+            let (low, high) = (pr.get_low(), pr.get_high());
+            match (is_icmp, want) {
+                // ICMP: forward is SRC->DST using the REQUEST type, reverse the RESPONSE type.
+                (true, ScopeMatchType::Forward) => request.source_port() == low,
+                (true, ScopeMatchType::Reverse) => request.source_port() == high,
+                (false, ScopeMatchType::Forward) => (low..=high).contains(&request.dest_port()),
+                (false, ScopeMatchType::Reverse) => (low..=high).contains(&request.source_port()),
+            }
+        }
+        Err(::capnp::NotInSchema(_)) => false,
+    };
+    if !port_matches {
+        return false;
+    }
+
+    // If we are UDP and the UDP-one-way flag is set, then reverse match is not permitted.
+    let one_way_reply = request.protocol() == ip_proto::UDP
+        && *want == ScopeMatchType::Reverse
+        && matches!(scope.get_flag(), Ok(policy_capnp::ScopeFlag::UdpOneWay));
+    !one_way_reply
 }
 
 #[cfg(test)]
@@ -868,6 +842,10 @@ mod test {
     /// scope must be honoured: a request to any listed port or to a port inside
     /// the range matches forward, a reply from any of them matches reverse, and
     /// a port outside them all matches nothing.
+    ///
+    /// The client's own (source) port must not decide the direction: a client
+    /// whose port happens to fall in one scope, talking to a service port in
+    /// another, is still a forward request (and its reply a reverse one).
     #[test]
     fn test_multi_port_scope() {
         setup();
@@ -886,23 +864,34 @@ mod test {
         let service_addr = "fd5a:5052:3000::2";
 
         // Single ports from the list, plus both ends and the middle of the range.
-        for port in [443, 4343, 8000, 8005, 8010] {
-            let request = PacketDesc::new_tcp(client_addr, service_addr, 12345, port).unwrap();
-            match ctx.eval_request(&user, &service, &request).unwrap() {
-                PartialEvalResult::AllowWithoutRoute(hits) => {
-                    assert_eq!(hits.len(), 1, "port {port}");
-                    assert!(hits[0].direction == Direction::Forward, "port {port}");
-                }
-                other => panic!("port {port}: expected forward allow, not {:?}", other),
-            }
+        let service_ports = [443, 4343, 8000, 8005, 8010];
+        // A client port outside every scope, plus client ports that collide with
+        // an earlier or later scope than the service port.
+        let client_ports = [12345, 443, 4343, 8005];
 
-            let reply = PacketDesc::new_tcp(service_addr, client_addr, port, 12345).unwrap();
-            match ctx.eval_request(&service, &user, &reply).unwrap() {
-                PartialEvalResult::AllowWithoutRoute(hits) => {
-                    assert_eq!(hits.len(), 1, "port {port}");
-                    assert!(hits[0].direction == Direction::Reverse, "port {port}");
+        for port in service_ports {
+            for client_port in client_ports {
+                let ctx_msg = format!("client port {client_port}, service port {port}");
+
+                let request =
+                    PacketDesc::new_tcp(client_addr, service_addr, client_port, port).unwrap();
+                match ctx.eval_request(&user, &service, &request).unwrap() {
+                    PartialEvalResult::AllowWithoutRoute(hits) => {
+                        assert_eq!(hits.len(), 1, "{ctx_msg}");
+                        assert!(hits[0].direction == Direction::Forward, "{ctx_msg}");
+                    }
+                    other => panic!("{ctx_msg}: expected forward allow, not {:?}", other),
                 }
-                other => panic!("port {port}: expected reverse allow, not {:?}", other),
+
+                let reply =
+                    PacketDesc::new_tcp(service_addr, client_addr, port, client_port).unwrap();
+                match ctx.eval_request(&service, &user, &reply).unwrap() {
+                    PartialEvalResult::AllowWithoutRoute(hits) => {
+                        assert_eq!(hits.len(), 1, "{ctx_msg}");
+                        assert!(hits[0].direction == Direction::Reverse, "{ctx_msg}");
+                    }
+                    other => panic!("{ctx_msg}: expected reverse allow, not {:?}", other),
+                }
             }
         }
 
