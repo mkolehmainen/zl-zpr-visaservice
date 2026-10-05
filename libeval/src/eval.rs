@@ -863,6 +863,59 @@ mod test {
         }
     }
 
+    /// A service configured with several ports (`port = "443, 4343, 8000-8010"`
+    /// in multiport.zplc) compiles to one policy line with several scopes. Every
+    /// scope must be honoured: a request to any listed port or to a port inside
+    /// the range matches forward, a reply from any of them matches reverse, and
+    /// a port outside them all matches nothing.
+    #[test]
+    fn test_multi_port_scope() {
+        setup();
+        let pol = load_policy("multiport.bin2");
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let mut user = new_user_actor();
+        user.add_attr_from_parts("user.zpr.tag.red", "", Duration::from_secs(60))
+            .unwrap();
+        let mut service = Actor::new();
+        service
+            .add_attr_from_parts(key::SERVICES, "web", Duration::from_secs(60))
+            .unwrap();
+
+        let client_addr = "fd5a:5052:3000::1";
+        let service_addr = "fd5a:5052:3000::2";
+
+        // Single ports from the list, plus both ends and the middle of the range.
+        for port in [443, 4343, 8000, 8005, 8010] {
+            let request = PacketDesc::new_tcp(client_addr, service_addr, 12345, port).unwrap();
+            match ctx.eval_request(&user, &service, &request).unwrap() {
+                PartialEvalResult::AllowWithoutRoute(hits) => {
+                    assert_eq!(hits.len(), 1, "port {port}");
+                    assert!(hits[0].direction == Direction::Forward, "port {port}");
+                }
+                other => panic!("port {port}: expected forward allow, not {:?}", other),
+            }
+
+            let reply = PacketDesc::new_tcp(service_addr, client_addr, port, 12345).unwrap();
+            match ctx.eval_request(&service, &user, &reply).unwrap() {
+                PartialEvalResult::AllowWithoutRoute(hits) => {
+                    assert_eq!(hits.len(), 1, "port {port}");
+                    assert!(hits[0].direction == Direction::Reverse, "port {port}");
+                }
+                other => panic!("port {port}: expected reverse allow, not {:?}", other),
+            }
+        }
+
+        // Ports outside every scope, including either side of the range.
+        for port in [80, 4344, 7999, 8011] {
+            let request = PacketDesc::new_tcp(client_addr, service_addr, 12345, port).unwrap();
+            match ctx.eval_request(&user, &service, &request).unwrap() {
+                PartialEvalResult::Deny(FinalDeny::NoMatch(_)) => {}
+                other => panic!("port {port}: expected NoMatch deny, not {:?}", other),
+            }
+        }
+    }
+
     #[test]
     fn test_visa_info() {
         setup();
