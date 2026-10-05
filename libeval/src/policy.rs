@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Error as IoError;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -195,6 +195,20 @@ impl Policy {
             }
         }
         matched_policies
+    }
+
+    /// The services granted to an actor with the given attributes: the union of the
+    /// services of every join policy they match. Connect stamps this into
+    /// [key::SERVICES], and an attribute refresh recomputes it, so what an actor
+    /// provides follows its attributes (zipline#181). An expired attribute matches
+    /// no join policy (see [JPolicy::matches]), so it grants nothing.
+    pub fn join_services(&self, attrs: &[Attribute]) -> HashSet<String> {
+        self.match_join_policies(attrs)
+            .into_iter()
+            .filter_map(|jp| jp.services.as_ref())
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     /// Test-only: append a join policy directly, bypassing the compiled policy

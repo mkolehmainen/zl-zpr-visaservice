@@ -276,17 +276,13 @@ impl EvalContext {
             matching_jps.len()
         );
 
-        // Each policy may have flags and services.
+        // Each policy may have flags and services. Services go through
+        // Policy::join_services, the same computation an attribute refresh uses.
         let mut flags: EnumSet<JFlag> = EnumSet::new();
-        let mut services = HashSet::new();
         for jp in matching_jps {
             flags |= jp.flags;
-            if let Some(svcs) = &jp.services {
-                for s in svcs {
-                    services.insert(s.clone());
-                }
-            }
         }
+        let services = self.policy.join_services(&query_claims);
 
         let mut actor = Actor::new();
 
@@ -324,11 +320,8 @@ impl EvalContext {
 
         if !services.is_empty() {
             debug!(target: EVAL, "actor provides services: {:?}", services);
-            let svc_attr = Attribute::builder(key::SERVICES)
-                .expires_in(NEVER_EXPIRES)
-                .values(services);
-            actor.add_attribute(svc_attr).unwrap();
         }
+        actor.set_services(services);
 
         actor
             .add_attribute(
@@ -1276,6 +1269,74 @@ mod test {
             flags: EnumSet::new(),
             services: None,
         }
+    }
+
+    // ---- zipline#181: the services an actor provides follow its attributes. ----
+
+    /// Join policy granting `service` to actors whose `device.tags` has `tag`.
+    fn jp_tag_grants_service(tag: &str, service: &str) -> JPolicy {
+        JPolicy {
+            matches: vec![AttrExp {
+                key: "device.tags".to_string(),
+                op: AttrOp::Has,
+                value: vec![tag.to_string()],
+            }],
+            flags: EnumSet::new(),
+            services: Some(vec![service.to_string()]),
+        }
+    }
+
+    /// `join_services` is the union of the services of every matching join policy,
+    /// and empty when none match.
+    #[test]
+    fn test_join_services_follow_attributes() {
+        let mut pol = Policy::new_empty();
+        pol.push_join_policy(jp_tag_grants_service("server", "ssh"));
+        pol.push_join_policy(jp_tag_grants_service("media", "plex"));
+        pol.push_join_policy(jp_cn_eq("box.zpr.org"));
+
+        let cn = Attribute::builder(key::CN).value("box.zpr.org");
+        let tags = |values: &[&str]| Attribute::builder("device.tags").values(values);
+
+        let both = pol.join_services(&[cn.clone(), tags(&["server", "media"])]);
+        assert_eq!(both, HashSet::from(["ssh".to_string(), "plex".to_string()]));
+
+        let one = pol.join_services(&[cn.clone(), tags(&["server"])]);
+        assert_eq!(one, HashSet::from(["ssh".to_string()]));
+
+        // A matching join policy without services contributes nothing.
+        assert!(pol.join_services(&[cn]).is_empty());
+    }
+
+    /// An expired hosting attribute grants no service: expiry is indeterminate,
+    /// so a refresh that could not reach the source must not keep the service.
+    #[test]
+    fn test_join_services_ignore_expired_attribute() {
+        let mut pol = Policy::new_empty();
+        pol.push_join_policy(jp_tag_grants_service("server", "ssh"));
+
+        let expired = Attribute::builder("device.tags")
+            .expires_in(Duration::ZERO)
+            .value("server");
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(pol.join_services(&[expired]).is_empty());
+    }
+
+    /// Connect stamps exactly what `join_services` computes for the claims.
+    #[test]
+    fn test_approve_connection_stamps_join_services() {
+        let mut pol = Policy::new_empty();
+        pol.push_join_policy(jp_tag_grants_service("server", "ssh"));
+        let ctx = EvalContext::new(Arc::new(pol));
+
+        let claims = vec![
+            Attribute::builder(key::CN).value("box.zpr.org"),
+            Attribute::builder("device.tags").value("server"),
+        ];
+        let actor = ctx
+            .approve_connection(Some(claims.as_slice()), None)
+            .unwrap();
+        assert!(actor.provides("ssh"));
     }
 
     /// Approve a connection for `cn` requesting zpr.addr `addr` against a

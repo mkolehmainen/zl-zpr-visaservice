@@ -1205,13 +1205,12 @@ impl ConnectionControl {
             .flat_map(|o| o.authd.iter())
             .map(|a| a.get_key())
             .collect();
-        let policy_stamped = [key::ROLE, key::SERVICES, key::VINST, key::CONFIG_ID];
         let mut authd_claims: Vec<Attribute> = actor
             .attrs_iter()
             .filter(|a| {
                 !renewed_sources.contains(&a.get_source().to_string())
                     && !renewed_keys.contains(&a.get_key())
-                    && !policy_stamped.contains(&a.get_key())
+                    && !key::POLICY_STAMPED.contains(&a.get_key())
             })
             .cloned()
             .collect();

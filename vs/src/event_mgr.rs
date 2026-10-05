@@ -454,8 +454,9 @@ mod tests {
     use crate::assembly::tests::new_assembly_for_tests;
     use crate::config;
     use crate::test_helpers::{
-        TS_KEY, TS_SOURCE, build_sweep_asm, create_sweep_visa, make_container_bytes,
-        make_node_actor_defexp, register_ts, seed_source_attr, stored_attr,
+        TS_KEY, TS_SOURCE, build_sweep_asm, create_routed_sweep_visa, create_sweep_visa,
+        make_attr_hosted_service_policy, make_container_bytes, make_node_actor_defexp, register_ts,
+        seed_source_attr, stored_attr,
     };
     use libeval::attribute::{Attribute, key};
     use std::time::Duration;
@@ -812,6 +813,149 @@ mod tests {
             stored_attr(&asm, "fd5a:5052:4000::a", TS_KEY).await,
             Some("sales".to_string())
         );
+    }
+
+    // ---- zipline#181: the services an actor provides follow its attributes. ----
+
+    /// Service and port hosted by attribute in the zipline#181 tests; the flow
+    /// `create_sweep_visa` makes (`::4000::a` -> `::4000::b`, TCP 80) targets it.
+    const HOSTED_SVC: &str = "web";
+    const HOSTED_PORT: u16 = 80;
+    /// The hosting attribute: `::4000::b` hosts [HOSTED_SVC] while it holds it.
+    const HOST_KEY: &str = "device.tags";
+    const HOST_VALUE: &str = "server";
+    const HOST_ADDR: &str = "fd5a:5052:4000::b";
+
+    /// Install the attribute-hosted service policy and register a trusted service
+    /// vending the hosting attribute, then give the stored host the attribute and the
+    /// service it implies -- the state a connect under this policy leaves behind.
+    async fn setup_attr_hosted_service(
+        asm: &Arc<Assembly>,
+    ) -> Arc<crate::test_helpers::MutableTrustedService> {
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_attr_hosted_service_policy(
+                HOSTED_SVC,
+                HOSTED_PORT,
+                HOST_KEY,
+                HOST_VALUE,
+            ))
+            .await
+            .unwrap();
+        let svc = register_ts(asm, &[(HOST_KEY, HOST_VALUE)]);
+        seed_source_attr(asm, HOST_ADDR, HOST_KEY, HOST_VALUE).await;
+        let addr: IpAddr = HOST_ADDR.parse().unwrap();
+        let mut host = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        host.set_services(HashSet::from([HOSTED_SVC.to_string()]));
+        asm.actor_mgr
+            .update_actor(&host, &Default::default())
+            .await
+            .unwrap();
+        assert!(
+            stored_provides(asm, HOST_ADDR, HOSTED_SVC).await,
+            "setup: host must provide"
+        );
+        svc
+    }
+
+    /// Whether the stored actor at `zpr_addr` provides `service_id`.
+    async fn stored_provides(asm: &Arc<Assembly>, zpr_addr: &str, service_id: &str) -> bool {
+        let addr: IpAddr = zpr_addr.parse().unwrap();
+        let actor = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&addr)
+            .await
+            .unwrap()
+            .unwrap();
+        actor.provides(service_id)
+    }
+
+    /// Change the hosting data the trusted service vends, and reload it.
+    async fn change_host_attrs(
+        svc: &crate::test_helpers::MutableTrustedService,
+        attrs: &[(&str, &str)],
+    ) {
+        use crate::trusted_services::TrustedServiceInterface;
+        *svc.attrs.lock().unwrap() = attrs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        svc.flush().await.unwrap();
+    }
+
+    /// While the host keeps its hosting attribute, a change sweep recomputes the same
+    /// services and the visa to it survives.
+    #[tokio::test]
+    async fn test_trusted_service_change_keeps_visa_while_host_keeps_attr() {
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let svc = setup_attr_hosted_service(&asm).await;
+        create_routed_sweep_visa(&asm, &node_a, 0).await;
+
+        change_host_attrs(&svc, &[(HOST_KEY, HOST_VALUE)]).await;
+        handle_trusted_service_change(&asm).await;
+
+        assert!(stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await);
+        assert!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a host that keeps its attribute must keep its visas"
+        );
+    }
+
+    /// A host that loses its hosting attribute stops providing the service, and the
+    /// change sweep revokes the visa to it -- without a reconnect or a policy push.
+    #[tokio::test]
+    async fn test_trusted_service_change_revokes_visa_when_host_loses_attr() {
+        let (asm, node_a) = build_sweep_asm(true).await;
+        let svc = setup_attr_hosted_service(&asm).await;
+        let id = create_routed_sweep_visa(&asm, &node_a, 0).await;
+
+        change_host_attrs(&svc, &[]).await;
+        handle_trusted_service_change(&asm).await;
+
+        assert!(
+            !stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await,
+            "losing the hosting attribute must drop the service"
+        );
+        assert_eq!(
+            asm.visa_mgr
+                .get_pending_revoke_visa_ids_for_node(&node_a)
+                .await
+                .unwrap(),
+            vec![id]
+        );
+    }
+
+    /// An actor that gains the hosting attribute starts providing the service on its
+    /// next refresh (the visa-request path refreshes the destination actor).
+    #[tokio::test]
+    async fn test_refresh_grants_service_when_host_gains_attr() {
+        let (asm, _node_a) = build_sweep_asm(true).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_attr_hosted_service_policy(
+                HOSTED_SVC,
+                HOSTED_PORT,
+                HOST_KEY,
+                HOST_VALUE,
+            ))
+            .await
+            .unwrap();
+        // The host connected before it had the attribute, so it provides nothing.
+        let svc = register_ts(&asm, &[]);
+        assert!(!stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await);
+
+        change_host_attrs(&svc, &[(HOST_KEY, HOST_VALUE)]).await;
+        let addr: IpAddr = HOST_ADDR.parse().unwrap();
+        refresh_actors(&asm, HashSet::from([addr])).await;
+
+        assert!(stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await);
     }
 
     /// zipline#53 (PR #24 review, finding 2): installing a policy that
