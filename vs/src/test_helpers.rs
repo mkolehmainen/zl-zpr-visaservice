@@ -555,12 +555,14 @@ pub fn make_allow_policy_for_tcp_service(service_id: &str, port: u16) -> Vec<u8>
 /// one join policy granting the service on that condition, plus one unconditional
 /// ALLOW communication policy for it. The ZPL equivalent is
 /// `define <service_id> as a service with <host_key>:'<host_value>'.` followed by
-/// `allow devices to access <service_id>.` (zipline#181).
+/// `allow devices to access <service_id>.` (zipline#181). `flags` are the join
+/// policy's flags, e.g. [PFlags::node] for a service only nodes may host.
 pub fn make_attr_hosted_service_policy(
     service_id: &str,
     port: u16,
     host_key: &str,
     host_value: &str,
+    flags: PFlags,
 ) -> Vec<u8> {
     let jp = JoinPolicy {
         conditions: vec![
@@ -569,7 +571,7 @@ pub fn make_attr_hosted_service_policy(
                 .build()
                 .unwrap(),
         ],
-        flags: PFlags::default(),
+        flags,
         provides: Some(vec![Service {
             id: service_id.to_string(),
             endpoints: vec![Scope {

@@ -111,10 +111,14 @@ pub(crate) async fn refresh_and_persist_actor(
 }
 
 /// Recompute the services the actor provides ([key::SERVICES]) from its current
-/// attributes, the same way connect does ([Policy::join_services]), so a service hosted
+/// attributes, from the join policies they match as at connect, so a service hosted
 /// by attribute follows that attribute (zipline#181). Without this, an actor that gains
 /// the hosting attribute provides nothing until it reconnects, and one that loses it
 /// keeps providing the service -- and keeps its visas through the change sweep.
+///
+/// The actor's role is fixed at connect, so only the services connect would grant an
+/// actor of that role count ([Policy::join_services_for_role]): an adapter never picks
+/// up a node-only service here (Codex P1 on PR #50).
 ///
 /// The policy-stamped keys are left out of the claims matched, as reauthorize does. An
 /// attribute stripped because its source was unreachable grants nothing, so the
@@ -125,7 +129,7 @@ fn restamp_services(policy: &Policy, actor: &mut Actor) {
         .filter(|a| !key::POLICY_STAMPED.contains(&a.get_key()))
         .cloned()
         .collect();
-    let services = policy.join_services(&claims);
+    let services = policy.join_services_for_role(&claims, actor.is_node());
     let current: HashSet<String> = actor.services_iter().map(str::to_string).collect();
     if services == current {
         return;

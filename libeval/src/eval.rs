@@ -1322,6 +1322,51 @@ mod test {
         assert!(pol.join_services(&[expired]).is_empty());
     }
 
+    /// As [jp_tag_grants_service], but the join policy also marks the actor a node.
+    fn jp_tag_grants_node_service(tag: &str, service: &str) -> JPolicy {
+        let mut jp = jp_tag_grants_service(tag, service);
+        jp.flags = JFlag::IsNode.into();
+        jp
+    }
+
+    /// Recomputing for an adapter skips node join policies: an attribute that would
+    /// make it match one must not hand a node-only service to an actor that stays an
+    /// adapter (connect would have made it a node instead). Codex P1 on PR #50.
+    #[test]
+    fn test_join_services_for_adapter_skip_node_policies() {
+        let mut pol = Policy::new_empty();
+        pol.push_join_policy(jp_tag_grants_service("server", "ssh"));
+        pol.push_join_policy(jp_tag_grants_node_service("relay", "vss"));
+
+        let tags = Attribute::builder("device.tags").values(["server", "relay"]);
+        assert_eq!(
+            pol.join_services_for_role(&[tags], false),
+            HashSet::from(["ssh".to_string()])
+        );
+    }
+
+    /// Recomputing for a node grants the union, as connect does, only while it still
+    /// matches a node join policy; otherwise it gets nothing (fail-closed, the same
+    /// verdict `approve_connected` reaches).
+    #[test]
+    fn test_join_services_for_node_require_node_policy() {
+        let mut pol = Policy::new_empty();
+        pol.push_join_policy(jp_tag_grants_service("server", "ssh"));
+        pol.push_join_policy(jp_tag_grants_node_service("relay", "vss"));
+
+        let both = Attribute::builder("device.tags").values(["server", "relay"]);
+        assert_eq!(
+            pol.join_services_for_role(&[both], true),
+            HashSet::from(["ssh".to_string(), "vss".to_string()])
+        );
+
+        let no_node_match = Attribute::builder("device.tags").value("server");
+        assert!(
+            pol.join_services_for_role(&[no_node_match], true)
+                .is_empty()
+        );
+    }
+
     /// Connect stamps exactly what `join_services` computes for the claims.
     #[test]
     fn test_approve_connection_stamps_join_services() {

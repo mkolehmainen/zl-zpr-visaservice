@@ -838,6 +838,7 @@ mod tests {
                 HOSTED_PORT,
                 HOST_KEY,
                 HOST_VALUE,
+                PFlags::default(),
             ))
             .await
             .unwrap();
@@ -944,6 +945,7 @@ mod tests {
                 HOSTED_PORT,
                 HOST_KEY,
                 HOST_VALUE,
+                PFlags::default(),
             ))
             .await
             .unwrap();
@@ -956,6 +958,39 @@ mod tests {
         refresh_actors(&asm, HashSet::from([addr])).await;
 
         assert!(stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await);
+    }
+
+    /// An adapter that gains the attribute of a node-only hosting policy does not start
+    /// providing that service: the refresh cannot make it a node, so it must not get a
+    /// node's services either (Codex P1 on PR #50).
+    #[tokio::test]
+    async fn test_refresh_withholds_node_service_from_adapter() {
+        let (asm, _node_a) = build_sweep_asm(true).await;
+        asm.policy_mgr
+            .update_policy_from_container_bytes(make_attr_hosted_service_policy(
+                HOSTED_SVC,
+                HOSTED_PORT,
+                HOST_KEY,
+                HOST_VALUE,
+                PFlags::node(false),
+            ))
+            .await
+            .unwrap();
+        let svc = register_ts(&asm, &[]);
+
+        change_host_attrs(&svc, &[(HOST_KEY, HOST_VALUE)]).await;
+        let addr: IpAddr = HOST_ADDR.parse().unwrap();
+        refresh_actors(&asm, HashSet::from([addr])).await;
+
+        assert_eq!(
+            stored_attr(&asm, HOST_ADDR, HOST_KEY).await,
+            Some(HOST_VALUE.to_string()),
+            "the attribute itself is refreshed"
+        );
+        assert!(
+            !stored_provides(&asm, HOST_ADDR, HOSTED_SVC).await,
+            "an adapter must not pick up a node-only service"
+        );
     }
 
     /// zipline#53 (PR #24 review, finding 2): installing a policy that
