@@ -13,6 +13,7 @@ use std::net::IpAddr;
 
 use libeval::actor::Actor;
 use libeval::attribute::{Attribute, key};
+use libeval::policy::Policy;
 
 use tracing::{debug, warn};
 
@@ -84,6 +85,8 @@ pub(crate) async fn refresh_and_persist_actor(
     let outcome =
         refresh_expired_attributes(&asm.ts_mgr, &policy.lookup_identity_keys(), actor).await;
     if outcome.changed {
+        // The attributes moved, so the services they grant may have too.
+        restamp_services(&policy, actor);
         asm.actor_mgr
             .update_actor(actor, &asm.policy_service_names())
             .await?;
@@ -105,6 +108,38 @@ pub(crate) async fn refresh_and_persist_actor(
         )));
     }
     Ok(outcome.changed)
+}
+
+/// Recompute the services the actor provides ([key::SERVICES]) from its current
+/// attributes, from the join policies they match as at connect, so a service hosted
+/// by attribute follows that attribute (zipline#181). Without this, an actor that gains
+/// the hosting attribute provides nothing until it reconnects, and one that loses it
+/// keeps providing the service -- and keeps its visas through the change sweep.
+///
+/// The actor's role is fixed at connect, so only the services connect would grant an
+/// actor of that role count ([Policy::join_services_for_role]): an adapter never picks
+/// up a node-only service here (Codex P1 on PR #50).
+///
+/// The policy-stamped keys are left out of the claims matched, as reauthorize does. An
+/// attribute stripped because its source was unreachable grants nothing, so the
+/// services it granted are dropped: fail-closed.
+fn restamp_services(policy: &Policy, actor: &mut Actor) {
+    let claims: Vec<Attribute> = actor
+        .attrs_iter()
+        .filter(|a| !key::POLICY_STAMPED.contains(&a.get_key()))
+        .cloned()
+        .collect();
+    let services = policy.join_services_for_role(&claims, actor.is_node());
+    let current: HashSet<String> = actor.services_iter().map(str::to_string).collect();
+    if services == current {
+        return;
+    }
+    debug!(
+        target: VREQ,
+        "actor {:?} services change after attribute refresh: {current:?} -> {services:?}",
+        actor.get_zpr_addr()
+    );
+    actor.set_services(services);
 }
 
 /// Refresh the actor's attributes from the trusted service manager where

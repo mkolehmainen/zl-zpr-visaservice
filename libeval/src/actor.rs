@@ -1,12 +1,12 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::time::SystemTime;
 use thiserror::Error;
 
 use crate::attribute::key;
-use crate::attribute::{Attribute, ROLE_ADAPTER, ROLE_NODE};
+use crate::attribute::{Attribute, NEVER_EXPIRES, ROLE_ADAPTER, ROLE_NODE};
 
 #[derive(Debug, Error)]
 pub enum AttributeError {
@@ -224,6 +224,24 @@ impl Actor {
             .is_some_and(|a| a.value_has(service_id))
     }
 
+    /// Replace the set of services this actor provides ([key::SERVICES]). The set
+    /// comes from policy (the join policies the actor matches), never from a claim,
+    /// so it does not expire. An empty set removes the attribute: the actor is then
+    /// not a provider at all.
+    pub fn set_services(&mut self, services: HashSet<String>) {
+        self.attrs.remove(key::SERVICES);
+        if services.is_empty() {
+            return;
+        }
+        // Sorted, so the stored attribute does not depend on hash order.
+        let mut services: Vec<String> = services.into_iter().collect();
+        services.sort();
+        let attr = Attribute::builder(key::SERVICES)
+            .expires_in(NEVER_EXPIRES)
+            .values(services);
+        self.attrs.insert(key::SERVICES.to_string(), attr);
+    }
+
     pub fn services_iter(&self) -> impl Iterator<Item = &str> {
         self.attrs
             .get(key::SERVICES)
@@ -256,6 +274,24 @@ impl Actor {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// set_services replaces the provided-services attribute, and an empty set
+    /// removes it so the actor is no longer a provider (zipline#181).
+    #[test]
+    fn test_set_services_replaces_and_clears() {
+        let mut actor = Actor::new();
+        actor.set_services(HashSet::from(["ssh".to_string(), "plex".to_string()]));
+        assert!(actor.provides("ssh") && actor.provides("plex"));
+        assert!(actor.is_provider());
+
+        actor.set_services(HashSet::from(["plex".to_string()]));
+        assert!(!actor.provides("ssh"));
+        assert!(actor.provides("plex"));
+
+        actor.set_services(HashSet::new());
+        assert!(!actor.is_provider());
+        assert!(!actor.has_attribute_named(key::SERVICES));
+    }
 
     /// With both namespaced authority attributes present at different expiries,
     /// get_authentication_expiration returns the minimum of the two.

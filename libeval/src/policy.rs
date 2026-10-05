@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Error as IoError;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use openssl::pkey::{PKey, Public};
 use thiserror::Error;
 
 use crate::attribute::{Attribute, key};
-use crate::joinpolicy::JPolicy;
+use crate::joinpolicy::{JFlag, JPolicy};
 use crate::logging::targets::EVAL;
 use tracing::warn;
 
@@ -195,6 +195,45 @@ impl Policy {
             }
         }
         matched_policies
+    }
+
+    /// The services granted to an actor with the given attributes: the union of the
+    /// services of every join policy they match. Connect stamps this into
+    /// [key::SERVICES], and an attribute refresh recomputes it, so what an actor
+    /// provides follows its attributes (zipline#181). An expired attribute matches
+    /// no join policy (see [JPolicy::matches]), so it grants nothing.
+    pub fn join_services(&self, attrs: &[Attribute]) -> HashSet<String> {
+        self.match_join_policies(attrs)
+            .into_iter()
+            .filter_map(|jp| jp.services.as_ref())
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// The services to restamp onto an already-connected actor whose role is fixed
+    /// (`is_node`), when its attributes change: what connect would grant an actor of
+    /// that role, so a refresh can never contradict the role connect assigned.
+    ///
+    /// - An adapter skips join policies flagged [JFlag::IsNode]. Matching one would have
+    ///   made it a node at connect, and a refresh cannot change the role, so a
+    ///   node-only service must not reach an actor that stays an adapter.
+    /// - A node gets the union of everything it matches, as at connect, but only while
+    ///   it still matches a node join policy. Without one it no longer qualifies as a
+    ///   node at all (`approve_connected` rejects it), so it gets nothing: fail-closed.
+    pub fn join_services_for_role(&self, attrs: &[Attribute], is_node: bool) -> HashSet<String> {
+        let matching = self.match_join_policies(attrs);
+        let is_node_policy = |jp: &&JPolicy| jp.flags.contains(JFlag::IsNode);
+        if is_node && !matching.iter().any(is_node_policy) {
+            return HashSet::new();
+        }
+        matching
+            .into_iter()
+            .filter(|jp| is_node || !is_node_policy(jp))
+            .filter_map(|jp| jp.services.as_ref())
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     /// Test-only: append a join policy directly, bypassing the compiled policy

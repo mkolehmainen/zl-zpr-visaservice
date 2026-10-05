@@ -550,6 +550,66 @@ pub fn make_allow_policy_for_tcp_service(service_id: &str, port: u16) -> Vec<u8>
     )
 }
 
+/// Build a policy container in which `service_id` (TCP `port`) is hosted by any
+/// actor whose `host_key` attribute equals `host_value`, and anyone may access it:
+/// one join policy granting the service on that condition, plus one unconditional
+/// ALLOW communication policy for it. The ZPL equivalent is
+/// `define <service_id> as a service with <host_key>:'<host_value>'.` followed by
+/// `allow devices to access <service_id>.` (zipline#181). `flags` are the join
+/// policy's flags, e.g. [PFlags::node] for a service only nodes may host.
+pub fn make_attr_hosted_service_policy(
+    service_id: &str,
+    port: u16,
+    host_key: &str,
+    host_value: &str,
+    flags: PFlags,
+) -> Vec<u8> {
+    let jp = JoinPolicy {
+        conditions: vec![
+            zpr::policy_types::Attribute::tuple(host_key)
+                .value(host_value)
+                .build()
+                .unwrap(),
+        ],
+        flags,
+        provides: Some(vec![Service {
+            id: service_id.to_string(),
+            endpoints: vec![Scope {
+                protocol: 6, // TCP
+                flag: None,
+                port: Some(port),
+                port_range: None,
+            }],
+            kind: ServiceType::Regular,
+        }]),
+    };
+
+    let mut msg = capnp::message::Builder::new_default();
+    {
+        let mut policy_bldr = msg.init_root::<capnp_policy::policy::Builder>();
+        policy_bldr.set_created("2024-01-01T00:00:00Z");
+        policy_bldr.set_version(1);
+        policy_bldr.set_metadata("");
+        jp.write_to(&mut policy_bldr.reborrow().init_join_policies(1).get(0));
+        let mut coms = policy_bldr.reborrow().init_com_policies(1);
+        let mut com = coms.reborrow().get(0);
+        com.set_allow(true);
+        com.set_service_id(service_id);
+        let mut scopes = com.reborrow().init_scope(1);
+        let mut scope = scopes.reborrow().get(0);
+        scope.set_protocol(6); // TCP
+        scope.init_port().set_port_num(port);
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &msg).unwrap();
+    make_container_bytes(
+        crate::config::POLICY_MIN_COMPILER_MAJOR,
+        crate::config::POLICY_MIN_COMPILER_MINOR,
+        crate::config::POLICY_MIN_COMPILER_PATCH,
+        &bytes,
+    )
+}
+
 /// Build a `Peering` between two ZPR addresses, each reachable at its own address as
 /// substrate so a `FakeResolver::ip_only()` resolves it. `describe_link(node_a, node_b)`
 /// on the resulting policy finds this link.
@@ -660,11 +720,36 @@ pub async fn build_sweep_asm(with_link: bool) -> (Arc<Assembly>, IpAddr) {
 }
 
 /// Create a single-node visa held (PendingInstall) by `req` for the given
-/// five-tuple, seeded at `vinst`. Returns its id.
+/// five-tuple, seeded at `vinst`. Returns its id. Its path is `req` alone, so a
+/// sweep on the linked assembly sees the route move and revokes it; use
+/// [create_routed_sweep_visa] for a visa the sweep can keep.
 pub async fn create_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: u64) -> u64 {
+    create_sweep_visa_on_route(asm, req, vinst, &Route::new_direct((*req).into())).await
+}
+
+/// As [create_sweep_visa], but on the best route between the two sweep nodes, which
+/// is the route a re-check computes. Needs the linked assembly
+/// (`build_sweep_asm(true)`).
+pub async fn create_routed_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: u64) -> u64 {
+    let node_a: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+    let node_b: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+    let route = asm
+        .topo_mgr
+        .get_best_route(&node_a, &node_b)
+        .expect("sweep nodes must be linked");
+    create_sweep_visa_on_route(asm, req, vinst, &route).await
+}
+
+/// Create the sweep visa (`::4000::a` -> `::4000::b`, TCP 80) held by `req` on
+/// `route`, seeded at `vinst`. Returns its id.
+async fn create_sweep_visa_on_route(
+    asm: &Arc<Assembly>,
+    req: &IpAddr,
+    vinst: u64,
+    route: &Route,
+) -> u64 {
     let pdesc = PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 1234, 80).unwrap();
     let hit = Hit::new_no_signal(0, Direction::Forward);
-    let route = Route::new_direct((*req).into());
     let vwmd = asm
         .visa_mgr
         .create_visa(
@@ -672,7 +757,7 @@ pub async fn create_sweep_visa(asm: &Arc<Assembly>, req: &IpAddr, vinst: u64) ->
             req,
             &pdesc,
             &hit,
-            &route,
+            route,
             "",
             0,
             vinst,

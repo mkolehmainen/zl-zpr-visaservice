@@ -71,6 +71,12 @@ pub mod key {
 
     /// A2A DH Public Key
     pub const A2A_DH_PUBKEY: &str = "zpr.a2a_dh_pubkey";
+
+    /// Keys that policy stamps onto an actor rather than taking from a claim. Re-running
+    /// policy over an actor (reauthorize, or recomputing [SERVICES] after an attribute
+    /// refresh) must leave these out of the claims it matches, or a previous result
+    /// would feed into the next one.
+    pub const POLICY_STAMPED: [&str; 4] = [ROLE, SERVICES, VINST, CONFIG_ID];
 }
 
 #[derive(Debug, Error)]
