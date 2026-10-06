@@ -1692,6 +1692,40 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         }
         let zpr_addr = maybe_zpr_addr.unwrap();
 
+        // Scope the disconnect to the calling node (zipline#182): a live node
+        // may disconnect only itself, an adapter docked to it, or an AAA actor
+        // whose registered docking node is the caller. Without this check any
+        // live node could name any actor or node and `cc.disconnect` would
+        // tear it down — one subverted node could deny the whole ZPRnet,
+        // breaking the SECURITY_MODEL.md Case 2 containment. An unknown target
+        // has no docking entry and so falls out here as a refusal, which is
+        // the safe default. Mirrors the session bindings `reauthorize` has.
+        let caller_addr = self.node.get_zpr_addr();
+        let in_scope = match caller_addr {
+            Some(caller) => {
+                zpr_addr == *caller
+                    || self.asm.actor_mgr.get_docking_node_for_adapter(&zpr_addr) == Some(*caller)
+                    || self.asm.actor_mgr.get_docking_node_for_aaa(&zpr_addr) == Some(*caller)
+            }
+            // A caller with no ZPR address cannot own anything; refuse.
+            None => false,
+        };
+        if !in_scope {
+            warn!(
+                target: API,
+                "notify_disconnect from node {:?} for out-of-scope target {}: refused",
+                self.node.get_cn(), zpr_addr
+            );
+            let res_builder = resp.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::InvalidOperation,
+                "disconnect target is not the calling node or docked to it",
+            );
+            return Ok(());
+        }
+
         let reason = dnotice.get_reason_code()?;
         debug!(
             target: API,
@@ -2776,6 +2810,333 @@ mod tests {
                 new_handle.node_is_live().await,
                 "the reconnect's own handle must be live"
             );
+        }
+    }
+
+    /// zipline#182: `notifyDisconnect` must be scoped to the calling node.
+    /// A live node may disconnect only itself, an adapter docked to it, or
+    /// an AAA actor whose registered docking node is the caller — anything
+    /// else is refused with `invalidOperation`, state untouched, no
+    /// `ActorLeaves` event.
+    mod disconnect_scope {
+        use super::*;
+        use crate::assembly::tests::new_assembly_with_event_rx;
+        use crate::test_helpers::{make_adapter_actor_defexp, make_node_actor_defexp};
+        use std::sync::Arc;
+        use zpr::vsapi::v1::DisconnectReason;
+
+        const NODE_A: &str = "fd5a:5052:3000::1";
+        const NODE_B: &str = "fd5a:5052:3000::2";
+        const ADAPTER: &str = "fd5a:5052:4000::a";
+        const AAA: &str = "fd5a:5052:5000::1";
+
+        /// Assembly with event receiver, nodes A and B in the actor db, and
+        /// the capnp handle node A holds from its authenticate call.
+        async fn build_two_node_asm() -> (
+            Arc<Assembly>,
+            tokio::sync::mpsc::Receiver<VsEvent>,
+            vsapi::v_s_handle::Client,
+        ) {
+            let (asm, event_rx) = new_assembly_with_event_rx(None).await;
+            let asm = Arc::new(asm);
+            let node_a = make_node_actor_defexp(NODE_A, "node-a", "[fd5a:5052:3000::101]:1234");
+            asm.actor_mgr
+                .add_node(&node_a, false, &Default::default())
+                .await
+                .unwrap();
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(NODE_B, "node-b", "[fd5a:5052:3000::102]:1234"),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            let handle: vsapi::v_s_handle::Client =
+                capnp_rpc::new_client(VSHandleImpl::new(asm.clone(), node_a));
+            (asm, event_rx, handle)
+        }
+
+        /// Send a `notifyDisconnect` for `target` (None = no address, the
+        /// node-disconnecting-itself fallback) and return Ok(()) or the
+        /// error code the VS answered with.
+        async fn send_notify_disconnect(
+            handle: &vsapi::v_s_handle::Client,
+            target: Option<std::net::IpAddr>,
+        ) -> Result<(), vsapi::ErrorCode> {
+            let mut req = handle.notify_disconnect_request();
+            {
+                let mut dnotice = req.get().init_req();
+                if let Some(addr) = target {
+                    let mut addr_bldr = dnotice.reborrow().init_zpr_addr();
+                    addr.write_to(&mut addr_bldr);
+                }
+                dnotice.set_reason_code(DisconnectReason::RemoteDisconnect);
+            }
+            let resp = req.send().promise.await.unwrap();
+            let res = resp.get().unwrap().get_res().unwrap();
+            match res.which().unwrap() {
+                vsapi::ok_or_error::Which::Ok(_) => Ok(()),
+                vsapi::ok_or_error::Which::Error(err) => Err(err.unwrap().get_code().unwrap()),
+            }
+        }
+
+        /// Node A names an adapter docked at node B: refused, the adapter's
+        /// actor record and docking entry unchanged, no event recorded.
+        #[tokio::test]
+        async fn notify_disconnect_refuses_adapter_docked_elsewhere() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (asm, mut event_rx, handle) = build_two_node_asm().await;
+                    let node_b_addr: std::net::IpAddr = NODE_B.parse().unwrap();
+                    let adapter_addr: std::net::IpAddr = ADAPTER.parse().unwrap();
+                    asm.actor_mgr
+                        .add_adapter_via_node(
+                            &make_adapter_actor_defexp(ADAPTER, "adapter-b"),
+                            &node_b_addr,
+                            &Default::default(),
+                        )
+                        .await
+                        .unwrap();
+
+                    assert_eq!(
+                        send_notify_disconnect(&handle, Some(adapter_addr)).await,
+                        Err(vsapi::ErrorCode::InvalidOperation),
+                        "a node must not disconnect an adapter docked at another node"
+                    );
+                    assert!(
+                        asm.actor_mgr
+                            .get_actor_by_zpr_addr(&adapter_addr)
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "the refused target's actor record must be unchanged"
+                    );
+                    assert_eq!(
+                        asm.actor_mgr.get_docking_node_for_adapter(&adapter_addr),
+                        Some(node_b_addr),
+                        "the refused target's docking entry must be unchanged"
+                    );
+                    assert!(
+                        event_rx.try_recv().is_err(),
+                        "no ActorLeaves event may be recorded for a refused disconnect"
+                    );
+                })
+                .await;
+        }
+
+        /// Node A names node B's own address: refused, node B stays in the
+        /// topology and its docked adapters are untouched.
+        #[tokio::test]
+        async fn notify_disconnect_refuses_other_node_target() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (asm, mut event_rx, handle) = build_two_node_asm().await;
+                    let node_b_addr: std::net::IpAddr = NODE_B.parse().unwrap();
+                    let adapter_addr: std::net::IpAddr = ADAPTER.parse().unwrap();
+                    asm.actor_mgr
+                        .add_adapter_via_node(
+                            &make_adapter_actor_defexp(ADAPTER, "adapter-b"),
+                            &node_b_addr,
+                            &Default::default(),
+                        )
+                        .await
+                        .unwrap();
+
+                    assert_eq!(
+                        send_notify_disconnect(&handle, Some(node_b_addr)).await,
+                        Err(vsapi::ErrorCode::InvalidOperation),
+                        "a node must not disconnect another node"
+                    );
+                    assert!(
+                        asm.actor_mgr
+                            .get_actor_by_zpr_addr(&node_b_addr)
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "the refused node must stay in the actor db"
+                    );
+                    assert_eq!(
+                        asm.actor_mgr
+                            .get_adapters_connected_to_node(&node_b_addr)
+                            .await
+                            .unwrap(),
+                        vec![adapter_addr],
+                        "the refused node's docked adapters must be untouched"
+                    );
+                    assert!(
+                        event_rx.try_recv().is_err(),
+                        "no ActorLeaves event may be recorded for a refused disconnect"
+                    );
+                })
+                .await;
+        }
+
+        /// The no-address fallback — the node disconnecting itself — still
+        /// works: self-disconnect is in scope by definition.
+        #[tokio::test]
+        async fn notify_disconnect_allows_self_fallback_no_address() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (asm, mut event_rx, handle) = build_two_node_asm().await;
+                    let node_a_addr: std::net::IpAddr = NODE_A.parse().unwrap();
+
+                    assert_eq!(
+                        send_notify_disconnect(&handle, None).await,
+                        Ok(()),
+                        "a node must be able to disconnect itself (fallback path)"
+                    );
+                    assert!(
+                        asm.actor_mgr
+                            .get_actor_by_zpr_addr(&node_a_addr)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "the self-disconnected node must be removed"
+                    );
+                    match event_rx.try_recv() {
+                        Ok(VsEvent::ActorLeaves(addr, _)) => assert_eq!(addr, node_a_addr),
+                        other => panic!("expected ActorLeaves for the node, got {other:?}"),
+                    }
+                })
+                .await;
+        }
+
+        /// A node naming its own address explicitly is the same
+        /// self-disconnect and still works.
+        #[tokio::test]
+        async fn notify_disconnect_allows_explicit_self_address() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (asm, mut event_rx, handle) = build_two_node_asm().await;
+                    let node_a_addr: std::net::IpAddr = NODE_A.parse().unwrap();
+
+                    assert_eq!(
+                        send_notify_disconnect(&handle, Some(node_a_addr)).await,
+                        Ok(()),
+                        "a node must be able to disconnect itself (explicit address)"
+                    );
+                    assert!(
+                        asm.actor_mgr
+                            .get_actor_by_zpr_addr(&node_a_addr)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "the self-disconnected node must be removed"
+                    );
+                    match event_rx.try_recv() {
+                        Ok(VsEvent::ActorLeaves(addr, _)) => assert_eq!(addr, node_a_addr),
+                        other => panic!("expected ActorLeaves for the node, got {other:?}"),
+                    }
+                })
+                .await;
+        }
+
+        /// A node can still disconnect an adapter docked to itself.
+        #[tokio::test]
+        async fn notify_disconnect_allows_adapter_docked_to_caller() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (asm, mut event_rx, handle) = build_two_node_asm().await;
+                    let node_a_addr: std::net::IpAddr = NODE_A.parse().unwrap();
+                    let adapter_addr: std::net::IpAddr = ADAPTER.parse().unwrap();
+                    asm.actor_mgr
+                        .add_adapter_via_node(
+                            &make_adapter_actor_defexp(ADAPTER, "adapter-a"),
+                            &node_a_addr,
+                            &Default::default(),
+                        )
+                        .await
+                        .unwrap();
+
+                    assert_eq!(
+                        send_notify_disconnect(&handle, Some(adapter_addr)).await,
+                        Ok(()),
+                        "a node must be able to disconnect an adapter docked to it"
+                    );
+                    assert!(
+                        asm.actor_mgr
+                            .get_actor_by_zpr_addr(&adapter_addr)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "the adapter must be removed"
+                    );
+                    assert_eq!(
+                        asm.actor_mgr.get_docking_node_for_adapter(&adapter_addr),
+                        None,
+                        "the adapter's docking entry must be gone"
+                    );
+                    match event_rx.try_recv() {
+                        Ok(VsEvent::ActorLeaves(addr, _)) => assert_eq!(addr, adapter_addr),
+                        other => panic!("expected ActorLeaves for the adapter, got {other:?}"),
+                    }
+                })
+                .await;
+        }
+
+        /// zipline#182 Q2: an AAA actor whose registered docking node is the
+        /// caller IS disconnectable by that caller.
+        #[tokio::test]
+        async fn notify_disconnect_allows_aaa_registered_to_caller() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (asm, _event_rx, handle) = build_two_node_asm().await;
+                    let node_a_addr: std::net::IpAddr = NODE_A.parse().unwrap();
+                    let aaa_addr: std::net::IpAddr = AAA.parse().unwrap();
+                    asm.actor_mgr.register_aaa(
+                        aaa_addr,
+                        node_a_addr,
+                        SystemTime::now() + Duration::from_secs(600),
+                    );
+
+                    assert_eq!(
+                        send_notify_disconnect(&handle, Some(aaa_addr)).await,
+                        Ok(()),
+                        "an AAA actor registered to the caller must be disconnectable"
+                    );
+                })
+                .await;
+        }
+
+        /// zipline#182 Q2, the other half: an AAA actor registered to a
+        /// DIFFERENT node is refused like any other out-of-scope target.
+        #[tokio::test]
+        async fn notify_disconnect_refuses_aaa_registered_elsewhere() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (asm, mut event_rx, handle) = build_two_node_asm().await;
+                    let node_b_addr: std::net::IpAddr = NODE_B.parse().unwrap();
+                    let aaa_addr: std::net::IpAddr = AAA.parse().unwrap();
+                    asm.actor_mgr.register_aaa(
+                        aaa_addr,
+                        node_b_addr,
+                        SystemTime::now() + Duration::from_secs(600),
+                    );
+
+                    assert_eq!(
+                        send_notify_disconnect(&handle, Some(aaa_addr)).await,
+                        Err(vsapi::ErrorCode::InvalidOperation),
+                        "an AAA actor registered to another node must be refused"
+                    );
+                    assert_eq!(
+                        asm.actor_mgr.get_docking_node_for_aaa(&aaa_addr),
+                        Some(node_b_addr),
+                        "the refused AAA registration must be unchanged"
+                    );
+                    assert!(
+                        event_rx.try_recv().is_err(),
+                        "no ActorLeaves event may be recorded for a refused disconnect"
+                    );
+                })
+                .await;
         }
     }
 }
