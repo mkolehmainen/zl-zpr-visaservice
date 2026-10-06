@@ -287,6 +287,13 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         return Ok(VisaDecision::Deny(DenyCode::NoReason));
     }
 
+    // Test seam (zipline#183 review): the two refresh awaits above are suspension
+    // points where docking state can move. A gated test parks the request here and
+    // mutates the connection table, standing in for a disconnect/reconnect that
+    // lands mid-await -- deterministic, no timing games. Compiled out of release.
+    #[cfg(test)]
+    race_gate::pause_if_gated(&job.requesting_node).await;
+
     // Docking-node resolution, routing, and policy eval all live in the shared
     // core (used by the Phase 2 sweep too). Actor resolution above stays
     // per-caller — the request path fabricates AAA and denies on missing.
@@ -756,6 +763,67 @@ async fn get_actors(
         }
     };
     Ok((source_actor, dest_actor))
+}
+
+/// Test-only rendezvous for racing docking-state changes against an in-flight
+/// request (zipline#183 review, Codex P1). A test arms a gate for its (unique)
+/// requesting-node address; `process_visa_request` parks at the gate after the
+/// attribute-refresh awaits, the test mutates docking state, then resumes it.
+/// Keyed by requesting node so concurrently-running tests never trip each
+/// other's gates. Compiled only into test builds.
+#[cfg(test)]
+pub(crate) mod race_gate {
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Notify;
+
+    struct Gate {
+        parked: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    fn gates() -> &'static Mutex<HashMap<IpAddr, Gate>> {
+        static GATES: OnceLock<Mutex<HashMap<IpAddr, Gate>>> = OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm a gate for requests from `node`. Returns `(parked, resume)`: await
+    /// `parked.notified()` to learn the request has reached the gate, then
+    /// `resume.notify_one()` to let it continue. Single-permit `Notify`
+    /// semantics make both directions race-free regardless of arrival order.
+    pub(crate) fn arm(node: IpAddr) -> (Arc<Notify>, Arc<Notify>) {
+        let parked = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        gates().lock().unwrap().insert(
+            node,
+            Gate {
+                parked: parked.clone(),
+                resume: resume.clone(),
+            },
+        );
+        (parked, resume)
+    }
+
+    /// Disarm the gate so later requests from `node` run through unimpeded.
+    pub(crate) fn disarm(node: &IpAddr) {
+        gates().lock().unwrap().remove(node);
+    }
+
+    /// Called from `process_visa_request`: if a gate is armed for this
+    /// requesting node, signal the test and wait to be resumed. No-op (and
+    /// lock-only cost) for every other request.
+    pub(crate) async fn pause_if_gated(node: &IpAddr) {
+        let armed = {
+            let map = gates().lock().unwrap();
+            map.get(node).map(|g| (g.parked.clone(), g.resume.clone()))
+        };
+        if let Some((parked, resume)) = armed {
+            parked.notify_one();
+            resume.notified().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1434,20 +1502,28 @@ mod tests {
     //   just not docking either endpoint)
     //   policy: unconditional ALLOW for svc:web on TCP 8080
     async fn build_binding_test_asm() -> Arc<Assembly> {
+        build_binding_test_asm_in("fd5a:5052:3000", "fd5a:5052:4000").await
+    }
+
+    /// As [build_binding_test_asm], with the node and adapter subnets supplied.
+    /// The race-gate test needs addresses no other concurrently-running test
+    /// requests from: the gate is keyed by requesting-node address, and the AAA
+    /// tests above also request from `fd5a:5052:3000::*`.
+    async fn build_binding_test_asm_in(node_net: &str, adapter_net: &str) -> Arc<Assembly> {
         let asm = new_assembly_for_tests(None).await;
 
-        let n1: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
-        let n2: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
-        let n3: IpAddr = "fd5a:5052:3000::3".parse().unwrap();
+        let n1: IpAddr = format!("{node_net}::1").parse().unwrap();
+        let n2: IpAddr = format!("{node_net}::2").parse().unwrap();
+        let n3: IpAddr = format!("{node_net}::3").parse().unwrap();
 
         for (addr, cn, sub) in [
-            ("fd5a:5052:3000::1", "node-1", "10.0.0.1:1001"),
-            ("fd5a:5052:3000::2", "node-2", "10.0.0.2:1002"),
-            ("fd5a:5052:3000::3", "node-3", "10.0.0.3:1003"),
+            (format!("{node_net}::1"), "node-1", "10.0.0.1:1001"),
+            (format!("{node_net}::2"), "node-2", "10.0.0.2:1002"),
+            (format!("{node_net}::3"), "node-3", "10.0.0.3:1003"),
         ] {
             asm.actor_mgr
                 .add_node(
-                    &make_node_actor_defexp(addr, cn, sub),
+                    &make_node_actor_defexp(&addr, cn, sub),
                     false,
                     &Default::default(),
                 )
@@ -1470,7 +1546,7 @@ mod tests {
         // Client adapter A docked at N1; provider adapter B (svc:web) docked at N2.
         asm.actor_mgr
             .add_adapter_via_node(
-                &make_adapter_actor_defexp("fd5a:5052:4000::a", "client-a"),
+                &make_adapter_actor_defexp(&format!("{adapter_net}::a"), "client-a"),
                 &n1,
                 &Default::default(),
             )
@@ -1480,7 +1556,7 @@ mod tests {
             .add_adapter_via_node(
                 &make_actor_with_services_defexp(
                     ROLE_ADAPTER,
-                    "fd5a:5052:4000::b",
+                    &format!("{adapter_net}::b"),
                     &["svc:web"],
                     "web-svc",
                 ),
@@ -1606,5 +1682,83 @@ mod tests {
             outcome, "Allow",
             "the destination's docking node must still get its visa, got {outcome}"
         );
+    }
+
+    // zipline#183 review (Codex P1, PR #52): the requester-binding check must hold
+    // against the docking state policy evaluation resolves, not a snapshot taken
+    // before the attribute-refresh awaits. Here the source adapter A undocks from
+    // the requesting node N1 and re-docks at N3 while the request is parked at the
+    // refresh seam: by evaluation time N1 docks neither actor, so the request must
+    // get the same plain Deny(NoMatch) as any other off-path request, and nothing
+    // may be created or distributed. Before the fix the stale pre-refresh snapshot
+    // authorizes N1, policy allows A(N3)->B(N2), and a visa is stored and pushed.
+    #[tokio::test]
+    async fn visa_request_is_denied_when_requester_undocks_during_refresh() {
+        // Subnets unique to this test: the race gate is keyed by requesting-node
+        // address and other tests also request from fd5a:5052:3000::*.
+        let asm = build_binding_test_asm_in("fd5a:5052:3100", "fd5a:5052:4100").await;
+
+        let n1: IpAddr = "fd5a:5052:3100::1".parse().unwrap();
+        let n3: IpAddr = "fd5a:5052:3100::3".parse().unwrap();
+        let a_addr: IpAddr = "fd5a:5052:4100::a".parse().unwrap();
+        let pkt =
+            PacketDesc::new_tcp("fd5a:5052:4100::a", "fd5a:5052:4100::b", 12345, 8080).unwrap();
+
+        let (parked, resume) = race_gate::arm(n1);
+
+        // Request from N1, which docks source A at submission time, for a
+        // policy-allowed flow.
+        let asm_task = asm.clone();
+        let request = tokio::spawn(async move {
+            let (job, _rx) = VisaRequestJob::new(n1, pkt);
+            process_visa_request(asm_task, &job).await
+        });
+
+        // Wait for the request to pass the early binding check and park at the
+        // refresh seam, then move A: disconnect from N1, reconnect through N3.
+        parked.notified().await;
+        let actor_a = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&a_addr)
+            .await
+            .unwrap()
+            .expect("adapter A must exist");
+        asm.actor_mgr
+            .remove_actor_by_zpr_addr(&a_addr)
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&actor_a, &n3, &Default::default())
+            .await
+            .unwrap();
+        resume.notify_one();
+
+        let outcome = match request.await.unwrap() {
+            Ok(VisaDecision::Deny(code)) => format!("Deny({code:?})"),
+            Ok(VisaDecision::Allow(..)) => "Allow".to_string(),
+            Err(e) => format!("Err({e:?})"),
+        };
+        race_gate::disarm(&n1);
+
+        assert_eq!(
+            outcome, "Deny(NoMatch)",
+            "a requester that undocked mid-request must get the plain off-path deny, \
+             got {outcome}"
+        );
+        assert!(
+            asm.visa_mgr.list_all_visa_ids().await.unwrap().is_empty(),
+            "no visa may be stored when the requester undocked mid-request"
+        );
+        for node in ["fd5a:5052:3100::2", "fd5a:5052:3100::3"] {
+            let node_addr: IpAddr = node.parse().unwrap();
+            assert!(
+                asm.visa_mgr
+                    .get_pending_visa_ids_for_node(&node_addr)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "nothing may be queued for {node} by a request whose requester undocked"
+            );
+        }
     }
 }
