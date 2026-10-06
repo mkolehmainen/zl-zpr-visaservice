@@ -45,7 +45,9 @@ use crate::logging::targets::VREQ;
 use crate::packet::describe_five_tuple;
 use crate::visa_bootstrap;
 use crate::visa_mgr::VisaWithMetadata;
-use crate::visa_policy::{PolicyOutcome, evaluate_against_policy, route_for_allow};
+use crate::visa_policy::{
+    PolicyOutcome, evaluate_against_policy, resolve_docking_node, route_for_allow,
+};
 use crate::{config, net_mgr};
 
 pub enum VisaDecision {
@@ -248,6 +250,32 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
             return Ok(VisaDecision::Deny(DenyCode::DestNotFound));
         }
     };
+
+    // Bind the request to the requesting node (zipline#183): refuse it unless that
+    // node docks the source or the destination actor. VISA_SERVICE.md requires the
+    // requester to have a directly connected ingress or egress adapter; without
+    // this check a subverted node could probe policy for flows between other
+    // actors ("allowed" leaked as an internal error, distinguishable from a deny)
+    // and push unrequested visas onto other nodes' paths. The deny is deliberately
+    // DenyCode::NoMatch -- byte-for-byte the response an ordinary policy no-match
+    // produces -- so the refusal reveals nothing about what policy would have
+    // said; the log below is the only record (server-side) of the real reason.
+    // Fabricated AAA actors resolve through the AAA table, which the request side
+    // registered to `job.requesting_node` moments ago, so AAA passes by
+    // construction. The bootstrap path returned above, before this check.
+    let src_dock = resolve_docking_node(&asm, &source_actor, &source_zpr_addr);
+    let dst_dock = resolve_docking_node(&asm, &dest_actor, &dest_zpr_addr);
+    if src_dock != Some(job.requesting_node) && dst_dock != Some(job.requesting_node) {
+        warn!(target: VREQ,
+            "visa request from node {} denied: flow {} is between actors not docked at \
+             the requesting node (source docks at {:?}, dest docks at {:?})",
+            job.requesting_node,
+            describe_five_tuple(&job.packet_desc),
+            src_dock,
+            dst_dock
+        );
+        return Ok(VisaDecision::Deny(DenyCode::NoMatch));
+    }
 
     // If necessary, refresh any expired attributes
     if let Err(e) = refresh_and_persist_actor(&asm, &mut source_actor).await {
@@ -1551,6 +1579,32 @@ mod tests {
             allowed_flow_outcome, denied_flow_outcome,
             "an off-path requester must not be able to distinguish an allowed flow \
              from a denied one"
+        );
+    }
+
+    // zipline#183 regression: a request from the SOURCE actor's docking node (N1)
+    // still succeeds end-to-end for an allowed flow.
+    #[tokio::test]
+    async fn visa_request_from_source_docking_node_still_allowed() {
+        let asm = build_binding_test_asm().await;
+        let outcome =
+            binding_request_outcome(asm, "fd5a:5052:3000::1", binding_allowed_pkt()).await;
+        assert_eq!(
+            outcome, "Allow",
+            "the source's docking node must still get its visa, got {outcome}"
+        );
+    }
+
+    // zipline#183 regression: a request from the DESTINATION actor's docking node
+    // (N2) -- the reverse-direction / return-visa case -- still succeeds.
+    #[tokio::test]
+    async fn visa_request_from_dest_docking_node_still_allowed() {
+        let asm = build_binding_test_asm().await;
+        let outcome =
+            binding_request_outcome(asm, "fd5a:5052:3000::2", binding_allowed_pkt()).await;
+        assert_eq!(
+            outcome, "Allow",
+            "the destination's docking node must still get its visa, got {outcome}"
         );
     }
 }

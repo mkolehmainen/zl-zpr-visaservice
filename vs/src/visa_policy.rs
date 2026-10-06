@@ -40,7 +40,13 @@ pub(crate) enum PolicyOutcome {
 
 /// Resolve an actor's docking node: the connection-table entry, falling back to
 /// the AAA table for fabricated anonymous actors. `None` means undocked.
-fn resolve_docking_node(asm: &Assembly, actor: &Actor, zpr_addr: &IpAddr) -> Option<IpAddr> {
+/// `pub(crate)` so the request path can bind a request to its requesting node
+/// (zipline#183) with exactly the resolution the shared eval core uses.
+pub(crate) fn resolve_docking_node(
+    asm: &Assembly,
+    actor: &Actor,
+    zpr_addr: &IpAddr,
+) -> Option<IpAddr> {
     asm.actor_mgr
         .get_docking_node_for_actor(actor)
         .or_else(|| asm.actor_mgr.get_docking_node_for_aaa(zpr_addr))
