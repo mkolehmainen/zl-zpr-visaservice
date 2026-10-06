@@ -508,8 +508,13 @@ impl ActorMgr {
     /// See issue: https://github.com/org-zpr/zpr-visaservice/issues/200
     pub fn get_docking_node_for_aaa(&self, aaa_addr: &IpAddr) -> Option<IpAddr> {
         let now = SystemTime::now();
-        match self.aaa_table.get(aaa_addr) {
-            Some(entry) if entry.value().1 > now => Some(entry.value().0),
+        // Two-phase lookup: copy the entry out and DROP the read guard before any
+        // eviction. `DashMap::get` holds a shard read lock for the guard's lifetime,
+        // so calling `remove_if` on the same key inside a `match` on the guard
+        // self-deadlocks on the shard (PR #51 review, P1).
+        let entry = self.aaa_table.get(aaa_addr).map(|e| *e.value());
+        match entry {
+            Some((docking_node, expiry)) if expiry > now => Some(docking_node),
             _ => {
                 self.aaa_table
                     .remove_if(aaa_addr, |_, (_, expiry)| *expiry <= now); // rechecks the entry while holding write lock
