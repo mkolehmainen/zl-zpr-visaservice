@@ -737,8 +737,8 @@ mod tests {
     use crate::assembly::Assembly;
     use crate::assembly::tests::new_assembly_for_tests;
     use crate::test_helpers::{
-        make_actor, make_actor_with_services_defexp, make_container_bytes, make_node_actor_defexp,
-        make_policy_with_com_conditions,
+        make_actor, make_actor_with_services_defexp, make_adapter_actor_defexp,
+        make_container_bytes, make_node_actor_defexp, make_policy_with_com_conditions,
     };
     use libeval::attribute::ROLE_ADAPTER;
     use libeval::eval_result::Direction;
@@ -1393,6 +1393,164 @@ mod tests {
         assert!(
             matches!(result, VisaDecision::Deny(DenyCode::NoMatch)),
             "expected NoMatch (policy eval reached)"
+        );
+    }
+
+    // --- requesting-node binding tests (zipline#183) ---
+
+    // Shared setup for the binding tests:
+    //   node N1 (fd5a:5052:3000::1) docks client adapter A (fd5a:5052:4000::a)
+    //   node N2 (fd5a:5052:3000::2) docks provider adapter B (fd5a:5052:4000::b, svc:web)
+    //   node N3 (fd5a:5052:3000::3) docks neither actor (the off-path requester)
+    //   links N1<->N2 (the flow's route) and N1<->N3, N2<->N3 (N3 is connected,
+    //   just not docking either endpoint)
+    //   policy: unconditional ALLOW for svc:web on TCP 8080
+    async fn build_binding_test_asm() -> Arc<Assembly> {
+        let asm = new_assembly_for_tests(None).await;
+
+        let n1: IpAddr = "fd5a:5052:3000::1".parse().unwrap();
+        let n2: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
+        let n3: IpAddr = "fd5a:5052:3000::3".parse().unwrap();
+
+        for (addr, cn, sub) in [
+            ("fd5a:5052:3000::1", "node-1", "10.0.0.1:1001"),
+            ("fd5a:5052:3000::2", "node-2", "10.0.0.2:1002"),
+            ("fd5a:5052:3000::3", "node-3", "10.0.0.3:1003"),
+        ] {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(addr, cn, sub),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        asm.topo_mgr.add_node(n1).unwrap();
+        asm.topo_mgr.add_node(n2).unwrap();
+        asm.topo_mgr.add_node(n3).unwrap();
+        asm.topo_mgr
+            .add_link(n1, n2, LinkId("link-12".into()), vec![], 1)
+            .unwrap();
+        asm.topo_mgr
+            .add_link(n1, n3, LinkId("link-13".into()), vec![], 1)
+            .unwrap();
+        asm.topo_mgr
+            .add_link(n2, n3, LinkId("link-23".into()), vec![], 1)
+            .unwrap();
+
+        // Client adapter A docked at N1; provider adapter B (svc:web) docked at N2.
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &make_adapter_actor_defexp("fd5a:5052:4000::a", "client-a"),
+                &n1,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &make_actor_with_services_defexp(
+                    ROLE_ADAPTER,
+                    "fd5a:5052:4000::b",
+                    &["svc:web"],
+                    "web-svc",
+                ),
+                &n2,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // Unconditional ALLOW for svc:web on TCP 8080: A -> B dport 8080 is allowed
+        // by policy, any other dport has no match.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(
+                crate::test_helpers::make_allow_policy_for_tcp_service("svc:web", 8080),
+            )
+            .await
+            .unwrap();
+
+        Arc::new(asm)
+    }
+
+    /// A -> B on the allowed port (8080), i.e. a flow policy WOULD allow.
+    fn binding_allowed_pkt() -> PacketDesc {
+        PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 12345, 8080).unwrap()
+    }
+
+    /// A -> B on a port no com policy covers, i.e. a flow policy denies (NoMatch).
+    fn binding_unmatched_pkt() -> PacketDesc {
+        PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 12345, 9999).unwrap()
+    }
+
+    /// Flatten a request's outcome for comparison: deny code, allow marker, or error
+    /// marker. The oracle test compares these byte-for-byte between the allowed and
+    /// denied flows, so an internal error must NOT collapse into a deny.
+    async fn binding_request_outcome(
+        asm: Arc<Assembly>,
+        requester: &str,
+        pkt: PacketDesc,
+    ) -> String {
+        let requesting_node: IpAddr = requester.parse().unwrap();
+        let (job, _rx) = VisaRequestJob::new(requesting_node, pkt);
+        match process_visa_request(asm, &job).await {
+            Ok(VisaDecision::Deny(code)) => format!("Deny({code:?})"),
+            Ok(VisaDecision::Allow(..)) => "Allow".to_string(),
+            Err(e) => format!("Err({e:?})"),
+        }
+    }
+
+    // zipline#183: a request from a node that docks neither actor must be refused with
+    // a plain Deny(NoMatch) before policy runs, creating no visa and pushing nothing
+    // to other nodes -- even when policy would allow the flow.
+    #[tokio::test]
+    async fn visa_request_from_node_docking_neither_actor_is_denied() {
+        let asm = build_binding_test_asm().await;
+
+        let outcome =
+            binding_request_outcome(asm.clone(), "fd5a:5052:3000::3", binding_allowed_pkt()).await;
+        assert_eq!(
+            outcome, "Deny(NoMatch)",
+            "off-path requester must get a plain policy-shaped deny, not {outcome}"
+        );
+
+        // Nothing may be created or distributed for the refused request.
+        assert!(
+            asm.visa_mgr.list_all_visa_ids().await.unwrap().is_empty(),
+            "no visa may be stored for an off-path request"
+        );
+        for node in ["fd5a:5052:3000::1", "fd5a:5052:3000::2"] {
+            let node_addr: IpAddr = node.parse().unwrap();
+            assert!(
+                asm.visa_mgr
+                    .get_pending_visa_ids_for_node(&node_addr)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "nothing may be queued for {node} by an off-path request"
+            );
+        }
+    }
+
+    // zipline#183 (the policy oracle): for an off-path requester, the response to a
+    // policy-allowed flow must be byte-for-byte the same as to a policy-denied flow.
+    // Before the fix the allowed case surfaced as an internal error ("allowed" leaks
+    // through the error) while the denied case was Deny(NoMatch).
+    #[tokio::test]
+    async fn off_path_deny_is_indistinguishable_from_policy_no_match() {
+        let asm = build_binding_test_asm().await;
+
+        let allowed_flow_outcome =
+            binding_request_outcome(asm.clone(), "fd5a:5052:3000::3", binding_allowed_pkt()).await;
+        let denied_flow_outcome =
+            binding_request_outcome(asm.clone(), "fd5a:5052:3000::3", binding_unmatched_pkt())
+                .await;
+
+        assert_eq!(
+            allowed_flow_outcome, denied_flow_outcome,
+            "an off-path requester must not be able to distinguish an allowed flow \
+             from a denied one"
         );
     }
 }
