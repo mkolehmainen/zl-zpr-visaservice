@@ -1692,6 +1692,41 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         }
         let zpr_addr = maybe_zpr_addr.unwrap();
 
+        // Scope the disconnect to the calling node (zipline#182): a live node
+        // may disconnect only itself, an adapter docked to it, or an AAA actor
+        // whose registered docking node is the caller. Without this check any
+        // live node could name any actor or node and `cc.disconnect` would
+        // tear it down — one subverted node could deny the whole ZPRnet,
+        // breaking the SECURITY_MODEL.md Case 2 containment. An unknown target
+        // has no docking entry and so falls out here as a refusal, which is
+        // the safe default. Mirrors the session bindings `reauthorize` has.
+        let caller_addr = self.node.get_zpr_addr();
+        let in_scope = match caller_addr {
+            Some(caller) => {
+                zpr_addr == *caller
+                    || self.asm.actor_mgr.get_docking_node_for_adapter(&zpr_addr)
+                        == Some(*caller)
+                    || self.asm.actor_mgr.get_docking_node_for_aaa(&zpr_addr) == Some(*caller)
+            }
+            // A caller with no ZPR address cannot own anything; refuse.
+            None => false,
+        };
+        if !in_scope {
+            warn!(
+                target: API,
+                "notify_disconnect from node {:?} for out-of-scope target {}: refused",
+                self.node.get_cn(), zpr_addr
+            );
+            let res_builder = resp.get().init_res();
+            let mut err_builder = res_builder.init_error();
+            write_error(
+                &mut err_builder,
+                vsapi::ErrorCode::InvalidOperation,
+                "disconnect target is not the calling node or docked to it",
+            );
+            return Ok(());
+        }
+
         let reason = dnotice.get_reason_code()?;
         debug!(
             target: API,
