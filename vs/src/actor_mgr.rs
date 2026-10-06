@@ -1759,4 +1759,43 @@ mod test {
              connected-adapters set before teardown makes the orphans unfindable"
         );
     }
+
+    /// An EXPIRED AAA registration must yield `None` (lazy eviction), not a
+    /// deadlock (zl-zpr-visaservice#51 review, P1): the expired-entry branch of
+    /// `get_docking_node_for_aaa` used to call `DashMap::remove_if` while the
+    /// `DashMap::get` read guard from the surrounding `match` was still alive —
+    /// both lock the same shard for the same key, so the lookup self-deadlocked.
+    /// The lookup is synchronous, so the deadlock would hang the VSAPI executor;
+    /// here it would hang the test suite, so the lookup runs on its own thread
+    /// and the test fails (rather than hangs) if it does not finish in time.
+    #[test]
+    fn test_get_docking_node_for_aaa_expired_entry_evicts_without_deadlock() {
+        let mgr = Arc::new(make_mgr());
+        let aaa_addr: IpAddr = "fd5a:5052:aaa::1".parse().unwrap();
+        let docking_node: IpAddr = "fd5a:5052::1".parse().unwrap();
+
+        // Register an entry that is already expired.
+        mgr.register_aaa(
+            aaa_addr,
+            docking_node,
+            SystemTime::now() - Duration::from_secs(60),
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mgr2 = Arc::clone(&mgr);
+        std::thread::spawn(move || {
+            let _ = tx.send(mgr2.get_docking_node_for_aaa(&aaa_addr));
+        });
+
+        let looked_up = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("get_docking_node_for_aaa deadlocked on an expired AAA entry");
+        assert_eq!(looked_up, None, "an expired AAA entry must not resolve");
+
+        // And the lazy eviction must actually have removed the entry.
+        assert!(
+            !mgr.aaa_table.contains_key(&aaa_addr),
+            "the expired AAA entry must be evicted by the lookup"
+        );
+    }
 }
