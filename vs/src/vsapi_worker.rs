@@ -1704,8 +1704,7 @@ impl vsapi::v_s_handle::Server for VSHandleImpl {
         let in_scope = match caller_addr {
             Some(caller) => {
                 zpr_addr == *caller
-                    || self.asm.actor_mgr.get_docking_node_for_adapter(&zpr_addr)
-                        == Some(*caller)
+                    || self.asm.actor_mgr.get_docking_node_for_adapter(&zpr_addr) == Some(*caller)
                     || self.asm.actor_mgr.get_docking_node_for_aaa(&zpr_addr) == Some(*caller)
             }
             // A caller with no ZPR address cannot own anything; refuse.
@@ -2878,9 +2877,7 @@ mod tests {
             let res = resp.get().unwrap().get_res().unwrap();
             match res.which().unwrap() {
                 vsapi::ok_or_error::Which::Ok(_) => Ok(()),
-                vsapi::ok_or_error::Which::Error(err) => {
-                    Err(err.unwrap().get_code().unwrap())
-                }
+                vsapi::ok_or_error::Which::Error(err) => Err(err.unwrap().get_code().unwrap()),
             }
         }
 
