@@ -263,6 +263,13 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
     // Fabricated AAA actors resolve through the AAA table, which the request side
     // registered to `job.requesting_node` moments ago, so AAA passes by
     // construction. The bootstrap path returned above, before this check.
+    //
+    // This early check is not the binding guarantee -- it rejects off-path probes
+    // before the refresh awaits below spend anything on them. The authoritative
+    // check re-runs on the Allow arm against the docking state evaluation itself
+    // resolved (PR #52 review, Codex P1): docking can move while those awaits are
+    // suspended, and a snapshot taken here can authorize a requester that no
+    // longer docks either endpoint by the time policy evaluates.
     let src_dock = resolve_docking_node(&asm, &source_actor, &source_zpr_addr);
     let dst_dock = resolve_docking_node(&asm, &dest_actor, &dest_zpr_addr);
     if src_dock != Some(job.requesting_node) && dst_dock != Some(job.requesting_node) {
@@ -313,7 +320,30 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         PolicyOutcome::Allow {
             hits,
             default_route,
+            src_dock,
+            dst_dock,
         } => {
+            // Re-run the requester-binding check against the docking state the
+            // evaluation itself resolved (zipline#183, PR #52 review, Codex P1).
+            // The early check above ran before the refresh awaits; if the
+            // requester's endpoint undocked and re-docked elsewhere while they
+            // were suspended, the allow would otherwise reach visa_from_allow,
+            // which stores the visa and starts path distribution before
+            // actualization fails for the now-off-path requester -- restoring
+            // exactly the oracle and unrequested pushes the early check exists
+            // to prevent. Same deliberate Deny(NoMatch) + server-side warn.
+            if src_dock != job.requesting_node && dst_dock != job.requesting_node {
+                warn!(target: VREQ,
+                    "visa request from node {} denied: docking moved during the request; \
+                     flow {} is no longer between actors docked at the requesting node \
+                     (source docks at {:?}, dest docks at {:?})",
+                    job.requesting_node,
+                    describe_five_tuple(&job.packet_desc),
+                    src_dock,
+                    dst_dock
+                );
+                return Ok(VisaDecision::Deny(DenyCode::NoMatch));
+            }
             visa_from_allow(
                 asm.clone(),
                 job,

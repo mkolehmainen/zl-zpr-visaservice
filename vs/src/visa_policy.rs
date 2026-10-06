@@ -28,12 +28,20 @@ use crate::logging::targets::VREQ;
 /// Outcome of running resolved actors and a packet through policy (docking-node
 /// resolution, routing, and eval). Shared by the request path and the
 /// policy-update visa sweep so both run identical policy logic.
+///
+/// An `Allow` carries the docking nodes the evaluation resolved (`src_dock`,
+/// `dst_dock`) so the request path can bind the requester to the SAME docking
+/// state the decision used (zipline#183, PR #52 review): a check against an
+/// earlier snapshot can pass for a requester whose endpoint undocked while the
+/// attribute refreshes were awaited. The sweep ignores them.
 pub(crate) enum PolicyOutcome {
     // default_route: None => route came from the hit (NeedsRoute-allow);
     // Some(best) => the AllowWithoutRoute case.
     Allow {
         hits: Vec<Hit>,
         default_route: Option<Route>,
+        src_dock: IpAddr,
+        dst_dock: IpAddr,
     },
     Deny(DenyCode),
 }
@@ -119,6 +127,8 @@ pub(crate) async fn evaluate_against_policy(
         PartialEvalResult::AllowWithoutRoute(hits) => Ok(PolicyOutcome::Allow {
             hits,
             default_route: Some(default_route),
+            src_dock: node_addr_a,
+            dst_dock: node_addr_b,
         }),
         PartialEvalResult::Deny(FinalDeny::Deny(_hits)) => {
             info!(target: VREQ, "eval denied by policy");
@@ -132,6 +142,8 @@ pub(crate) async fn evaluate_against_policy(
                 FinalEvalResult::Allow(hits) => Ok(PolicyOutcome::Allow {
                     hits,
                     default_route: None,
+                    src_dock: node_addr_a,
+                    dst_dock: node_addr_b,
                 }),
                 FinalEvalResult::Deny(_hits) => {
                     info!(target: VREQ, "eval denied by policy with routes");
