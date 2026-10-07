@@ -688,6 +688,39 @@ async fn teardown_culled_nodes(asm: &Assembly, culled: &[crate::actor_mgr::Culle
     }
 }
 
+/// zipline#184: `vs --min-compiler-version` prints the minimum policy
+/// compiler version this build accepts and exits.
+#[cfg(test)]
+mod min_compiler_version_tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parses_min_compiler_version_flag() {
+        let cli = Cli::try_parse_from(["vs", "--min-compiler-version"]).unwrap();
+        assert!(cli.min_compiler_version);
+        let cli = Cli::try_parse_from(["vs"]).unwrap();
+        assert!(!cli.min_compiler_version);
+    }
+
+    // Tracks the constants, so a compiler minor bump needs no test edit.
+    #[test]
+    fn test_min_compiler_version_line_matches_constants() {
+        assert_eq!(
+            min_compiler_version_line(),
+            format!(
+                "{}.{}.{}",
+                config::POLICY_MIN_COMPILER_MAJOR,
+                config::POLICY_MIN_COMPILER_MINOR,
+                config::POLICY_MIN_COMPILER_PATCH
+            )
+        );
+        assert_eq!(
+            min_compiler_version_line(),
+            config::POLICY_MIN_VERSION.to_string()
+        );
+    }
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::*;
