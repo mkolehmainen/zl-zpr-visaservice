@@ -110,11 +110,28 @@ struct Cli {
     /// Emit a default configuration file and exit.
     #[arg(long)]
     gen_config: bool,
+
+    /// Print the minimum policy compiler version this build accepts (MAJOR.MINOR must match, PATCH >=) and exit.
+    #[arg(long)]
+    min_compiler_version: bool,
+}
+
+/// The line `--min-compiler-version` prints: `MAJOR.MINOR.PATCH` of
+/// [config::POLICY_MIN_VERSION] (zipline#184).
+fn min_compiler_version_line() -> String {
+    config::POLICY_MIN_VERSION.to_string()
 }
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+
+    // Handled first, before logging, config, identity or ValKey, so it works
+    // on a host with none of them; wins over any other flag (zipline#184).
+    if cli.min_compiler_version {
+        println!("{}", min_compiler_version_line());
+        return std::process::ExitCode::SUCCESS;
+    }
 
     if cli.gen_config {
         let default_cfg = VSConfig::default();
