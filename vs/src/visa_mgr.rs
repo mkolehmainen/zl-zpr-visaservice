@@ -850,6 +850,10 @@ impl VisaMgr {
                 PolicyOutcome::Allow {
                     hits,
                     default_route,
+                    // The sweep rechecks an existing visa; requester binding was
+                    // enforced when it was issued (zipline#183), so the docking
+                    // nodes the eval resolved are not re-checked here.
+                    ..
                 } => (hits, default_route),
                 PolicyOutcome::Deny(_) => return Ok(VisaRecheck::Revoke),
             };

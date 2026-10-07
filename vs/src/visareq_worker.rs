@@ -45,7 +45,9 @@ use crate::logging::targets::VREQ;
 use crate::packet::describe_five_tuple;
 use crate::visa_bootstrap;
 use crate::visa_mgr::VisaWithMetadata;
-use crate::visa_policy::{PolicyOutcome, evaluate_against_policy, route_for_allow};
+use crate::visa_policy::{
+    PolicyOutcome, evaluate_against_policy, resolve_docking_node, route_for_allow,
+};
 use crate::{config, net_mgr};
 
 pub enum VisaDecision {
@@ -249,6 +251,39 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         }
     };
 
+    // Bind the request to the requesting node (zipline#183): refuse it unless that
+    // node docks the source or the destination actor. VISA_SERVICE.md requires the
+    // requester to have a directly connected ingress or egress adapter; without
+    // this check a subverted node could probe policy for flows between other
+    // actors ("allowed" leaked as an internal error, distinguishable from a deny)
+    // and push unrequested visas onto other nodes' paths. The deny is deliberately
+    // DenyCode::NoMatch -- byte-for-byte the response an ordinary policy no-match
+    // produces -- so the refusal reveals nothing about what policy would have
+    // said; the log below is the only record (server-side) of the real reason.
+    // Fabricated AAA actors resolve through the AAA table, which the request side
+    // registered to `job.requesting_node` moments ago, so AAA passes by
+    // construction. The bootstrap path returned above, before this check.
+    //
+    // This early check is not the binding guarantee -- it rejects off-path probes
+    // before the refresh awaits below spend anything on them. The authoritative
+    // check re-runs on the Allow arm against the docking state evaluation itself
+    // resolved (PR #52 review, Codex P1): docking can move while those awaits are
+    // suspended, and a snapshot taken here can authorize a requester that no
+    // longer docks either endpoint by the time policy evaluates.
+    let src_dock = resolve_docking_node(&asm, &source_actor, &source_zpr_addr);
+    let dst_dock = resolve_docking_node(&asm, &dest_actor, &dest_zpr_addr);
+    if src_dock != Some(job.requesting_node) && dst_dock != Some(job.requesting_node) {
+        warn!(target: VREQ,
+            "visa request from node {} denied: flow {} is between actors not docked at \
+             the requesting node (source docks at {:?}, dest docks at {:?})",
+            job.requesting_node,
+            describe_five_tuple(&job.packet_desc),
+            src_dock,
+            dst_dock
+        );
+        return Ok(VisaDecision::Deny(DenyCode::NoMatch));
+    }
+
     // If necessary, refresh any expired attributes
     if let Err(e) = refresh_and_persist_actor(&asm, &mut source_actor).await {
         error!(target: VREQ, "failed to update source actor after refreshing attributes: {}", e);
@@ -258,6 +293,13 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         error!(target: VREQ, "failed to update dest actor after refreshing attributes: {}", e);
         return Ok(VisaDecision::Deny(DenyCode::NoReason));
     }
+
+    // Test seam (zipline#183 review): the two refresh awaits above are suspension
+    // points where docking state can move. A gated test parks the request here and
+    // mutates the connection table, standing in for a disconnect/reconnect that
+    // lands mid-await -- deterministic, no timing games. Compiled out of release.
+    #[cfg(test)]
+    race_gate::pause_if_gated(&job.requesting_node).await;
 
     // Docking-node resolution, routing, and policy eval all live in the shared
     // core (used by the Phase 2 sweep too). Actor resolution above stays
@@ -278,7 +320,30 @@ async fn process_visa_request(asm: Arc<Assembly>, job: &VisaRequestJob) -> VisaR
         PolicyOutcome::Allow {
             hits,
             default_route,
+            src_dock,
+            dst_dock,
         } => {
+            // Re-run the requester-binding check against the docking state the
+            // evaluation itself resolved (zipline#183, PR #52 review, Codex P1).
+            // The early check above ran before the refresh awaits; if the
+            // requester's endpoint undocked and re-docked elsewhere while they
+            // were suspended, the allow would otherwise reach visa_from_allow,
+            // which stores the visa and starts path distribution before
+            // actualization fails for the now-off-path requester -- restoring
+            // exactly the oracle and unrequested pushes the early check exists
+            // to prevent. Same deliberate Deny(NoMatch) + server-side warn.
+            if src_dock != job.requesting_node && dst_dock != job.requesting_node {
+                warn!(target: VREQ,
+                    "visa request from node {} denied: docking moved during the request; \
+                     flow {} is no longer between actors docked at the requesting node \
+                     (source docks at {:?}, dest docks at {:?})",
+                    job.requesting_node,
+                    describe_five_tuple(&job.packet_desc),
+                    src_dock,
+                    dst_dock
+                );
+                return Ok(VisaDecision::Deny(DenyCode::NoMatch));
+            }
             visa_from_allow(
                 asm.clone(),
                 job,
@@ -730,6 +795,67 @@ async fn get_actors(
     Ok((source_actor, dest_actor))
 }
 
+/// Test-only rendezvous for racing docking-state changes against an in-flight
+/// request (zipline#183 review, Codex P1). A test arms a gate for its (unique)
+/// requesting-node address; `process_visa_request` parks at the gate after the
+/// attribute-refresh awaits, the test mutates docking state, then resumes it.
+/// Keyed by requesting node so concurrently-running tests never trip each
+/// other's gates. Compiled only into test builds.
+#[cfg(test)]
+pub(crate) mod race_gate {
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Notify;
+
+    struct Gate {
+        parked: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
+    fn gates() -> &'static Mutex<HashMap<IpAddr, Gate>> {
+        static GATES: OnceLock<Mutex<HashMap<IpAddr, Gate>>> = OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm a gate for requests from `node`. Returns `(parked, resume)`: await
+    /// `parked.notified()` to learn the request has reached the gate, then
+    /// `resume.notify_one()` to let it continue. Single-permit `Notify`
+    /// semantics make both directions race-free regardless of arrival order.
+    pub(crate) fn arm(node: IpAddr) -> (Arc<Notify>, Arc<Notify>) {
+        let parked = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        gates().lock().unwrap().insert(
+            node,
+            Gate {
+                parked: parked.clone(),
+                resume: resume.clone(),
+            },
+        );
+        (parked, resume)
+    }
+
+    /// Disarm the gate so later requests from `node` run through unimpeded.
+    pub(crate) fn disarm(node: &IpAddr) {
+        gates().lock().unwrap().remove(node);
+    }
+
+    /// Called from `process_visa_request`: if a gate is armed for this
+    /// requesting node, signal the test and wait to be resumed. No-op (and
+    /// lock-only cost) for every other request.
+    pub(crate) async fn pause_if_gated(node: &IpAddr) {
+        let armed = {
+            let map = gates().lock().unwrap();
+            map.get(node).map(|g| (g.parked.clone(), g.resume.clone()))
+        };
+        if let Some((parked, resume)) = armed {
+            parked.notify_one();
+            resume.notified().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,8 +863,8 @@ mod tests {
     use crate::assembly::Assembly;
     use crate::assembly::tests::new_assembly_for_tests;
     use crate::test_helpers::{
-        make_actor, make_actor_with_services_defexp, make_container_bytes, make_node_actor_defexp,
-        make_policy_with_com_conditions,
+        make_actor, make_actor_with_services_defexp, make_adapter_actor_defexp,
+        make_container_bytes, make_node_actor_defexp, make_policy_with_com_conditions,
     };
     use libeval::attribute::ROLE_ADAPTER;
     use libeval::eval_result::Direction;
@@ -1394,5 +1520,275 @@ mod tests {
             matches!(result, VisaDecision::Deny(DenyCode::NoMatch)),
             "expected NoMatch (policy eval reached)"
         );
+    }
+
+    // --- requesting-node binding tests (zipline#183) ---
+
+    // Shared setup for the binding tests:
+    //   node N1 (fd5a:5052:3000::1) docks client adapter A (fd5a:5052:4000::a)
+    //   node N2 (fd5a:5052:3000::2) docks provider adapter B (fd5a:5052:4000::b, svc:web)
+    //   node N3 (fd5a:5052:3000::3) docks neither actor (the off-path requester)
+    //   links N1<->N2 (the flow's route) and N1<->N3, N2<->N3 (N3 is connected,
+    //   just not docking either endpoint)
+    //   policy: unconditional ALLOW for svc:web on TCP 8080
+    async fn build_binding_test_asm() -> Arc<Assembly> {
+        build_binding_test_asm_in("fd5a:5052:3000", "fd5a:5052:4000").await
+    }
+
+    /// As [build_binding_test_asm], with the node and adapter subnets supplied.
+    /// The race-gate test needs addresses no other concurrently-running test
+    /// requests from: the gate is keyed by requesting-node address, and the AAA
+    /// tests above also request from `fd5a:5052:3000::*`.
+    async fn build_binding_test_asm_in(node_net: &str, adapter_net: &str) -> Arc<Assembly> {
+        let asm = new_assembly_for_tests(None).await;
+
+        let n1: IpAddr = format!("{node_net}::1").parse().unwrap();
+        let n2: IpAddr = format!("{node_net}::2").parse().unwrap();
+        let n3: IpAddr = format!("{node_net}::3").parse().unwrap();
+
+        for (addr, cn, sub) in [
+            (format!("{node_net}::1"), "node-1", "10.0.0.1:1001"),
+            (format!("{node_net}::2"), "node-2", "10.0.0.2:1002"),
+            (format!("{node_net}::3"), "node-3", "10.0.0.3:1003"),
+        ] {
+            asm.actor_mgr
+                .add_node(
+                    &make_node_actor_defexp(&addr, cn, sub),
+                    false,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        asm.topo_mgr.add_node(n1).unwrap();
+        asm.topo_mgr.add_node(n2).unwrap();
+        asm.topo_mgr.add_node(n3).unwrap();
+        asm.topo_mgr
+            .add_link(n1, n2, LinkId("link-12".into()), vec![], 1)
+            .unwrap();
+        asm.topo_mgr
+            .add_link(n1, n3, LinkId("link-13".into()), vec![], 1)
+            .unwrap();
+        asm.topo_mgr
+            .add_link(n2, n3, LinkId("link-23".into()), vec![], 1)
+            .unwrap();
+
+        // Client adapter A docked at N1; provider adapter B (svc:web) docked at N2.
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &make_adapter_actor_defexp(&format!("{adapter_net}::a"), "client-a"),
+                &n1,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(
+                &make_actor_with_services_defexp(
+                    ROLE_ADAPTER,
+                    &format!("{adapter_net}::b"),
+                    &["svc:web"],
+                    "web-svc",
+                ),
+                &n2,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // Unconditional ALLOW for svc:web on TCP 8080: A -> B dport 8080 is allowed
+        // by policy, any other dport has no match.
+        asm.policy_mgr
+            .update_policy_from_container_bytes(
+                crate::test_helpers::make_allow_policy_for_tcp_service("svc:web", 8080),
+            )
+            .await
+            .unwrap();
+
+        Arc::new(asm)
+    }
+
+    /// A -> B on the allowed port (8080), i.e. a flow policy WOULD allow.
+    fn binding_allowed_pkt() -> PacketDesc {
+        PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 12345, 8080).unwrap()
+    }
+
+    /// A -> B on a port no com policy covers, i.e. a flow policy denies (NoMatch).
+    fn binding_unmatched_pkt() -> PacketDesc {
+        PacketDesc::new_tcp("fd5a:5052:4000::a", "fd5a:5052:4000::b", 12345, 9999).unwrap()
+    }
+
+    /// Flatten a request's outcome for comparison: deny code, allow marker, or error
+    /// marker. The oracle test compares these byte-for-byte between the allowed and
+    /// denied flows, so an internal error must NOT collapse into a deny.
+    async fn binding_request_outcome(
+        asm: Arc<Assembly>,
+        requester: &str,
+        pkt: PacketDesc,
+    ) -> String {
+        let requesting_node: IpAddr = requester.parse().unwrap();
+        let (job, _rx) = VisaRequestJob::new(requesting_node, pkt);
+        match process_visa_request(asm, &job).await {
+            Ok(VisaDecision::Deny(code)) => format!("Deny({code:?})"),
+            Ok(VisaDecision::Allow(..)) => "Allow".to_string(),
+            Err(e) => format!("Err({e:?})"),
+        }
+    }
+
+    // zipline#183: a request from a node that docks neither actor must be refused with
+    // a plain Deny(NoMatch) before policy runs, creating no visa and pushing nothing
+    // to other nodes -- even when policy would allow the flow.
+    #[tokio::test]
+    async fn visa_request_from_node_docking_neither_actor_is_denied() {
+        let asm = build_binding_test_asm().await;
+
+        let outcome =
+            binding_request_outcome(asm.clone(), "fd5a:5052:3000::3", binding_allowed_pkt()).await;
+        assert_eq!(
+            outcome, "Deny(NoMatch)",
+            "off-path requester must get a plain policy-shaped deny, not {outcome}"
+        );
+
+        // Nothing may be created or distributed for the refused request.
+        assert!(
+            asm.visa_mgr.list_all_visa_ids().await.unwrap().is_empty(),
+            "no visa may be stored for an off-path request"
+        );
+        for node in ["fd5a:5052:3000::1", "fd5a:5052:3000::2"] {
+            let node_addr: IpAddr = node.parse().unwrap();
+            assert!(
+                asm.visa_mgr
+                    .get_pending_visa_ids_for_node(&node_addr)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "nothing may be queued for {node} by an off-path request"
+            );
+        }
+    }
+
+    // zipline#183 (the policy oracle): for an off-path requester, the response to a
+    // policy-allowed flow must be byte-for-byte the same as to a policy-denied flow.
+    // Before the fix the allowed case surfaced as an internal error ("allowed" leaks
+    // through the error) while the denied case was Deny(NoMatch).
+    #[tokio::test]
+    async fn off_path_deny_is_indistinguishable_from_policy_no_match() {
+        let asm = build_binding_test_asm().await;
+
+        let allowed_flow_outcome =
+            binding_request_outcome(asm.clone(), "fd5a:5052:3000::3", binding_allowed_pkt()).await;
+        let denied_flow_outcome =
+            binding_request_outcome(asm.clone(), "fd5a:5052:3000::3", binding_unmatched_pkt())
+                .await;
+
+        assert_eq!(
+            allowed_flow_outcome, denied_flow_outcome,
+            "an off-path requester must not be able to distinguish an allowed flow \
+             from a denied one"
+        );
+    }
+
+    // zipline#183 regression: a request from the SOURCE actor's docking node (N1)
+    // still succeeds end-to-end for an allowed flow.
+    #[tokio::test]
+    async fn visa_request_from_source_docking_node_still_allowed() {
+        let asm = build_binding_test_asm().await;
+        let outcome =
+            binding_request_outcome(asm, "fd5a:5052:3000::1", binding_allowed_pkt()).await;
+        assert_eq!(
+            outcome, "Allow",
+            "the source's docking node must still get its visa, got {outcome}"
+        );
+    }
+
+    // zipline#183 regression: a request from the DESTINATION actor's docking node
+    // (N2) -- the reverse-direction / return-visa case -- still succeeds.
+    #[tokio::test]
+    async fn visa_request_from_dest_docking_node_still_allowed() {
+        let asm = build_binding_test_asm().await;
+        let outcome =
+            binding_request_outcome(asm, "fd5a:5052:3000::2", binding_allowed_pkt()).await;
+        assert_eq!(
+            outcome, "Allow",
+            "the destination's docking node must still get its visa, got {outcome}"
+        );
+    }
+
+    // zipline#183 review (Codex P1, PR #52): the requester-binding check must hold
+    // against the docking state policy evaluation resolves, not a snapshot taken
+    // before the attribute-refresh awaits. Here the source adapter A undocks from
+    // the requesting node N1 and re-docks at N3 while the request is parked at the
+    // refresh seam: by evaluation time N1 docks neither actor, so the request must
+    // get the same plain Deny(NoMatch) as any other off-path request, and nothing
+    // may be created or distributed. Before the fix the stale pre-refresh snapshot
+    // authorizes N1, policy allows A(N3)->B(N2), and a visa is stored and pushed.
+    #[tokio::test]
+    async fn visa_request_is_denied_when_requester_undocks_during_refresh() {
+        // Subnets unique to this test: the race gate is keyed by requesting-node
+        // address and other tests also request from fd5a:5052:3000::*.
+        let asm = build_binding_test_asm_in("fd5a:5052:3100", "fd5a:5052:4100").await;
+
+        let n1: IpAddr = "fd5a:5052:3100::1".parse().unwrap();
+        let n3: IpAddr = "fd5a:5052:3100::3".parse().unwrap();
+        let a_addr: IpAddr = "fd5a:5052:4100::a".parse().unwrap();
+        let pkt =
+            PacketDesc::new_tcp("fd5a:5052:4100::a", "fd5a:5052:4100::b", 12345, 8080).unwrap();
+
+        let (parked, resume) = race_gate::arm(n1);
+
+        // Request from N1, which docks source A at submission time, for a
+        // policy-allowed flow.
+        let asm_task = asm.clone();
+        let request = tokio::spawn(async move {
+            let (job, _rx) = VisaRequestJob::new(n1, pkt);
+            process_visa_request(asm_task, &job).await
+        });
+
+        // Wait for the request to pass the early binding check and park at the
+        // refresh seam, then move A: disconnect from N1, reconnect through N3.
+        parked.notified().await;
+        let actor_a = asm
+            .actor_mgr
+            .get_actor_by_zpr_addr(&a_addr)
+            .await
+            .unwrap()
+            .expect("adapter A must exist");
+        asm.actor_mgr
+            .remove_actor_by_zpr_addr(&a_addr)
+            .await
+            .unwrap();
+        asm.actor_mgr
+            .add_adapter_via_node(&actor_a, &n3, &Default::default())
+            .await
+            .unwrap();
+        resume.notify_one();
+
+        let outcome = match request.await.unwrap() {
+            Ok(VisaDecision::Deny(code)) => format!("Deny({code:?})"),
+            Ok(VisaDecision::Allow(..)) => "Allow".to_string(),
+            Err(e) => format!("Err({e:?})"),
+        };
+        race_gate::disarm(&n1);
+
+        assert_eq!(
+            outcome, "Deny(NoMatch)",
+            "a requester that undocked mid-request must get the plain off-path deny, \
+             got {outcome}"
+        );
+        assert!(
+            asm.visa_mgr.list_all_visa_ids().await.unwrap().is_empty(),
+            "no visa may be stored when the requester undocked mid-request"
+        );
+        for node in ["fd5a:5052:3100::2", "fd5a:5052:3100::3"] {
+            let node_addr: IpAddr = node.parse().unwrap();
+            assert!(
+                asm.visa_mgr
+                    .get_pending_visa_ids_for_node(&node_addr)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "nothing may be queued for {node} by a request whose requester undocked"
+            );
+        }
     }
 }
