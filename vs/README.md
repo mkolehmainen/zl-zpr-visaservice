@@ -28,6 +28,9 @@ vs /path/to/policy.bin2
 
 - To use a custom configuration file: `-c my-config.toml`.
 - For verbose log output: `-v`.
+- To print the minimum policy compiler version this build accepts and exit:
+  `--min-compiler-version` (MAJOR and MINOR must match exactly, PATCH must be
+  at least the printed value).
 
 By default, `vs` will look for TLS credentials in `admin-tls-cert.pem` and
 `admin-tls-key.pem`. You can generate these:

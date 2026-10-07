@@ -110,11 +110,28 @@ struct Cli {
     /// Emit a default configuration file and exit.
     #[arg(long)]
     gen_config: bool,
+
+    /// Print the minimum policy compiler version this build accepts (MAJOR.MINOR must match, PATCH >=) and exit.
+    #[arg(long)]
+    min_compiler_version: bool,
+}
+
+/// The line `--min-compiler-version` prints: `MAJOR.MINOR.PATCH` of
+/// [config::POLICY_MIN_VERSION] (zipline#184).
+fn min_compiler_version_line() -> String {
+    config::POLICY_MIN_VERSION.to_string()
 }
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+
+    // Handled first, before logging, config, identity or ValKey, so it works
+    // on a host with none of them; wins over any other flag (zipline#184).
+    if cli.min_compiler_version {
+        println!("{}", min_compiler_version_line());
+        return std::process::ExitCode::SUCCESS;
+    }
 
     if cli.gen_config {
         let default_cfg = VSConfig::default();
@@ -685,6 +702,39 @@ async fn teardown_culled_nodes(asm: &Assembly, culled: &[crate::actor_mgr::Culle
                 error!(target: MAIN, "failed to remove records of culled node {}: {e}", node.node_addr);
             }
         }
+    }
+}
+
+/// zipline#184: `vs --min-compiler-version` prints the minimum policy
+/// compiler version this build accepts and exits.
+#[cfg(test)]
+mod min_compiler_version_tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parses_min_compiler_version_flag() {
+        let cli = Cli::try_parse_from(["vs", "--min-compiler-version"]).unwrap();
+        assert!(cli.min_compiler_version);
+        let cli = Cli::try_parse_from(["vs"]).unwrap();
+        assert!(!cli.min_compiler_version);
+    }
+
+    // Tracks the constants, so a compiler minor bump needs no test edit.
+    #[test]
+    fn test_min_compiler_version_line_matches_constants() {
+        assert_eq!(
+            min_compiler_version_line(),
+            format!(
+                "{}.{}.{}",
+                config::POLICY_MIN_COMPILER_MAJOR,
+                config::POLICY_MIN_COMPILER_MINOR,
+                config::POLICY_MIN_COMPILER_PATCH
+            )
+        );
+        assert_eq!(
+            min_compiler_version_line(),
+            config::POLICY_MIN_VERSION.to_string()
+        );
     }
 }
 
