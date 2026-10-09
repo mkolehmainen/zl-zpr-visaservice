@@ -107,6 +107,16 @@ Common Types
 |                 |   "visas": number[], "visas_enqueued": number[],         |
 |                 |   "pending_revocation": number,                          |
 |                 |   "vss_port": number | null }                            |
+|                 |   in_sync is true while a live VSS worker exists for the |
+|                 |   node (one in its 3 s start delay or still connecting   |
+|                 |   counts). A node with a live vsapi session gets a new   |
+|                 |   worker on its next ping (~5 s), so a false that lasts  |
+|                 |   longer means the node itself is unreachable.           |
+|                 |   vss_port is the registered VSS port and stays set      |
+|                 |   after the worker exits. last_contact is the last time  |
+|                 |   the VS heard from the node in either direction: node   |
+|                 |   join, any inbound vsapi call (incl. the 5 s node       |
+|                 |   ping), or a successful outbound VSS ping.              |
 |                 |                                                          |
 | ServiceDesc     | { "service_name": string, "actor_cn": string,            |
 |                 |   "zpr_addr": string, "dock_zpr_addr": string,           |
