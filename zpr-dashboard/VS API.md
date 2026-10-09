@@ -174,6 +174,16 @@ Returns:
 ```
 
 `cn` is null for actors without a CN (e.g. an OIDC-only connect).
+`SYNC_BOOL` (`in_sync`) is true while the VS has a live VSS worker for the
+node; a worker in its 3 s start delay or still connecting counts. A node with
+a live vsapi session gets a new worker on its next ping (~5 s), so a `false`
+that lasts longer than that means the VS has no live VSS worker and cannot
+push to the node's VSS (for example, the node's VSS listener refuses the
+connect, so each new worker exits at once). It does not show that the node
+is unreachable: use `last_contact` (`CONTACT`) for that.
+`CONTACT` (`last_contact`) is the last time the VS heard from the node in
+either direction: node join, any inbound vsapi call (including the 5 s node
+ping), or a successful outbound VSS ping; null if there was no contact.
 `node_details` is null for non-node actors (further fields elided above; see
 `admin-http-api.txt` for the full NodeRecordBrief shape).
 

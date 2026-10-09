@@ -189,14 +189,28 @@ impl PartialOrd for ServiceDescriptor {
 pub struct NodeRecordBrief {
     // Number of visas pending install on the node
     pub pending_install: u32,
-    // Last time node was contacted by the visa service, 0 if there was no contact
+    // Last time the visa service heard from the node, in either direction;
+    // None if there was no contact. Updated when the node joins
+    // (`ActorMgr::add_node`), on every inbound vsapi call from the node
+    // (`register_vss`, `authorize_connect`, `reauthorize`, `visa_request`,
+    // `ping`, `visa_ids_request`, `visa_request_by_id` in `vsapi_worker.rs`;
+    // the node pings every 5 s), and on each successful outbound VSS ping
+    // (`vss_worker.rs`).
     #[serde_as(as = "Option<TimestampSeconds<i64>>")]
     pub last_contact: Option<SystemTime>,
     // Number of visa requests on the node
     pub visa_requests: u64,
     // Number of calls to authorize_connect by the node
     pub connect_requests: u64,
-    // If the node is connected to the vss
+    // True if a live VSS worker exists for the node in the visa service
+    // (`VssMgr::has_live_worker`); false once the worker has exited. A worker
+    // still in its start delay (3 s) or still connecting counts as running.
+    // A node with a live vsapi session gets a new worker on its next ping
+    // (~5 s), so a `false` that lasts longer than that means the VS has no
+    // live VSS worker and cannot push to the node's VSS (e.g. the VSS
+    // listener refuses the connect, so each new worker exits at once). It
+    // does not show that the node is unreachable: use `last_contact` for
+    // that. Does not consider pending installs or revocations.
     pub in_sync: bool,
     // Approved visa requests
     pub approved_vreqs: u64,
@@ -215,7 +229,8 @@ pub struct NodeRecordBrief {
     pub visas_enqueued: Vec<u64>,
     // Number of visas pending revocation on the node
     pub pending_revocation: u32,
-    // Port of the VSS the node is connected to
+    // Port of the VSS the node registered (node DB VSS record). Kept after
+    // the VSS worker exits, so it can be set while `in_sync` is false.
     pub vss_port: Option<u16>,
 }
 

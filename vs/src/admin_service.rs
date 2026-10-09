@@ -712,14 +712,15 @@ async fn build_node_record_brief(
         .get_num_pending_revoked_visas(zpr_addr)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let (vss_port, in_sync) = match actor_mgr
+    // vss_port comes from the node DB VSS record, which outlives the worker
+    // (ping uses it to start a new one). in_sync comes from the live worker
+    // map, so an exited worker reads false (zipline#187).
+    let vss_port = actor_mgr
         .get_node_vss(zpr_addr)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        Some(socket_addr) => (Some(socket_addr.port()), true),
-        None => (None, false),
-    };
+        .map(|socket_addr| socket_addr.port());
+    let in_sync = asm.vss_mgr.has_live_worker(zpr_addr);
 
     Ok(NodeRecordBrief {
         pending_install,
@@ -3330,6 +3331,151 @@ mod tests {
             vec!["fd5a:5052::44".to_string()],
             "the CN-less adapter must appear in NodeRecordBrief.adapters by address"
         );
+    }
+
+    /// GET /admin/actors/{addr} for a node and return its `node_details`.
+    async fn get_node_brief(asm: &Arc<Assembly>, api_key: &str, addr: &str) -> NodeRecordBrief {
+        let shared_state = Arc::new(tokio::sync::RwLock::new(AdminState::new(asm.clone())));
+        let app = admin_app(shared_state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/admin/actors/{addr}"))
+                    .header("X-API-Key", api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let descriptor: ActorDescriptor = serde_json::from_slice(&body).unwrap();
+        descriptor.node_details.expect("node carries node_details")
+    }
+
+    /// zipline#187: a node that has gone silent -- its VSS worker exited after
+    /// its ping failures and the handle was cleared, and no vsapi `ping` from
+    /// the node follows to start a new worker -- must report `in_sync: false`.
+    /// The node DB VSS record is kept (Q1), so `vss_port` still reports the
+    /// port, and `last_contact` does not advance across the exit.
+    #[tokio::test]
+    async fn test_node_brief_in_sync_false_after_vss_worker_exit_silent_node() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::46", "node-silent", "[fd5a:5052::146]:1234");
+        let node_addr = *node.get_zpr_addr().unwrap();
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let vss_addr: SocketAddr = "[fd5a:5052::146]:9877".parse().unwrap();
+        asm.actor_mgr
+            .set_node_vss(&node_addr, &vss_addr)
+            .await
+            .unwrap();
+
+        // A live worker: the handle's command channel is open.
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<crate::vss::VssCmd>(8);
+        asm.vss_mgr.insert_test_handle(node_addr, cmd_tx);
+        let before = get_node_brief(&asm, &api_key, "fd5a:5052::46").await;
+        assert!(before.in_sync, "a live worker reports in_sync");
+
+        // The worker exits (its receiver drops) and run_vss_job clears the
+        // handle. The node is silent: no ping follows, nothing restarts it.
+        drop(cmd_rx);
+        asm.vss_mgr.clear_handle_for_test(&node_addr);
+
+        let after = get_node_brief(&asm, &api_key, "fd5a:5052::46").await;
+        assert!(
+            !after.in_sync,
+            "a node whose VSS worker exited must not report in_sync"
+        );
+        assert_eq!(
+            after.vss_port,
+            Some(9877),
+            "the node DB VSS record is kept, so vss_port still reports it"
+        );
+        assert_eq!(
+            after.last_contact, before.last_contact,
+            "a silent node's last_contact must not advance across the worker exit"
+        );
+    }
+
+    /// zipline#187: a live worker reports `in_sync: true`, and a worker restart
+    /// (`restart_vss_worker`) does not cause a false `false`: the old worker
+    /// exits and runs `clear_handle` after the replacement is installed. The
+    /// replacement sits in its start delay, which counts as running (Q2).
+    #[tokio::test]
+    async fn test_node_brief_in_sync_true_live_and_across_restart() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::48", "node-restart", "[fd5a:5052::148]:1234");
+        let node_addr = *node.get_zpr_addr().unwrap();
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let vss_addr: SocketAddr = "[fd5a:5052::148]:9877".parse().unwrap();
+        asm.actor_mgr
+            .set_node_vss(&node_addr, &vss_addr)
+            .await
+            .unwrap();
+
+        let (old_tx, old_rx) = tokio::sync::mpsc::channel::<crate::vss::VssCmd>(8);
+        asm.vss_mgr.insert_test_handle(node_addr, old_tx);
+        let live = get_node_brief(&asm, &api_key, "fd5a:5052::48").await;
+        assert!(live.in_sync, "a live worker reports in_sync");
+
+        // Restart: the replacement waits an hour before it connects, so it
+        // never touches the network in this test.
+        asm.vss_mgr
+            .restart_vss_worker(
+                asm.clone(),
+                &node_addr,
+                &vss_addr,
+                std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+        let mid = get_node_brief(&asm, &api_key, "fd5a:5052::48").await;
+        assert!(
+            mid.in_sync,
+            "the replacement in its start delay counts as running"
+        );
+
+        // The old worker exits after the replacement is installed.
+        drop(old_rx);
+        asm.vss_mgr.clear_handle_for_test(&node_addr);
+        let after = get_node_brief(&asm, &api_key, "fd5a:5052::48").await;
+        assert!(
+            after.in_sync,
+            "a restart must not cause a false in_sync=false"
+        );
+        assert_eq!(after.vss_port, Some(9877));
+    }
+
+    /// zipline#187: a VSS record with no worker ever started is the same state
+    /// with no history -- `in_sync: false`, `vss_port` set.
+    #[tokio::test]
+    async fn test_node_brief_in_sync_false_with_vss_record_and_no_worker() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node =
+            make_node_actor_defexp("fd5a:5052::47", "node-noworker", "[fd5a:5052::147]:1234");
+        let node_addr = *node.get_zpr_addr().unwrap();
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let vss_addr: SocketAddr = "[fd5a:5052::147]:9877".parse().unwrap();
+        asm.actor_mgr
+            .set_node_vss(&node_addr, &vss_addr)
+            .await
+            .unwrap();
+
+        let brief = get_node_brief(&asm, &api_key, "fd5a:5052::47").await;
+        assert!(!brief.in_sync, "no VSS worker means not in_sync");
+        assert_eq!(brief.vss_port, Some(9877));
     }
 
     /// GET /admin/actors/{addr}: a malformed address is a 400 (new behaviour --
