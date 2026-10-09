@@ -206,8 +206,11 @@ pub struct NodeRecordBrief {
     // (`VssMgr::has_live_worker`); false once the worker has exited. A worker
     // still in its start delay (3 s) or still connecting counts as running.
     // A node with a live vsapi session gets a new worker on its next ping
-    // (~5 s), so a `false` that lasts longer than that means the node itself
-    // is unreachable. Does not consider pending installs or revocations.
+    // (~5 s), so a `false` that lasts longer than that means the VS has no
+    // live VSS worker and cannot push to the node's VSS (e.g. the VSS
+    // listener refuses the connect, so each new worker exits at once). It
+    // does not show that the node is unreachable: use `last_contact` for
+    // that. Does not consider pending installs or revocations.
     pub in_sync: bool,
     // Approved visa requests
     pub approved_vreqs: u64,
