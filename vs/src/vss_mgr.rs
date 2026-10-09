@@ -181,6 +181,13 @@ impl VssMgr {
         self.workers.insert(node_addr, VssHandle { cmd_tx });
     }
 
+    /// Run the worker-exit housekeeping ([VssMgr::clear_handle]) without a real
+    /// worker, so tests can model a VSS worker that has exited.
+    #[cfg(test)]
+    pub fn clear_handle_for_test(&self, naddr: &IpAddr) {
+        self.clear_handle(naddr);
+    }
+
     /// Housekeeping function to remove (presumably stale/not-running) worker.
     /// Called when the worker run loop exits.
     ///
