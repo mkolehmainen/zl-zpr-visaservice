@@ -173,6 +173,21 @@ impl VssMgr {
         self.workers.get(naddr).map(|h| h.clone())
     }
 
+    /// `true` iff a VSS worker for the node is in the map and its command
+    /// channel is still open, i.e. the worker has not exited.
+    ///
+    /// The entry is inserted when the worker is queued, so a worker still in
+    /// its start delay or still connecting counts as live. An exited worker
+    /// closes its receiver before [VssMgr::clear_handle] removes the entry, so
+    /// the closed-channel check also covers that short window. A replacement
+    /// installed by [VssMgr::restart_vss_worker] is live as soon as it is in
+    /// the map (zipline#187).
+    pub fn has_live_worker(&self, naddr: &IpAddr) -> bool {
+        self.workers
+            .get(naddr)
+            .is_some_and(|h| !h.cmd_tx.is_closed())
+    }
+
     /// Install a handle whose commands go to a test-owned channel instead of a real
     /// VSS worker, so tests can answer `VssCmd`s directly (no capnp needed —
     /// [VssHandle] is just an mpsc sender). Overwrites any existing handle.
@@ -303,5 +318,62 @@ async fn run_vss_job(job: Job) {
             info!(target: VSS, "VSS worker for node {} has exited", node_addr);
             // TODO: Do we need to track somewhere that we are no longer in communication with this node?
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node() -> IpAddr {
+        "fd5a:5052::50".parse().unwrap()
+    }
+
+    #[test]
+    fn has_live_worker_false_without_entry() {
+        let mgr = VssMgr::new();
+        assert!(!mgr.has_live_worker(&node()));
+    }
+
+    #[test]
+    fn has_live_worker_true_with_open_channel() {
+        let mgr = VssMgr::new();
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<VssCmd>(1);
+        mgr.insert_test_handle(node(), cmd_tx);
+        assert!(mgr.has_live_worker(&node()));
+    }
+
+    #[test]
+    fn has_live_worker_false_after_worker_exit() {
+        let mgr = VssMgr::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<VssCmd>(1);
+        mgr.insert_test_handle(node(), cmd_tx);
+        // The worker exits: its receiver drops before clear_handle runs.
+        drop(cmd_rx);
+        assert!(
+            !mgr.has_live_worker(&node()),
+            "a closed channel is not a live worker, even before clear_handle"
+        );
+        mgr.clear_handle(&node());
+        assert!(
+            mgr.get_handle(&node()).is_none(),
+            "clear_handle drops the entry"
+        );
+        assert!(!mgr.has_live_worker(&node()));
+    }
+
+    /// The `restart_vss_worker` map effect: the old handle is overwritten by
+    /// the new one, then the old worker exits and runs `clear_handle`. The
+    /// replacement stays live (no false `false` across a restart).
+    #[test]
+    fn has_live_worker_true_across_restart() {
+        let mgr = VssMgr::new();
+        let (old_tx, old_rx) = mpsc::channel::<VssCmd>(1);
+        mgr.insert_test_handle(node(), old_tx);
+        let (new_tx, _new_rx) = mpsc::channel::<VssCmd>(1);
+        mgr.insert_test_handle(node(), new_tx);
+        drop(old_rx);
+        mgr.clear_handle(&node());
+        assert!(mgr.has_live_worker(&node()));
     }
 }

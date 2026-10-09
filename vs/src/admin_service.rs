@@ -712,14 +712,15 @@ async fn build_node_record_brief(
         .get_num_pending_revoked_visas(zpr_addr)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let (vss_port, in_sync) = match actor_mgr
+    // vss_port comes from the node DB VSS record, which outlives the worker
+    // (ping uses it to start a new one). in_sync comes from the live worker
+    // map, so an exited worker reads false (zipline#187).
+    let vss_port = actor_mgr
         .get_node_vss(zpr_addr)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        Some(socket_addr) => (Some(socket_addr.port()), true),
-        None => (None, false),
-    };
+        .map(|socket_addr| socket_addr.port());
+    let in_sync = asm.vss_mgr.has_live_worker(zpr_addr);
 
     Ok(NodeRecordBrief {
         pending_install,
