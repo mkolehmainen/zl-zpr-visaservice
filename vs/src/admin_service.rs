@@ -3402,6 +3402,58 @@ mod tests {
         );
     }
 
+    /// zipline#187: a live worker reports `in_sync: true`, and a worker restart
+    /// (`restart_vss_worker`) does not cause a false `false`: the old worker
+    /// exits and runs `clear_handle` after the replacement is installed. The
+    /// replacement sits in its start delay, which counts as running (Q2).
+    #[tokio::test]
+    async fn test_node_brief_in_sync_true_live_and_across_restart() {
+        let asm = Arc::new(new_assembly_for_tests(None).await);
+        let api_key = setup_test_api_r_key(&asm);
+        let node = make_node_actor_defexp("fd5a:5052::48", "node-restart", "[fd5a:5052::148]:1234");
+        let node_addr = *node.get_zpr_addr().unwrap();
+        asm.actor_mgr
+            .add_node(&node, false, &Default::default())
+            .await
+            .unwrap();
+        let vss_addr: SocketAddr = "[fd5a:5052::148]:9877".parse().unwrap();
+        asm.actor_mgr
+            .set_node_vss(&node_addr, &vss_addr)
+            .await
+            .unwrap();
+
+        let (old_tx, old_rx) = tokio::sync::mpsc::channel::<crate::vss::VssCmd>(8);
+        asm.vss_mgr.insert_test_handle(node_addr, old_tx);
+        let live = get_node_brief(&asm, &api_key, "fd5a:5052::48").await;
+        assert!(live.in_sync, "a live worker reports in_sync");
+
+        // Restart: the replacement waits an hour before it connects, so it
+        // never touches the network in this test.
+        asm.vss_mgr
+            .restart_vss_worker(
+                asm.clone(),
+                &node_addr,
+                &vss_addr,
+                std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+        let mid = get_node_brief(&asm, &api_key, "fd5a:5052::48").await;
+        assert!(
+            mid.in_sync,
+            "the replacement in its start delay counts as running"
+        );
+
+        // The old worker exits after the replacement is installed.
+        drop(old_rx);
+        asm.vss_mgr.clear_handle_for_test(&node_addr);
+        let after = get_node_brief(&asm, &api_key, "fd5a:5052::48").await;
+        assert!(
+            after.in_sync,
+            "a restart must not cause a false in_sync=false"
+        );
+        assert_eq!(after.vss_port, Some(9877));
+    }
+
     /// zipline#187: a VSS record with no worker ever started is the same state
     /// with no history -- `in_sync: false`, `vss_port` set.
     #[tokio::test]
