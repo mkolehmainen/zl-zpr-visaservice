@@ -32,7 +32,7 @@ jobs:
     strategy:
       matrix:
         target: [vs-admin, admin-api-types, libeval]
-    uses: org-zpr/zpr-dev-tools/.github/workflows/rust-containerized-build-test.yml@v1.2
+    uses: org-zpr/zpr-dev-tools/.github/workflows/rust-containerized-build-test.yml@v1.5.0
     with:
       name: ${{ matrix.target }}
       path: ./${{ matrix.target }}
